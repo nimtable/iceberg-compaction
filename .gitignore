@@ -1,0 +1,38 @@
+# macOS
+**/*.DS_Store
+
+# Visual Studio Code
+.vscode/*
+!.vscode/*.example
+.devcontainer/
+
+# JetBrains
+.idea/
+*.iml
+.fleet/
+
+# GitPod
+.gitpod.yml
+
+# CLion
+cmake-build-debug/
+/cmake-build-wsl_profile/
+
+# build
+*.exe
+*.app
+build/
+
+# Rust
+src/**/target
+src/**/target_tarpaulin
+target/
+target-bisector-*/
+src/proto/
+
+# ctags
+**/tags
+
+log/
+
+*.log

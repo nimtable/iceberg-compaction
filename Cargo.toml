@@ -1,0 +1,14 @@
+[package]
+name = "ic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "683fb89edeaf8d1baae69e1f376d68b92be1d496", features = [
+    "storage-s3",
+    "storage-gcs",
+] }
+thiserror = "2.0.11"
+async-trait = "0.1.86"
+parquet = { version = "53.2", features = ["async"] }
+serde = { version = "1", features = ["rc"] }
