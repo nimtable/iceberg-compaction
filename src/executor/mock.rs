@@ -13,4 +13,12 @@ impl CompactionExecutor for MockExecutor {
     ) -> Result<Vec<DataFile>, CompactionError> {
         Ok(input_files)
     }
+
+    async fn compact_table(
+        &self,
+        _table: Table,
+        _config: Arc<CompactionConfig>,
+    ) -> Result<Vec<DataFile>, CompactionError> {
+        Ok(vec![])
+    }
 }

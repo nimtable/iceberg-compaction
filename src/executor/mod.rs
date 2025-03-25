@@ -21,4 +21,10 @@ pub trait CompactionExecutor: Send + Sync + 'static {
         input_files: Vec<DataFile>,
         config: Arc<CompactionConfig>,
     ) -> Result<Vec<DataFile>, CompactionError>;
+
+    async fn compact_table(
+        &self,
+        table: Table,
+        config: Arc<CompactionConfig>,
+    ) -> Result<Vec<DataFile>, CompactionError>;
 }

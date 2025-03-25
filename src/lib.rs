@@ -1,3 +1,5 @@
+#![feature(proc_macro_hygiene, stmt_expr_attributes)]
+
 pub mod config;
 pub mod error;
 pub mod executor;
