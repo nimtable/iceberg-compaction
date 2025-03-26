@@ -10,6 +10,9 @@ pub enum CompactionError {
 
     #[error("Execution failed: {0}")]
     Execution(String),
+
+    #[error("Commit error: {0}")]
+    Commit(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

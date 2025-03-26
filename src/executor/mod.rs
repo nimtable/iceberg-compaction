@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use iceberg::TableIdent;
 
 use crate::config::CompactionConfig;
 use crate::error::CompactionError;
@@ -17,7 +18,7 @@ pub use datafusion::DataFusionExecutor;
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn compact(
         &self,
-        table: Table,
+        table: &TableIdent,
         input_files: Vec<DataFile>,
         config: Arc<CompactionConfig>,
     ) -> Result<Vec<DataFile>, CompactionError>;
