@@ -1,7 +1,10 @@
-use ::datafusion::{parquet::file::properties::WriterProperties, prelude::SessionContext};
+use ::datafusion::{
+    parquet::file::properties::WriterProperties,
+    prelude::{SessionConfig, SessionContext},
+};
 use async_trait::async_trait;
 use file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
-use futures::StreamExt;
+use futures::{future::try_join_all, StreamExt};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     scan::FileScanTask,
@@ -17,6 +20,7 @@ use iceberg::{
 };
 use sqlx::types::Uuid;
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
@@ -38,10 +42,14 @@ impl CompactionExecutor for DataFusionExecutor {
         file_io: FileIO,
         schema: Schema,
         input_file_scan_tasks: AllFileScanTasks,
-        _config: Arc<CompactionConfig>,
+        config: Arc<CompactionConfig>,
         dir_path: String,
     ) -> Result<Vec<DataFile>, CompactionError> {
-        let ctx = SessionContext::new();
+        let batch_parallelism = config.batch_parallelism.unwrap_or(1);
+        let mut config = SessionConfig::new();
+        config = config.with_target_partitions(4);
+        let ctx = SessionContext::new_with_config(config);
+
         let AllFileScanTasks {
             data_files,
             position_delete_files,
@@ -149,6 +157,7 @@ impl CompactionExecutor for DataFusionExecutor {
             "test_all_delete_data_file",
             need_seq_num,
             need_file_path_and_pos,
+            batch_parallelism,
         )?;
 
         let mut merge_on_read_sql = format!(
@@ -164,6 +173,7 @@ impl CompactionExecutor for DataFusionExecutor {
                 "test_all_delete_position_delete",
                 false,
                 false,
+                batch_parallelism,
             )?;
             merge_on_read_sql.push_str(" left anti join test_all_delete_position_delete on test_all_delete_data_file.file_path = test_all_delete_position_delete.file_path and test_all_delete_data_file.pos = test_all_delete_position_delete.pos");
         }
@@ -176,6 +186,7 @@ impl CompactionExecutor for DataFusionExecutor {
                 "test_all_delete_equality_delete",
                 false,
                 false,
+                batch_parallelism,
             )?;
             merge_on_read_sql.push_str(format!(
                 " left anti join test_all_delete_equality_delete on {} and test_all_delete_data_file.seq_num < test_all_delete_equality_delete.seq_num",
@@ -184,22 +195,39 @@ impl CompactionExecutor for DataFusionExecutor {
         }
 
         let df = ctx.sql(merge_on_read_sql.as_str()).await?;
-        let mut data_file_writer = Self::build_iceberg_writer(dir_path, schema, file_io).await?;
-
         let batchs = df.execute_stream_partitioned().await?;
-
+        let mut futures = Vec::with_capacity(batch_parallelism);
         for mut batch in batchs {
-            while let Some(b) = batch.as_mut().next().await {
-                data_file_writer.write(b?).await?;
-            }
+            let dir_path = dir_path.clone();
+            let schema = schema.clone();
+            let file_io = file_io.clone();
+            let future: JoinHandle<
+                std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
+            > = tokio::spawn(async move {
+                let mut data_file_writer =
+                    Self::build_iceberg_writer(dir_path, schema, file_io).await?;
+                while let Some(b) = batch.as_mut().next().await {
+                    data_file_writer.write(b?).await?;
+                }
+                let data_files = data_file_writer.close().await?;
+                Ok(data_files)
+            });
+            futures.push(future);
         }
 
-        let data_files = data_file_writer.close().await.unwrap();
-        Ok(data_files)
+        let all_data_files = try_join_all(futures)
+            .await
+            .map_err(|e| CompactionError::Execution(e.to_string()))?
+            .into_iter()
+            .map(|res| res.map(|v| v.into_iter())) // 转换每个 Result<Vec<T>> 为 Result<迭代器>
+            .collect::<Result<Vec<_>, _>>()
+            .map(|iters| iters.into_iter().flatten().collect())?;
+        Ok(all_data_files)
     }
 }
 
 impl DataFusionExecutor {
+    #[allow(clippy::too_many_arguments)]
     fn register_table_provider(
         schema: Schema,
         file_scan_tasks: Vec<FileScanTask>,
@@ -208,6 +236,7 @@ impl DataFusionExecutor {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
+        batch_parallelism: usize,
     ) -> Result<(), CompactionError> {
         let schema = schema_to_arrow_schema(&schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
@@ -216,6 +245,7 @@ impl DataFusionExecutor {
             file_io,
             need_seq_num,
             need_file_path_and_pos,
+            batch_parallelism,
         );
 
         ctx.register_table(table_name, Arc::new(data_file_table_provider))
@@ -254,8 +284,6 @@ impl DataFusionExecutor {
 }
 #[cfg(test)]
 mod tests {
-    use core::clone;
-    use datafusion::parquet::file;
     use futures_async_stream::for_await;
     use iceberg::scan::FileScanTask;
     use iceberg::table::Table;
@@ -388,7 +416,9 @@ mod tests {
                 file_io,
                 schema.as_ref().clone(),
                 all_file_scan_tasks,
-                Arc::new(CompactionConfig {}),
+                Arc::new(CompactionConfig {
+                    batch_parallelism: Some(4),
+                }),
                 default_location_generator.dir_path,
             )
             .await

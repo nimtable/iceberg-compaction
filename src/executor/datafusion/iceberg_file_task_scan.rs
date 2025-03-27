@@ -23,7 +23,7 @@ use iceberg_datafusion::to_datafusion_error;
 
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
-    file_scan_tasks: Vec<FileScanTask>,
+    file_scan_tasks_group: Vec<Vec<FileScanTask>>,
     plan_properties: PlanProperties,
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
@@ -33,6 +33,7 @@ pub(crate) struct IcebergFileTaskScan {
 }
 
 impl IcebergFileTaskScan {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_scan_tasks: Vec<FileScanTask>,
         schema: ArrowSchemaRef,
@@ -41,17 +42,21 @@ impl IcebergFileTaskScan {
         file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
+        batch_parallelism: usize,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
-        let plan_properties = Self::compute_properties(output_schema.clone());
+        let file_scan_tasks_group = split_n_vecs(file_scan_tasks, batch_parallelism);
+
+        let plan_properties =
+            Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
         let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
         Self {
-            file_scan_tasks,
+            file_scan_tasks_group,
             plan_properties,
             projection,
             predicates,
@@ -62,17 +67,33 @@ impl IcebergFileTaskScan {
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef) -> PlanProperties {
+    fn compute_properties(schema: ArrowSchemaRef, partitioning_size: usize) -> PlanProperties {
         // TODO:
         // This is more or less a placeholder, to be replaced
         // once we support output-partitioning
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(partitioning_size),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
     }
+}
+
+fn split_n_vecs(vecs: Vec<FileScanTask>, split_num: usize) -> Vec<Vec<FileScanTask>> {
+    let split_size = vecs.len() / split_num;
+    let remaining = vecs.len() % split_num;
+    let mut result_vecs: Vec<_> = (0..split_num)
+        .map(|i| {
+            let start = i * split_size;
+            let end = (i + 1) * split_size;
+            vecs[start..end].to_vec()
+        })
+        .collect();
+    for i in 0..remaining {
+        result_vecs[i].push(vecs[split_num * split_size + i].clone());
+    }
+    result_vecs
 }
 
 impl ExecutionPlan for IcebergFileTaskScan {
@@ -101,12 +122,12 @@ impl ExecutionPlan for IcebergFileTaskScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let fut = get_batch_stream(
             self.file_io.clone(),
-            self.file_scan_tasks.clone(),
+            self.file_scan_tasks_group[partition].clone(),
             self.need_seq_num,
             self.need_file_path_and_pos,
         );

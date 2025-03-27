@@ -1,4 +1,5 @@
 #![feature(proc_macro_hygiene, stmt_expr_attributes)]
+#![feature(coroutines)]
 
 pub mod config;
 pub mod error;
