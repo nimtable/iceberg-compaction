@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "82c63b3452379c6b9f361e1dc7df43e14ece72aa", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d", features = [
     "storage-s3",
     "storage-gcs",
 ] }
@@ -13,9 +13,9 @@ async-trait = "0.1.86"
 parquet = { version = "53.2", features = ["async"] }
 serde = { version = "1", features = ["rc"] }
 datafusion = "45.0.0"
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "82c63b3452379c6b9f361e1dc7df43e14ece72aa" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
 url = "2"
-iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "82c63b3452379c6b9f361e1dc7df43e14ece72aa"}
+iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d"}
 tokio = { version = "1", default-features = false}
 sqlx = { version = "0.8.2", default-features = false, features = [
     "bigdecimal",

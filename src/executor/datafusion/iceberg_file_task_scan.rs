@@ -16,8 +16,8 @@ use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
+use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
-use iceberg::table::Table;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
 
@@ -27,7 +27,7 @@ pub(crate) struct IcebergFileTaskScan {
     plan_properties: PlanProperties,
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
-    table: Table,
+    file_io: FileIO,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
 }
@@ -38,7 +38,7 @@ impl IcebergFileTaskScan {
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        table: Table,
+        file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
     ) -> Self {
@@ -55,7 +55,7 @@ impl IcebergFileTaskScan {
             plan_properties,
             projection,
             predicates,
-            table,
+            file_io: file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
         }
@@ -105,7 +105,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let fut = get_batch_stream(
-            self.table.clone(),
+            self.file_io.clone(),
             self.file_scan_tasks.clone(),
             self.need_seq_num,
             self.need_file_path_and_pos,
@@ -120,7 +120,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
 }
 
 async fn get_batch_stream(
-    table: Table,
+    file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
@@ -131,7 +131,7 @@ async fn get_batch_stream(
             let data_file_content = task.data_file_content;
             let sequence_number = task.sequence_number;
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(table.file_io().clone());
+            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone());
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
                 .await

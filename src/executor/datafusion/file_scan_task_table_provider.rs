@@ -8,8 +8,8 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
-use iceberg::table::Table;
 
 use super::iceberg_file_task_scan::IcebergFileTaskScan;
 
@@ -18,7 +18,7 @@ use super::iceberg_file_task_scan::IcebergFileTaskScan;
 pub struct IcebergFileScanTaskTableProvider {
     file_scan_tasks: Vec<FileScanTask>,
     schema: ArrowSchemaRef,
-    table: Table,
+    file_io: FileIO,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
 }
@@ -26,14 +26,14 @@ impl IcebergFileScanTaskTableProvider {
     pub fn new(
         file_scan_tasks: Vec<FileScanTask>,
         schema: ArrowSchemaRef,
-        table: Table,
+        file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
     ) -> Self {
         Self {
             file_scan_tasks,
             schema,
-            table,
+            file_io: file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
         }
@@ -65,7 +65,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.schema.clone(),
             projection,
             filters,
-            self.table.clone(),
+            &self.file_io,
             self.need_seq_num,
             self.need_file_path_and_pos,
         )))

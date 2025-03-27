@@ -7,17 +7,11 @@ pub struct MockExecutor;
 impl CompactionExecutor for MockExecutor {
     async fn compact(
         &self,
-        _table: Table,
-        input_files: Vec<DataFile>,
+        _file_id: FileIO,
+        _schema: Schema,
+        _input_file_scan_tasks: AllFileScanTasks,
         _config: Arc<CompactionConfig>,
-    ) -> Result<Vec<DataFile>, CompactionError> {
-        Ok(input_files)
-    }
-
-    async fn compact_table(
-        &self,
-        _table: Table,
-        _config: Arc<CompactionConfig>,
+        _dir_path: String,
     ) -> Result<Vec<DataFile>, CompactionError> {
         Ok(vec![])
     }

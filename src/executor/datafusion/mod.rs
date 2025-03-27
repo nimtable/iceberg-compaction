@@ -2,7 +2,6 @@ use ::datafusion::{parquet::file::properties::WriterProperties, prelude::Session
 use async_trait::async_trait;
 use file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use futures::StreamExt;
-use futures_async_stream::for_await;
 use iceberg::{
     arrow::schema_to_arrow_schema,
     scan::FileScanTask,
@@ -17,7 +16,7 @@ use iceberg::{
     },
 };
 use sqlx::types::Uuid;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
@@ -36,22 +35,18 @@ pub struct DataFusionExecutor {
 impl CompactionExecutor for DataFusionExecutor {
     async fn compact(
         &self,
-        _table: Table,
-        _input_files: Vec<DataFile>,
+        file_io: FileIO,
+        schema: Schema,
+        input_file_scan_tasks: AllFileScanTasks,
         _config: Arc<CompactionConfig>,
-    ) -> Result<Vec<DataFile>, CompactionError> {
-        unimplemented!()
-    }
-    async fn compact_table(
-        &self,
-        table: Table,
-        _config: Arc<CompactionConfig>,
+        dir_path: String,
     ) -> Result<Vec<DataFile>, CompactionError> {
         let ctx = SessionContext::new();
-        let (data_files, position_delete_files, equality_delete_files) =
-            Self::get_tasks_from_table(table.clone()).await?;
-
-        let schema = table.metadata().current_schema().as_ref().clone();
+        let AllFileScanTasks {
+            data_files,
+            position_delete_files,
+            equality_delete_files,
+        } = input_file_scan_tasks;
         let highest_field_id = schema.highest_field_id();
         // Build scheam for position delete file, file_path + pos
         let position_delete_schema = Schema::builder()
@@ -149,7 +144,7 @@ impl CompactionExecutor for DataFusionExecutor {
         Self::register_table_provider(
             data_file_schema,
             data_files,
-            table.clone(),
+            &file_io,
             &ctx,
             "test_all_delete_data_file",
             need_seq_num,
@@ -164,7 +159,7 @@ impl CompactionExecutor for DataFusionExecutor {
             Self::register_table_provider(
                 position_delete_schema,
                 position_delete_files,
-                table.clone(),
+                &file_io,
                 &ctx,
                 "test_all_delete_position_delete",
                 false,
@@ -176,7 +171,7 @@ impl CompactionExecutor for DataFusionExecutor {
             Self::register_table_provider(
                 equality_delete_schema,
                 equality_delete_files,
-                table.clone(),
+                &file_io,
                 &ctx,
                 "test_all_delete_equality_delete",
                 false,
@@ -189,7 +184,7 @@ impl CompactionExecutor for DataFusionExecutor {
         }
 
         let df = ctx.sql(merge_on_read_sql.as_str()).await?;
-        let mut data_file_writer = Self::build_iceberg_writer(&table).await?;
+        let mut data_file_writer = Self::build_iceberg_writer(dir_path, schema, file_io).await?;
 
         let batchs = df.execute_stream_partitioned().await?;
 
@@ -205,9 +200,99 @@ impl CompactionExecutor for DataFusionExecutor {
 }
 
 impl DataFusionExecutor {
-    async fn get_tasks_from_table(
-        table: Table,
-    ) -> Result<(Vec<FileScanTask>, Vec<FileScanTask>, Vec<FileScanTask>), CompactionError> {
+    fn register_table_provider(
+        schema: Schema,
+        file_scan_tasks: Vec<FileScanTask>,
+        file_io: &FileIO,
+        ctx: &SessionContext,
+        table_name: &str,
+        need_seq_num: bool,
+        need_file_path_and_pos: bool,
+    ) -> Result<(), CompactionError> {
+        let schema = schema_to_arrow_schema(&schema)?;
+        let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
+            file_scan_tasks,
+            Arc::new(schema),
+            file_io,
+            need_seq_num,
+            need_file_path_and_pos,
+        );
+
+        ctx.register_table(table_name, Arc::new(data_file_table_provider))
+            .unwrap();
+        Ok(())
+    }
+    async fn build_iceberg_writer(
+        dir_path: String,
+        schema: Schema,
+        file_io: FileIO,
+    ) -> Result<
+        DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
+        CompactionError,
+    > {
+        let location_generator = DefaultLocationGenerator { dir_path };
+        let unique_uuid_suffix = Uuid::now_v7();
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "1".to_string(),
+            Some(unique_uuid_suffix.to_string()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::default(),
+            Arc::new(schema),
+            file_io,
+            location_generator,
+            file_name_generator,
+        );
+        let data_file_writer = DataFileWriterBuilder::new(parquet_writer_builder, None, 0)
+            .build()
+            .await
+            .unwrap();
+        Ok(data_file_writer)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use core::clone;
+    use datafusion::parquet::file;
+    use futures_async_stream::for_await;
+    use iceberg::scan::FileScanTask;
+    use iceberg::table::Table;
+    use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
+    use iceberg::Catalog;
+    use iceberg::{io::FileIOBuilder, transaction::Transaction, TableIdent};
+    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::executor::AllFileScanTasks;
+    use crate::CompactionError;
+    use crate::{executor::DataFusionExecutor, CompactionConfig, CompactionExecutor};
+
+    async fn build_catalog() -> SqlCatalog {
+        let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
+        let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
+        let config = SqlCatalogConfig::builder()
+            .uri(sql_lite_uri.to_string())
+            .name("demo1".to_string())
+            .warehouse_location(warehouse_location)
+            .file_io(
+                FileIOBuilder::new("s3a")
+                    .with_prop("s3.secret-access-key", "hummockadmin")
+                    .with_prop("s3.access-key-id", "hummockadmin")
+                    .with_prop("s3.endpoint", "http://127.0.0.1:9301")
+                    .with_prop("s3.region", "")
+                    .build()
+                    .unwrap(),
+            )
+            .sql_bind_style(SqlBindStyle::DollarNumeric)
+            .build();
+        let catalog = SqlCatalog::new(config).await.unwrap();
+        catalog
+    }
+
+    async fn get_tasks_from_table(table: Table) -> Result<AllFileScanTasks, CompactionError> {
         let snapshot_id = table.metadata().current_snapshot_id().unwrap();
 
         let scan = table
@@ -252,92 +337,11 @@ impl DataFusionExecutor {
                 }
             }
         }
-        Ok((
+        Ok(AllFileScanTasks {
             data_files,
-            position_delete_files.into_values().collect(),
-            equality_delete_files.into_values().collect(),
-        ))
-    }
-    fn register_table_provider(
-        schema: Schema,
-        file_scan_tasks: Vec<FileScanTask>,
-        table: Table,
-        ctx: &SessionContext,
-        table_name: &str,
-        need_seq_num: bool,
-        need_file_path_and_pos: bool,
-    ) -> Result<(), CompactionError> {
-        let schema = schema_to_arrow_schema(&schema)?;
-        let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
-            file_scan_tasks,
-            Arc::new(schema),
-            table,
-            need_seq_num,
-            need_file_path_and_pos,
-        );
-
-        ctx.register_table(table_name, Arc::new(data_file_table_provider))
-            .unwrap();
-        Ok(())
-    }
-    async fn build_iceberg_writer(
-        table: &Table,
-    ) -> Result<
-        DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
-        CompactionError,
-    > {
-        let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let unique_uuid_suffix = Uuid::now_v7();
-        let file_name_generator = DefaultFileNameGenerator::new(
-            "1".to_string(),
-            Some(unique_uuid_suffix.to_string()),
-            iceberg::spec::DataFileFormat::Parquet,
-        );
-
-        let schema = table.metadata().current_schema();
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            schema.clone(),
-            table.file_io().clone(),
-            location_generator,
-            file_name_generator,
-        );
-        let data_file_writer = DataFileWriterBuilder::new(parquet_writer_builder, None, 0)
-            .build()
-            .await
-            .unwrap();
-        Ok(data_file_writer)
-    }
-}
-#[cfg(test)]
-mod tests {
-    use iceberg::Catalog;
-    use iceberg::{io::FileIOBuilder, transaction::Transaction, TableIdent};
-    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
-    use std::sync::Arc;
-
-    use crate::{executor::DataFusionExecutor, CompactionConfig, CompactionExecutor};
-
-    async fn build_catalog() -> SqlCatalog {
-        let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
-        let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
-        let config = SqlCatalogConfig::builder()
-            .uri(sql_lite_uri.to_string())
-            .name("demo1".to_string())
-            .warehouse_location(warehouse_location)
-            .file_io(
-                FileIOBuilder::new("s3a")
-                    .with_prop("s3.secret-access-key", "hummockadmin")
-                    .with_prop("s3.access-key-id", "hummockadmin")
-                    .with_prop("s3.endpoint", "http://127.0.0.1:9301")
-                    .with_prop("s3.region", "")
-                    .build()
-                    .unwrap(),
-            )
-            .sql_bind_style(SqlBindStyle::DollarNumeric)
-            .build();
-        let catalog = SqlCatalog::new(config).await.unwrap();
-        catalog
+            position_delete_files: position_delete_files.into_values().collect(),
+            equality_delete_files: equality_delete_files.into_values().collect(),
+        })
     }
 
     #[tokio::test]
@@ -374,13 +378,19 @@ mod tests {
                 }
             }
         }
-
-        DataFusionExecutor::get_tasks_from_table(table.clone())
-            .await
-            .unwrap();
-
+        let all_file_scan_tasks = get_tasks_from_table(table.clone()).await.unwrap();
+        let file_io = table.file_io().clone();
+        let schema = table.metadata().current_schema();
+        let default_location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let new_data_files = data_fusion_executor
-            .compact_table(table.clone(), Arc::new(CompactionConfig {}))
+            .compact(
+                file_io,
+                schema.as_ref().clone(),
+                all_file_scan_tasks,
+                Arc::new(CompactionConfig {}),
+                default_location_generator.dir_path,
+            )
             .await
             .unwrap();
         let txn = Transaction::new(&table);
