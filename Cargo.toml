@@ -2,14 +2,6 @@
 resolver = "2"
 members = ["core", "prost", "services/compactor"]
 
-# [lib]
-# name = "ic"
-# path = "src/lib.rs"
-
-# [[bin]]
-# name = "ic-compactor-server"
-# path = "services/compactor/src/server.rs"
-
 [workspace.dependencies]
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "683fb89edeaf8d1baae69e1f376d68b92be1d496", features = [
     "storage-s3",
