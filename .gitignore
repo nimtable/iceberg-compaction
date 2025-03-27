@@ -27,6 +27,8 @@ build/
 core/**/target
 core/**/target_tarpaulin
 prost/**/target
+prost/src/**
+!prost/src/lib.rs
 sevices/compactor/**/target
 target/
 target-bisector-*/
