@@ -24,11 +24,12 @@ cmake-build-debug/
 build/
 
 # Rust
-src/**/target
-src/**/target_tarpaulin
+core/**/target
+core/**/target_tarpaulin
+prost/**/target
+sevices/compactor/**/target
 target/
 target-bisector-*/
-src/proto/
 
 # ctags
 **/tags

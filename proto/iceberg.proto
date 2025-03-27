@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package compactor;
+
+message DataFile {
+    string file_path = 1;
+}
+
+message RewriteFilesRequest {
+    repeated DataFile data_files = 1;
+}
+
+message RewriteFilesResponse {
+    repeated DataFile data_files = 1;
+}
+
+service CompactorService {
+    rpc RewriteFiles (stream RewriteFilesRequest) returns (stream RewriteFilesResponse);
+}
