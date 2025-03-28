@@ -20,7 +20,7 @@ async fn main() {
 
     let server_type = std::env::var("SERVER_TYPE").unwrap_or_else(|_| "grpc".to_string());
 
-    let _join_handle = match server_type.as_str() {
+    let join_handle = match server_type.as_str() {
         "grpc" => {
             println!("Starting gRPC server...");
             grpc_compactor_serve(listen_addr).await
@@ -31,4 +31,14 @@ async fn main() {
         }
         _ => panic!("Unknown server type: {}", server_type),
     };
+
+    // join_handle
+    match join_handle.await {
+        Ok(_) => {
+            println!("Server stopped gracefully");
+        }
+        Err(e) => {
+            eprintln!("Server stopped with error: {}", e);
+        }
+    }
 }
