@@ -4,18 +4,18 @@ use ::datafusion::{
 };
 use async_trait::async_trait;
 use file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
-use futures::{future::try_join_all, StreamExt};
+use futures::{StreamExt, future::try_join_all};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     scan::FileScanTask,
     spec::{NestedField, PrimitiveType, Schema, Type},
     writer::{
+        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder},
         file_writer::{
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             ParquetWriterBuilder,
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
         },
-        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use sqlx::types::Uuid;
@@ -28,7 +28,6 @@ const SEQ_NUM: &str = "seq_num";
 const FILE_PATH: &str = "file_path";
 const POS: &str = "pos";
 
-// use datafusion::prelude::*;
 use super::*;
 
 pub struct DataFusionExecutor {
@@ -38,7 +37,6 @@ pub struct DataFusionExecutor {
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
     async fn compact(
-        &self,
         file_io: FileIO,
         schema: Schema,
         input_file_scan_tasks: AllFileScanTasks,
@@ -285,18 +283,18 @@ impl DataFusionExecutor {
 #[cfg(test)]
 mod tests {
     use futures_async_stream::for_await;
+    use iceberg::Catalog;
     use iceberg::scan::FileScanTask;
     use iceberg::table::Table;
     use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-    use iceberg::Catalog;
-    use iceberg::{io::FileIOBuilder, transaction::Transaction, TableIdent};
+    use iceberg::{TableIdent, io::FileIOBuilder, transaction::Transaction};
     use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::executor::AllFileScanTasks;
     use crate::CompactionError;
-    use crate::{executor::DataFusionExecutor, CompactionConfig, CompactionExecutor};
+    use crate::executor::AllFileScanTasks;
+    use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
     async fn build_catalog() -> SqlCatalog {
         let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
@@ -374,7 +372,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() {
-        let data_fusion_executor = DataFusionExecutor {};
         let catalog = build_catalog().await;
         let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
         let table = catalog.load_table(&table_id).await.unwrap();
@@ -411,18 +408,17 @@ mod tests {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let new_data_files = data_fusion_executor
-            .compact(
-                file_io,
-                schema.as_ref().clone(),
-                all_file_scan_tasks,
-                Arc::new(CompactionConfig {
-                    batch_parallelism: Some(4),
-                }),
-                default_location_generator.dir_path,
-            )
-            .await
-            .unwrap();
+        let new_data_files = DataFusionExecutor::compact(
+            file_io,
+            schema.as_ref().clone(),
+            all_file_scan_tasks,
+            Arc::new(CompactionConfig {
+                batch_parallelism: Some(4),
+            }),
+            default_location_generator.dir_path,
+        )
+        .await
+        .unwrap();
         let txn = Transaction::new(&table);
         let mut rewrite_action = txn.rewrite_files(None, vec![]).unwrap();
         rewrite_action

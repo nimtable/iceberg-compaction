@@ -1,16 +1,15 @@
-[package]
-name = "ic"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["core", "prost", "services/compactor"]
 
-[dependencies]
+[workspace.dependencies]
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d", features = [
     "storage-s3",
     "storage-gcs",
 ] }
-thiserror = "2.0.11"
 async-trait = "0.1.86"
 parquet = { version = "53.2", features = ["async"] }
+prost = "0.12"
 serde = { version = "1", features = ["rc"] }
 datafusion = "45.0.0"
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
@@ -32,3 +31,10 @@ sqlx = { version = "0.8.2", default-features = false, features = [
 futures = "0.3.17"
 futures-async-stream = "0.2.9"
 async-stream = "0.3.5"
+thiserror = "2.0.11"
+tonic = "0.11.0"
+ic-core = { path = "./core" }
+ic-prost = { path = "./prost" }
+ic-service-compactor = { path = "./services/compactor" }
+prost-build = { version = "0.12" }
+tonic-build = "0.11.0"

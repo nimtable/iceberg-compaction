@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package compactor;
+
+enum DataContentType {
+    DATA = 0;
+    POSITION_DELETES = 1;
+    EQUALIRY_DELETES = 2;
+}
+
+enum DataFileFormat {
+    AVRO = 0;
+    ORC = 1;
+    PARQUET = 2;
+}
+
+message PrimitiveType {
+      message Decimal {
+        uint32 precision = 1;
+        uint32 scale = 2;
+    }
+  oneof kind {
+    bool boolean = 1;
+    bool int = 2;
+    bool long = 3;
+    bool float = 4;
+    bool double = 5;
+    Decimal decimal = 6;
+    bool date = 7;
+    bool time = 8;
+    bool timestamp = 9;
+    bool timestamptz = 10;
+    bool timestamp_ns = 11;
+    bool timestamptz_ns = 12; 
+    bool string = 13;
+    bool uuid = 14;
+    uint64 fixed = 15;
+    bool binary = 16;
+  }
+}
+
+message StructType {
+    repeated NestedFieldDescriptor fields = 1;
+}
+
+message MapType {
+    NestedFieldDescriptor key_field = 1;
+    NestedFieldDescriptor value_field = 2;
+}
+
+message NestedFieldDescriptor{
+    uint32 id = 1;
+    string name = 2;
+    bool required = 3;
+    oneof field_type {
+        PrimitiveType primitive = 4;
+        StructType struct = 5;
+        NestedFieldDescriptor list = 6;
+        MapType map = 7;
+    }
+}
+
+message SchemaDescriptor {
+    uint32 schema_id = 1;
+    repeated NestedFieldDescriptor fields = 2;
+}
+
+message FileScanTaskDescriptor {
+    uint32 start = 1;
+    uint32 length = 2;
+    uint32 record_count = 3;
+    string data_file_path = 4;
+    DataContentType data_file_content = 5;
+    DataFileFormat data_file_format = 6;
+    SchemaDescriptor schema = 7;
+    repeated int32 project_field_ids = 8;
+    uint32 sequence_number = 9;
+    repeated int32 equality_ids = 10;
+}
+
+message FileIo {
+    message S3FileIoInner {
+        string scheme_str = 1;
+        string client_url = 2;
+        map<string, string> client_confog = 3;
+        map<string, string> s3_confog = 4;
+    }
+    oneof file_io_inner {
+        S3FileIoInner s3_file_io_inner = 1;
+    }
+    string scheme_str = 2;
+    map<string, string> props = 4;
+}
+
+message RewriteFilesRequest {
+    repeated FileScanTaskDescriptor file_scan_task_descriptor = 1;
+    map<string, string> rewrite_file_config = 2;
+    string dir_path = 3;
+    FileIo file_io = 4;
+}
+
+message RewriteFilesResponse {
+}
+
+service CompactorService {
+    rpc RewriteFiles (RewriteFilesRequest) returns (RewriteFilesResponse);
+}

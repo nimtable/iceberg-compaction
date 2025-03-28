@@ -17,7 +17,6 @@ pub mod util;
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn compact(
-        &self,
         file_id: FileIO,
         schema: Schema,
         input_file_scan_tasks: AllFileScanTasks,

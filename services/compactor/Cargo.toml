@@ -1,0 +1,16 @@
+[package]
+name = "ic-service-compactor"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "compactor-server"
+path = "src/bin/compactor-server.rs"
+
+[dependencies]
+async-trait = "0.1.86"
+ic-prost = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tonic-web = "0.11"
+ic-core ={ workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "ic-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+iceberg = { workspace = true }
+parquet = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+datafusion = { workspace = true }
+iceberg-datafusion = { workspace = true }
+url = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+futures = { workspace = true }
+futures-async-stream = { workspace = true }
+async-stream = { workspace = true }
