@@ -10,9 +10,9 @@ use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
 pub use mock::MockExecutor;
-
 pub mod datafusion;
 pub use datafusion::DataFusionExecutor;
+pub mod util;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
