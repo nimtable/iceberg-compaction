@@ -11,9 +11,8 @@ message RewriteFilesRequest {
 }
 
 message RewriteFilesResponse {
-    repeated DataFile data_files = 1;
 }
 
 service CompactorService {
-    rpc RewriteFiles (stream RewriteFilesRequest) returns (stream RewriteFilesResponse);
+    rpc RewriteFiles (RewriteFilesRequest) returns (RewriteFilesResponse);
 }

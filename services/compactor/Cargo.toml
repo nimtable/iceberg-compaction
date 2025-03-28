@@ -10,6 +10,6 @@ path = "src/bin/compactor-server.rs"
 [dependencies]
 async-trait = "0.1.86"
 ic-prost = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
 tonic = { workspace = true }
 tokio = { workspace = true }
+tonic-web = "0.11"
