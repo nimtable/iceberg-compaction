@@ -23,10 +23,5 @@ message EchoResponse {
 
 service CompactorService {
     rpc RewriteFiles (RewriteFilesRequest) returns (RewriteFilesResponse);
-    rpc Echo (EchoRequest) returns (EchoResponse) {
-        option (google.api.http) = {
-            post: "/v1/echo"
-            body: "*"
-        };
-    }
+    rpc Echo (EchoRequest) returns (EchoResponse);
 }
