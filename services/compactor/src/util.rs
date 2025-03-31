@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ic_core::CompactionError;
 use ic_core::executor::AllFileScanTasks;
+use ic_prost::compactor::DataFile;
 use ic_prost::compactor::FileIoBuilder;
 use ic_prost::compactor::FileScanTaskDescriptor;
 use ic_prost::compactor::NestedFieldDescriptor;
@@ -9,6 +10,7 @@ use ic_prost::compactor::SchemaDescriptor;
 use ic_prost::compactor::nested_field_descriptor::FieldType;
 use ic_prost::compactor::primitive_type::Kind;
 use ic_prost::compactor::primitive_type::KindWithoutInner;
+use iceberg::spec::DataContentType;
 use iceberg::spec::NestedField;
 use iceberg::spec::Type;
 use iceberg::{scan::FileScanTask, spec::Schema};
@@ -27,9 +29,9 @@ pub fn build_file_scan_tasks_schema_from_pb(
             length: file_scan_task_descriptor.length,
             record_count: Some(file_scan_task_descriptor.record_count),
             data_file_path: file_scan_task_descriptor.data_file_path,
-            data_file_content: build_data_file_content_from_pb(
+            data_file_content: DataContentType::try_from(
                 file_scan_task_descriptor.data_file_content,
-            ),
+            )?,
             data_file_format: build_data_file_format_from_pb(
                 file_scan_task_descriptor.data_file_format,
             ),
@@ -63,24 +65,6 @@ pub fn build_file_scan_tasks_schema_from_pb(
         },
         schema,
     ))
-}
-
-fn build_data_file_content_from_pb(data_file_content: i32) -> iceberg::spec::DataContentType {
-    match data_file_content {
-        0 => iceberg::spec::DataContentType::Data,
-        1 => iceberg::spec::DataContentType::PositionDeletes,
-        2 => iceberg::spec::DataContentType::EqualityDeletes,
-        _ => unreachable!(),
-    }
-}
-
-fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataFileFormat {
-    match data_file_format {
-        0 => iceberg::spec::DataFileFormat::Avro,
-        1 => iceberg::spec::DataFileFormat::Orc,
-        2 => iceberg::spec::DataFileFormat::Parquet,
-        _ => unreachable!(),
-    }
 }
 
 fn build_schema_from_pb(schema: SchemaDescriptor) -> Result<Schema, CompactionError> {
@@ -197,9 +181,34 @@ fn build_field_from_pb(field: &NestedFieldDescriptor) -> Result<NestedField, Com
     ))
 }
 
+
+fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataFileFormat {
+    match data_file_format {
+        0 => iceberg::spec::DataFileFormat::Avro,
+        1 => iceberg::spec::DataFileFormat::Orc,
+        2 => iceberg::spec::DataFileFormat::Parquet,
+        _ => unreachable!(),
+    }
+}
+
+fn into_pb_data_file_format(
+    data_file_format: iceberg::spec::DataFileFormat,
+) -> i32 {
+    match data_file_format {
+        iceberg::spec::DataFileFormat::Avro => 0,
+        iceberg::spec::DataFileFormat::Orc => 1,
+        iceberg::spec::DataFileFormat::Parquet => 2,
+    }
+}
+
+
 pub fn build_file_io_from_pb(
     file_io_builder: FileIoBuilder,
 ) -> Result<iceberg::io::FileIO, CompactionError> {
     let file_io_builde = iceberg::io::FileIOBuilder::new(file_io_builder.scheme_str);
     Ok(file_io_builde.with_props(file_io_builder.props).build()?)
+}
+
+pub fn data_file_into_pb (data_file: iceberg::spec::DataFile) -> DataFile {
+     
 }

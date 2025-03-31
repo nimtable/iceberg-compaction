@@ -4,6 +4,7 @@ use ic_core::executor::DataFusionExecutor;
 use ic_core::{CompactionConfig, CompactionExecutor};
 use ic_prost::compactor::compactor_service_server::CompactorService;
 use ic_prost::compactor::{RewriteFilesRequest, RewriteFilesResponse};
+use iceberg::spec::SerializedDataFile;
 
 use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb};
 
@@ -16,7 +17,6 @@ impl CompactorService for CompactorServiceImpl {
         &self,
         request: tonic::Request<RewriteFilesRequest>,
     ) -> std::result::Result<tonic::Response<RewriteFilesResponse>, tonic::Status> {
-        //TODO: compact the input files with executor
         let request = request.into_inner();
         let (all_file_scan_tasks, schema) = build_file_scan_tasks_schema_from_pb(
             request.file_scan_task_descriptor,
@@ -37,7 +37,7 @@ impl CompactorService for CompactorServiceImpl {
             serde_json::to_value(request.rewrite_file_config).unwrap(),
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
-        DataFusionExecutor::compact(
+        let data_files = DataFusionExecutor::rewrite_files(
             file_io,
             schema,
             all_file_scan_tasks,
@@ -46,6 +46,7 @@ impl CompactorService for CompactorServiceImpl {
         )
         .await
         .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
+
         Ok(tonic::Response::new(RewriteFilesResponse {}))
     }
 }

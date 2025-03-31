@@ -15,7 +15,7 @@ pub use datafusion::DataFusionExecutor;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
-    async fn compact(
+    async fn rewrite_files(
         file_io: FileIO,
         schema: Arc<Schema>,
         input_file_scan_tasks: AllFileScanTasks,

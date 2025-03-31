@@ -36,7 +36,7 @@ pub struct DataFusionExecutor {
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
-    async fn compact(
+    async fn rewrite_files(
         file_io: FileIO,
         schema: Arc<Schema>,
         input_file_scan_tasks: AllFileScanTasks,
@@ -409,7 +409,7 @@ mod tests {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let new_data_files = DataFusionExecutor::compact(
+        let new_data_files = DataFusionExecutor::rewrite_files(
             file_io,
             schema.clone(),
             all_file_scan_tasks,
