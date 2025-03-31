@@ -1,5 +1,5 @@
 use ic_prost::compactor::compactor_service_server::CompactorService;
-use ic_prost::compactor::{RewriteFilesRequest, RewriteFilesResponse};
+use ic_prost::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
 
 #[derive(Default)]
 pub struct CompactorServiceImpl;
@@ -13,5 +13,15 @@ impl CompactorService for CompactorServiceImpl {
         //TODO: compact the input files with executor
 
         Ok(tonic::Response::new(RewriteFilesResponse {}))
+    }
+
+    async fn echo(
+        &self,
+        request: tonic::Request<EchoRequest>,
+    ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
+        tracing::info!("Echo request: {:?}", request);
+        Ok(tonic::Response::new(EchoResponse {
+            message: format!("Echo: {}", request.into_inner().message),
+        }))
     }
 }

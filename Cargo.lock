@@ -1451,6 +1451,9 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-web",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

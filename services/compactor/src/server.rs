@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 pub async fn grpc_compactor_serve(
     listen_addr: SocketAddr,
@@ -26,6 +27,7 @@ pub async fn http_compactor_serve(
     let server = Server::builder()
         .accept_http1(true)
         // This will apply the gRPC-Web translation layer
+        .layer(CorsLayer::new().allow_origin(Any))
         .layer(GrpcWebLayer::new())
         .add_service(service)
         .serve(listen_addr);
