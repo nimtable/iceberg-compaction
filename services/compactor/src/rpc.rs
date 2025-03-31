@@ -1,5 +1,11 @@
+use std::sync::Arc;
+
+use ic_core::executor::DataFusionExecutor;
+use ic_core::{CompactionConfig, CompactionExecutor};
 use ic_prost::compactor::compactor_service_server::CompactorService;
 use ic_prost::compactor::{RewriteFilesRequest, RewriteFilesResponse};
+
+use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb};
 
 #[derive(Default)]
 pub struct CompactorServiceImpl;
@@ -8,10 +14,38 @@ pub struct CompactorServiceImpl;
 impl CompactorService for CompactorServiceImpl {
     async fn rewrite_files(
         &self,
-        _request: tonic::Request<RewriteFilesRequest>,
+        request: tonic::Request<RewriteFilesRequest>,
     ) -> std::result::Result<tonic::Response<RewriteFilesResponse>, tonic::Status> {
         //TODO: compact the input files with executor
-
+        let request = request.into_inner();
+        let (all_file_scan_tasks, schema) = build_file_scan_tasks_schema_from_pb(
+            request.file_scan_task_descriptor,
+            request
+                .schema
+                .ok_or_else(|| tonic::Status::invalid_argument("schema is required"))?,
+        )
+        .map_err(|e| {
+            tonic::Status::internal(format!("Failed to build file scan tasks schema: {}", e))
+        })?;
+        let file_io = build_file_io_from_pb(
+            request
+                .file_io_builder
+                .ok_or_else(|| tonic::Status::invalid_argument("file_io is required"))?,
+        )
+        .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
+        let config = serde_json::from_value::<CompactionConfig>(
+            serde_json::to_value(request.rewrite_file_config).unwrap(),
+        )
+        .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
+        DataFusionExecutor::compact(
+            file_io,
+            schema,
+            all_file_scan_tasks,
+            Arc::new(config),
+            request.dir_path,
+        )
+        .await
+        .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
         Ok(tonic::Response::new(RewriteFilesResponse {}))
     }
 }

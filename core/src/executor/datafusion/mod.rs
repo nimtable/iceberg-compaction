@@ -38,7 +38,7 @@ pub struct DataFusionExecutor {
 impl CompactionExecutor for DataFusionExecutor {
     async fn compact(
         file_io: FileIO,
-        schema: Schema,
+        schema: Arc<Schema>,
         input_file_scan_tasks: AllFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
@@ -142,6 +142,7 @@ impl CompactionExecutor for DataFusionExecutor {
             )));
         }
         let data_file_schema = schema
+            .as_ref()
             .clone()
             .into_builder()
             .with_fields(add_schema_fields)
@@ -252,7 +253,7 @@ impl DataFusionExecutor {
     }
     async fn build_iceberg_writer(
         dir_path: String,
-        schema: Schema,
+        schema: Arc<Schema>,
         file_io: FileIO,
     ) -> Result<
         DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
@@ -268,7 +269,7 @@ impl DataFusionExecutor {
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
             WriterProperties::default(),
-            Arc::new(schema),
+            schema,
             file_io,
             location_generator,
             file_name_generator,
@@ -410,7 +411,7 @@ mod tests {
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let new_data_files = DataFusionExecutor::compact(
             file_io,
-            schema.as_ref().clone(),
+            schema.clone(),
             all_file_scan_tasks,
             Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),

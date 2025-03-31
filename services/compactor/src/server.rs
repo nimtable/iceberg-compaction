@@ -8,7 +8,7 @@ use tonic_web::GrpcWebLayer;
 pub async fn grpc_compactor_serve(
     listen_addr: SocketAddr,
 ) -> JoinHandle<Result<(), tonic::transport::Error>> {
-    let compactor_srv = CompactorServiceImpl::default();
+    let compactor_srv = CompactorServiceImpl {};
 
     let server = Server::builder()
         .add_service(CompactorServiceServer::new(compactor_srv))
@@ -20,7 +20,7 @@ pub async fn grpc_compactor_serve(
 pub async fn http_compactor_serve(
     listen_addr: SocketAddr,
 ) -> JoinHandle<Result<(), tonic::transport::Error>> {
-    let compactor_service_impl = CompactorServiceImpl::default();
+    let compactor_service_impl = CompactorServiceImpl {};
     let service = CompactorServiceServer::new(compactor_service_impl);
 
     let server = Server::builder()

@@ -12,13 +12,12 @@ pub mod mock;
 pub use mock::MockExecutor;
 pub mod datafusion;
 pub use datafusion::DataFusionExecutor;
-pub mod util;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn compact(
-        file_id: FileIO,
-        schema: Schema,
+        file_io: FileIO,
+        schema: Arc<Schema>,
         input_file_scan_tasks: AllFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
@@ -26,7 +25,7 @@ pub trait CompactionExecutor: Send + Sync + 'static {
 }
 
 pub struct AllFileScanTasks {
-    data_files: Vec<FileScanTask>,
-    position_delete_files: Vec<FileScanTask>,
-    equality_delete_files: Vec<FileScanTask>,
+    pub data_files: Vec<FileScanTask>,
+    pub position_delete_files: Vec<FileScanTask>,
+    pub equality_delete_files: Vec<FileScanTask>,
 }

@@ -19,3 +19,4 @@ sqlx = { workspace = true }
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 async-stream = { workspace = true }
+serde_with = { workspace = true }
