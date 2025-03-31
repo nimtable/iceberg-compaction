@@ -93,26 +93,22 @@ message RewriteFilesRequest {
     SchemaDescriptor schema = 5;
 }
 
-message BytesVec {
-    repeated bytes inner = 1;
-}
-
 message PrimitiveLiteral {
-    enum KindWithoutInner {
+    enum KindWithoutInnerLiteral {
         ABOVE_MAX = 0;
         BELOW_MIN = 1;
     }
-  oneof kind {
+  oneof kindLiteral {
     bool boolean = 1;
     int32 int = 2;
     int64 long = 3;
     float float = 4;
     double double = 5;
     string string = 6;
-    BytesVec binary = 7;
-    BytesVec int128 = 8;
-    BytesVec uint128 = 9;
-    KindWithoutInner kind_without_inner = 10;
+    bytes binary = 7;
+    bytes int128 = 8;
+    bytes uint128 = 9;
+    KindWithoutInnerLiteral kind_without_inner_literal = 10;
   }
 }
 
@@ -120,7 +116,7 @@ message OptionalLiteral {
   optional Literal value = 1;
 }
 
-message StructDescriptor{
+message StructLiteralDescriptor{
     repeated OptionalLiteral inner = 1;
 }
 
@@ -132,8 +128,8 @@ message MapLiteral {
 message Literal{
     oneof literal {
         PrimitiveLiteral primitive = 1;
-        StructDescriptor struct = 2;
-        StructDescriptor list = 3;
+        StructLiteralDescriptor struct = 2;
+        StructLiteralDescriptor list = 3;
         MapLiteral map = 4;
     }
 }
@@ -147,7 +143,7 @@ message DataFile {
     DataContentType content = 1;
     string file_path = 2;
     DataFileFormat file_format = 3;
-    StructDescriptor partition = 4;
+    StructLiteralDescriptor partition = 4;
     uint64 record_count = 5;
     uint64 file_size_in_bytes = 6;
     map<int32, uint64> column_sizes = 7;
@@ -163,7 +159,7 @@ message DataFile {
     int32 partition_spec_id = 17;
 }
 message RewriteFilesResponse {
-    DataFile data_file = 1;
+    repeated DataFile data_files = 1;
 }
 
 service CompactorService {

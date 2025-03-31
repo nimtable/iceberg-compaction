@@ -3,11 +3,22 @@ use std::sync::Arc;
 use ic_core::CompactionError;
 use ic_core::executor::AllFileScanTasks;
 use ic_prost::compactor::DataFile;
+use ic_prost::compactor::Datum;
 use ic_prost::compactor::FileIoBuilder;
 use ic_prost::compactor::FileScanTaskDescriptor;
+use ic_prost::compactor::Literal;
+use ic_prost::compactor::MapLiteral;
 use ic_prost::compactor::NestedFieldDescriptor;
+use ic_prost::compactor::OptionalLiteral;
+use ic_prost::compactor::PrimitiveLiteral;
+use ic_prost::compactor::PrimitiveType;
 use ic_prost::compactor::SchemaDescriptor;
+use ic_prost::compactor::StructLiteralDescriptor;
+use ic_prost::compactor::literal;
 use ic_prost::compactor::nested_field_descriptor::FieldType;
+use ic_prost::compactor::primitive_literal::KindLiteral;
+use ic_prost::compactor::primitive_literal::KindWithoutInnerLiteral;
+use ic_prost::compactor::primitive_type::Decimal;
 use ic_prost::compactor::primitive_type::Kind;
 use ic_prost::compactor::primitive_type::KindWithoutInner;
 use iceberg::spec::DataContentType;
@@ -181,7 +192,6 @@ fn build_field_from_pb(field: &NestedFieldDescriptor) -> Result<NestedField, Com
     ))
 }
 
-
 fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataFileFormat {
     match data_file_format {
         0 => iceberg::spec::DataFileFormat::Avro,
@@ -191,16 +201,13 @@ fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataF
     }
 }
 
-fn into_pb_data_file_format(
-    data_file_format: iceberg::spec::DataFileFormat,
-) -> i32 {
+fn into_pb_data_file_format(data_file_format: iceberg::spec::DataFileFormat) -> i32 {
     match data_file_format {
         iceberg::spec::DataFileFormat::Avro => 0,
         iceberg::spec::DataFileFormat::Orc => 1,
         iceberg::spec::DataFileFormat::Parquet => 2,
     }
 }
-
 
 pub fn build_file_io_from_pb(
     file_io_builder: FileIoBuilder,
@@ -209,6 +216,199 @@ pub fn build_file_io_from_pb(
     Ok(file_io_builde.with_props(file_io_builder.props).build()?)
 }
 
-pub fn data_file_into_pb (data_file: iceberg::spec::DataFile) -> DataFile {
-     
+pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
+    DataFile {
+        content: data_file.content_type() as i32,
+        file_path: data_file.file_path().to_string(),
+        file_format: into_pb_data_file_format(data_file.file_format()),
+        partition: Some(struct_into_pb(data_file.partition().clone())),
+        record_count: data_file.record_count(),
+        file_size_in_bytes: data_file.file_size_in_bytes(),
+        column_sizes: data_file.column_sizes().clone(),
+        value_counts: data_file.value_counts().clone(),
+        null_value_counts: data_file.null_value_counts().clone(),
+        nan_value_counts: data_file.nan_value_counts().clone(),
+        lower_bounds: data_file
+            .lower_bounds()
+            .clone()
+            .into_iter()
+            .map(|(k, v)| (k, datum_into_pb(v.clone())))
+            .collect(),
+        upper_bounds: data_file
+            .lower_bounds()
+            .clone()
+            .into_iter()
+            .map(|(k, v)| (k, datum_into_pb(v.clone())))
+            .collect(),
+        key_metadata: data_file.key_metadata().map(|k| k.to_vec()),
+        split_offsets: data_file.split_offsets().to_vec(),
+        equality_ids: data_file.equality_ids().to_vec(),
+        sort_order_id: data_file.sort_order_id(),
+        partition_spec_id: 0,
+    }
+}
+fn datum_into_pb(datum: iceberg::spec::Datum) -> Datum {
+    let primitive_literal = primitive_literal_into_pb(datum.literal().clone());
+    let primitive_type = primitive_type_to_pb(datum.data_type());
+    Datum {
+        r#type: Some(primitive_type),
+        literal: Some(primitive_literal),
+    }
+}
+
+fn primitive_type_to_pb(primitive_type: &iceberg::spec::PrimitiveType) -> PrimitiveType {
+    match primitive_type {
+        iceberg::spec::PrimitiveType::Boolean => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Boolean as i32)),
+        },
+        iceberg::spec::PrimitiveType::Int => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int as i32)),
+        },
+        iceberg::spec::PrimitiveType::Long => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Long as i32)),
+        },
+        iceberg::spec::PrimitiveType::Float => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Float as i32)),
+        },
+        iceberg::spec::PrimitiveType::Double => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Double as i32)),
+        },
+        iceberg::spec::PrimitiveType::Decimal { precision, scale } => PrimitiveType {
+            kind: Some(Kind::Decimal(Decimal {
+                precision: *precision,
+                scale: *scale,
+            })),
+        },
+        iceberg::spec::PrimitiveType::Date => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Date as i32)),
+        },
+        iceberg::spec::PrimitiveType::Time => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Time as i32)),
+        },
+        iceberg::spec::PrimitiveType::Timestamp => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Timestamp as i32)),
+        },
+        iceberg::spec::PrimitiveType::Timestamptz => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Timestamptz as i32)),
+        },
+        iceberg::spec::PrimitiveType::TimestampNs => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::TimestampNs as i32)),
+        },
+        iceberg::spec::PrimitiveType::TimestamptzNs => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(
+                KindWithoutInner::TimestamptzNs as i32,
+            )),
+        },
+        iceberg::spec::PrimitiveType::String => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::String as i32)),
+        },
+        iceberg::spec::PrimitiveType::Uuid => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Uuid as i32)),
+        },
+        iceberg::spec::PrimitiveType::Fixed(size) => PrimitiveType {
+            kind: Some(Kind::Fixed(*size)),
+        },
+        iceberg::spec::PrimitiveType::Binary => PrimitiveType {
+            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Binary as i32)),
+        },
+    }
+}
+
+fn primitive_literal_into_pb(
+    primitive_literal: iceberg::spec::PrimitiveLiteral,
+) -> PrimitiveLiteral {
+    match primitive_literal {
+        iceberg::spec::PrimitiveLiteral::Boolean(b) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Boolean(b)),
+        },
+        iceberg::spec::PrimitiveLiteral::Int(i) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Int(i)),
+        },
+        iceberg::spec::PrimitiveLiteral::Long(l) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Long(l)),
+        },
+        iceberg::spec::PrimitiveLiteral::Float(f) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Float(f.0)),
+        },
+        iceberg::spec::PrimitiveLiteral::Double(f) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Double(f.0)),
+        },
+        iceberg::spec::PrimitiveLiteral::String(s) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::String(s)),
+        },
+        iceberg::spec::PrimitiveLiteral::Binary(b) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Binary(b)),
+        },
+        iceberg::spec::PrimitiveLiteral::Int128(i) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Int128(i.to_be_bytes().to_vec())),
+        },
+        iceberg::spec::PrimitiveLiteral::UInt128(i) => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::Uint128(i.to_be_bytes().to_vec())),
+        },
+        iceberg::spec::PrimitiveLiteral::AboveMax => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::KindWithoutInnerLiteral(
+                KindWithoutInnerLiteral::AboveMax as i32,
+            )),
+        },
+        iceberg::spec::PrimitiveLiteral::BelowMin => PrimitiveLiteral {
+            kind_literal: Some(KindLiteral::KindWithoutInnerLiteral(
+                KindWithoutInnerLiteral::BelowMin as i32,
+            )),
+        },
+    }
+}
+fn struct_into_pb(structs: iceberg::spec::Struct) -> StructLiteralDescriptor {
+    let literals = structs
+        .into_iter()
+        .map(|literal| {
+            let literal = literal.map(|l| literal_into_pb(l));
+            OptionalLiteral { value: literal }
+        })
+        .collect();
+    StructLiteralDescriptor { inner: literals }
+}
+
+fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
+    match literal {
+        iceberg::spec::Literal::Primitive(primitive_literal) => {
+            let primitive_literal = primitive_literal_into_pb(primitive_literal);
+            Literal {
+                literal: Some(literal::Literal::Primitive(primitive_literal)),
+            }
+        }
+        iceberg::spec::Literal::Struct(literals) => {
+            let literals = struct_into_pb(literals);
+            Literal {
+                literal: Some(literal::Literal::Struct(literals)),
+            }
+        }
+        iceberg::spec::Literal::List(literals) => {
+            let literals = literals
+                .into_iter()
+                .map(|literal| {
+                    let literal = literal.map(|l| literal_into_pb(l));
+                    OptionalLiteral { value: literal }
+                })
+                .collect();
+            Literal {
+                literal: Some(literal::Literal::List(StructLiteralDescriptor {
+                    inner: literals,
+                })),
+            }
+        }
+        iceberg::spec::Literal::Map(map) => {
+            let mut keys = Vec::with_capacity(map.len());
+            let mut values = Vec::with_capacity(map.len());
+            for (k, v) in map.into_iter() {
+                keys.push(literal_into_pb(k));
+                let value = OptionalLiteral {
+                    value: v.map(|l| literal_into_pb(l)),
+                };
+                values.push(value);
+            }
+            Literal {
+                literal: Some(literal::Literal::Map(MapLiteral { keys, values })),
+            }
+        }
+    }
 }

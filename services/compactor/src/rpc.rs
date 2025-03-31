@@ -4,9 +4,8 @@ use ic_core::executor::DataFusionExecutor;
 use ic_core::{CompactionConfig, CompactionExecutor};
 use ic_prost::compactor::compactor_service_server::CompactorService;
 use ic_prost::compactor::{RewriteFilesRequest, RewriteFilesResponse};
-use iceberg::spec::SerializedDataFile;
 
-use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb};
+use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, data_file_into_pb};
 
 #[derive(Default)]
 pub struct CompactorServiceImpl;
@@ -47,6 +46,10 @@ impl CompactorService for CompactorServiceImpl {
         .await
         .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
 
-        Ok(tonic::Response::new(RewriteFilesResponse {}))
+        let data_files = data_files
+            .into_iter()
+            .map(|file| data_file_into_pb(file))
+            .collect();
+        Ok(tonic::Response::new(RewriteFilesResponse { data_files }))
     }
 }
