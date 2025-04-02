@@ -13,6 +13,15 @@ message RewriteFilesRequest {
 message RewriteFilesResponse {
 }
 
+message EchoRequest {
+    string message = 1;
+}
+
+message EchoResponse {
+    string message = 1;
+}
+
 service CompactorService {
     rpc RewriteFiles (RewriteFilesRequest) returns (RewriteFilesResponse);
+    rpc Echo (EchoRequest) returns (EchoResponse);
 }
