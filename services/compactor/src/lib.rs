@@ -1,3 +1,3 @@
-mod rpc;
+pub mod rpc;
 pub mod server;
-mod util;
+pub mod util;

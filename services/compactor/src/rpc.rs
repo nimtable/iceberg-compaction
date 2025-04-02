@@ -46,10 +46,7 @@ impl CompactorService for CompactorServiceImpl {
         .await
         .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
 
-        let data_files = data_files
-            .into_iter()
-            .map(|file| data_file_into_pb(file))
-            .collect();
+        let data_files = data_files.into_iter().map(data_file_into_pb).collect();
         Ok(tonic::Response::new(RewriteFilesResponse { data_files }))
     }
 }

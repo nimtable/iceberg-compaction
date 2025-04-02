@@ -361,7 +361,7 @@ fn struct_into_pb(structs: iceberg::spec::Struct) -> StructLiteralDescriptor {
     let literals = structs
         .into_iter()
         .map(|literal| {
-            let literal = literal.map(|l| literal_into_pb(l));
+            let literal = literal.map(literal_into_pb);
             OptionalLiteral { value: literal }
         })
         .collect();
@@ -386,7 +386,7 @@ fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
             let literals = literals
                 .into_iter()
                 .map(|literal| {
-                    let literal = literal.map(|l| literal_into_pb(l));
+                    let literal = literal.map(literal_into_pb);
                     OptionalLiteral { value: literal }
                 })
                 .collect();
@@ -402,13 +402,272 @@ fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
             for (k, v) in map.into_iter() {
                 keys.push(literal_into_pb(k));
                 let value = OptionalLiteral {
-                    value: v.map(|l| literal_into_pb(l)),
+                    value: v.map(literal_into_pb),
                 };
                 values.push(value);
             }
             Literal {
                 literal: Some(literal::Literal::Map(MapLiteral { keys, values })),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use ic_prost::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
+
+    #[test]
+    fn test_build_field_from_pb_struct() {
+        let nested_field = NestedFieldDescriptor {
+            id: 1,
+            name: "nested".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let struct_field = NestedFieldDescriptor {
+            id: 2,
+            name: "struct_field".to_string(),
+            field_type: Some(FieldType::Struct(StructType {
+                fields: vec![nested_field],
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let result = build_field_from_pb(&struct_field);
+        assert!(result.is_ok());
+        let field = result.unwrap();
+        assert_eq!(field.id, 2);
+        assert_eq!(field.name, "struct_field");
+        assert!(field.required);
+
+        match *field.field_type {
+            Type::Struct(struct_type) => {
+                assert_eq!(struct_type.fields().len(), 1);
+                let nested = *struct_type.fields()[0].field_type.clone();
+                assert!(matches!(
+                    nested,
+                    Type::Primitive(iceberg::spec::PrimitiveType::Int)
+                ));
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_build_field_from_pb_list() {
+        let element_field = NestedFieldDescriptor {
+            id: 1,
+            name: "element".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let list_field = NestedFieldDescriptor {
+            id: 2,
+            name: "list_field".to_string(),
+            field_type: Some(FieldType::List(Box::new(element_field))),
+            required: true,
+            ..Default::default()
+        };
+
+        let result = build_field_from_pb(&list_field);
+        assert!(result.is_ok());
+        let field = result.unwrap();
+        assert_eq!(field.id, 2);
+        assert_eq!(field.name, "list_field");
+        assert!(field.required);
+
+        match *field.field_type {
+            Type::List(list_type) => {
+                let element_type = *list_type.element_field.field_type.clone();
+                assert!(matches!(
+                    element_type,
+                    Type::Primitive(iceberg::spec::PrimitiveType::String)
+                ));
+            }
+            _ => panic!("Expected List type"),
+        }
+    }
+
+    #[test]
+    fn test_build_field_from_pb_map() {
+        let key_field = NestedFieldDescriptor {
+            id: 1,
+            name: "key".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let value_field = NestedFieldDescriptor {
+            id: 2,
+            name: "value".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let map_field = NestedFieldDescriptor {
+            id: 3,
+            name: "map_field".to_string(),
+            field_type: Some(FieldType::Map(Box::new(MapType {
+                key_field: Some(Box::new(key_field)),
+                value_field: Some(Box::new(value_field)),
+                ..Default::default()
+            }))),
+            required: true,
+            ..Default::default()
+        };
+
+        let result = build_field_from_pb(&map_field);
+        assert!(result.is_ok());
+        let field = result.unwrap();
+        assert_eq!(field.id, 3);
+        assert_eq!(field.name, "map_field");
+        assert!(field.required);
+
+        match *field.field_type {
+            Type::Map(map_type) => {
+                let key_type = *map_type.key_field.field_type.clone();
+                let value_type = *map_type.value_field.field_type.clone();
+                assert!(matches!(
+                    key_type,
+                    Type::Primitive(iceberg::spec::PrimitiveType::String)
+                ));
+                assert!(matches!(
+                    value_type,
+                    Type::Primitive(iceberg::spec::PrimitiveType::Int)
+                ));
+            }
+            _ => panic!("Expected Map type"),
+        }
+    }
+
+    #[test]
+    fn test_build_field_from_pb_deeply_nested() {
+        let inner_struct_field1 = NestedFieldDescriptor {
+            id: 1,
+            name: "int_field".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let inner_struct_field2 = NestedFieldDescriptor {
+            id: 2,
+            name: "string_field".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let inner_struct = NestedFieldDescriptor {
+            id: 3,
+            name: "inner_struct".to_string(),
+            field_type: Some(FieldType::Struct(StructType {
+                fields: vec![inner_struct_field1, inner_struct_field2],
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let list_field = NestedFieldDescriptor {
+            id: 4,
+            name: "list_field".to_string(),
+            field_type: Some(FieldType::List(Box::new(inner_struct))),
+            required: true,
+            ..Default::default()
+        };
+
+        let key_field = NestedFieldDescriptor {
+            id: 5,
+            name: "key".to_string(),
+            field_type: Some(FieldType::Primitive(PrimitiveType {
+                kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
+                ..Default::default()
+            })),
+            required: true,
+            ..Default::default()
+        };
+
+        let map_field = NestedFieldDescriptor {
+            id: 6,
+            name: "map_field".to_string(),
+            field_type: Some(FieldType::Map(Box::new(MapType {
+                key_field: Some(Box::new(key_field)),
+                value_field: Some(Box::new(list_field)),
+                ..Default::default()
+            }))),
+            required: true,
+            ..Default::default()
+        };
+
+        let result = build_field_from_pb(&map_field);
+        assert!(result.is_ok());
+        let field = result.unwrap();
+        assert_eq!(field.id, 6);
+        assert_eq!(field.name, "map_field");
+        assert!(field.required);
+
+        match *field.field_type {
+            Type::Map(map_type) => {
+                let key_type = *map_type.key_field.field_type.clone();
+                assert!(matches!(
+                    key_type,
+                    Type::Primitive(iceberg::spec::PrimitiveType::String)
+                ));
+
+                let value_type = *map_type.value_field.field_type.clone();
+                match value_type {
+                    Type::List(list_type) => {
+                        let element_type = *list_type.element_field.field_type.clone();
+                        match element_type {
+                            Type::Struct(struct_type) => {
+                                assert_eq!(struct_type.fields().len(), 2);
+                                let field1_type = *struct_type.fields()[0].field_type.clone();
+                                let field2_type = *struct_type.fields()[1].field_type.clone();
+                                assert!(matches!(
+                                    field1_type,
+                                    Type::Primitive(iceberg::spec::PrimitiveType::Int)
+                                ));
+                                assert!(matches!(
+                                    field2_type,
+                                    Type::Primitive(iceberg::spec::PrimitiveType::String)
+                                ));
+                            }
+                            _ => panic!("Expected Struct type in List"),
+                        }
+                    }
+                    _ => panic!("Expected List type in Map value"),
+                }
+            }
+            _ => panic!("Expected Map type"),
         }
     }
 }
