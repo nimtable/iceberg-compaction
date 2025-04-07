@@ -3,7 +3,6 @@ use std::sync::Arc;
 use ic_core::CompactionError;
 use ic_core::executor::AllFileScanTasks;
 use ic_prost::compactor::DataFile;
-use ic_prost::compactor::Datum;
 use ic_prost::compactor::FileIoBuilder;
 use ic_prost::compactor::FileScanTaskDescriptor;
 use ic_prost::compactor::Literal;
@@ -11,14 +10,12 @@ use ic_prost::compactor::MapLiteral;
 use ic_prost::compactor::NestedFieldDescriptor;
 use ic_prost::compactor::OptionalLiteral;
 use ic_prost::compactor::PrimitiveLiteral;
-use ic_prost::compactor::PrimitiveType;
 use ic_prost::compactor::SchemaDescriptor;
 use ic_prost::compactor::StructLiteralDescriptor;
 use ic_prost::compactor::literal;
 use ic_prost::compactor::nested_field_descriptor::FieldType;
 use ic_prost::compactor::primitive_literal::KindLiteral;
 use ic_prost::compactor::primitive_literal::KindWithoutInnerLiteral;
-use ic_prost::compactor::primitive_type::Decimal;
 use ic_prost::compactor::primitive_type::Kind;
 use ic_prost::compactor::primitive_type::KindWithoutInner;
 use iceberg::spec::DataContentType;
@@ -47,7 +44,7 @@ pub fn build_file_scan_tasks_schema_from_pb(
                 file_scan_task_descriptor.data_file_format,
             ),
             schema: schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: file_scan_task_descriptor.project_field_ids,
             predicate: None,
             deletes: vec![],
             sequence_number: file_scan_task_descriptor.sequence_number,
@@ -55,7 +52,6 @@ pub fn build_file_scan_tasks_schema_from_pb(
         };
         match file_scan_task.data_file_content {
             iceberg::spec::DataContentType::Data => {
-                file_scan_task.project_field_ids = vec![];
                 data_files.push(file_scan_task);
             }
             iceberg::spec::DataContentType::PositionDeletes => {
@@ -210,10 +206,10 @@ fn into_pb_data_file_format(data_file_format: iceberg::spec::DataFileFormat) -> 
 }
 
 pub fn build_file_io_from_pb(
-    file_io_builder: FileIoBuilder,
+    file_io_builder_pb: FileIoBuilder,
 ) -> Result<iceberg::io::FileIO, CompactionError> {
-    let file_io_builde = iceberg::io::FileIOBuilder::new(file_io_builder.scheme_str);
-    Ok(file_io_builde.with_props(file_io_builder.props).build()?)
+    let file_io_builder = iceberg::io::FileIO::from_path(file_io_builder_pb.scheme_str)?;
+    Ok(file_io_builder.with_props(file_io_builder_pb.props).build()?)
 }
 
 pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
@@ -232,85 +228,19 @@ pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
             .lower_bounds()
             .clone()
             .into_iter()
-            .map(|(k, v)| (k, datum_into_pb(v.clone())))
+            .map(|(k, v)| (k, v.to_bytes().unwrap().into_vec()))
             .collect(),
         upper_bounds: data_file
             .lower_bounds()
             .clone()
             .into_iter()
-            .map(|(k, v)| (k, datum_into_pb(v.clone())))
+            .map(|(k, v)| (k, v.to_bytes().unwrap().into_vec()))
             .collect(),
         key_metadata: data_file.key_metadata().map(|k| k.to_vec()),
         split_offsets: data_file.split_offsets().to_vec(),
         equality_ids: data_file.equality_ids().to_vec(),
         sort_order_id: data_file.sort_order_id(),
         partition_spec_id: 0,
-    }
-}
-fn datum_into_pb(datum: iceberg::spec::Datum) -> Datum {
-    let primitive_literal = primitive_literal_into_pb(datum.literal().clone());
-    let primitive_type = primitive_type_to_pb(datum.data_type());
-    Datum {
-        r#type: Some(primitive_type),
-        literal: Some(primitive_literal),
-    }
-}
-
-fn primitive_type_to_pb(primitive_type: &iceberg::spec::PrimitiveType) -> PrimitiveType {
-    match primitive_type {
-        iceberg::spec::PrimitiveType::Boolean => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Boolean as i32)),
-        },
-        iceberg::spec::PrimitiveType::Int => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int as i32)),
-        },
-        iceberg::spec::PrimitiveType::Long => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Long as i32)),
-        },
-        iceberg::spec::PrimitiveType::Float => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Float as i32)),
-        },
-        iceberg::spec::PrimitiveType::Double => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Double as i32)),
-        },
-        iceberg::spec::PrimitiveType::Decimal { precision, scale } => PrimitiveType {
-            kind: Some(Kind::Decimal(Decimal {
-                precision: *precision,
-                scale: *scale,
-            })),
-        },
-        iceberg::spec::PrimitiveType::Date => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Date as i32)),
-        },
-        iceberg::spec::PrimitiveType::Time => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Time as i32)),
-        },
-        iceberg::spec::PrimitiveType::Timestamp => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Timestamp as i32)),
-        },
-        iceberg::spec::PrimitiveType::Timestamptz => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Timestamptz as i32)),
-        },
-        iceberg::spec::PrimitiveType::TimestampNs => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::TimestampNs as i32)),
-        },
-        iceberg::spec::PrimitiveType::TimestamptzNs => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(
-                KindWithoutInner::TimestamptzNs as i32,
-            )),
-        },
-        iceberg::spec::PrimitiveType::String => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::String as i32)),
-        },
-        iceberg::spec::PrimitiveType::Uuid => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Uuid as i32)),
-        },
-        iceberg::spec::PrimitiveType::Fixed(size) => PrimitiveType {
-            kind: Some(Kind::Fixed(*size)),
-        },
-        iceberg::spec::PrimitiveType::Binary => PrimitiveType {
-            kind: Some(Kind::KindWithoutInner(KindWithoutInner::Binary as i32)),
-        },
     }
 }
 

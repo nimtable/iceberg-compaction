@@ -75,7 +75,7 @@ message FileScanTaskDescriptor {
     string data_file_path = 4;
     DataContentType data_file_content = 5;
     DataFileFormat data_file_format = 6;
-    repeated int64 project_field_ids = 7;
+    repeated int32 project_field_ids = 7;
     int64 sequence_number = 8;
     repeated int32 equality_ids = 9;
 }
@@ -134,11 +134,6 @@ message Literal{
     }
 }
 
-message Datum {
-    PrimitiveType type = 1;
-    PrimitiveLiteral literal = 2;
-}
-
 message DataFile {
     DataContentType content = 1;
     string file_path = 2;
@@ -150,8 +145,8 @@ message DataFile {
     map<int32, uint64> value_counts = 8;
     map<int32, uint64> null_value_counts = 9;
     map<int32, uint64> nan_value_counts = 10;
-    map<int32, Datum> lower_bounds = 11;
-    map<int32, Datum> upper_bounds = 12;
+    map<int32, bytes> lower_bounds = 11;
+    map<int32, bytes> upper_bounds = 12;
     optional bytes key_metadata = 13;
     repeated int64 split_offsets = 14;
     repeated int32 equality_ids = 15;
