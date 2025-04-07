@@ -1,5 +1,5 @@
-use ic_prost::compactor::compactor_service_server::CompactorService;
-use ic_prost::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
+use ic_codegen::compactor::compactor_service_server::CompactorService;
+use ic_codegen::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
 
 #[derive(Default)]
 pub struct CompactorServiceImpl;
