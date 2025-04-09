@@ -1,0 +1,11 @@
+# Compactor service configuration for local development
+
+# Server configuration
+server:
+  host: "127.0.0.1"
+  port: 7777
+
+# Logging configuration
+logging:
+  level: "debug"
+  format: "text"

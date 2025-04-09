@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ic_core::executor::DataFusionExecutor;
 use ic_core::{CompactionConfig, CompactionExecutor};
-use ic_prost::compactor::compactor_service_server::CompactorService;
-use ic_prost::compactor::{RewriteFilesRequest, RewriteFilesResponse};
+use ic_codegen::compactor::compactor_service_server::CompactorService;
+use ic_codegen::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
 
 use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, data_file_into_pb};
 
@@ -48,5 +48,15 @@ impl CompactorService for CompactorServiceImpl {
 
         let data_files = data_files.into_iter().map(data_file_into_pb).collect();
         Ok(tonic::Response::new(RewriteFilesResponse { data_files }))
+    }
+
+    async fn echo(
+        &self,
+        request: tonic::Request<EchoRequest>,
+    ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
+        tracing::info!("Echo request: {:?}", request);
+        Ok(tonic::Response::new(EchoResponse {
+            message: format!("Echo: {}", request.into_inner().message),
+        }))
     }
 }

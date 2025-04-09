@@ -157,6 +157,15 @@ message RewriteFilesResponse {
     repeated DataFile data_files = 1;
 }
 
+message EchoRequest {
+    string message = 1;
+}
+
+message EchoResponse {
+    string message = 1;
+}
+
 service CompactorService {
     rpc RewriteFiles (RewriteFilesRequest) returns (RewriteFilesResponse);
+    rpc Echo (EchoRequest) returns (EchoResponse);
 }

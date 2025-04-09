@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "prost", "services/compactor"]
+members = ["core", "codegen", "services/compactor"]
 
 [workspace.dependencies]
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d", features = [
@@ -34,7 +34,7 @@ async-stream = "0.3.5"
 thiserror = "2.0.11"
 tonic = "0.11.0"
 ic-core = { path = "./core" }
-ic-prost = { path = "./prost" }
+ic-codegen = { path = "./codegen" }
 ic-service-compactor = { path = "./services/compactor" }
 prost-build = { version = "0.12" }
 tonic-build = "0.11.0"

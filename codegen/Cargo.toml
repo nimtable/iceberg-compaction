@@ -1,0 +1,16 @@
+[package]
+name = "ic-codegen"
+version = "0.1.0"
+edition = "2024"
+description = "Protocol Buffers code generation for IC project"
+
+[lib]
+name = "ic_codegen"
+path = "src/lib.rs"
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.11" 
