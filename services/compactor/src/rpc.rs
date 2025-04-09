@@ -33,7 +33,12 @@ impl CompactorService for CompactorServiceImpl {
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
         let config = serde_json::from_value::<CompactionConfig>(
-            serde_json::to_value(request.rewrite_file_config).unwrap(),
+            serde_json::to_value(request.rewrite_file_config).map_err(|e| {
+                tonic::Status::internal(format!(
+                    "Failed to convert rewrite_file_config to JSON value: {}",
+                    e
+                ))
+            })?,
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
         let data_files = DataFusionExecutor::rewrite_files(

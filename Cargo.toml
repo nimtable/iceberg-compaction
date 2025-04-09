@@ -3,40 +3,36 @@ resolver = "2"
 members = ["core", "codegen", "services/compactor"]
 
 [workspace.dependencies]
+# Async runtime and utilities
+async-stream = "0.3.5"
+async-trait = "0.1.86"
+futures = "0.3.17"
+futures-async-stream = "0.2.9"
+tokio = { version = "1", default-features = false}
+
+# Data processing and storage
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d", features = [
     "storage-s3",
     "storage-gcs",
 ] }
-async-trait = "0.1.86"
 parquet = { version = "53.2", features = ["async"] }
+
+# gRPC and Protocol Buffers
 prost = "0.12"
-serde = { version = "1", features = ["rc"] }
-datafusion = "45.0.0"
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
-url = "2"
-iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d"}
-tokio = { version = "1", default-features = false}
-sqlx = { version = "0.8.2", default-features = false, features = [
-    "bigdecimal",
-    "chrono",
-    "json",
-    "mysql",
-    "postgres",
-    "runtime-tokio-native-tls",
-    "rust_decimal",
-    "sqlite",
-    "time",
-    "uuid",
-] }
-futures = "0.3.17"
-futures-async-stream = "0.2.9"
-async-stream = "0.3.5"
-thiserror = "2.0.11"
 tonic = "0.11.0"
+
+# Serialization
+serde = { version = "1", features = ["rc"] }
+serde_with = { version = "3", features = ["json"] }
+serde_json = { version = "1"}
+
+# Error handling
+thiserror = "2.0.11"
+
+# Utilities
+url = "2"
+
+# Local workspace members
 ic-core = { path = "./core" }
 ic-codegen = { path = "./codegen" }
 ic-service-compactor = { path = "./services/compactor" }
-prost-build = { version = "0.12" }
-tonic-build = "0.11.0"
-serde_with = { version = "3", features = ["json"] }
-serde_json = { version = "1"}

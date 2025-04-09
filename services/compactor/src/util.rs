@@ -348,7 +348,7 @@ fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
 #[cfg(test)]
 mod test {
     use super::*;
-    use ic_prost::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
+    use ic_codegen::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
 
     #[test]
     fn test_build_field_from_pb_struct() {
@@ -357,10 +357,8 @@ mod test {
             name: "nested".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let struct_field = NestedFieldDescriptor {
@@ -368,10 +366,8 @@ mod test {
             name: "struct_field".to_string(),
             field_type: Some(FieldType::Struct(StructType {
                 fields: vec![nested_field],
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let result = build_field_from_pb(&struct_field);
@@ -401,10 +397,8 @@ mod test {
             name: "element".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let list_field = NestedFieldDescriptor {
@@ -412,7 +406,6 @@ mod test {
             name: "list_field".to_string(),
             field_type: Some(FieldType::List(Box::new(element_field))),
             required: true,
-            ..Default::default()
         };
 
         let result = build_field_from_pb(&list_field);
@@ -441,10 +434,8 @@ mod test {
             name: "key".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let value_field = NestedFieldDescriptor {
@@ -452,10 +443,8 @@ mod test {
             name: "value".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let map_field = NestedFieldDescriptor {
@@ -464,10 +453,8 @@ mod test {
             field_type: Some(FieldType::Map(Box::new(MapType {
                 key_field: Some(Box::new(key_field)),
                 value_field: Some(Box::new(value_field)),
-                ..Default::default()
             }))),
             required: true,
-            ..Default::default()
         };
 
         let result = build_field_from_pb(&map_field);
@@ -501,10 +488,8 @@ mod test {
             name: "int_field".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let inner_struct_field2 = NestedFieldDescriptor {
@@ -512,10 +497,8 @@ mod test {
             name: "string_field".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let inner_struct = NestedFieldDescriptor {
@@ -523,10 +506,8 @@ mod test {
             name: "inner_struct".to_string(),
             field_type: Some(FieldType::Struct(StructType {
                 fields: vec![inner_struct_field1, inner_struct_field2],
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let list_field = NestedFieldDescriptor {
@@ -534,7 +515,6 @@ mod test {
             name: "list_field".to_string(),
             field_type: Some(FieldType::List(Box::new(inner_struct))),
             required: true,
-            ..Default::default()
         };
 
         let key_field = NestedFieldDescriptor {
@@ -542,10 +522,8 @@ mod test {
             name: "key".to_string(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
-                ..Default::default()
             })),
             required: true,
-            ..Default::default()
         };
 
         let map_field = NestedFieldDescriptor {
@@ -554,10 +532,8 @@ mod test {
             field_type: Some(FieldType::Map(Box::new(MapType {
                 key_field: Some(Box::new(key_field)),
                 value_field: Some(Box::new(list_field)),
-                ..Default::default()
             }))),
             required: true,
-            ..Default::default()
         };
 
         let result = build_field_from_pb(&map_field);

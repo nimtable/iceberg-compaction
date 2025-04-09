@@ -10,12 +10,12 @@ path = "src/bin/main.rs"
 [dependencies]
 async-trait = "0.1.86"
 ic-codegen = { workspace = true }
-tonic = { workspace = true }
-tokio = { workspace = true }
-ic-core ={ workspace = true }
+ic-core = { workspace = true }
 iceberg = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
+tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"

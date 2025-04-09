@@ -14,7 +14,6 @@ use iceberg::scan::FileScanTask;
 use super::iceberg_file_task_scan::IcebergFileTaskScan;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IcebergFileScanTaskTableProvider {
     file_scan_tasks: Vec<FileScanTask>,
     schema: ArrowSchemaRef,
@@ -27,7 +26,7 @@ impl IcebergFileScanTaskTableProvider {
     pub fn new(
         file_scan_tasks: Vec<FileScanTask>,
         schema: ArrowSchemaRef,
-        file_io: &FileIO,
+        file_io: FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
@@ -35,7 +34,7 @@ impl IcebergFileScanTaskTableProvider {
         Self {
             file_scan_tasks,
             schema,
-            file_io: file_io.clone(),
+            file_io,
             need_seq_num,
             need_file_path_and_pos,
             batch_parallelism,

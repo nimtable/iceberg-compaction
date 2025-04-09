@@ -7,8 +7,9 @@ use file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use futures::{StreamExt, future::try_join_all};
 use iceberg::{
     arrow::schema_to_arrow_schema,
+    io::FileIO,
     scan::FileScanTask,
-    spec::{NestedField, PrimitiveType, Schema, Type},
+    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder},
@@ -21,18 +22,19 @@ use iceberg::{
 use sqlx::types::Uuid;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+
+use crate::{CompactionConfig, CompactionError};
+
+use super::{AllFileScanTasks, CompactionExecutor};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
+pub mod sql_builder;
 
 const SEQ_NUM: &str = "seq_num";
 const FILE_PATH: &str = "file_path";
 const POS: &str = "pos";
 
-use super::*;
-
-pub struct DataFusionExecutor {
-    // ctx: SessionContext,
-}
+pub struct DataFusionExecutor {}
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
@@ -53,105 +55,24 @@ impl CompactionExecutor for DataFusionExecutor {
             position_delete_files,
             equality_delete_files,
         } = input_file_scan_tasks;
-        let highest_field_id = schema.highest_field_id();
-        // Build scheam for position delete file, file_path + pos
-        let position_delete_schema = Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::new(
-                    1,
-                    FILE_PATH,
-                    Type::Primitive(PrimitiveType::String),
-                    true,
-                )),
-                Arc::new(NestedField::new(
-                    2,
-                    POS,
-                    Type::Primitive(PrimitiveType::Long),
-                    true,
-                )),
-            ])
-            .build()?;
-        // Build schema for equality delete file, equality_ids + seq_num
-        let mut equlity_ids: Option<Vec<i32>> = None;
-        for i in &equality_delete_files {
-            if let Some(ids) = equlity_ids.as_ref() {
-                if ids.eq(&i.equality_ids) {
-                    continue;
-                } else {
-                    return Err(CompactionError::Config(
-                        "equality_ids not equal".to_string(),
-                    ));
-                }
-            } else {
-                equlity_ids = Some(i.equality_ids.clone());
-            }
-        }
-        let mut equality_delete_vec = vec![];
-        if let Some(ids) = equlity_ids.as_ref() {
-            for i in ids {
-                let field = schema
-                    .field_by_id(*i)
-                    .ok_or_else(|| CompactionError::Config("equality_ids not found".to_string()))?;
-                equality_delete_vec.push(field.clone());
-            }
-        }
-        let equality_join_names: Vec<_> =
-            equality_delete_vec.iter().map(|i| i.name.clone()).collect();
 
-        if !equality_delete_vec.is_empty() {
-            equality_delete_vec.push(Arc::new(NestedField::new(
-                highest_field_id + 1,
-                SEQ_NUM,
-                Type::Primitive(PrimitiveType::Long),
-                true,
-            )));
-        }
-        let equality_delete_schema = Schema::builder().with_fields(equality_delete_vec).build()?;
-        let need_file_path_and_pos = !position_delete_files.is_empty();
-        let need_seq_num = !equality_join_names.is_empty();
-
-        // Build schema for data file, old schema + seq_num + file_path + pos
-        let project_names: Vec<_> = schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|i| i.name.clone())
-            .collect();
-        let highest_field_id = schema.highest_field_id();
-        let mut add_schema_fields = vec![];
-        if need_seq_num {
-            add_schema_fields.push(Arc::new(NestedField::new(
-                highest_field_id + 1,
-                SEQ_NUM,
-                Type::Primitive(PrimitiveType::Long),
-                true,
-            )));
-        }
-        if need_file_path_and_pos {
-            add_schema_fields.push(Arc::new(NestedField::new(
-                highest_field_id + 2,
-                FILE_PATH,
-                Type::Primitive(PrimitiveType::String),
-                true,
-            )));
-            add_schema_fields.push(Arc::new(NestedField::new(
-                highest_field_id + 3,
-                POS,
-                Type::Primitive(PrimitiveType::Long),
-                true,
-            )));
-        }
-        let data_file_schema = schema
-            .as_ref()
-            .clone()
-            .into_builder()
-            .with_fields(add_schema_fields)
+        let mut data_fusion_task_context = DataFusionTaskContext::builder()?
+            .with_schema(schema)
+            .with_datafile(data_files)
+            .with_position_delete_files(position_delete_files)
+            .with_equality_delete_files(equality_delete_files)
             .build()?;
 
-        Self::register_table_provider(
-            data_file_schema,
-            data_files,
-            &file_io,
+        let need_seq_num = data_fusion_task_context.need_seq_num();
+        let need_file_path_and_pos = data_fusion_task_context.need_file_path_and_pos();
+
+        let data_file_schema = data_fusion_task_context.schema.take().unwrap();
+
+        //
+        Self::register_data_table_provider(
+            &data_file_schema,
+            data_fusion_task_context.data_files.take().unwrap(),
+            file_io.clone(),
             &ctx,
             "test_all_delete_data_file",
             need_seq_num,
@@ -159,46 +80,44 @@ impl CompactionExecutor for DataFusionExecutor {
             batch_parallelism,
         )?;
 
-        let mut merge_on_read_sql = format!(
-            "select {} from test_all_delete_data_file",
-            project_names.join(",")
-        );
-        if need_file_path_and_pos {
-            Self::register_table_provider(
-                position_delete_schema,
-                position_delete_files,
-                &file_io,
+        if let Some(position_delete_schema) = data_fusion_task_context.position_delete_schema.take()
+        {
+            Self::register_delete_table_provider(
+                &position_delete_schema,
+                data_fusion_task_context
+                    .position_delete_files
+                    .take()
+                    .unwrap(),
+                file_io.clone(),
                 &ctx,
                 "test_all_delete_position_delete",
-                false,
-                false,
                 batch_parallelism,
             )?;
-            merge_on_read_sql.push_str(" left anti join test_all_delete_position_delete on test_all_delete_data_file.file_path = test_all_delete_position_delete.file_path and test_all_delete_data_file.pos = test_all_delete_position_delete.pos");
-        }
-        if need_seq_num {
-            Self::register_table_provider(
-                equality_delete_schema,
-                equality_delete_files,
-                &file_io,
-                &ctx,
-                "test_all_delete_equality_delete",
-                false,
-                false,
-                batch_parallelism,
-            )?;
-            merge_on_read_sql.push_str(format!(
-                " left anti join test_all_delete_equality_delete on {} and test_all_delete_data_file.seq_num < test_all_delete_equality_delete.seq_num",
-                equality_join_names.iter().map(|i| format!("test_all_delete_data_file.{} = test_all_delete_equality_delete.{}",i,i)).collect::<Vec<String>>().join(" and "),
-            ).as_str());
         }
 
-        let df = ctx.sql(merge_on_read_sql.as_str()).await?;
+        if let Some(equality_delete_schema) = data_fusion_task_context.equality_delete_schema.take()
+        {
+            Self::register_delete_table_provider(
+                &equality_delete_schema,
+                data_fusion_task_context
+                    .equality_delete_files
+                    .take()
+                    .unwrap(),
+                file_io.clone(),
+                &ctx,
+                "test_all_delete_equality_delete",
+                batch_parallelism,
+            )?;
+        }
+
+        let arc_data_file_schema = Arc::new(data_file_schema);
+
+        let df = ctx.sql(&data_fusion_task_context.merge_on_read_sql).await?;
         let batchs = df.execute_stream_partitioned().await?;
         let mut futures = Vec::with_capacity(batch_parallelism);
         for mut batch in batchs {
             let dir_path = dir_path.clone();
-            let schema = schema.clone();
+            let schema = arc_data_file_schema.clone();
             let file_io = file_io.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
@@ -218,7 +137,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .await
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
-            .map(|res| res.map(|v| v.into_iter())) // 转换每个 Result<Vec<T>> 为 Result<迭代器>
+            .map(|res| res.map(|v| v.into_iter()))
             .collect::<Result<Vec<_>, _>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
         Ok(all_data_files)
@@ -227,17 +146,60 @@ impl CompactionExecutor for DataFusionExecutor {
 
 impl DataFusionExecutor {
     #[allow(clippy::too_many_arguments)]
-    fn register_table_provider(
-        schema: Schema,
+    fn register_data_table_provider(
+        schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
-        file_io: &FileIO,
+        file_io: FileIO,
         ctx: &SessionContext,
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
     ) -> Result<(), CompactionError> {
-        let schema = schema_to_arrow_schema(&schema)?;
+        Self::register_table_provider_impl(
+            schema,
+            file_scan_tasks,
+            file_io,
+            ctx,
+            table_name,
+            need_seq_num,
+            need_file_path_and_pos,
+            batch_parallelism,
+        )
+    }
+
+    fn register_delete_table_provider(
+        schema: &Schema,
+        file_scan_tasks: Vec<FileScanTask>,
+        file_io: FileIO,
+        ctx: &SessionContext,
+        table_name: &str,
+        batch_parallelism: usize,
+    ) -> Result<(), CompactionError> {
+        Self::register_table_provider_impl(
+            schema,
+            file_scan_tasks,
+            file_io,
+            ctx,
+            table_name,
+            false,
+            false,
+            batch_parallelism,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_table_provider_impl(
+        schema: &Schema,
+        file_scan_tasks: Vec<FileScanTask>,
+        file_io: FileIO,
+        ctx: &SessionContext,
+        table_name: &str,
+        need_seq_num: bool,
+        need_file_path_and_pos: bool,
+        batch_parallelism: usize,
+    ) -> Result<(), CompactionError> {
+        let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
             Arc::new(schema),
@@ -251,6 +213,7 @@ impl DataFusionExecutor {
             .unwrap();
         Ok(())
     }
+
     async fn build_iceberg_writer(
         dir_path: String,
         schema: Arc<Schema>,
@@ -281,6 +244,198 @@ impl DataFusionExecutor {
         Ok(data_file_writer)
     }
 }
+
+struct DataFusionTaskContext {
+    pub(crate) schema: Option<Schema>,
+    pub(crate) data_files: Option<Vec<FileScanTask>>,
+    pub(crate) position_delete_files: Option<Vec<FileScanTask>>,
+    pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
+    pub(crate) position_delete_schema: Option<Schema>,
+    pub(crate) equality_delete_schema: Option<Schema>,
+    pub(crate) merge_on_read_sql: String,
+}
+
+struct DataFusionTaskContextBuilder {
+    schema: Arc<Schema>,
+    data_files: Vec<FileScanTask>,
+    position_delete_files: Vec<FileScanTask>,
+    equality_delete_files: Vec<FileScanTask>,
+}
+
+impl DataFusionTaskContextBuilder {
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
+        self.schema = schema;
+        self
+    }
+
+    pub fn with_datafile(mut self, data_files: Vec<FileScanTask>) -> Self {
+        self.data_files = data_files;
+        self
+    }
+
+    pub fn with_position_delete_files(mut self, position_delete_files: Vec<FileScanTask>) -> Self {
+        self.position_delete_files = position_delete_files;
+        self
+    }
+
+    pub fn with_equality_delete_files(mut self, equality_delete_files: Vec<FileScanTask>) -> Self {
+        self.equality_delete_files = equality_delete_files;
+        self
+    }
+
+    pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
+        let highest_field_id = self.schema.highest_field_id();
+        // Build scheam for position delete file, file_path + pos
+        let position_delete_schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::new(
+                    1,
+                    FILE_PATH,
+                    Type::Primitive(PrimitiveType::String),
+                    true,
+                )),
+                Arc::new(NestedField::new(
+                    2,
+                    POS,
+                    Type::Primitive(PrimitiveType::Long),
+                    true,
+                )),
+            ])
+            .build()?;
+        // Build schema for equality delete file, equality_ids + seq_num
+        let mut equality_ids: Option<Vec<i32>> = None;
+        for i in &self.equality_delete_files {
+            if let Some(ids) = equality_ids.as_ref() {
+                if ids.eq(&i.equality_ids) {
+                    continue;
+                } else {
+                    return Err(CompactionError::Config(
+                        "equality_ids not equal".to_string(),
+                    ));
+                }
+            } else {
+                equality_ids = Some(i.equality_ids.clone());
+            }
+        }
+        let mut equality_delete_vec = vec![];
+        if let Some(ids) = equality_ids.as_ref() {
+            for i in ids {
+                let field = self
+                    .schema
+                    .field_by_id(*i)
+                    .ok_or_else(|| CompactionError::Config("equality_ids not found".to_string()))?;
+                equality_delete_vec.push(field.clone());
+            }
+        }
+        let equality_join_names: Vec<_> =
+            equality_delete_vec.iter().map(|i| i.name.clone()).collect();
+
+        if !equality_delete_vec.is_empty() {
+            equality_delete_vec.push(Arc::new(NestedField::new(
+                highest_field_id + 1,
+                SEQ_NUM,
+                Type::Primitive(PrimitiveType::Long),
+                true,
+            )));
+        }
+        let equality_delete_schema = Schema::builder().with_fields(equality_delete_vec).build()?;
+        let need_file_path_and_pos = !self.position_delete_files.is_empty();
+        let need_seq_num = !equality_join_names.is_empty();
+
+        // Build schema for data file, old schema + seq_num + file_path + pos
+        let project_names: Vec<_> = self
+            .schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        let highest_field_id = self.schema.highest_field_id();
+        let mut add_schema_fields = vec![];
+        if need_seq_num {
+            add_schema_fields.push(Arc::new(NestedField::new(
+                highest_field_id + 1,
+                SEQ_NUM,
+                Type::Primitive(PrimitiveType::Long),
+                true,
+            )));
+        }
+        if need_file_path_and_pos {
+            add_schema_fields.push(Arc::new(NestedField::new(
+                highest_field_id + 2,
+                FILE_PATH,
+                Type::Primitive(PrimitiveType::String),
+                true,
+            )));
+            add_schema_fields.push(Arc::new(NestedField::new(
+                highest_field_id + 3,
+                POS,
+                Type::Primitive(PrimitiveType::Long),
+                true,
+            )));
+        }
+        let data_file_schema = self
+            .schema
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields(add_schema_fields)
+            .build()?;
+
+        let sql_builder = sql_builder::SqlBuilder::new(
+            "test_all_delete_data_file",
+            &project_names,
+            &self.position_delete_files,
+            &self.equality_delete_files,
+            &equality_join_names,
+            need_seq_num,
+            need_file_path_and_pos,
+        );
+        let merge_on_read_sql = sql_builder.build_merge_on_read_sql();
+
+        Ok(DataFusionTaskContext {
+            schema: Some(data_file_schema),
+            data_files: Some(self.data_files),
+            position_delete_files: Some(self.position_delete_files),
+            equality_delete_files: Some(self.equality_delete_files),
+            position_delete_schema: if need_file_path_and_pos {
+                Some(position_delete_schema)
+            } else {
+                None
+            },
+            equality_delete_schema: if need_seq_num {
+                Some(equality_delete_schema)
+            } else {
+                None
+            },
+            merge_on_read_sql,
+        })
+    }
+}
+
+impl DataFusionTaskContext {
+    pub fn builder() -> Result<DataFusionTaskContextBuilder, CompactionError> {
+        Ok(DataFusionTaskContextBuilder {
+            schema: Arc::new(Schema::builder().build()?),
+            data_files: vec![],
+            position_delete_files: vec![],
+            equality_delete_files: vec![],
+        })
+    }
+
+    pub fn need_file_path_and_pos(&self) -> bool {
+        self.position_delete_files
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    pub fn need_seq_num(&self) -> bool {
+        self.equality_delete_files
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures_async_stream::for_await;
@@ -315,8 +470,7 @@ mod tests {
             )
             .sql_bind_style(SqlBindStyle::DollarNumeric)
             .build();
-        let catalog = SqlCatalog::new(config).await.unwrap();
-        catalog
+        SqlCatalog::new(config).await.unwrap()
     }
 
     async fn get_tasks_from_table(table: Table) -> Result<AllFileScanTasks, CompactionError> {

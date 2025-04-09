@@ -1,4 +1,6 @@
 use std::any::Any;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
@@ -80,20 +82,53 @@ impl IcebergFileTaskScan {
     }
 }
 
-fn split_n_vecs(vecs: Vec<FileScanTask>, split_num: usize) -> Vec<Vec<FileScanTask>> {
-    let split_size = vecs.len() / split_num;
-    let remaining = vecs.len() % split_num;
-    let mut result_vecs: Vec<_> = (0..split_num)
-        .map(|i| {
-            let start = i * split_size;
-            let end = (i + 1) * split_size;
-            vecs[start..end].to_vec()
-        })
-        .collect();
-    for i in 0..remaining {
-        result_vecs[i].push(vecs[split_num * split_size + i].clone());
+fn split_n_vecs(
+    file_scan_tasks: Vec<FileScanTask>,
+    max_split_num: usize,
+) -> Vec<Vec<FileScanTask>> {
+    #[derive(Default)]
+    struct FileScanTaskGroup {
+        tasks: Vec<FileScanTask>,
+        total_length: u64,
     }
-    result_vecs
+
+    impl Ord for FileScanTaskGroup {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.total_length.cmp(&other.total_length)
+        }
+    }
+
+    impl PartialOrd for FileScanTaskGroup {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Eq for FileScanTaskGroup {}
+
+    impl PartialEq for FileScanTaskGroup {
+        fn eq(&self, other: &Self) -> bool {
+            self.total_length == other.total_length
+        }
+    }
+
+    let mut heap = BinaryHeap::new();
+    // push all groups into heap
+    for _ in 0..max_split_num {
+        heap.push(Reverse(FileScanTaskGroup::default()));
+    }
+
+    for file_task in file_scan_tasks {
+        let mut group = heap.peek_mut().unwrap();
+        group.0.total_length += file_task.length;
+        group.0.tasks.push(file_task);
+    }
+
+    // convert heap into vec and extract tasks
+    heap.into_vec()
+        .into_iter()
+        .map(|reverse_group| reverse_group.0.tasks)
+        .collect()
 }
 
 impl ExecutionPlan for IcebergFileTaskScan {
@@ -263,4 +298,88 @@ pub fn get_column_names(
             .map(|p| schema.field(*p).name().clone())
             .collect::<Vec<String>>()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::scan::FileScanTask;
+    use iceberg::spec::{DataContentType, Schema};
+    use std::sync::Arc;
+
+    fn create_file_scan_task(length: u64) -> FileScanTask {
+        FileScanTask {
+            length,
+            start: 0,
+            record_count: Some(0),
+            data_file_path: "test.parquet".to_string(),
+            data_file_content: DataContentType::Data,
+            data_file_format: iceberg::spec::DataFileFormat::Parquet,
+            schema: Arc::new(Schema::builder().build().unwrap()),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 0,
+            equality_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn test_split_n_vecs_basic() {
+        let file_scan_tasks = (1..=12)
+            .map(|i| create_file_scan_task(i + 100))
+            .collect::<Vec<_>>();
+
+        let groups = split_n_vecs(file_scan_tasks, 3);
+
+        assert_eq!(groups.len(), 3);
+
+        let group_lengths: Vec<u64> = groups
+            .iter()
+            .map(|group| group.iter().map(|task| task.length).sum())
+            .collect();
+
+        let max_length = *group_lengths.iter().max().unwrap();
+        let min_length = *group_lengths.iter().min().unwrap();
+        assert!(max_length - min_length <= 10, "Groups should be balanced");
+
+        let total_tasks: usize = groups.iter().map(|group| group.len()).sum();
+        assert_eq!(total_tasks, 12);
+    }
+
+    #[test]
+    fn test_split_n_vecs_empty() {
+        let file_scan_tasks = Vec::new();
+        let groups = split_n_vecs(file_scan_tasks, 3);
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|group| group.is_empty()));
+    }
+
+    #[test]
+    fn test_split_n_vecs_single_task() {
+        let file_scan_tasks = vec![create_file_scan_task(100)];
+        let groups = split_n_vecs(file_scan_tasks, 3);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.iter().filter(|group| !group.is_empty()).count(), 1);
+    }
+
+    #[test]
+    fn test_split_n_vecs_uneven_distribution() {
+        let file_scan_tasks = vec![
+            create_file_scan_task(1000),
+            create_file_scan_task(100),
+            create_file_scan_task(100),
+            create_file_scan_task(100),
+            create_file_scan_task(100),
+        ];
+
+        let groups = split_n_vecs(file_scan_tasks, 2);
+        assert_eq!(groups.len(), 2);
+
+        let group_with_large_task = groups
+            .iter()
+            .find(|group| group.iter().any(|task| task.length == 1000))
+            .unwrap();
+        assert_eq!(group_with_large_task.len(), 1);
+    }
 }

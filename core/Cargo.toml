@@ -4,19 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = { workspace = true }
 async-trait = { workspace = true }
+datafusion = "45.0.0"
+futures = { workspace = true }
+futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
 parquet = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
-datafusion = { workspace = true }
-iceberg-datafusion = { workspace = true }
-url = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
-tokio = { workspace = true }
-sqlx = { workspace = true }
-futures = { workspace = true }
-futures-async-stream = { workspace = true }
-async-stream = { workspace = true }
 serde_with = { workspace = true }
+sqlx = { version = "0.8.2",default-features = false, features = ["bigdecimal","chrono","json","mysql","postgres","runtime-tokio-native-tls","rust_decimal","sqlite","time","uuid",] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
