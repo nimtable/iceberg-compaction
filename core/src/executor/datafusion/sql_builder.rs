@@ -108,7 +108,7 @@ mod tests {
             start: 0,
             length: 0,
             record_count: None,
-            data_file_path: "test.parquet".to_string(),
+            data_file_path: "test.parquet".to_owned(),
             data_file_content: iceberg::spec::DataContentType::Data,
             data_file_format: iceberg::spec::DataFileFormat::Parquet,
             schema: create_test_schema(),
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_build_merge_on_read_sql_no_deletes() {
-        let project_names = vec!["id".to_string(), "name".to_string()];
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
         let position_delete_files = Vec::new();
         let equality_delete_files = Vec::new();
         let equality_join_names = Vec::new();
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_build_merge_on_read_sql_with_position_deletes() {
-        let project_names = vec!["id".to_string(), "name".to_string()];
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
         let position_delete_files = vec![create_test_file_scan_task()];
         let equality_delete_files = Vec::new();
         let equality_join_names = Vec::new();
@@ -166,12 +166,12 @@ mod tests {
 
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes() {
-        let project_names = vec!["id".to_string(), "name".to_string()];
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
         let position_delete_files = Vec::new();
         let mut task = create_test_file_scan_task();
         task.equality_ids = vec![1];
         let equality_delete_files = vec![task];
-        let equality_join_names = vec!["id".to_string()];
+        let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
             "test_table",
@@ -189,12 +189,12 @@ mod tests {
 
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes_and_seq_num() {
-        let project_names = vec!["id".to_string(), "name".to_string()];
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
         let position_delete_files = Vec::new();
         let mut task = create_test_file_scan_task();
         task.equality_ids = vec![1];
         let equality_delete_files = vec![task];
-        let equality_join_names = vec!["id".to_string()];
+        let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
             "test_table",
@@ -211,12 +211,12 @@ mod tests {
 
     #[test]
     fn test_build_merge_on_read_sql_with_both_deletes() {
-        let project_names = vec!["id".to_string(), "name".to_string()];
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
         let position_delete_files = vec![create_test_file_scan_task()];
         let mut task = create_test_file_scan_task();
         task.equality_ids = vec![1];
         let equality_delete_files = vec![task];
-        let equality_join_names = vec!["id".to_string()];
+        let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
             "test_table",

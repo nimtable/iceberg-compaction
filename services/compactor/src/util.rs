@@ -217,7 +217,7 @@ pub fn build_file_io_from_pb(
 pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
     DataFile {
         content: data_file.content_type() as i32,
-        file_path: data_file.file_path().to_string(),
+        file_path: data_file.file_path().to_owned(),
         file_format: into_pb_data_file_format(data_file.file_format()),
         partition: Some(struct_into_pb(data_file.partition().clone())),
         record_count: data_file.record_count(),
@@ -354,7 +354,7 @@ mod test {
     fn test_build_field_from_pb_struct() {
         let nested_field = NestedFieldDescriptor {
             id: 1,
-            name: "nested".to_string(),
+            name: "nested".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
             })),
@@ -363,7 +363,7 @@ mod test {
 
         let struct_field = NestedFieldDescriptor {
             id: 2,
-            name: "struct_field".to_string(),
+            name: "struct_field".to_owned(),
             field_type: Some(FieldType::Struct(StructType {
                 fields: vec![nested_field],
             })),
@@ -394,7 +394,7 @@ mod test {
     fn test_build_field_from_pb_list() {
         let element_field = NestedFieldDescriptor {
             id: 1,
-            name: "element".to_string(),
+            name: "element".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
             })),
@@ -403,7 +403,7 @@ mod test {
 
         let list_field = NestedFieldDescriptor {
             id: 2,
-            name: "list_field".to_string(),
+            name: "list_field".to_owned(),
             field_type: Some(FieldType::List(Box::new(element_field))),
             required: true,
         };
@@ -431,7 +431,7 @@ mod test {
     fn test_build_field_from_pb_map() {
         let key_field = NestedFieldDescriptor {
             id: 1,
-            name: "key".to_string(),
+            name: "key".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
             })),
@@ -440,7 +440,7 @@ mod test {
 
         let value_field = NestedFieldDescriptor {
             id: 2,
-            name: "value".to_string(),
+            name: "value".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
             })),
@@ -449,7 +449,7 @@ mod test {
 
         let map_field = NestedFieldDescriptor {
             id: 3,
-            name: "map_field".to_string(),
+            name: "map_field".to_owned(),
             field_type: Some(FieldType::Map(Box::new(MapType {
                 key_field: Some(Box::new(key_field)),
                 value_field: Some(Box::new(value_field)),
@@ -485,7 +485,7 @@ mod test {
     fn test_build_field_from_pb_deeply_nested() {
         let inner_struct_field1 = NestedFieldDescriptor {
             id: 1,
-            name: "int_field".to_string(),
+            name: "int_field".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::Int.into())),
             })),
@@ -494,7 +494,7 @@ mod test {
 
         let inner_struct_field2 = NestedFieldDescriptor {
             id: 2,
-            name: "string_field".to_string(),
+            name: "string_field".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
             })),
@@ -503,7 +503,7 @@ mod test {
 
         let inner_struct = NestedFieldDescriptor {
             id: 3,
-            name: "inner_struct".to_string(),
+            name: "inner_struct".to_owned(),
             field_type: Some(FieldType::Struct(StructType {
                 fields: vec![inner_struct_field1, inner_struct_field2],
             })),
@@ -512,14 +512,14 @@ mod test {
 
         let list_field = NestedFieldDescriptor {
             id: 4,
-            name: "list_field".to_string(),
+            name: "list_field".to_owned(),
             field_type: Some(FieldType::List(Box::new(inner_struct))),
             required: true,
         };
 
         let key_field = NestedFieldDescriptor {
             id: 5,
-            name: "key".to_string(),
+            name: "key".to_owned(),
             field_type: Some(FieldType::Primitive(PrimitiveType {
                 kind: Some(Kind::KindWithoutInner(KindWithoutInner::String.into())),
             })),
@@ -528,7 +528,7 @@ mod test {
 
         let map_field = NestedFieldDescriptor {
             id: 6,
-            name: "map_field".to_string(),
+            name: "map_field".to_owned(),
             field_type: Some(FieldType::Map(Box::new(MapType {
                 key_field: Some(Box::new(key_field)),
                 value_field: Some(Box::new(list_field)),
