@@ -43,10 +43,11 @@ impl CompactionExecutor for DataFusionExecutor {
         config: Arc<CompactionConfig>,
         dir_path: String,
     ) -> Result<Vec<DataFile>, CompactionError> {
-        let batch_parallelism = config.batch_parallelism.unwrap_or(1);
-        let mut config = SessionConfig::new();
-        config = config.with_target_partitions(4);
-        let ctx = SessionContext::new_with_config(config);
+        let batch_parallelism = config.batch_parallelism.unwrap_or(4);
+        let target_partitions = config.target_partitions.unwrap_or(4);
+        let mut session_config = SessionConfig::new();
+        session_config = session_config.with_target_partitions(target_partitions);
+        let ctx = SessionContext::new_with_config(session_config);
 
         let AllFileScanTasks {
             data_files,
@@ -218,7 +219,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .await
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
-            .map(|res| res.map(|v| v.into_iter())) // 转换每个 Result<Vec<T>> 为 Result<迭代器>
+            .map(|res| res.map(|v| v.into_iter()))
             .collect::<Result<Vec<_>, _>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
         Ok(all_data_files)
@@ -415,6 +416,7 @@ mod tests {
             all_file_scan_tasks,
             Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),
+                target_partitions: Some(4),
             }),
             default_location_generator.dir_path,
         )

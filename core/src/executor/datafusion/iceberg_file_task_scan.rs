@@ -49,7 +49,6 @@ impl IcebergFileTaskScan {
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
         let file_scan_tasks_group = split_n_vecs(file_scan_tasks, batch_parallelism);
-
         let plan_properties =
             Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
         let projection = get_column_names(schema.clone(), projection);

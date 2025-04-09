@@ -348,7 +348,7 @@ fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
 #[cfg(test)]
 mod test {
     use super::*;
-    use ic_prost::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
+    use ic_codegen::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
 
     #[test]
     fn test_build_field_from_pb_struct() {
