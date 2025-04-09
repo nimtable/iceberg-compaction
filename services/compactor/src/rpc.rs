@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use ic_core::executor::DataFusionExecutor;
-use ic_core::{CompactionConfig, CompactionExecutor};
 use ic_codegen::compactor::compactor_service_server::CompactorService;
 use ic_codegen::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
+use ic_core::executor::DataFusionExecutor;
+use ic_core::{CompactionConfig, CompactionExecutor};
 
 use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, data_file_into_pb};
 

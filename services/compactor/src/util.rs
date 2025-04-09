@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use ic_core::CompactionError;
-use ic_core::executor::AllFileScanTasks;
 use ic_codegen::compactor::DataFile;
 use ic_codegen::compactor::FileIoBuilder;
 use ic_codegen::compactor::FileScanTaskDescriptor;
@@ -18,6 +16,8 @@ use ic_codegen::compactor::primitive_literal::KindLiteral;
 use ic_codegen::compactor::primitive_literal::KindWithoutInnerLiteral;
 use ic_codegen::compactor::primitive_type::Kind;
 use ic_codegen::compactor::primitive_type::KindWithoutInner;
+use ic_core::CompactionError;
+use ic_core::executor::AllFileScanTasks;
 use iceberg::spec::DataContentType;
 use iceberg::spec::NestedField;
 use iceberg::spec::Type;
@@ -209,7 +209,9 @@ pub fn build_file_io_from_pb(
     file_io_builder_pb: FileIoBuilder,
 ) -> Result<iceberg::io::FileIO, CompactionError> {
     let file_io_builder = iceberg::io::FileIO::from_path(file_io_builder_pb.scheme_str)?;
-    Ok(file_io_builder.with_props(file_io_builder_pb.props).build()?)
+    Ok(file_io_builder
+        .with_props(file_io_builder_pb.props)
+        .build()?)
 }
 
 pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
