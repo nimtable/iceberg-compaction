@@ -26,9 +26,9 @@ build/
 # Rust
 core/**/target
 core/**/target_tarpaulin
-prost/**/target
-prost/src/**
-!prost/src/lib.rs
+codegen/**/target
+codegen/src/**
+!codegen/src/lib.rs
 sevices/compactor/**/target
 target/
 target-bisector-*/
