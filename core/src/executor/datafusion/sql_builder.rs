@@ -2,18 +2,26 @@ use iceberg::scan::FileScanTask;
 
 use super::{DATA_FILE_TABLE, EQUALITY_DELETE_TABLE, POSITION_DELETE_TABLE};
 
+/// SQL Builder for generating merge-on-read SQL queries
 pub struct SqlBuilder<'a> {
+    /// Column names to be projected in the query
     project_names: &'a Vec<String>,
+    /// Position delete files to be used in the query
     position_delete_files: &'a Vec<FileScanTask>,
+    /// Equality delete files to be used in the query
     equality_delete_files: &'a Vec<FileScanTask>,
 
+    /// Column names to be used for equality delete joins
     equality_join_names: &'a Vec<String>,
 
+    /// Whether to include sequence number comparison in equality delete joins
     need_seq_num: bool,
+    /// Whether to include file path and position in position delete joins
     need_file_path_and_pos: bool,
 }
 
 impl<'a> SqlBuilder<'a> {
+    /// Creates a new SQL Builder with the specified parameters
     pub fn new(
         project_names: &'a Vec<String>,
         position_delete_files: &'a Vec<FileScanTask>,
@@ -32,7 +40,14 @@ impl<'a> SqlBuilder<'a> {
         }
     }
 
+    /// Builds a merge-on-read SQL query
+    ///
+    /// This method constructs a SQL query that:
+    /// 1. Selects the specified columns from the data file table
+    /// 2. Optionally joins with position delete files to exclude deleted rows
+    /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(&self) -> String {
+        // Start with a basic SELECT query from the data file table
         let mut sql = format!(
             "select {} from {}",
             self.project_names.join(","),
@@ -40,6 +55,7 @@ impl<'a> SqlBuilder<'a> {
         );
 
         // Add position delete join if needed
+        // This excludes rows that have been deleted by position
         if self.need_file_path_and_pos && !self.position_delete_files.is_empty() {
             sql.push_str(&format!(
                 " left anti join {} on {}.file_path = {}.file_path and {}.pos = {}.pos",
@@ -52,6 +68,7 @@ impl<'a> SqlBuilder<'a> {
         }
 
         // Add equality delete join if needed
+        // This excludes rows that match the equality conditions in the delete files
         if !self.equality_delete_files.is_empty() {
             sql.push_str(&format!(
                 " left anti join {} on {}",
@@ -66,6 +83,8 @@ impl<'a> SqlBuilder<'a> {
                     .join(" and ")
             ));
 
+            // Add sequence number comparison if needed
+            // This ensures that only newer deletes are applied
             if self.need_seq_num {
                 sql.push_str(&format!(
                     " and {}.seq_num < {}.seq_num",
@@ -84,6 +103,7 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
+    /// Creates a test schema with id and name fields
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(
             Schema::builder()
@@ -106,6 +126,7 @@ mod tests {
         )
     }
 
+    /// Creates a test file scan task
     fn create_test_file_scan_task() -> FileScanTask {
         FileScanTask {
             start: 0,
@@ -123,6 +144,7 @@ mod tests {
         }
     }
 
+    /// Test building SQL with no delete files
     #[test]
     fn test_build_merge_on_read_sql_no_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -148,6 +170,7 @@ mod tests {
         );
     }
 
+    /// Test building SQL with position delete files
     #[test]
     fn test_build_merge_on_read_sql_with_position_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -178,6 +201,7 @@ mod tests {
         )));
     }
 
+    /// Test building SQL with equality delete files
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -206,6 +230,7 @@ mod tests {
         )));
     }
 
+    /// Test building SQL with equality delete files and sequence number comparison
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes_and_seq_num() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -230,6 +255,7 @@ mod tests {
         )));
     }
 
+    /// Test building SQL with both position and equality delete files
     #[test]
     fn test_build_merge_on_read_sql_with_both_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];

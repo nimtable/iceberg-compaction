@@ -78,7 +78,7 @@ impl CompactionExecutor for DataFusionExecutor {
         let data_file_schema = data_fusion_task_context.data_file_schema.take().unwrap();
         let input_schema = data_fusion_task_context.input_schema.take().unwrap();
 
-        //
+        // register data file table provider
         Self::register_data_table_provider(
             &data_file_schema,
             data_fusion_task_context.data_files.take().unwrap(),
@@ -125,6 +125,7 @@ impl CompactionExecutor for DataFusionExecutor {
         let df = ctx.sql(&data_fusion_task_context.merge_on_read_sql).await?;
         let batchs = df.execute_stream_partitioned().await?;
         let mut futures = Vec::with_capacity(batch_parallelism);
+        // build iceberg writer for each partition
         for mut batch in batchs {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
@@ -143,7 +144,7 @@ impl CompactionExecutor for DataFusionExecutor {
             });
             futures.push(future);
         }
-
+        // collect all data files from all partitions
         let all_data_files = try_join_all(futures)
             .await
             .map_err(|e| CompactionError::Execution(e.to_string()))?
@@ -296,6 +297,7 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
+    // build data fusion task context
     pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
         let highest_field_id = self.schema.highest_field_id();
         // Build scheam for position delete file, file_path + pos
@@ -363,6 +365,7 @@ impl DataFusionTaskContextBuilder {
             .collect();
         let highest_field_id = self.schema.highest_field_id();
         let mut add_schema_fields = vec![];
+        // add sequence number column if needed
         if need_seq_num {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 1,
@@ -371,6 +374,7 @@ impl DataFusionTaskContextBuilder {
                 true,
             )));
         }
+        // add file path and position column if needed
         if need_file_path_and_pos {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 2,
@@ -385,6 +389,7 @@ impl DataFusionTaskContextBuilder {
                 true,
             )));
         }
+        // data file schema is old schema + seq_num + file_path + pos. used for data file table provider
         let data_file_schema = self
             .schema
             .as_ref()
@@ -392,6 +397,7 @@ impl DataFusionTaskContextBuilder {
             .into_builder()
             .with_fields(add_schema_fields)
             .build()?;
+        // input schema is old schema. used for data file writer
         let input_schema = self.schema.as_ref().clone();
 
         let sql_builder = sql_builder::SqlBuilder::new(
@@ -582,6 +588,7 @@ mod tests {
             Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),
                 target_partitions: Some(4),
+                data_file_prefix: None,
             }),
             default_location_generator.dir_path,
         )

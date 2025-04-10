@@ -25,6 +25,7 @@ use iceberg_datafusion::to_datafusion_error;
 
 use super::SEQ_NUM;
 
+/// An execution plan for scanning iceberg file scan tasks
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
     file_scan_tasks_group: Vec<Vec<FileScanTask>>,
@@ -83,6 +84,7 @@ impl IcebergFileTaskScan {
     }
 }
 
+/// Splits a list of file scan tasks into a list of groups
 fn split_n_vecs(
     file_scan_tasks: Vec<FileScanTask>,
     max_split_num: usize,
@@ -176,6 +178,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
     }
 }
 
+/// Gets a stream of record batches from a list of file scan tasks
 async fn get_batch_stream(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
@@ -198,9 +201,11 @@ async fn get_batch_stream(
                 let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match data_file_content {
                     iceberg::spec::DataContentType::Data => {
+                        // add sequence number if needed
                         if need_seq_num {
                             batch = add_seq_num_into_batch(batch, sequence_number)?;
                         }
+                        // add file path and position if needed
                         if need_file_path_and_pos {
                             batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
                             index_start += batch.num_rows() as i64;
@@ -221,6 +226,7 @@ async fn get_batch_stream(
     Ok(Box::pin(stream))
 }
 
+/// Adds a sequence number column to a record batch
 fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBatch> {
     let schema = batch.schema();
     let seq_num_field = Arc::new(Field::new(
@@ -238,6 +244,7 @@ fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBa
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
 }
 
+/// Adds a file path and position column to a record batch
 fn add_file_path_pos_into_batch(
     batch: RecordBatch,
     file_path: &str,
