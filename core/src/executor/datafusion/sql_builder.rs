@@ -1,7 +1,8 @@
 use iceberg::scan::FileScanTask;
 
+use super::{DATA_FILE_TABLE, EQUALITY_DELETE_TABLE, POSITION_DELETE_TABLE};
+
 pub struct SqlBuilder<'a> {
-    table_name: &'a str,
     project_names: &'a Vec<String>,
     position_delete_files: &'a Vec<FileScanTask>,
     equality_delete_files: &'a Vec<FileScanTask>,
@@ -14,7 +15,6 @@ pub struct SqlBuilder<'a> {
 
 impl<'a> SqlBuilder<'a> {
     pub fn new(
-        table_name: &'a str,
         project_names: &'a Vec<String>,
         position_delete_files: &'a Vec<FileScanTask>,
         equality_delete_files: &'a Vec<FileScanTask>,
@@ -23,7 +23,6 @@ impl<'a> SqlBuilder<'a> {
         need_file_path_and_pos: bool,
     ) -> Self {
         Self {
-            table_name,
             project_names,
             position_delete_files,
             equality_delete_files,
@@ -37,27 +36,31 @@ impl<'a> SqlBuilder<'a> {
         let mut sql = format!(
             "select {} from {}",
             self.project_names.join(","),
-            self.table_name
+            DATA_FILE_TABLE
         );
 
         // Add position delete join if needed
         if self.need_file_path_and_pos && !self.position_delete_files.is_empty() {
             sql.push_str(&format!(
-                " left anti join {}_position_delete on {}.file_path = {}_position_delete.file_path and {}.pos = {}_position_delete.pos",
-                self.table_name, self.table_name, self.table_name, self.table_name, self.table_name
+                " left anti join {} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+                POSITION_DELETE_TABLE,
+                DATA_FILE_TABLE,
+                POSITION_DELETE_TABLE,
+                DATA_FILE_TABLE,
+                POSITION_DELETE_TABLE
             ));
         }
 
         // Add equality delete join if needed
         if !self.equality_delete_files.is_empty() {
             sql.push_str(&format!(
-                " left anti join {}_equality_delete on {}",
-                self.table_name,
+                " left anti join {} on {}",
+                EQUALITY_DELETE_TABLE,
                 self.equality_join_names
                     .iter()
                     .map(|name| format!(
-                        "{}.{} = {}_equality_delete.{}",
-                        self.table_name, name, self.table_name, name
+                        "{}.{} = {}.{}",
+                        DATA_FILE_TABLE, name, EQUALITY_DELETE_TABLE, name
                     ))
                     .collect::<Vec<_>>()
                     .join(" and ")
@@ -65,8 +68,8 @@ impl<'a> SqlBuilder<'a> {
 
             if self.need_seq_num {
                 sql.push_str(&format!(
-                    " and {}.seq_num < {}_equality_delete.seq_num",
-                    self.table_name, self.table_name
+                    " and {}.seq_num < {}.seq_num",
+                    DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
                 ));
             }
         }
@@ -128,7 +131,6 @@ mod tests {
         let equality_join_names = Vec::new();
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -138,7 +140,11 @@ mod tests {
         );
         assert_eq!(
             builder.build_merge_on_read_sql(),
-            "select id,name from test_table"
+            format!(
+                "select {} from {}",
+                project_names.join(","),
+                DATA_FILE_TABLE
+            )
         );
     }
 
@@ -150,7 +156,6 @@ mod tests {
         let equality_join_names = Vec::new();
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -159,9 +164,18 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_position_delete"));
-        assert!(sql.contains("test_table.file_path = test_table_position_delete.file_path"));
-        assert!(sql.contains("test_table.pos = test_table_position_delete.pos"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
+        )));
     }
 
     #[test]
@@ -174,7 +188,6 @@ mod tests {
         let equality_join_names = vec!["id".to_string()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -183,8 +196,14 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_equality_delete"));
-        assert!(sql.contains("test_table.id = test_table_equality_delete.id"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.id = {}.id",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 
     #[test]
@@ -197,7 +216,6 @@ mod tests {
         let equality_join_names = vec!["id".to_string()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -206,7 +224,10 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("test_table.seq_num < test_table_equality_delete.seq_num"));
+        assert!(sql.contains(&format!(
+            "{}.seq_num < {}.seq_num",
+            DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 
     #[test]
@@ -219,7 +240,6 @@ mod tests {
         let equality_join_names = vec!["id".to_string()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -228,11 +248,29 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_position_delete"));
-        assert!(sql.contains("left anti join test_table_equality_delete"));
-        assert!(sql.contains("test_table.file_path = test_table_position_delete.file_path"));
-        assert!(sql.contains("test_table.pos = test_table_position_delete.pos"));
-        assert!(sql.contains("test_table.id = test_table_equality_delete.id"));
-        assert!(sql.contains("test_table.seq_num < test_table_equality_delete.seq_num"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.id = {}.id",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{}.seq_num < {}.seq_num",
+            DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 }

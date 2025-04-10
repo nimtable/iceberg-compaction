@@ -23,6 +23,8 @@ use iceberg::scan::FileScanTask;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
 
+use super::SEQ_NUM;
+
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
     file_scan_tasks_group: Vec<Vec<FileScanTask>>,
@@ -222,7 +224,7 @@ async fn get_batch_stream(
 fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBatch> {
     let schema = batch.schema();
     let seq_num_field = Arc::new(Field::new(
-        "seq_num",
+        SEQ_NUM,
         datafusion::arrow::datatypes::DataType::Int64,
         false,
     ));

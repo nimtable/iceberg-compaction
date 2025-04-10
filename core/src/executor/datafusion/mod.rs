@@ -33,6 +33,9 @@ pub mod sql_builder;
 const SEQ_NUM: &str = "seq_num";
 const FILE_PATH: &str = "file_path";
 const POS: &str = "pos";
+const DATA_FILE_TABLE: &str = "data_file_table";
+const POSITION_DELETE_TABLE: &str = "position_delete_table";
+const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
 
 pub struct DataFusionExecutor {}
 
@@ -75,7 +78,7 @@ impl CompactionExecutor for DataFusionExecutor {
             data_fusion_task_context.data_files.take().unwrap(),
             file_io.clone(),
             &ctx,
-            "test_all_delete_data_file",
+            DATA_FILE_TABLE,
             need_seq_num,
             need_file_path_and_pos,
             batch_parallelism,
@@ -91,7 +94,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     .unwrap(),
                 file_io.clone(),
                 &ctx,
-                "test_all_delete_position_delete",
+                POSITION_DELETE_TABLE,
                 batch_parallelism,
             )?;
         }
@@ -106,7 +109,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     .unwrap(),
                 file_io.clone(),
                 &ctx,
-                "test_all_delete_equality_delete",
+                EQUALITY_DELETE_TABLE,
                 batch_parallelism,
             )?;
         }
@@ -384,7 +387,6 @@ impl DataFusionTaskContextBuilder {
             .build()?;
 
         let sql_builder = sql_builder::SqlBuilder::new(
-            "test_all_delete_data_file",
             &project_names,
             &self.position_delete_files,
             &self.equality_delete_files,
