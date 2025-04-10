@@ -2326,6 +2326,7 @@ dependencies = [
  "datafusion",
  "futures",
  "futures-async-stream",
+ "ic-codegen",
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",

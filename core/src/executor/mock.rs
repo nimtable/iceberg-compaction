@@ -8,10 +8,10 @@ impl CompactionExecutor for MockExecutor {
     async fn rewrite_files(
         _file_io: FileIO,
         _schema: Arc<Schema>,
-        _input_file_scan_tasks: AllFileScanTasks,
+        _input_file_scan_tasks: InputFileScanTasks,
         _config: Arc<CompactionConfig>,
         _dir_path: String,
-    ) -> Result<Vec<DataFile>, CompactionError> {
-        Ok(vec![])
+    ) -> Result<CompactionResult, CompactionError> {
+        Ok(CompactionResult::default())
     }
 }

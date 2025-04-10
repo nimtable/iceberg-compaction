@@ -17,7 +17,7 @@ use ic_codegen::compactor::primitive_literal::KindWithoutInnerLiteral;
 use ic_codegen::compactor::primitive_type::Kind;
 use ic_codegen::compactor::primitive_type::KindWithoutInner;
 use ic_core::CompactionError;
-use ic_core::executor::AllFileScanTasks;
+use ic_core::executor::InputFileScanTasks;
 use iceberg::spec::DataContentType;
 use iceberg::spec::NestedField;
 use iceberg::spec::Type;
@@ -30,7 +30,7 @@ use iceberg::{scan::FileScanTask, spec::Schema};
 pub fn build_file_scan_tasks_schema_from_pb(
     file_scan_task_descriptors: Vec<FileScanTaskDescriptor>,
     schema: SchemaDescriptor,
-) -> Result<(AllFileScanTasks, Arc<Schema>), CompactionError> {
+) -> Result<(InputFileScanTasks, Arc<Schema>), CompactionError> {
     let mut data_files = vec![];
     let mut position_delete_files = vec![];
     let mut equality_delete_files = vec![];
@@ -69,7 +69,7 @@ pub fn build_file_scan_tasks_schema_from_pb(
         }
     }
     Ok((
-        AllFileScanTasks {
+        InputFileScanTasks {
             data_files,
             position_delete_files,
             equality_delete_files,

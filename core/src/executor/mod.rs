@@ -12,20 +12,35 @@ pub mod mock;
 pub use mock::MockExecutor;
 pub mod datafusion;
 pub use datafusion::DataFusionExecutor;
+pub use ic_codegen::compactor::RewriteFilesStat;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn rewrite_files(
         file_io: FileIO,
         schema: Arc<Schema>,
-        input_file_scan_tasks: AllFileScanTasks,
+        input_file_scan_tasks: InputFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
-    ) -> Result<Vec<DataFile>, CompactionError>;
+    ) -> Result<CompactionResult, CompactionError>;
 }
 
-pub struct AllFileScanTasks {
+pub struct InputFileScanTasks {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,
     pub equality_delete_files: Vec<FileScanTask>,
+}
+
+impl InputFileScanTasks {
+    pub fn input_files_count(&self) -> u32 {
+        self.data_files.len() as u32
+            + self.position_delete_files.len() as u32
+            + self.equality_delete_files.len() as u32
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompactionResult {
+    pub data_files: Vec<DataFile>,
+    pub stat: RewriteFilesStat,
 }
