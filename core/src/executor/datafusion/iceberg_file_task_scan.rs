@@ -198,7 +198,7 @@ async fn get_batch_stream(
                 let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match data_file_content {
                     iceberg::spec::DataContentType::Data => {
-                        if need_seq_num{
+                        if need_seq_num {
                             batch = add_seq_num_into_batch(batch, sequence_number)?;
                         }
                         if need_file_path_and_pos {
@@ -313,7 +313,7 @@ mod tests {
             length,
             start: 0,
             record_count: Some(0),
-            data_file_path: "test.parquet".to_string(),
+            data_file_path: "test.parquet".to_owned(),
             data_file_content: DataContentType::Data,
             data_file_format: iceberg::spec::DataFileFormat::Parquet,
             schema: Arc::new(Schema::builder().build().unwrap()),

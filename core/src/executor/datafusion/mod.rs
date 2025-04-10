@@ -229,7 +229,7 @@ impl DataFusionExecutor {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
-            "1".to_string(),
+            "1".to_owned(),
             Some(unique_uuid_suffix.to_string()),
             iceberg::spec::DataFileFormat::Parquet,
         );
@@ -313,9 +313,7 @@ impl DataFusionTaskContextBuilder {
                 if ids.eq(&i.equality_ids) {
                     continue;
                 } else {
-                    return Err(CompactionError::Config(
-                        "equality_ids not equal".to_string(),
-                    ));
+                    return Err(CompactionError::Config("equality_ids not equal".to_owned()));
                 }
             } else {
                 equality_ids = Some(i.equality_ids.clone());
@@ -327,7 +325,7 @@ impl DataFusionTaskContextBuilder {
                 let field = self
                     .schema
                     .field_by_id(*i)
-                    .ok_or_else(|| CompactionError::Config("equality_ids not found".to_string()))?;
+                    .ok_or_else(|| CompactionError::Config("equality_ids not found".to_owned()))?;
                 equality_delete_vec.push(field.clone());
             }
         }
@@ -459,8 +457,8 @@ mod tests {
         let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
         let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
         let config = SqlCatalogConfig::builder()
-            .uri(sql_lite_uri.to_string())
-            .name("demo1".to_string())
+            .uri(sql_lite_uri.to_owned())
+            .name("demo1".to_owned())
             .warehouse_location(warehouse_location)
             .file_io(
                 FileIOBuilder::new("s3a")
