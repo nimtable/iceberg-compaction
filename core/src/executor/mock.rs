@@ -5,12 +5,13 @@ pub struct MockExecutor;
 
 #[async_trait]
 impl CompactionExecutor for MockExecutor {
-    async fn compact(
-        &self,
-        _table: Table,
-        input_files: Vec<DataFile>,
+    async fn rewrite_files(
+        _file_io: FileIO,
+        _schema: Arc<Schema>,
+        _input_file_scan_tasks: AllFileScanTasks,
         _config: Arc<CompactionConfig>,
+        _dir_path: String,
     ) -> Result<Vec<DataFile>, CompactionError> {
-        Ok(input_files)
+        Ok(vec![])
     }
 }

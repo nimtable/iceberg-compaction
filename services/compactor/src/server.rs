@@ -7,7 +7,7 @@ use tonic::transport::Server;
 pub async fn grpc_compactor_serve(
     listen_addr: SocketAddr,
 ) -> JoinHandle<Result<(), tonic::transport::Error>> {
-    let compactor_srv = CompactorServiceImpl::default();
+    let compactor_srv = CompactorServiceImpl {};
 
     let server = Server::builder()
         .add_service(CompactorServiceServer::new(compactor_srv))

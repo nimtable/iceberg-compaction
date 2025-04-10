@@ -3,21 +3,36 @@ resolver = "2"
 members = ["core", "codegen", "services/compactor"]
 
 [workspace.dependencies]
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "683fb89edeaf8d1baae69e1f376d68b92be1d496", features = [
+# Async runtime and utilities
+async-stream = "0.3.5"
+async-trait = "0.1.86"
+futures = "0.3.17"
+futures-async-stream = "0.2.9"
+tokio = { version = "1", default-features = false}
+
+# Data processing and storage
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d", features = [
     "storage-s3",
     "storage-gcs",
 ] }
-async-trait = "0.1.86"
 parquet = { version = "53.2", features = ["async"] }
-prost = "0.12"
-serde = { version = "1", features = ["rc"] }
-thiserror = "2.0.11"
-tonic = "0.11.0"
-tokio = { version = "1", features = ["full"] }
 
+# gRPC and Protocol Buffers
+prost = "0.12"
+tonic = "0.11.0"
+
+# Serialization
+serde = { version = "1", features = ["rc"] }
+serde_with = { version = "3", features = ["json"] }
+serde_json = { version = "1"}
+
+# Error handling
+thiserror = "2.0.11"
+
+# Utilities
+url = "2"
+
+# Local workspace members
 ic-core = { path = "./core" }
 ic-codegen = { path = "./codegen" }
 ic-service-compactor = { path = "./services/compactor" }
-
-prost-build = { version = "0.12" }
-tonic-build = "0.11.0"

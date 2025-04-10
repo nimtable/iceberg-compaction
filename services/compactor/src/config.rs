@@ -36,4 +36,4 @@ impl Config {
         let config: Config = serde_yaml::from_str(&contents)?;
         Ok(config)
     }
-} 
+}
