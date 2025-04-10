@@ -13,6 +13,7 @@ use iceberg::scan::FileScanTask;
 
 use super::iceberg_file_task_scan::IcebergFileTaskScan;
 
+/// A table provider for iceberg file scan tasks
 #[derive(Debug, Clone)]
 pub struct IcebergFileScanTaskTableProvider {
     file_scan_tasks: Vec<FileScanTask>,
@@ -55,6 +56,10 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
         TableType::Base
     }
 
+    /// Scans the iceberg file scan tasks
+    ///
+    /// This function creates an execution plan for scanning the iceberg file scan tasks.
+    /// It uses the IcebergFileTaskScan struct to create the execution plan.    
     async fn scan(
         &self,
         _state: &dyn Session,

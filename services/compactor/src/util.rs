@@ -23,6 +23,10 @@ use iceberg::spec::NestedField;
 use iceberg::spec::Type;
 use iceberg::{scan::FileScanTask, spec::Schema};
 
+/// Builds file scan tasks and schema from protobuf descriptors
+///
+/// This function converts protobuf descriptors into Iceberg file scan tasks and schema.
+/// It handles different types of files: data files, position delete files, and equality delete files.
 pub fn build_file_scan_tasks_schema_from_pb(
     file_scan_task_descriptors: Vec<FileScanTaskDescriptor>,
     schema: SchemaDescriptor,
@@ -74,6 +78,7 @@ pub fn build_file_scan_tasks_schema_from_pb(
     ))
 }
 
+/// Builds an Iceberg schema from a protobuf schema descriptor
 fn build_schema_from_pb(schema: SchemaDescriptor) -> Result<Schema, CompactionError> {
     let iceberg_schema_builder = Schema::builder();
     let fields = schema
@@ -87,6 +92,7 @@ fn build_schema_from_pb(schema: SchemaDescriptor) -> Result<Schema, CompactionEr
     Ok(iceberg_schema_builder.with_fields(fields).build()?)
 }
 
+/// Builds an Iceberg nested field from a protobuf field descriptor
 fn build_field_from_pb(field: &NestedFieldDescriptor) -> Result<NestedField, CompactionError> {
     let field_type = match field
         .field_type
@@ -188,6 +194,7 @@ fn build_field_from_pb(field: &NestedFieldDescriptor) -> Result<NestedField, Com
     ))
 }
 
+/// Converts a protobuf data file format to an Iceberg data file format
 fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataFileFormat {
     match data_file_format {
         0 => iceberg::spec::DataFileFormat::Avro,
@@ -197,6 +204,7 @@ fn build_data_file_format_from_pb(data_file_format: i32) -> iceberg::spec::DataF
     }
 }
 
+/// Converts an Iceberg data file format to a protobuf data file format
 fn into_pb_data_file_format(data_file_format: iceberg::spec::DataFileFormat) -> i32 {
     match data_file_format {
         iceberg::spec::DataFileFormat::Avro => 0,
@@ -205,6 +213,7 @@ fn into_pb_data_file_format(data_file_format: iceberg::spec::DataFileFormat) -> 
     }
 }
 
+/// Builds an Iceberg FileIO from a protobuf FileIOBuilder
 pub fn build_file_io_from_pb(
     file_io_builder_pb: FileIoBuilder,
 ) -> Result<iceberg::io::FileIO, CompactionError> {
@@ -214,6 +223,7 @@ pub fn build_file_io_from_pb(
         .build()?)
 }
 
+/// Converts an Iceberg data file to a protobuf DataFile
 pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
     DataFile {
         content: data_file.content_type() as i32,
@@ -246,6 +256,7 @@ pub fn data_file_into_pb(data_file: iceberg::spec::DataFile) -> DataFile {
     }
 }
 
+/// Converts an Iceberg primitive literal to a protobuf PrimitiveLiteral
 fn primitive_literal_into_pb(
     primitive_literal: iceberg::spec::PrimitiveLiteral,
 ) -> PrimitiveLiteral {
@@ -289,6 +300,8 @@ fn primitive_literal_into_pb(
         },
     }
 }
+
+/// Converts an Iceberg struct to a protobuf StructLiteralDescriptor
 fn struct_into_pb(structs: iceberg::spec::Struct) -> StructLiteralDescriptor {
     let literals = structs
         .into_iter()
@@ -300,6 +313,7 @@ fn struct_into_pb(structs: iceberg::spec::Struct) -> StructLiteralDescriptor {
     StructLiteralDescriptor { inner: literals }
 }
 
+/// Converts an Iceberg literal to a protobuf Literal
 fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
     match literal {
         iceberg::spec::Literal::Primitive(primitive_literal) => {
@@ -350,6 +364,7 @@ mod test {
     use super::*;
     use ic_codegen::compactor::{MapType, NestedFieldDescriptor, PrimitiveType, StructType};
 
+    /// Test building a struct field from protobuf
     #[test]
     fn test_build_field_from_pb_struct() {
         let nested_field = NestedFieldDescriptor {
@@ -390,6 +405,7 @@ mod test {
         }
     }
 
+    /// Test building a list field from protobuf
     #[test]
     fn test_build_field_from_pb_list() {
         let element_field = NestedFieldDescriptor {
@@ -427,6 +443,7 @@ mod test {
         }
     }
 
+    /// Test building a map field from protobuf
     #[test]
     fn test_build_field_from_pb_map() {
         let key_field = NestedFieldDescriptor {
@@ -481,6 +498,7 @@ mod test {
         }
     }
 
+    /// Test building a deeply nested field from protobuf
     #[test]
     fn test_build_field_from_pb_deeply_nested() {
         let inner_struct_field1 = NestedFieldDescriptor {

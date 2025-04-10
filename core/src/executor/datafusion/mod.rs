@@ -33,6 +33,10 @@ pub mod sql_builder;
 const SEQ_NUM: &str = "seq_num";
 const FILE_PATH: &str = "file_path";
 const POS: &str = "pos";
+const DATA_FILE_TABLE: &str = "data_file_table";
+const POSITION_DELETE_TABLE: &str = "position_delete_table";
+const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
+const DEFAULT_PREFIX: &str = "10";
 
 pub struct DataFusionExecutor {}
 
@@ -47,6 +51,10 @@ impl CompactionExecutor for DataFusionExecutor {
     ) -> Result<Vec<DataFile>, CompactionError> {
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
+        let data_file_prefix = config
+            .data_file_prefix
+            .clone()
+            .unwrap_or(DEFAULT_PREFIX.to_owned());
         let mut session_config = SessionConfig::new();
         session_config = session_config.with_target_partitions(target_partitions);
         let ctx = SessionContext::new_with_config(session_config);
@@ -67,15 +75,16 @@ impl CompactionExecutor for DataFusionExecutor {
         let need_seq_num = data_fusion_task_context.need_seq_num();
         let need_file_path_and_pos = data_fusion_task_context.need_file_path_and_pos();
 
-        let data_file_schema = data_fusion_task_context.schema.take().unwrap();
+        let data_file_schema = data_fusion_task_context.data_file_schema.take().unwrap();
+        let input_schema = data_fusion_task_context.input_schema.take().unwrap();
 
-        //
+        // register data file table provider
         Self::register_data_table_provider(
             &data_file_schema,
             data_fusion_task_context.data_files.take().unwrap(),
             file_io.clone(),
             &ctx,
-            "test_all_delete_data_file",
+            DATA_FILE_TABLE,
             need_seq_num,
             need_file_path_and_pos,
             batch_parallelism,
@@ -91,7 +100,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     .unwrap(),
                 file_io.clone(),
                 &ctx,
-                "test_all_delete_position_delete",
+                POSITION_DELETE_TABLE,
                 batch_parallelism,
             )?;
         }
@@ -106,25 +115,27 @@ impl CompactionExecutor for DataFusionExecutor {
                     .unwrap(),
                 file_io.clone(),
                 &ctx,
-                "test_all_delete_equality_delete",
+                EQUALITY_DELETE_TABLE,
                 batch_parallelism,
             )?;
         }
 
-        let arc_data_file_schema = Arc::new(data_file_schema);
+        let arc_input_schema = Arc::new(input_schema);
 
         let df = ctx.sql(&data_fusion_task_context.merge_on_read_sql).await?;
         let batchs = df.execute_stream_partitioned().await?;
         let mut futures = Vec::with_capacity(batch_parallelism);
+        // build iceberg writer for each partition
         for mut batch in batchs {
             let dir_path = dir_path.clone();
-            let schema = arc_data_file_schema.clone();
+            let schema = arc_input_schema.clone();
+            let data_file_prefix = data_file_prefix.clone();
             let file_io = file_io.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
                 let mut data_file_writer =
-                    Self::build_iceberg_writer(dir_path, schema, file_io).await?;
+                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io).await?;
                 while let Some(b) = batch.as_mut().next().await {
                     data_file_writer.write(b?).await?;
                 }
@@ -133,7 +144,7 @@ impl CompactionExecutor for DataFusionExecutor {
             });
             futures.push(future);
         }
-
+        // collect all data files from all partitions
         let all_data_files = try_join_all(futures)
             .await
             .map_err(|e| CompactionError::Execution(e.to_string()))?
@@ -216,6 +227,7 @@ impl DataFusionExecutor {
     }
 
     async fn build_iceberg_writer(
+        data_file_prefix: String,
         dir_path: String,
         schema: Arc<Schema>,
         file_io: FileIO,
@@ -226,7 +238,7 @@ impl DataFusionExecutor {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
-            "1".to_owned(),
+            data_file_prefix,
             Some(unique_uuid_suffix.to_string()),
             iceberg::spec::DataFileFormat::Parquet,
         );
@@ -247,7 +259,8 @@ impl DataFusionExecutor {
 }
 
 struct DataFusionTaskContext {
-    pub(crate) schema: Option<Schema>,
+    pub(crate) data_file_schema: Option<Schema>,
+    pub(crate) input_schema: Option<Schema>,
     pub(crate) data_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_files: Option<Vec<FileScanTask>>,
     pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
@@ -284,6 +297,7 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
+    // build data fusion task context
     pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
         let highest_field_id = self.schema.highest_field_id();
         // Build scheam for position delete file, file_path + pos
@@ -351,6 +365,7 @@ impl DataFusionTaskContextBuilder {
             .collect();
         let highest_field_id = self.schema.highest_field_id();
         let mut add_schema_fields = vec![];
+        // add sequence number column if needed
         if need_seq_num {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 1,
@@ -359,6 +374,7 @@ impl DataFusionTaskContextBuilder {
                 true,
             )));
         }
+        // add file path and position column if needed
         if need_file_path_and_pos {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 2,
@@ -373,6 +389,7 @@ impl DataFusionTaskContextBuilder {
                 true,
             )));
         }
+        // data file schema is old schema + seq_num + file_path + pos. used for data file table provider
         let data_file_schema = self
             .schema
             .as_ref()
@@ -380,9 +397,10 @@ impl DataFusionTaskContextBuilder {
             .into_builder()
             .with_fields(add_schema_fields)
             .build()?;
+        // input schema is old schema. used for data file writer
+        let input_schema = self.schema.as_ref().clone();
 
         let sql_builder = sql_builder::SqlBuilder::new(
-            "test_all_delete_data_file",
             &project_names,
             &self.position_delete_files,
             &self.equality_delete_files,
@@ -393,7 +411,8 @@ impl DataFusionTaskContextBuilder {
         let merge_on_read_sql = sql_builder.build_merge_on_read_sql();
 
         Ok(DataFusionTaskContext {
-            schema: Some(data_file_schema),
+            data_file_schema: Some(data_file_schema),
+            input_schema: Some(input_schema),
             data_files: Some(self.data_files),
             position_delete_files: Some(self.position_delete_files),
             equality_delete_files: Some(self.equality_delete_files),
@@ -569,6 +588,7 @@ mod tests {
             Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),
                 target_partitions: Some(4),
+                data_file_prefix: None,
             }),
             default_location_generator.dir_path,
         )

@@ -1,20 +1,28 @@
 use iceberg::scan::FileScanTask;
 
+use super::{DATA_FILE_TABLE, EQUALITY_DELETE_TABLE, POSITION_DELETE_TABLE};
+
+/// SQL Builder for generating merge-on-read SQL queries
 pub struct SqlBuilder<'a> {
-    table_name: &'a str,
+    /// Column names to be projected in the query
     project_names: &'a Vec<String>,
+    /// Position delete files to be used in the query
     position_delete_files: &'a Vec<FileScanTask>,
+    /// Equality delete files to be used in the query
     equality_delete_files: &'a Vec<FileScanTask>,
 
+    /// Column names to be used for equality delete joins
     equality_join_names: &'a Vec<String>,
 
+    /// Whether to include sequence number comparison in equality delete joins
     need_seq_num: bool,
+    /// Whether to include file path and position in position delete joins
     need_file_path_and_pos: bool,
 }
 
 impl<'a> SqlBuilder<'a> {
+    /// Creates a new SQL Builder with the specified parameters
     pub fn new(
-        table_name: &'a str,
         project_names: &'a Vec<String>,
         position_delete_files: &'a Vec<FileScanTask>,
         equality_delete_files: &'a Vec<FileScanTask>,
@@ -23,7 +31,6 @@ impl<'a> SqlBuilder<'a> {
         need_file_path_and_pos: bool,
     ) -> Self {
         Self {
-            table_name,
             project_names,
             position_delete_files,
             equality_delete_files,
@@ -33,40 +40,55 @@ impl<'a> SqlBuilder<'a> {
         }
     }
 
+    /// Builds a merge-on-read SQL query
+    ///
+    /// This method constructs a SQL query that:
+    /// 1. Selects the specified columns from the data file table
+    /// 2. Optionally joins with position delete files to exclude deleted rows
+    /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(&self) -> String {
+        // Start with a basic SELECT query from the data file table
         let mut sql = format!(
             "select {} from {}",
             self.project_names.join(","),
-            self.table_name
+            DATA_FILE_TABLE
         );
 
         // Add position delete join if needed
+        // This excludes rows that have been deleted by position
         if self.need_file_path_and_pos && !self.position_delete_files.is_empty() {
             sql.push_str(&format!(
-                " left anti join {}_position_delete on {}.file_path = {}_position_delete.file_path and {}.pos = {}_position_delete.pos",
-                self.table_name, self.table_name, self.table_name, self.table_name, self.table_name
+                " left anti join {} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+                POSITION_DELETE_TABLE,
+                DATA_FILE_TABLE,
+                POSITION_DELETE_TABLE,
+                DATA_FILE_TABLE,
+                POSITION_DELETE_TABLE
             ));
         }
 
         // Add equality delete join if needed
+        // This excludes rows that match the equality conditions in the delete files
         if !self.equality_delete_files.is_empty() {
             sql.push_str(&format!(
-                " left anti join {}_equality_delete on {}",
-                self.table_name,
+                " left anti join {} on {}",
+                EQUALITY_DELETE_TABLE,
                 self.equality_join_names
                     .iter()
                     .map(|name| format!(
-                        "{}.{} = {}_equality_delete.{}",
-                        self.table_name, name, self.table_name, name
+                        "{}.{} = {}.{}",
+                        DATA_FILE_TABLE, name, EQUALITY_DELETE_TABLE, name
                     ))
                     .collect::<Vec<_>>()
                     .join(" and ")
             ));
 
+            // Add sequence number comparison if needed
+            // This ensures that only newer deletes are applied
             if self.need_seq_num {
                 sql.push_str(&format!(
-                    " and {}.seq_num < {}_equality_delete.seq_num",
-                    self.table_name, self.table_name
+                    " and {}.seq_num < {}.seq_num",
+                    DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
                 ));
             }
         }
@@ -81,6 +103,7 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
+    /// Creates a test schema with id and name fields
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(
             Schema::builder()
@@ -103,6 +126,7 @@ mod tests {
         )
     }
 
+    /// Creates a test file scan task
     fn create_test_file_scan_task() -> FileScanTask {
         FileScanTask {
             start: 0,
@@ -120,6 +144,7 @@ mod tests {
         }
     }
 
+    /// Test building SQL with no delete files
     #[test]
     fn test_build_merge_on_read_sql_no_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -128,7 +153,6 @@ mod tests {
         let equality_join_names = Vec::new();
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -138,10 +162,15 @@ mod tests {
         );
         assert_eq!(
             builder.build_merge_on_read_sql(),
-            "select id,name from test_table"
+            format!(
+                "select {} from {}",
+                project_names.join(","),
+                DATA_FILE_TABLE
+            )
         );
     }
 
+    /// Test building SQL with position delete files
     #[test]
     fn test_build_merge_on_read_sql_with_position_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -150,7 +179,6 @@ mod tests {
         let equality_join_names = Vec::new();
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -159,11 +187,21 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_position_delete"));
-        assert!(sql.contains("test_table.file_path = test_table_position_delete.file_path"));
-        assert!(sql.contains("test_table.pos = test_table_position_delete.pos"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
+        )));
     }
 
+    /// Test building SQL with equality delete files
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -174,7 +212,6 @@ mod tests {
         let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -183,10 +220,17 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_equality_delete"));
-        assert!(sql.contains("test_table.id = test_table_equality_delete.id"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.id = {}.id",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 
+    /// Test building SQL with equality delete files and sequence number comparison
     #[test]
     fn test_build_merge_on_read_sql_with_equality_deletes_and_seq_num() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -197,7 +241,6 @@ mod tests {
         let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -206,9 +249,13 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("test_table.seq_num < test_table_equality_delete.seq_num"));
+        assert!(sql.contains(&format!(
+            "{}.seq_num < {}.seq_num",
+            DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 
+    /// Test building SQL with both position and equality delete files
     #[test]
     fn test_build_merge_on_read_sql_with_both_deletes() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -219,7 +266,6 @@ mod tests {
         let equality_join_names = vec!["id".to_owned()];
 
         let builder = SqlBuilder::new(
-            "test_table",
             &project_names,
             &position_delete_files,
             &equality_delete_files,
@@ -228,11 +274,29 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql();
-        assert!(sql.contains("left anti join test_table_position_delete"));
-        assert!(sql.contains("left anti join test_table_equality_delete"));
-        assert!(sql.contains("test_table.file_path = test_table_position_delete.file_path"));
-        assert!(sql.contains("test_table.pos = test_table_position_delete.pos"));
-        assert!(sql.contains("test_table.id = test_table_equality_delete.id"));
-        assert!(sql.contains("test_table.seq_num < test_table_equality_delete.seq_num"));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "left anti join {} on {}",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.file_path = {}.file_path and {}.pos = {}.pos",
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{} on {}.id = {}.id",
+            EQUALITY_DELETE_TABLE, DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
+        assert!(sql.contains(&format!(
+            "{}.seq_num < {}.seq_num",
+            DATA_FILE_TABLE, EQUALITY_DELETE_TABLE
+        )));
     }
 }
