@@ -70,7 +70,8 @@ impl CompactionExecutor for DataFusionExecutor {
         let need_seq_num = data_fusion_task_context.need_seq_num();
         let need_file_path_and_pos = data_fusion_task_context.need_file_path_and_pos();
 
-        let data_file_schema = data_fusion_task_context.schema.take().unwrap();
+        let data_file_schema = data_fusion_task_context.data_file_schema.take().unwrap();
+        let input_schema = data_fusion_task_context.input_schema.take().unwrap();
 
         //
         Self::register_data_table_provider(
@@ -114,14 +115,14 @@ impl CompactionExecutor for DataFusionExecutor {
             )?;
         }
 
-        let arc_data_file_schema = Arc::new(data_file_schema);
+        let arc_input_schema = Arc::new(input_schema);
 
         let df = ctx.sql(&data_fusion_task_context.merge_on_read_sql).await?;
         let batchs = df.execute_stream_partitioned().await?;
         let mut futures = Vec::with_capacity(batch_parallelism);
         for mut batch in batchs {
             let dir_path = dir_path.clone();
-            let schema = arc_data_file_schema.clone();
+            let schema = arc_input_schema.clone();
             let file_io = file_io.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
@@ -250,7 +251,8 @@ impl DataFusionExecutor {
 }
 
 struct DataFusionTaskContext {
-    pub(crate) schema: Option<Schema>,
+    pub(crate) data_file_schema: Option<Schema>,
+    pub(crate) input_schema: Option<Schema>,
     pub(crate) data_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_files: Option<Vec<FileScanTask>>,
     pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
@@ -383,6 +385,7 @@ impl DataFusionTaskContextBuilder {
             .into_builder()
             .with_fields(add_schema_fields)
             .build()?;
+        let input_schema = self.schema.as_ref().clone();
 
         let sql_builder = sql_builder::SqlBuilder::new(
             &project_names,
@@ -395,7 +398,8 @@ impl DataFusionTaskContextBuilder {
         let merge_on_read_sql = sql_builder.build_merge_on_read_sql();
 
         Ok(DataFusionTaskContext {
-            schema: Some(data_file_schema),
+            data_file_schema: Some(data_file_schema),
+            input_schema: Some(input_schema),
             data_files: Some(self.data_files),
             position_delete_files: Some(self.position_delete_files),
             equality_delete_files: Some(self.equality_delete_files),
