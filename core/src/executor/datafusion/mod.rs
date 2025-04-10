@@ -36,6 +36,7 @@ const POS: &str = "pos";
 const DATA_FILE_TABLE: &str = "data_file_table";
 const POSITION_DELETE_TABLE: &str = "position_delete_table";
 const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
+const DEFAULT_PREFIX: &str = "10";
 
 pub struct DataFusionExecutor {}
 
@@ -50,6 +51,10 @@ impl CompactionExecutor for DataFusionExecutor {
     ) -> Result<Vec<DataFile>, CompactionError> {
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
+        let data_file_prefix = config
+            .data_file_prefix
+            .clone()
+            .unwrap_or(DEFAULT_PREFIX.to_owned());
         let mut session_config = SessionConfig::new();
         session_config = session_config.with_target_partitions(target_partitions);
         let ctx = SessionContext::new_with_config(session_config);
@@ -123,12 +128,13 @@ impl CompactionExecutor for DataFusionExecutor {
         for mut batch in batchs {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
+            let data_file_prefix = data_file_prefix.clone();
             let file_io = file_io.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
                 let mut data_file_writer =
-                    Self::build_iceberg_writer(dir_path, schema, file_io).await?;
+                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io).await?;
                 while let Some(b) = batch.as_mut().next().await {
                     data_file_writer.write(b?).await?;
                 }
@@ -220,6 +226,7 @@ impl DataFusionExecutor {
     }
 
     async fn build_iceberg_writer(
+        data_file_prefix: String,
         dir_path: String,
         schema: Arc<Schema>,
         file_io: FileIO,
@@ -230,7 +237,7 @@ impl DataFusionExecutor {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
-            "1".to_owned(),
+            data_file_prefix,
             Some(unique_uuid_suffix.to_string()),
             iceberg::spec::DataFileFormat::Parquet,
         );

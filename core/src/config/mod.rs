@@ -6,4 +6,5 @@ use serde_with::serde_as;
 pub struct CompactionConfig {
     pub batch_parallelism: Option<usize>,
     pub target_partitions: Option<usize>,
+    pub data_file_prefix: Option<String>,
 }
