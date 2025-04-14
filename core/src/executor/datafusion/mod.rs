@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 
 use crate::{CompactionConfig, CompactionError};
 
-use super::{AllFileScanTasks, CompactionExecutor};
+use super::{CompactionExecutor, CompactionResult, InputFileScanTasks, RewriteFilesStat};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 pub mod sql_builder;
@@ -45,10 +45,10 @@ impl CompactionExecutor for DataFusionExecutor {
     async fn rewrite_files(
         file_io: FileIO,
         schema: Arc<Schema>,
-        input_file_scan_tasks: AllFileScanTasks,
+        input_file_scan_tasks: InputFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
-    ) -> Result<Vec<DataFile>, CompactionError> {
+    ) -> Result<CompactionResult, CompactionError> {
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
         let data_file_prefix = config
@@ -59,7 +59,10 @@ impl CompactionExecutor for DataFusionExecutor {
         session_config = session_config.with_target_partitions(target_partitions);
         let ctx = SessionContext::new_with_config(session_config);
 
-        let AllFileScanTasks {
+        let mut stat = RewriteFilesStat::default();
+        let rewritten_files_count = input_file_scan_tasks.input_files_count();
+
+        let InputFileScanTasks {
             data_files,
             position_delete_files,
             equality_delete_files,
@@ -145,14 +148,25 @@ impl CompactionExecutor for DataFusionExecutor {
             futures.push(future);
         }
         // collect all data files from all partitions
-        let all_data_files = try_join_all(futures)
+        let output_data_files: Vec<DataFile> = try_join_all(futures)
             .await
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
             .map(|res| res.map(|v| v.into_iter()))
             .collect::<Result<Vec<_>, _>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
-        Ok(all_data_files)
+
+        stat.added_files_count = output_data_files.len() as u32;
+        stat.rewritten_bytes = output_data_files
+            .iter()
+            .map(|f| f.file_size_in_bytes())
+            .sum();
+        stat.rewritten_files_count = rewritten_files_count as u32;
+
+        Ok(CompactionResult {
+            data_files: output_data_files,
+            stat,
+        })
     }
 }
 
@@ -467,7 +481,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::CompactionError;
-    use crate::executor::AllFileScanTasks;
+    use crate::executor::{CompactionResult, InputFileScanTasks};
     use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
     async fn build_catalog() -> SqlCatalog {
@@ -491,7 +505,7 @@ mod tests {
         SqlCatalog::new(config).await.unwrap()
     }
 
-    async fn get_tasks_from_table(table: Table) -> Result<AllFileScanTasks, CompactionError> {
+    async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks, CompactionError> {
         let snapshot_id = table.metadata().current_snapshot_id().unwrap();
 
         let scan = table
@@ -536,7 +550,7 @@ mod tests {
                 }
             }
         }
-        Ok(AllFileScanTasks {
+        Ok(InputFileScanTasks {
             data_files,
             position_delete_files: position_delete_files.into_values().collect(),
             equality_delete_files: equality_delete_files.into_values().collect(),
@@ -581,7 +595,10 @@ mod tests {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let new_data_files = DataFusionExecutor::rewrite_files(
+        let CompactionResult {
+            data_files: output_data_files,
+            stat: _,
+        } = DataFusionExecutor::rewrite_files(
             file_io,
             schema.clone(),
             all_file_scan_tasks,
@@ -597,7 +614,7 @@ mod tests {
         let txn = Transaction::new(&table);
         let mut rewrite_action = txn.rewrite_files(None, vec![]).unwrap();
         rewrite_action
-            .add_data_files(new_data_files.clone())
+            .add_data_files(output_data_files.clone())
             .unwrap();
         rewrite_action.delete_files(data_file).unwrap();
         rewrite_action.delete_files(delete_file).unwrap();

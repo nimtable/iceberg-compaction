@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 datafusion = "45.0.0"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
+ic-codegen = {workspace = true}
 iceberg = { workspace = true }
 iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e7744e5ac03ffaee2465b532e6c5787df9cb4a9d" }

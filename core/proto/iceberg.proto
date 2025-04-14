@@ -153,8 +153,17 @@ message DataFile {
     optional int32 sort_order_id = 16;
     int32 partition_spec_id = 17;
 }
+
+message RewriteFilesStat {
+    uint32 rewritten_files_count = 2;
+    uint32 added_files_count = 3;
+    uint64 rewritten_bytes = 4;
+    uint32 failed_data_files_count = 5;
+}
+
 message RewriteFilesResponse {
     repeated DataFile data_files = 1;
+    RewriteFilesStat stat = 2;
 }
 
 message EchoRequest {

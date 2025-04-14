@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ic_codegen::compactor::compactor_service_server::CompactorService;
 use ic_codegen::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, RewriteFilesResponse};
-use ic_core::executor::DataFusionExecutor;
+use ic_core::executor::{CompactionResult, DataFusionExecutor};
 use ic_core::{CompactionConfig, CompactionExecutor};
 
 use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, data_file_into_pb};
@@ -41,7 +41,7 @@ impl CompactorService for CompactorServiceImpl {
             })?,
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
-        let data_files = DataFusionExecutor::rewrite_files(
+        let CompactionResult { data_files, stat } = DataFusionExecutor::rewrite_files(
             file_io,
             schema,
             all_file_scan_tasks,
@@ -52,7 +52,10 @@ impl CompactorService for CompactorServiceImpl {
         .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
 
         let data_files = data_files.into_iter().map(data_file_into_pb).collect();
-        Ok(tonic::Response::new(RewriteFilesResponse { data_files }))
+        Ok(tonic::Response::new(RewriteFilesResponse {
+            data_files,
+            stat: Some(stat),
+        }))
     }
 
     async fn echo(
