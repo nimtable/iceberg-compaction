@@ -326,6 +326,7 @@ mod tests {
 
         let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true, false);
         let sql = builder.build_merge_on_read_sql();
+
         assert!(sql.contains(&format!(
             "LEFT ANTI JOIN {} ON {}",
             equality_delete_table_name_1, DATA_FILE_TABLE

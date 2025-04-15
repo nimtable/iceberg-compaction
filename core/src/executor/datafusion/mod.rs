@@ -318,8 +318,8 @@ impl DataFusionTaskContextBuilder {
 
     // build data fusion task context
     pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
-        let highest_field_id = self.schema.highest_field_id();
-        // Build scheam for position delete file, file_path + pos
+        let mut highest_field_id = self.schema.highest_field_id();
+        // Build schema for position delete file, file_path + pos
         let position_delete_schema = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::new(
@@ -336,72 +336,35 @@ impl DataFusionTaskContextBuilder {
                 )),
             ])
             .build()?;
-        // Build schema for equality delete file, equality_ids + seq_num
+
+        // Build schema for equality delete files, equality_ids + seq_num
         let mut equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
         let mut table_idx = 0;
-        for i in &self.equality_delete_files {
-            if let Some(ids) = equality_ids.as_ref() {
-                if !ids.eq(&i.equality_ids) {
-                    // build schema for equality delete file
-                    let mut equality_delete_fields = Vec::with_capacity(i.equality_ids.len());
-                    for id in &i.equality_ids {
-                        let field = self.schema.field_by_id(*id).ok_or_else(|| {
-                            CompactionError::Config("equality_ids not found".to_owned())
-                        })?;
-                        equality_delete_fields.push(field.clone());
-                    }
 
-                    equality_delete_fields.push(Arc::new(NestedField::new(
-                        highest_field_id + 1,
-                        SEQ_NUM,
-                        Type::Primitive(PrimitiveType::Long),
-                        true,
-                    )));
-
-                    let equality_delete_schema = Schema::builder()
-                        .with_fields(equality_delete_fields)
-                        .build()?;
-                    equality_delete_metadatas.push(EqualityDeleteMetadata::new(
-                        equality_delete_schema,
-                        format!("{}_{}", EQUALITY_DELETE_TABLE, table_idx),
-                    ));
-                    table_idx += 1;
-                }
-            } else if !i.equality_ids.is_empty() {
-                equality_ids = Some(i.equality_ids.clone());
-                let mut equality_delete_fields = Vec::with_capacity(i.equality_ids.len());
-                for id in &i.equality_ids {
-                    let field = self.schema.field_by_id(*id).ok_or_else(|| {
-                        CompactionError::Config("equality_ids not found".to_owned())
-                    })?;
-                    equality_delete_fields.push(field.clone());
-                }
-
-                equality_delete_fields.push(Arc::new(NestedField::new(
-                    highest_field_id + 1,
-                    SEQ_NUM,
-                    Type::Primitive(PrimitiveType::Long),
-                    true,
-                )));
-
-                let equality_delete_schema = Schema::builder()
-                    .with_fields(equality_delete_fields)
-                    .build()?;
-
+        for task in &self.equality_delete_files {
+            if equality_ids
+                .as_ref()
+                .is_none_or(|ids| !ids.eq(&task.equality_ids))
+            {
+                // If ids are different or not assigned, create a new metadata
+                let equality_delete_schema =
+                    self.build_equality_delete_schema(&task.equality_ids, &mut highest_field_id)?;
+                let equality_delete_table_name = format!("{}_{}", EQUALITY_DELETE_TABLE, table_idx);
                 equality_delete_metadatas.push(EqualityDeleteMetadata::new(
                     equality_delete_schema,
-                    format!("{}_{}", EQUALITY_DELETE_TABLE, table_idx),
+                    equality_delete_table_name,
                 ));
+                equality_ids = Some(task.equality_ids.clone());
                 table_idx += 1;
             }
 
+            // Add the file scan task to the last metadata
             if let Some(last_metadata) = equality_delete_metadatas.last_mut() {
-                last_metadata.add_file_scan_task(i.clone());
+                last_metadata.add_file_scan_task(task.clone());
             }
         }
 
-        // let equality_delete_schema = Schema::builder().with_fields(equality_delete_vec).build()?;
         let need_file_path_and_pos = !self.position_delete_files.is_empty();
         let need_seq_num = !equality_delete_metadatas.is_empty();
 
@@ -477,6 +440,34 @@ impl DataFusionTaskContextBuilder {
             merge_on_read_sql,
         })
     }
+
+    /// Builds an equality delete schema based on the given equality_ids
+    fn build_equality_delete_schema(
+        &self,
+        equality_ids: &[i32],
+        highest_field_id: &mut i32,
+    ) -> Result<Schema, CompactionError> {
+        let mut equality_delete_fields = Vec::with_capacity(equality_ids.len());
+        for id in equality_ids {
+            let field = self
+                .schema
+                .field_by_id(*id)
+                .ok_or_else(|| CompactionError::Config("equality_ids not found".to_owned()))?;
+            equality_delete_fields.push(field.clone());
+        }
+        *highest_field_id += 1;
+        equality_delete_fields.push(Arc::new(NestedField::new(
+            *highest_field_id,
+            SEQ_NUM,
+            Type::Primitive(PrimitiveType::Long),
+            true,
+        )));
+
+        Schema::builder()
+            .with_fields(equality_delete_fields)
+            .build()
+            .map_err(CompactionError::Iceberg)
+    }
 }
 
 impl DataFusionTaskContext {
@@ -538,6 +529,7 @@ mod tests {
     use futures_async_stream::for_await;
     use iceberg::Catalog;
     use iceberg::scan::FileScanTask;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema};
     use iceberg::table::Table;
     use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
     use iceberg::{TableIdent, io::FileIOBuilder, transaction::Transaction};
@@ -546,6 +538,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::CompactionError;
+    use crate::executor::datafusion::DataFusionTaskContextBuilder;
     use crate::executor::{CompactionResult, InputFileScanTasks};
     use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
@@ -685,5 +678,49 @@ mod tests {
         rewrite_action.delete_files(delete_file).unwrap();
         let tx = rewrite_action.apply().await.unwrap();
         tx.commit(&catalog).await.unwrap();
+    }
+
+    #[test]
+    fn test_build_equality_delete_schema() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::new(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(PrimitiveType::Int),
+                    true,
+                )),
+                Arc::new(NestedField::new(
+                    2,
+                    "name",
+                    iceberg::spec::Type::Primitive(PrimitiveType::String),
+                    true,
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        let mut highest_field_id = schema.highest_field_id();
+
+        let builder = DataFusionTaskContextBuilder {
+            schema: Arc::new(schema),
+            data_files: vec![],
+            position_delete_files: vec![],
+            equality_delete_files: vec![],
+        };
+
+        let equality_ids = vec![1, 2];
+        let equality_delete_schema = builder
+            .build_equality_delete_schema(&equality_ids, &mut highest_field_id)
+            .unwrap();
+
+        assert_eq!(equality_delete_schema.as_struct().fields().len(), 3);
+        assert_eq!(equality_delete_schema.as_struct().fields()[0].name, "id");
+        assert_eq!(equality_delete_schema.as_struct().fields()[1].name, "name");
+        assert_eq!(
+            equality_delete_schema.as_struct().fields()[2].name,
+            "seq_num"
+        );
+        assert_eq!(highest_field_id, 3);
     }
 }
