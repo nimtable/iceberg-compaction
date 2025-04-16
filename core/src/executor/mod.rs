@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
+use iceberg::{io::FileIO, spec::PartitionSpec};
 use iceberg::scan::FileScanTask;
 
 use crate::config::CompactionConfig;
@@ -22,6 +22,7 @@ pub trait CompactionExecutor: Send + Sync + 'static {
         input_file_scan_tasks: InputFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
+        partition_spec: Arc<PartitionSpec>,
     ) -> Result<CompactionResult, CompactionError>;
 }
 
