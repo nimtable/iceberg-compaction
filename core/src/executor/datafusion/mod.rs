@@ -416,7 +416,6 @@ impl DataFusionTaskContextBuilder {
         let sql_builder = sql_builder::SqlBuilder::new(
             &project_names,
             &equality_delete_metadatas,
-            need_seq_num,
             need_file_path_and_pos,
         );
         let merge_on_read_sql = sql_builder.build_merge_on_read_sql();

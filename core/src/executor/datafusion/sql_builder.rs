@@ -7,8 +7,6 @@ pub struct SqlBuilder<'a> {
     /// Equality delete metadata to be used in the query
     equality_delete_metadatas: &'a Vec<EqualityDeleteMetadata>,
 
-    /// Whether to include sequence number comparison in equality delete joins
-    need_seq_num: bool,
     /// Whether to include file path AND position in position delete joins
     need_file_path_and_pos: bool,
 }
@@ -18,13 +16,11 @@ impl<'a> SqlBuilder<'a> {
     pub(crate) fn new(
         project_names: &'a Vec<String>,
         equality_delete_metadatas: &'a Vec<EqualityDeleteMetadata>,
-        need_seq_num: bool,
         need_file_path_and_pos: bool,
     ) -> Self {
         Self {
             project_names,
             equality_delete_metadatas,
-            need_seq_num,
             need_file_path_and_pos,
         }
     }
@@ -77,12 +73,10 @@ impl<'a> SqlBuilder<'a> {
 
                 // Add sequence number comparison if needed
                 // This ensures that only newer deletes are applied
-                if self.need_seq_num {
-                    sql.push_str(&format!(
-                        " AND {}.seq_num < {}.seq_num",
-                        DATA_FILE_TABLE, metadata.equality_delete_table_name
-                    ));
-                }
+                sql.push_str(&format!(
+                    " AND {}.seq_num < {}.seq_num",
+                    DATA_FILE_TABLE, metadata.equality_delete_table_name
+                ));
             }
         }
 
@@ -146,7 +140,7 @@ mod tests {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
         let equality_join_names = Vec::new();
 
-        let builder = SqlBuilder::new(&project_names, &equality_join_names, false, false);
+        let builder = SqlBuilder::new(&project_names, &equality_join_names, false);
         assert_eq!(
             builder.build_merge_on_read_sql(),
             format!(
@@ -163,7 +157,7 @@ mod tests {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
         let equality_join_names = Vec::new();
 
-        let builder = SqlBuilder::new(&project_names, &equality_join_names, false, true);
+        let builder = SqlBuilder::new(&project_names, &equality_join_names, true);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
             "LEFT ANTI JOIN {} ON {}",
@@ -199,7 +193,7 @@ mod tests {
             equality_delete_table_name.clone(),
         )];
 
-        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false, false);
+        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
             "LEFT ANTI JOIN {} ON {}",
@@ -232,7 +226,7 @@ mod tests {
             equality_delete_table_name.clone(),
         )];
 
-        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true, false);
+        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
             "{}.seq_num < {}.seq_num",
@@ -260,7 +254,7 @@ mod tests {
             equality_delete_table_name.clone(),
         )];
 
-        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true, true);
+        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
             "LEFT ANTI JOIN {} ON {}",
@@ -324,7 +318,7 @@ mod tests {
             ),
         ];
 
-        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true, false);
+        let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
 
         assert!(sql.contains(&format!(
