@@ -1,4 +1,7 @@
-use super::{DATA_FILE_TABLE, EqualityDeleteMetadata, POSITION_DELETE_TABLE};
+use super::{
+    DATA_FILE_TABLE, EqualityDeleteMetadata, POSITION_DELETE_TABLE, SYS_HIDDEN_FILE_PATH,
+    SYS_HIDDEN_POS, SYS_HIDDEN_SEQ_NUM,
+};
 
 /// SQL Builder for generating merge-on-read SQL queries
 pub struct SqlBuilder<'a> {
@@ -43,12 +46,7 @@ impl<'a> SqlBuilder<'a> {
         // This excludes rows that have been deleted by position
         if self.need_file_path_and_pos {
             sql.push_str(&format!(
-                " LEFT ANTI JOIN {} ON {}.file_path = {}.file_path AND {}.pos = {}.pos",
-                POSITION_DELETE_TABLE,
-                DATA_FILE_TABLE,
-                POSITION_DELETE_TABLE,
-                DATA_FILE_TABLE,
-                POSITION_DELETE_TABLE
+                " LEFT ANTI JOIN {POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}.{SYS_HIDDEN_FILE_PATH} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_FILE_PATH} AND {DATA_FILE_TABLE}.{SYS_HIDDEN_POS} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_POS}",
             ));
         }
 
@@ -64,8 +62,8 @@ impl<'a> SqlBuilder<'a> {
                         .equality_delete_join_names()
                         .iter()
                         .map(|name| format!(
-                            "{}.{} = {}.{}",
-                            DATA_FILE_TABLE, name, metadata.equality_delete_table_name, name
+                            "{DATA_FILE_TABLE}.{name} = {}.{name}",
+                            metadata.equality_delete_table_name
                         ))
                         .collect::<Vec<_>>()
                         .join(" AND ")
@@ -74,8 +72,8 @@ impl<'a> SqlBuilder<'a> {
                 // Add sequence number comparison if needed
                 // This ensures that only newer deletes are applied
                 sql.push_str(&format!(
-                    " AND {}.seq_num < {}.seq_num",
-                    DATA_FILE_TABLE, metadata.equality_delete_table_name
+                    " AND {DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {}.{SYS_HIDDEN_SEQ_NUM}",
+                    metadata.equality_delete_table_name
                 ));
             }
         }
@@ -159,17 +157,12 @@ mod tests {
 
         let builder = SqlBuilder::new(&project_names, &equality_join_names, true);
         let sql = builder.build_merge_on_read_sql();
+
         assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+            "LEFT ANTI JOIN {POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}",
         )));
         assert!(sql.contains(&format!(
-            "{} ON {}.file_path = {}.file_path AND {}.pos = {}.pos",
-            POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
-            POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
-            POSITION_DELETE_TABLE
+            "{POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}.{SYS_HIDDEN_FILE_PATH} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_FILE_PATH} AND {DATA_FILE_TABLE}.{SYS_HIDDEN_POS} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_POS}",
         )));
     }
 
@@ -196,12 +189,10 @@ mod tests {
         let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            equality_delete_table_name, DATA_FILE_TABLE
+            "LEFT ANTI JOIN {equality_delete_table_name} ON {DATA_FILE_TABLE}",
         )));
         assert!(sql.contains(&format!(
-            "{} ON {}.id = {}.id",
-            equality_delete_table_name, DATA_FILE_TABLE, equality_delete_table_name
+            "{equality_delete_table_name} ON {DATA_FILE_TABLE}.id = {equality_delete_table_name}.id",
         )));
     }
 
@@ -229,8 +220,7 @@ mod tests {
         let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
-            "{}.seq_num < {}.seq_num",
-            DATA_FILE_TABLE, equality_delete_table_name
+            "{DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {equality_delete_table_name}.{SYS_HIDDEN_SEQ_NUM}",
         )));
     }
 
@@ -257,28 +247,19 @@ mod tests {
         let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, true);
         let sql = builder.build_merge_on_read_sql();
         assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            POSITION_DELETE_TABLE, DATA_FILE_TABLE
+            "LEFT ANTI JOIN {POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}"
         )));
         assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            equality_delete_table_name, DATA_FILE_TABLE
+            "LEFT ANTI JOIN {equality_delete_table_name} ON {DATA_FILE_TABLE}",
         )));
         assert!(sql.contains(&format!(
-            "{} ON {}.file_path = {}.file_path AND {}.pos = {}.pos",
-            POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
-            POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
-            POSITION_DELETE_TABLE
+            "{POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}.{SYS_HIDDEN_FILE_PATH} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_FILE_PATH} AND {DATA_FILE_TABLE}.{SYS_HIDDEN_POS} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_POS}",
         )));
         assert!(sql.contains(&format!(
-            "{} ON {}.id = {}.id",
-            equality_delete_table_name, DATA_FILE_TABLE, equality_delete_table_name
+            "{equality_delete_table_name} ON {DATA_FILE_TABLE}.id = {equality_delete_table_name}.id",
         )));
         assert!(sql.contains(&format!(
-            "{}.seq_num < {}.seq_num",
-            DATA_FILE_TABLE, equality_delete_table_name
+            "{DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {equality_delete_table_name}.{SYS_HIDDEN_SEQ_NUM}",
         )));
     }
 
@@ -321,29 +302,53 @@ mod tests {
         let builder = SqlBuilder::new(&project_names, &equality_delete_metadatas, false);
         let sql = builder.build_merge_on_read_sql();
 
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            equality_delete_table_name_1, DATA_FILE_TABLE
-        )));
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {} ON {}",
-            equality_delete_table_name_2, DATA_FILE_TABLE
-        )));
-        assert!(sql.contains(&format!(
-            "{} ON {}.id = {}.id",
-            equality_delete_table_name_1, DATA_FILE_TABLE, equality_delete_table_name_1
-        )));
-        assert!(sql.contains(&format!(
-            "{} ON {}.id = {}.id",
-            equality_delete_table_name_2, DATA_FILE_TABLE, equality_delete_table_name_2
-        )));
-        assert!(sql.contains(&format!(
-            "{}.seq_num < {}.seq_num",
-            DATA_FILE_TABLE, equality_delete_table_name_1
-        )));
-        assert!(sql.contains(&format!(
-            "{}.seq_num < {}.seq_num",
-            DATA_FILE_TABLE, equality_delete_table_name_2
-        )));
+        assert!(sql.contains(
+            &("LEFT ANTI JOIN ".to_owned()
+                + &equality_delete_table_name_1
+                + " ON "
+                + DATA_FILE_TABLE)
+        ));
+        assert!(sql.contains(
+            &("LEFT ANTI JOIN ".to_owned()
+                + &equality_delete_table_name_2
+                + " ON "
+                + DATA_FILE_TABLE)
+        ));
+        assert!(sql.contains(
+            &(equality_delete_table_name_1.clone()
+                + " ON "
+                + DATA_FILE_TABLE
+                + ".id = "
+                + &equality_delete_table_name_1
+                + ".id")
+        ));
+        assert!(sql.contains(
+            &(equality_delete_table_name_2.clone()
+                + " ON "
+                + DATA_FILE_TABLE
+                + ".id = "
+                + &equality_delete_table_name_2
+                + ".id")
+        ));
+
+        // Check that the sequence number comparison is present for both equality delete tables
+        assert!(sql.contains(
+            &(DATA_FILE_TABLE.to_owned()
+                + "."
+                + SYS_HIDDEN_SEQ_NUM
+                + " < "
+                + &equality_delete_table_name_1
+                + "."
+                + SYS_HIDDEN_SEQ_NUM)
+        ));
+        assert!(sql.contains(
+            &(DATA_FILE_TABLE.to_owned()
+                + "."
+                + SYS_HIDDEN_SEQ_NUM
+                + " < "
+                + &equality_delete_table_name_2
+                + "."
+                + SYS_HIDDEN_SEQ_NUM)
+        ));
     }
 }

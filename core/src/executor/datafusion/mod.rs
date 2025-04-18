@@ -30,10 +30,10 @@ pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 pub mod sql_builder;
 
-const SEQ_NUM: &str = "sys_hidden_seq_num";
-const FILE_PATH: &str = "sys_hidden_file_path";
-const POS: &str = "sys_hidden_pos";
-const SYS_HIDDEN_COLS: [&str; 3] = [SEQ_NUM, FILE_PATH, POS];
+pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
+pub const SYS_HIDDEN_FILE_PATH: &str = "sys_hidden_file_path";
+pub const SYS_HIDDEN_POS: &str = "sys_hidden_pos";
+const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS];
 
 const DATA_FILE_TABLE: &str = "data_file_table";
 const POSITION_DELETE_TABLE: &str = "position_delete_table";
@@ -326,13 +326,13 @@ impl DataFusionTaskContextBuilder {
             .with_fields(vec![
                 Arc::new(NestedField::new(
                     1,
-                    FILE_PATH,
+                    SYS_HIDDEN_FILE_PATH,
                     Type::Primitive(PrimitiveType::String),
                     true,
                 )),
                 Arc::new(NestedField::new(
                     2,
-                    POS,
+                    SYS_HIDDEN_POS,
                     Type::Primitive(PrimitiveType::Long),
                     true,
                 )),
@@ -384,7 +384,7 @@ impl DataFusionTaskContextBuilder {
         if need_seq_num {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 1,
-                SEQ_NUM,
+                SYS_HIDDEN_SEQ_NUM,
                 Type::Primitive(PrimitiveType::Long),
                 true,
             )));
@@ -393,13 +393,13 @@ impl DataFusionTaskContextBuilder {
         if need_file_path_and_pos {
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 2,
-                FILE_PATH,
+                SYS_HIDDEN_FILE_PATH,
                 Type::Primitive(PrimitiveType::String),
                 true,
             )));
             add_schema_fields.push(Arc::new(NestedField::new(
                 highest_field_id + 3,
-                POS,
+                SYS_HIDDEN_POS,
                 Type::Primitive(PrimitiveType::Long),
                 true,
             )));
@@ -459,7 +459,7 @@ impl DataFusionTaskContextBuilder {
         *highest_field_id += 1;
         equality_delete_fields.push(Arc::new(NestedField::new(
             *highest_field_id,
-            SEQ_NUM,
+            SYS_HIDDEN_SEQ_NUM,
             Type::Primitive(PrimitiveType::Long),
             true,
         )));
