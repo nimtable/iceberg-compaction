@@ -540,7 +540,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::CompactionError;
-    use crate::executor::datafusion::DataFusionTaskContextBuilder;
+    use crate::executor::datafusion::{DataFusionTaskContextBuilder, EqualityDeleteMetadata};
     use crate::executor::{CompactionResult, InputFileScanTasks};
     use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
@@ -724,5 +724,49 @@ mod tests {
             "seq_num"
         );
         assert_eq!(highest_field_id, 3);
+    }
+
+    #[test]
+    fn test_equality_delete_join_names() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        // schema
+        let fields = vec![
+            Arc::new(NestedField::new(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+                true,
+            )),
+            Arc::new(NestedField::new(
+                2,
+                "name",
+                Type::Primitive(PrimitiveType::String),
+                true,
+            )),
+            Arc::new(NestedField::new(
+                3,
+                "sys_hidden_seq_num",
+                Type::Primitive(PrimitiveType::Long),
+                true,
+            )),
+            Arc::new(NestedField::new(
+                4,
+                "sys_hidden_file_path",
+                Type::Primitive(PrimitiveType::String),
+                true,
+            )),
+        ];
+        let schema = Schema::builder().with_fields(fields).build().unwrap();
+
+        let meta = EqualityDeleteMetadata {
+            equality_delete_schema: schema,
+            equality_delete_table_name: "test_table".to_string(),
+            file_scan_tasks: vec![],
+        };
+
+        let join_names = meta.equality_delete_join_names();
+        assert_eq!(join_names, vec!["id", "name"]);
     }
 }
