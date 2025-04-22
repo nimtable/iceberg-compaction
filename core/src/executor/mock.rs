@@ -6,6 +6,7 @@ pub struct MockExecutor;
 #[async_trait]
 impl CompactionExecutor for MockExecutor {
     async fn rewrite_files(
+        &self,
         _file_io: FileIO,
         _schema: Arc<Schema>,
         _input_file_scan_tasks: InputFileScanTasks,

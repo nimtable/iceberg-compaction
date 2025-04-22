@@ -41,15 +41,16 @@ impl CompactorService for CompactorServiceImpl {
             })?,
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
-        let CompactionResult { data_files, stat } = DataFusionExecutor::rewrite_files(
-            file_io,
-            schema,
-            all_file_scan_tasks,
-            Arc::new(config),
-            request.dir_path,
-        )
-        .await
-        .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
+        let CompactionResult { data_files, stat } = DataFusionExecutor::default()
+            .rewrite_files(
+                file_io,
+                schema,
+                all_file_scan_tasks,
+                Arc::new(config),
+                request.dir_path,
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
 
         let data_files = data_files.into_iter().map(data_file_into_pb).collect();
         Ok(tonic::Response::new(RewriteFilesResponse {

@@ -17,6 +17,7 @@ pub use ic_codegen::compactor::RewriteFilesStat;
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn rewrite_files(
+        &self,
         file_io: FileIO,
         schema: Arc<Schema>,
         input_file_scan_tasks: InputFileScanTasks,
