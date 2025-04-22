@@ -1,3 +1,4 @@
+use crate::error::Result;
 use ::datafusion::{
     parquet::file::properties::WriterProperties,
     prelude::{SessionConfig, SessionContext},
@@ -23,9 +24,12 @@ use sqlx::types::Uuid;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::{CompactionConfig, CompactionError};
+use crate::CompactionError;
 
-use super::{CompactionExecutor, CompactionResult, InputFileScanTasks, RewriteFilesStat};
+use super::{
+    CompactionExecutor, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
+    RewriteFilesStat,
+};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 pub mod sql_builder;
@@ -42,13 +46,14 @@ pub struct DataFusionExecutor {}
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
-    async fn rewrite_files(
-        file_io: FileIO,
-        schema: Arc<Schema>,
-        input_file_scan_tasks: InputFileScanTasks,
-        config: Arc<CompactionConfig>,
-        dir_path: String,
-    ) -> Result<CompactionResult, CompactionError> {
+    async fn rewrite_files(request: RewriteFilesRequest) -> Result<RewriteFilesResponse> {
+        let RewriteFilesRequest {
+            file_io,
+            schema,
+            input_file_scan_tasks,
+            config,
+            dir_path,
+        } = request;
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
         let data_file_prefix = config
@@ -134,17 +139,17 @@ impl CompactionExecutor for DataFusionExecutor {
             let schema = arc_input_schema.clone();
             let data_file_prefix = data_file_prefix.clone();
             let file_io = file_io.clone();
-            let future: JoinHandle<
-                std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
-            > = tokio::spawn(async move {
-                let mut data_file_writer =
-                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io).await?;
-                while let Some(b) = batch.as_mut().next().await {
-                    data_file_writer.write(b?).await?;
-                }
-                let data_files = data_file_writer.close().await?;
-                Ok(data_files)
-            });
+            let future: JoinHandle<Result<Vec<iceberg::spec::DataFile>>> =
+                tokio::spawn(async move {
+                    let mut data_file_writer =
+                        Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io)
+                            .await?;
+                    while let Some(b) = batch.as_mut().next().await {
+                        data_file_writer.write(b?).await?;
+                    }
+                    let data_files = data_file_writer.close().await?;
+                    Ok(data_files)
+                });
             futures.push(future);
         }
         // collect all data files from all partitions
@@ -153,7 +158,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
             .map(|res| res.map(|v| v.into_iter()))
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
 
         stat.added_files_count = output_data_files.len() as u32;
@@ -161,9 +166,9 @@ impl CompactionExecutor for DataFusionExecutor {
             .iter()
             .map(|f| f.file_size_in_bytes())
             .sum();
-        stat.rewritten_files_count = rewritten_files_count as u32;
+        stat.rewritten_files_count = rewritten_files_count;
 
-        Ok(CompactionResult {
+        Ok(RewriteFilesResponse {
             data_files: output_data_files,
             stat,
         })
@@ -181,7 +186,7 @@ impl DataFusionExecutor {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         Self::register_table_provider_impl(
             schema,
             file_scan_tasks,
@@ -201,7 +206,7 @@ impl DataFusionExecutor {
         ctx: &SessionContext,
         table_name: &str,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         Self::register_table_provider_impl(
             schema,
             file_scan_tasks,
@@ -224,7 +229,7 @@ impl DataFusionExecutor {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
@@ -247,7 +252,6 @@ impl DataFusionExecutor {
         file_io: FileIO,
     ) -> Result<
         DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
-        CompactionError,
     > {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
@@ -312,7 +316,7 @@ impl DataFusionTaskContextBuilder {
     }
 
     // build data fusion task context
-    pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
+    pub fn build(self) -> Result<DataFusionTaskContext> {
         let highest_field_id = self.schema.highest_field_id();
         // Build scheam for position delete file, file_path + pos
         let position_delete_schema = Schema::builder()
@@ -446,7 +450,7 @@ impl DataFusionTaskContextBuilder {
 }
 
 impl DataFusionTaskContext {
-    pub fn builder() -> Result<DataFusionTaskContextBuilder, CompactionError> {
+    pub fn builder() -> Result<DataFusionTaskContextBuilder> {
         Ok(DataFusionTaskContextBuilder {
             schema: Arc::new(Schema::builder().build()?),
             data_files: vec![],
@@ -481,7 +485,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::CompactionError;
-    use crate::executor::{CompactionResult, InputFileScanTasks};
+    use crate::executor::{InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse};
     use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
     async fn build_catalog() -> SqlCatalog {
@@ -595,22 +599,21 @@ mod tests {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let CompactionResult {
-            data_files: output_data_files,
-            stat: _,
-        } = DataFusionExecutor::rewrite_files(
-            file_io,
-            schema.clone(),
-            all_file_scan_tasks,
-            Arc::new(CompactionConfig {
+        let request = RewriteFilesRequest {
+            file_io: file_io,
+            schema: schema.clone(),
+            input_file_scan_tasks: all_file_scan_tasks,
+            config: Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),
                 target_partitions: Some(4),
                 data_file_prefix: None,
             }),
-            default_location_generator.dir_path,
-        )
-        .await
-        .unwrap();
+            dir_path: default_location_generator.dir_path,
+        };
+        let RewriteFilesResponse {
+            data_files: output_data_files,
+            stat: _,
+        } = DataFusionExecutor::rewrite_files(request).await.unwrap();
         let txn = Transaction::new(&table);
         let mut rewrite_action = txn.rewrite_files(None, vec![]).unwrap();
         rewrite_action
