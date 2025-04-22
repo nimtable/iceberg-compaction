@@ -16,6 +16,9 @@ use std::sync::Arc;
 use crate::executor::CompactionResult;
 use crate::executor::DataFusionExecutor;
 
+pub enum CompactionType {
+    Full(TableIdent),
+}
 pub struct Compaction {
     pub config: Arc<CompactionConfig>,
     pub executor: Box<dyn CompactionExecutor>,
@@ -29,6 +32,12 @@ impl Compaction {
             config,
             executor,
             catalog,
+        }
+    }
+
+    pub async fn compact(&self, compaction_type: CompactionType) -> Result<RewriteFilesStat> {
+        match compaction_type {
+            CompactionType::Full(table_id) => self.full_compact(table_id).await,
         }
     }
 
@@ -188,6 +197,9 @@ mod tests {
             data_file_prefix: None,
         });
         let compaction = Compaction::new(compaction_config, catalog);
-        compaction.full_compact(table_id).await.unwrap();
+        compaction
+            .compact(crate::compaction::CompactionType::Full(table_id))
+            .await
+            .unwrap();
     }
 }
