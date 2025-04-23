@@ -25,14 +25,11 @@ use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
     scan::FileScanTask,
-    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
+    spec::{DataFile, NestedField, PartitionSpec, PrimitiveType, Schema, Type},
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
-        base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder},
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-        },
+        base_writer::data_file_writer::{ DataFileWriterBuilder}, file_writer::{
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator}, ParquetWriterBuilder
+        }, function_writer::fanout_partition_writer::{FanoutPartitionWriterBuilder}, IcebergWriter, IcebergWriterBuilder
     },
 };
 use sqlx::types::Uuid;
@@ -64,6 +61,7 @@ impl CompactionExecutor for DataFusionExecutor {
         input_file_scan_tasks: InputFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
+        partition_spec: Arc<PartitionSpec>,
     ) -> Result<CompactionResult, CompactionError> {
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
@@ -150,11 +148,12 @@ impl CompactionExecutor for DataFusionExecutor {
             let schema = arc_input_schema.clone();
             let data_file_prefix = data_file_prefix.clone();
             let file_io = file_io.clone();
+            let partition_spec = partition_spec.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
                 let mut data_file_writer =
-                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io).await?;
+                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io,partition_spec).await?;
                 while let Some(b) = batch.as_mut().next().await {
                     data_file_writer.write(b?).await?;
                 }
@@ -261,8 +260,9 @@ impl DataFusionExecutor {
         dir_path: String,
         schema: Arc<Schema>,
         file_io: FileIO,
+        partition_spec: Arc<PartitionSpec>,
     ) -> Result<
-        DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
+        Box<dyn IcebergWriter>,
         CompactionError,
     > {
         let location_generator = DefaultLocationGenerator { dir_path };
@@ -275,16 +275,23 @@ impl DataFusionExecutor {
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
             WriterProperties::default(),
-            schema,
+            schema.clone(),
             file_io,
             location_generator,
             file_name_generator,
         );
-        let data_file_writer = DataFileWriterBuilder::new(parquet_writer_builder, None, 0)
-            .build()
-            .await
-            .unwrap();
-        Ok(data_file_writer)
+        let data_file_builder =
+            DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
+            let iceberg_output_writer =if partition_spec.fields().is_empty() {
+                Box::new(data_file_builder.build().await?) as Box<dyn IcebergWriter>
+            } else {
+                Box::new(FanoutPartitionWriterBuilder::new(
+                                    data_file_builder,
+                                    partition_spec.clone(), 
+                                    schema,
+                                )?.build().await?) as Box<dyn IcebergWriter>
+            };
+        Ok(iceberg_output_writer)
     }
 }
 
@@ -624,6 +631,7 @@ mod tests {
                 data_file_prefix: None,
             }),
             default_location_generator.dir_path,
+            table.metadata().default_partition_spec().clone(),
         )
         .await
         .unwrap();

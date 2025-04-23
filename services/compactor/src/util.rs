@@ -23,9 +23,11 @@ use ic_codegen::compactor::Literal;
 use ic_codegen::compactor::MapLiteral;
 use ic_codegen::compactor::NestedFieldDescriptor;
 use ic_codegen::compactor::OptionalLiteral;
+use ic_codegen::compactor::PartitionSpec;
 use ic_codegen::compactor::PrimitiveLiteral;
 use ic_codegen::compactor::SchemaDescriptor;
 use ic_codegen::compactor::StructLiteralDescriptor;
+use ic_codegen::compactor::Transform;
 use ic_codegen::compactor::literal;
 use ic_codegen::compactor::nested_field_descriptor::FieldType;
 use ic_codegen::compactor::primitive_literal::KindLiteral;
@@ -372,6 +374,71 @@ fn literal_into_pb(literal: iceberg::spec::Literal) -> Literal {
                 literal: Some(literal::Literal::Map(MapLiteral { keys, values })),
             }
         }
+    }
+}
+
+/// Builds an Iceberg PartitionSpec from a protobuf PartitionSpec
+///
+/// This function converts a protobuf PartitionSpec into an Iceberg PartitionSpec.
+/// It handles the conversion of partition fields and their transforms.
+pub fn build_partition_spec_from_pb(
+    partition_spec: PartitionSpec,
+    schema: Arc<Schema>,
+) -> Result<iceberg::spec::PartitionSpec, CompactionError> {
+    let mut builder = iceberg::spec::PartitionSpec::builder(schema);
+    builder = builder.with_spec_id(partition_spec.spec_id);
+    let fields = partition_spec.partition_fields.into_iter().map(|field| {
+        Ok::<iceberg::spec::UnboundPartitionField, CompactionError>(iceberg::spec::UnboundPartitionField{
+            source_id: field.source_id,
+            field_id: field.field_id,
+            name: field.name,
+            transform: build_transform_from_pb(&field.transform.ok_or_else(|| CompactionError::Config("cannot find transform from partition_field".to_owned()))?)?,
+        })
+    }).collect::<Result<Vec<_>, _>>()?;
+    builder = builder.add_unbound_fields(fields)?;
+    Ok(builder.build()?)
+}
+
+/// Builds an Iceberg Transform from a protobuf Transform
+///
+/// This function converts a protobuf Transform into an Iceberg Transform.
+/// It handles different transform types and their parameters.
+fn build_transform_from_pb(transform: &Transform) -> Result<iceberg::spec::Transform, CompactionError> {
+    match transform.params {
+        Some(ic_codegen::compactor::transform::Params::TransformWithoutInner(transform_type)) => {
+            match ic_codegen::compactor::transform::TransformWithoutInner::try_from(transform_type).map_err(|e| {
+                CompactionError::Config(format!("failed to parse kind: {}", e))
+            })? {
+                ic_codegen::compactor::transform::TransformWithoutInner::Identity => {
+                    Ok(iceberg::spec::Transform::Identity)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Year => {
+                    Ok(iceberg::spec::Transform::Year)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Month => {
+                    Ok(iceberg::spec::Transform::Month)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Day => {
+                    Ok(iceberg::spec::Transform::Day)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Hour => {
+                    Ok(iceberg::spec::Transform::Hour)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Void => {
+                    Ok(iceberg::spec::Transform::Void)
+                }
+                ic_codegen::compactor::transform::TransformWithoutInner::Unknown => {
+                    Ok(iceberg::spec::Transform::Unknown)
+                }
+            }
+        }
+        Some(ic_codegen::compactor::transform::Params::Bucket(bucket_num)) => {
+            Ok(iceberg::spec::Transform::Bucket(bucket_num))
+        }
+        Some(ic_codegen::compactor::transform::Params::Truncate(truncate_width)) => {
+            Ok(iceberg::spec::Transform::Truncate(truncate_width))
+        }
+        None => Err(CompactionError::Config("Transform params is None".to_owned())),
     }
 }
 
