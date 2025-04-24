@@ -60,6 +60,7 @@ impl Compaction {
                 all_file_scan_tasks,
                 self.config.clone(),
                 default_location_generator.dir_path,
+                table.metadata().default_partition_spec().clone(),
             )
             .await?;
         let txn = Transaction::new(&table);

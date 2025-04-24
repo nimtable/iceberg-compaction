@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025 IC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use ::datafusion::{
     parquet::file::properties::WriterProperties,
     prelude::{SessionConfig, SessionContext},
@@ -9,14 +25,15 @@ use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
     scan::FileScanTask,
-    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
+    spec::{DataFile, NestedField, PartitionSpec, PrimitiveType, Schema, Type},
     writer::{
         IcebergWriter, IcebergWriterBuilder,
-        base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder},
+        base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
             ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
         },
+        function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
     },
 };
 use sqlx::types::Uuid;
@@ -50,6 +67,7 @@ impl CompactionExecutor for DataFusionExecutor {
         input_file_scan_tasks: InputFileScanTasks,
         config: Arc<CompactionConfig>,
         dir_path: String,
+        partition_spec: Arc<PartitionSpec>,
     ) -> Result<CompactionResult, CompactionError> {
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
@@ -136,11 +154,18 @@ impl CompactionExecutor for DataFusionExecutor {
             let schema = arc_input_schema.clone();
             let data_file_prefix = data_file_prefix.clone();
             let file_io = file_io.clone();
+            let partition_spec = partition_spec.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
-                let mut data_file_writer =
-                    Self::build_iceberg_writer(data_file_prefix, dir_path, schema, file_io).await?;
+                let mut data_file_writer = Self::build_iceberg_writer(
+                    data_file_prefix,
+                    dir_path,
+                    schema,
+                    file_io,
+                    partition_spec,
+                )
+                .await?;
                 while let Some(b) = batch.as_mut().next().await {
                     data_file_writer.write(b?).await?;
                 }
@@ -247,10 +272,8 @@ impl DataFusionExecutor {
         dir_path: String,
         schema: Arc<Schema>,
         file_io: FileIO,
-    ) -> Result<
-        DataFileWriter<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
-        CompactionError,
-    > {
+        partition_spec: Arc<PartitionSpec>,
+    ) -> Result<Box<dyn IcebergWriter>, CompactionError> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
@@ -261,16 +284,27 @@ impl DataFusionExecutor {
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
             WriterProperties::default(),
-            schema,
+            schema.clone(),
             file_io,
             location_generator,
             file_name_generator,
         );
-        let data_file_writer = DataFileWriterBuilder::new(parquet_writer_builder, None, 0)
-            .build()
-            .await
-            .unwrap();
-        Ok(data_file_writer)
+        let data_file_builder =
+            DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
+        let iceberg_output_writer = if partition_spec.fields().is_empty() {
+            Box::new(data_file_builder.build().await?) as Box<dyn IcebergWriter>
+        } else {
+            Box::new(
+                FanoutPartitionWriterBuilder::new(
+                    data_file_builder,
+                    partition_spec.clone(),
+                    schema,
+                )?
+                .build()
+                .await?,
+            ) as Box<dyn IcebergWriter>
+        };
+        Ok(iceberg_output_writer)
     }
 }
 
