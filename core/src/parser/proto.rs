@@ -8,12 +8,14 @@ use ic_codegen::compactor::Literal;
 use ic_codegen::compactor::MapLiteral;
 use ic_codegen::compactor::NestedFieldDescriptor;
 use ic_codegen::compactor::OptionalLiteral;
+use ic_codegen::compactor::PartitionSpec;
 use ic_codegen::compactor::PrimitiveLiteral;
 use ic_codegen::compactor::RewriteFilesRequest as PbRewriteFilesRequest;
 use ic_codegen::compactor::RewriteFilesResponse as PbRewriteFilesResponse;
 use ic_codegen::compactor::RewriteFilesStat as PbRewriteFilesStat;
 use ic_codegen::compactor::SchemaDescriptor;
 use ic_codegen::compactor::StructLiteralDescriptor;
+use ic_codegen::compactor::Transform;
 use ic_codegen::compactor::literal;
 use ic_codegen::compactor::nested_field_descriptor::FieldType;
 use ic_codegen::compactor::primitive_literal::KindLiteral;
@@ -49,6 +51,7 @@ impl PbRewriteFilesRequestDecoder {
             schema,
             dir_path,
             rewrite_file_config,
+            partition_spec,
         } = self.rewrite_file_request_proto;
         let file_io = Self::decode_file_io(
             file_io_builder
@@ -73,12 +76,16 @@ impl PbRewriteFilesRequestDecoder {
             CompactionError::Config(format!("Failed to decode CompactionConfig: {}", e))
         })?;
 
+        let partition_spec = Self::decode_partition_spec(partition_spec, schema.clone())?
+            .unwrap_or_else(iceberg::spec::PartitionSpec::unpartition_spec);
+
         Ok(RewriteFilesRequest {
             file_io,
             schema,
             input_file_scan_tasks,
             config: Arc::new(config),
             dir_path,
+            partition_spec: Arc::new(partition_spec),
         })
     }
 
@@ -277,6 +284,94 @@ impl PbRewriteFilesRequestDecoder {
             1 => iceberg::spec::DataFileFormat::Orc,
             2 => iceberg::spec::DataFileFormat::Parquet,
             _ => unreachable!(),
+        }
+    }
+
+    /// Builds an Iceberg PartitionSpec from a protobuf PartitionSpec
+    ///
+    /// This function converts a protobuf PartitionSpec into an Iceberg PartitionSpec.
+    /// It handles the conversion of partition fields and their transforms.
+    pub fn decode_partition_spec(
+        partition_spec: Option<PartitionSpec>,
+        schema: Arc<Schema>,
+    ) -> Result<Option<iceberg::spec::PartitionSpec>> {
+        match partition_spec {
+            None => Ok(None),
+            Some(partition_spec) => {
+                let mut builder = iceberg::spec::PartitionSpec::builder(schema);
+                builder = builder.with_spec_id(partition_spec.spec_id);
+                let fields = partition_spec
+                    .partition_fields
+                    .into_iter()
+                    .map(|field| {
+                        Ok::<iceberg::spec::UnboundPartitionField, CompactionError>(
+                            iceberg::spec::UnboundPartitionField {
+                                source_id: field.source_id,
+                                field_id: field.field_id,
+                                name: field.name,
+                                transform: Self::decode_transform(&field.transform.ok_or_else(
+                                    || {
+                                        CompactionError::Config(
+                                            "cannot find transform from partition_field".to_owned(),
+                                        )
+                                    },
+                                )?)?,
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                builder = builder.add_unbound_fields(fields)?;
+                Ok(Some(builder.build()?))
+            }
+        }
+    }
+
+    /// Builds an Iceberg Transform from a protobuf Transform
+    ///
+    /// This function converts a protobuf Transform into an Iceberg Transform.
+    /// It handles different transform types and their parameters.
+    fn decode_transform(transform: &Transform) -> Result<iceberg::spec::Transform> {
+        match transform.params {
+            Some(ic_codegen::compactor::transform::Params::TransformWithoutInner(
+                transform_type,
+            )) => {
+                match ic_codegen::compactor::transform::TransformWithoutInner::try_from(
+                    transform_type,
+                )
+                .map_err(|e| CompactionError::Config(format!("failed to parse kind: {}", e)))?
+                {
+                    ic_codegen::compactor::transform::TransformWithoutInner::Identity => {
+                        Ok(iceberg::spec::Transform::Identity)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Year => {
+                        Ok(iceberg::spec::Transform::Year)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Month => {
+                        Ok(iceberg::spec::Transform::Month)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Day => {
+                        Ok(iceberg::spec::Transform::Day)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Hour => {
+                        Ok(iceberg::spec::Transform::Hour)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Void => {
+                        Ok(iceberg::spec::Transform::Void)
+                    }
+                    ic_codegen::compactor::transform::TransformWithoutInner::Unknown => {
+                        Ok(iceberg::spec::Transform::Unknown)
+                    }
+                }
+            }
+            Some(ic_codegen::compactor::transform::Params::Bucket(bucket_num)) => {
+                Ok(iceberg::spec::Transform::Bucket(bucket_num))
+            }
+            Some(ic_codegen::compactor::transform::Params::Truncate(truncate_width)) => {
+                Ok(iceberg::spec::Transform::Truncate(truncate_width))
+            }
+            None => Err(CompactionError::Config(
+                "Transform params is None".to_owned(),
+            )),
         }
     }
 }
