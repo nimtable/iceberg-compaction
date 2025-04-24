@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::{io::FileIO, spec::PartitionSpec};
 use iceberg::scan::FileScanTask;
+use iceberg::{io::FileIO, spec::PartitionSpec};
 
 use crate::config::CompactionConfig;
 use crate::error::CompactionError;

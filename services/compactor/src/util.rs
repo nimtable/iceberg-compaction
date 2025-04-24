@@ -387,14 +387,24 @@ pub fn build_partition_spec_from_pb(
 ) -> Result<iceberg::spec::PartitionSpec, CompactionError> {
     let mut builder = iceberg::spec::PartitionSpec::builder(schema);
     builder = builder.with_spec_id(partition_spec.spec_id);
-    let fields = partition_spec.partition_fields.into_iter().map(|field| {
-        Ok::<iceberg::spec::UnboundPartitionField, CompactionError>(iceberg::spec::UnboundPartitionField{
-            source_id: field.source_id,
-            field_id: field.field_id,
-            name: field.name,
-            transform: build_transform_from_pb(&field.transform.ok_or_else(|| CompactionError::Config("cannot find transform from partition_field".to_owned()))?)?,
+    let fields = partition_spec
+        .partition_fields
+        .into_iter()
+        .map(|field| {
+            Ok::<iceberg::spec::UnboundPartitionField, CompactionError>(
+                iceberg::spec::UnboundPartitionField {
+                    source_id: field.source_id,
+                    field_id: field.field_id,
+                    name: field.name,
+                    transform: build_transform_from_pb(&field.transform.ok_or_else(|| {
+                        CompactionError::Config(
+                            "cannot find transform from partition_field".to_owned(),
+                        )
+                    })?)?,
+                },
+            )
         })
-    }).collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     builder = builder.add_unbound_fields(fields)?;
     Ok(builder.build()?)
 }
@@ -403,12 +413,14 @@ pub fn build_partition_spec_from_pb(
 ///
 /// This function converts a protobuf Transform into an Iceberg Transform.
 /// It handles different transform types and their parameters.
-fn build_transform_from_pb(transform: &Transform) -> Result<iceberg::spec::Transform, CompactionError> {
+fn build_transform_from_pb(
+    transform: &Transform,
+) -> Result<iceberg::spec::Transform, CompactionError> {
     match transform.params {
         Some(ic_codegen::compactor::transform::Params::TransformWithoutInner(transform_type)) => {
-            match ic_codegen::compactor::transform::TransformWithoutInner::try_from(transform_type).map_err(|e| {
-                CompactionError::Config(format!("failed to parse kind: {}", e))
-            })? {
+            match ic_codegen::compactor::transform::TransformWithoutInner::try_from(transform_type)
+                .map_err(|e| CompactionError::Config(format!("failed to parse kind: {}", e)))?
+            {
                 ic_codegen::compactor::transform::TransformWithoutInner::Identity => {
                     Ok(iceberg::spec::Transform::Identity)
                 }
@@ -438,7 +450,9 @@ fn build_transform_from_pb(transform: &Transform) -> Result<iceberg::spec::Trans
         Some(ic_codegen::compactor::transform::Params::Truncate(truncate_width)) => {
             Ok(iceberg::spec::Transform::Truncate(truncate_width))
         }
-        None => Err(CompactionError::Config("Transform params is None".to_owned())),
+        None => Err(CompactionError::Config(
+            "Transform params is None".to_owned(),
+        )),
     }
 }
 

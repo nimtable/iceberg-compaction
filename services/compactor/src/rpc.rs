@@ -21,7 +21,10 @@ use ic_codegen::compactor::{EchoRequest, EchoResponse, RewriteFilesRequest, Rewr
 use ic_core::executor::{CompactionResult, DataFusionExecutor};
 use ic_core::{CompactionConfig, CompactionExecutor};
 
-use crate::util::{build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, build_partition_spec_from_pb, data_file_into_pb};
+use crate::util::{
+    build_file_io_from_pb, build_file_scan_tasks_schema_from_pb, build_partition_spec_from_pb,
+    data_file_into_pb,
+};
 
 #[derive(Default)]
 pub struct CompactorServiceImpl;
@@ -57,14 +60,20 @@ impl CompactorService for CompactorServiceImpl {
             })?,
         )
         .map_err(|e| tonic::Status::internal(format!("Failed to build file io: {}", e)))?;
-        let partition_spec = build_partition_spec_from_pb(request.partition_spec.ok_or_else(|| tonic::Status::internal("cannot find partition_spec in request".to_owned()))?, schema.clone()).map_err(|e| tonic::Status::internal(format!("Failed to build partition spec: {}", e)))?;
+        let partition_spec = build_partition_spec_from_pb(
+            request.partition_spec.ok_or_else(|| {
+                tonic::Status::internal("cannot find partition_spec in request".to_owned())
+            })?,
+            schema.clone(),
+        )
+        .map_err(|e| tonic::Status::internal(format!("Failed to build partition spec: {}", e)))?;
         let CompactionResult { data_files, stat } = DataFusionExecutor::rewrite_files(
             file_io,
             schema,
             all_file_scan_tasks,
             Arc::new(config),
             request.dir_path,
-            Arc::new(partition_spec)
+            Arc::new(partition_spec),
         )
         .await
         .map_err(|e| tonic::Status::internal(format!("Failed to compact files: {}", e)))?;
