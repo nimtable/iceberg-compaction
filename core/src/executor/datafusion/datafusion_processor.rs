@@ -468,6 +468,30 @@ impl DataFusionTaskContextBuilder {
             exec_sql,
         })
     }
+
+    pub fn build_position_scan(self) -> Result<DataFusionTaskContext> {
+        let position_delete_schema = Self::build_position_schema()?;
+        let project_names: Vec<_> = position_delete_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        Ok(DataFusionTaskContext {
+            data_file_schema: None,
+            input_schema: Some(position_delete_schema.clone()),
+            data_files: None,
+            position_delete_files: Some(self.position_delete_files),
+            equality_delete_files: None,
+            position_delete_schema: Some(position_delete_schema),
+            equality_delete_schema: None,
+            exec_sql: format!(
+                "select {} from {}",
+                project_names.join(","),
+                POSITION_DELETE_TABLE
+            ),
+        })
+    }
 }
 
 impl DataFusionTaskContext {
