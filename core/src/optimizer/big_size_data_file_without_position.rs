@@ -55,7 +55,7 @@ impl Rule for BigSizeDataFileWithoutPosition {
             position_delete_files,
             equality_delete_files,
         } = optimizer_context.input_file_scan_tasks;
-        if position_delete_files.is_empty() || data_files.is_empty() {
+        if !equality_delete_files.is_empty() || position_delete_files.is_empty() || data_files.is_empty() {
             return Ok(OptimizerContext {
                 input_file_scan_tasks: InputFileScanTasks {
                     data_files,
