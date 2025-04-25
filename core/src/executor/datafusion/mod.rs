@@ -1,3 +1,4 @@
+use crate::error::Result;
 /*
  * Copyright 2025 IC
  *
@@ -40,9 +41,12 @@ use sqlx::types::Uuid;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::{CompactionConfig, CompactionError};
+use crate::CompactionError;
 
-use super::{CompactionExecutor, CompactionResult, InputFileScanTasks, RewriteFilesStat};
+use super::{
+    CompactionExecutor, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
+    RewriteFilesStat,
+};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 pub mod sql_builder;
@@ -60,15 +64,15 @@ pub struct DataFusionExecutor {}
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
-    async fn rewrite_files(
-        &self,
-        file_io: FileIO,
-        schema: Arc<Schema>,
-        input_file_scan_tasks: InputFileScanTasks,
-        config: Arc<CompactionConfig>,
-        dir_path: String,
-        partition_spec: Arc<PartitionSpec>,
-    ) -> Result<CompactionResult, CompactionError> {
+    async fn rewrite_files(&self, request: RewriteFilesRequest) -> Result<RewriteFilesResponse> {
+        let RewriteFilesRequest {
+            file_io,
+            schema,
+            input_file_scan_tasks,
+            config,
+            dir_path,
+            partition_spec,
+        } = request;
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
         let data_file_prefix = config
@@ -180,7 +184,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
             .map(|res| res.map(|v| v.into_iter()))
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
 
         stat.added_files_count = output_data_files.len() as u32;
@@ -190,7 +194,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .sum();
         stat.rewritten_files_count = rewritten_files_count;
 
-        Ok(CompactionResult {
+        Ok(RewriteFilesResponse {
             data_files: output_data_files,
             stat,
         })
@@ -208,7 +212,7 @@ impl DataFusionExecutor {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         Self::register_table_provider_impl(
             schema,
             file_scan_tasks,
@@ -228,7 +232,7 @@ impl DataFusionExecutor {
         ctx: &SessionContext,
         table_name: &str,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         Self::register_table_provider_impl(
             schema,
             file_scan_tasks,
@@ -251,7 +255,7 @@ impl DataFusionExecutor {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
@@ -273,7 +277,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
-    ) -> Result<Box<dyn IcebergWriter>, CompactionError> {
+    ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
@@ -348,7 +352,7 @@ impl DataFusionTaskContextBuilder {
     }
 
     // build data fusion task context
-    pub fn build(self) -> Result<DataFusionTaskContext, CompactionError> {
+    pub fn build(self) -> Result<DataFusionTaskContext> {
         let highest_field_id = self.schema.highest_field_id();
         // Build scheam for position delete file, file_path + pos
         let position_delete_schema = Schema::builder()
@@ -482,7 +486,7 @@ impl DataFusionTaskContextBuilder {
 }
 
 impl DataFusionTaskContext {
-    pub fn builder() -> Result<DataFusionTaskContextBuilder, CompactionError> {
+    pub fn builder() -> Result<DataFusionTaskContextBuilder> {
         Ok(DataFusionTaskContextBuilder {
             schema: Arc::new(Schema::builder().build()?),
             data_files: vec![],

@@ -20,27 +20,40 @@ use async_trait::async_trait;
 use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
-use crate::config::CompactionConfig;
-use crate::error::CompactionError;
+use crate::parser::proto::RewriteFilesResponseProtoEncoder;
+use crate::{config::CompactionConfig, parser::proto::PbRewriteFilesRequestDecoder};
 use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
 pub use mock::MockExecutor;
 pub mod datafusion;
+use crate::error::Result;
 pub use datafusion::DataFusionExecutor;
-pub use ic_codegen::compactor::RewriteFilesStat;
+use ic_codegen::compactor::RewriteFilesRequest as PbRewriteFilesRequest;
+use ic_codegen::compactor::RewriteFilesResponse as PbRewriteFilesResponse;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
-    async fn rewrite_files(
+    async fn rewrite_files(&self, request: RewriteFilesRequest) -> Result<RewriteFilesResponse>;
+
+    async fn rewrite_file_proto(
         &self,
-        file_io: FileIO,
-        schema: Arc<Schema>,
-        input_file_scan_tasks: InputFileScanTasks,
-        config: Arc<CompactionConfig>,
-        dir_path: String,
-        partition_spec: Arc<PartitionSpec>,
-    ) -> Result<CompactionResult, CompactionError>;
+        request: PbRewriteFilesRequest,
+    ) -> Result<PbRewriteFilesResponse> {
+        let request = PbRewriteFilesRequestDecoder::new(request).decode()?;
+        let response = self.rewrite_files(request).await?;
+        let response = RewriteFilesResponseProtoEncoder::new(response).encode();
+        Ok(response)
+    }
+}
+
+pub struct RewriteFilesRequest {
+    pub file_io: FileIO,
+    pub schema: Arc<Schema>,
+    pub input_file_scan_tasks: InputFileScanTasks,
+    pub config: Arc<CompactionConfig>,
+    pub dir_path: String,
+    pub partition_spec: Arc<PartitionSpec>,
 }
 
 pub struct InputFileScanTasks {
@@ -58,7 +71,15 @@ impl InputFileScanTasks {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CompactionResult {
+pub struct RewriteFilesResponse {
     pub data_files: Vec<DataFile>,
     pub stat: RewriteFilesStat,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RewriteFilesStat {
+    pub rewritten_files_count: u32,
+    pub added_files_count: u32,
+    pub rewritten_bytes: u64,
+    pub failed_data_files_count: u32,
 }

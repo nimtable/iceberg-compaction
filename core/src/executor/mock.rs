@@ -14,22 +14,16 @@
  * limitations under the License.
  */
 
-use super::*;
 use async_trait::async_trait;
+
+use super::{CompactionExecutor, RewriteFilesRequest, RewriteFilesResponse};
+use crate::error::Result;
 
 pub struct MockExecutor;
 
 #[async_trait]
 impl CompactionExecutor for MockExecutor {
-    async fn rewrite_files(
-        &self,
-        _file_io: FileIO,
-        _schema: Arc<Schema>,
-        _input_file_scan_tasks: InputFileScanTasks,
-        _config: Arc<CompactionConfig>,
-        _dir_path: String,
-        _partition_spec: Arc<PartitionSpec>,
-    ) -> Result<CompactionResult, CompactionError> {
-        Ok(CompactionResult::default())
+    async fn rewrite_files(&self, _request: RewriteFilesRequest) -> Result<RewriteFilesResponse> {
+        Ok(RewriteFilesResponse::default())
     }
 }

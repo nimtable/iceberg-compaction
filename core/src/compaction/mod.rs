@@ -3,7 +3,7 @@ use iceberg::spec::DataFile;
 use iceberg::{Catalog, TableIdent};
 
 use crate::Result;
-use crate::executor::InputFileScanTasks;
+use crate::executor::{InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse};
 use crate::{CompactionConfig, CompactionExecutor};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;
@@ -13,7 +13,6 @@ use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::executor::CompactionResult;
 use crate::executor::DataFusionExecutor;
 
 pub enum CompactionType {
@@ -44,24 +43,25 @@ impl Compaction {
     pub async fn full_compact(&self, table_id: TableIdent) -> Result<RewriteFilesStat> {
         let table = self.catalog.load_table(&table_id).await?;
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
-        let all_file_scan_tasks = get_tasks_from_table(table.clone()).await?;
+        let input_file_scan_tasks = get_tasks_from_table(table.clone()).await?;
 
         let file_io = table.file_io().clone();
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let CompactionResult {
+        let rewrite_files_request = RewriteFilesRequest {
+            file_io,
+            schema: schema.clone(),
+            input_file_scan_tasks,
+            config: self.config.clone(),
+            dir_path: default_location_generator.dir_path,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+        };
+        let RewriteFilesResponse {
             data_files: output_data_files,
             stat,
         } = DataFusionExecutor::default()
-            .rewrite_files(
-                file_io,
-                schema.clone(),
-                all_file_scan_tasks,
-                self.config.clone(),
-                default_location_generator.dir_path,
-                table.metadata().default_partition_spec().clone(),
-            )
+            .rewrite_files(rewrite_files_request)
             .await?;
         let txn = Transaction::new(&table);
         let mut rewrite_action = txn.rewrite_files(None, vec![])?;
@@ -70,7 +70,12 @@ impl Compaction {
         rewrite_action.delete_files(delete_files)?;
         let tx = rewrite_action.apply().await?;
         tx.commit(self.catalog.as_ref()).await?;
-        Ok(stat)
+        Ok(RewriteFilesStat {
+            rewritten_files_count: stat.rewritten_files_count,
+            added_files_count: stat.added_files_count,
+            rewritten_bytes: stat.rewritten_bytes,
+            failed_data_files_count: stat.failed_data_files_count,
+        })
     }
 }
 

@@ -21,3 +21,4 @@ sqlx = { version = "0.8.2",default-features = false, features = ["bigdecimal","c
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+serde_json = { workspace = true }
