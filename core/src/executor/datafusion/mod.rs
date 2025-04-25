@@ -1,3 +1,4 @@
+use crate::error::Result;
 /*
  * Copyright 2025 IC
  *
@@ -38,10 +39,11 @@ use sqlx::types::Uuid;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::{CompactionConfig, CompactionError};
+use crate::CompactionError;
 
-use super::{CompactionExecutor, CompactionResult, InputFileScanTasks, RewriteFilesStat};
+use super::{CompactionExecutor, InputFileScanTasks, RewriteFilesStat};
 pub mod datafusion_processor;
+use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
@@ -51,14 +53,15 @@ pub struct DataFusionExecutor {}
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
-    async fn rewrite_files(
-        file_io: FileIO,
-        schema: Arc<Schema>,
-        input_file_scan_tasks: InputFileScanTasks,
-        config: Arc<CompactionConfig>,
-        dir_path: String,
-        partition_spec: Arc<PartitionSpec>,
-    ) -> Result<CompactionResult, CompactionError> {
+    async fn rewrite_files(request: RewriteFilesRequest) -> Result<RewriteFilesResponse> {
+        let RewriteFilesRequest {
+            file_io,
+            schema,
+            input_file_scan_tasks,
+            config,
+            dir_path,
+            partition_spec,
+        } = request;
         let batch_parallelism = config.batch_parallelism.unwrap_or(4);
         let target_partitions = config.target_partitions.unwrap_or(4);
         let data_file_prefix = config
@@ -124,7 +127,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .map_err(|e| CompactionError::Execution(e.to_string()))?
             .into_iter()
             .map(|res| res.map(|v| v.into_iter()))
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
 
         stat.added_files_count = output_data_files.len() as u32;
@@ -134,7 +137,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .sum();
         stat.rewritten_files_count = rewritten_files_count;
 
-        Ok(CompactionResult {
+        Ok(RewriteFilesResponse {
             data_files: output_data_files,
             stat,
         })
@@ -148,7 +151,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
-    ) -> Result<Box<dyn IcebergWriter>, CompactionError> {
+    ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
         let file_name_generator = DefaultFileNameGenerator::new(
@@ -196,7 +199,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::CompactionError;
-    use crate::executor::{CompactionResult, InputFileScanTasks};
+    use crate::executor::{InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse};
     use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
     async fn build_catalog() -> SqlCatalog {
@@ -310,23 +313,24 @@ mod tests {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let CompactionResult {
-            data_files: output_data_files,
-            stat: _,
-        } = DataFusionExecutor::rewrite_files(
-            file_io,
-            schema.clone(),
-            all_file_scan_tasks,
-            Arc::new(CompactionConfig {
+        let request = RewriteFilesRequest {
+            file_io: file_io,
+            schema: schema.clone(),
+            input_file_scan_tasks: all_file_scan_tasks,
+            config: Arc::new(CompactionConfig {
                 batch_parallelism: Some(4),
                 target_partitions: Some(4),
                 data_file_prefix: None,
             }),
-            default_location_generator.dir_path,
-            table.metadata().default_partition_spec().clone(),
-        )
-        .await
-        .unwrap();
+            dir_path: default_location_generator.dir_path,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+        };
+
+        let RewriteFilesResponse {
+            data_files: output_data_files,
+            stat: _,
+        } = DataFusionExecutor::rewrite_files(request).await.unwrap();
+
         let txn = Transaction::new(&table);
         let mut rewrite_action = txn.rewrite_files(None, vec![]).unwrap();
         rewrite_action
