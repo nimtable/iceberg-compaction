@@ -38,7 +38,7 @@ use iceberg::scan::FileScanTask;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
 
-use super::SEQ_NUM;
+use super::SYS_HIDDEN_SEQ_NUM;
 
 /// An execution plan for scanning iceberg file scan tasks
 #[derive(Debug)]
@@ -265,7 +265,7 @@ async fn get_batch_stream(
 fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBatch> {
     let schema = batch.schema();
     let seq_num_field = Arc::new(Field::new(
-        SEQ_NUM,
+        SYS_HIDDEN_SEQ_NUM,
         datafusion::arrow::datatypes::DataType::Int64,
         false,
     ));
