@@ -87,7 +87,6 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_position_delete_files(position_delete_files)
             .with_equality_delete_files(equality_delete_files)
             .build_merge_on_read()?;
-
         let (df, input_schema) =
             DatafusionProcessor::new(ctx, datafusion_task_ctx, batch_parallelism, file_io.clone())
                 .execute()
@@ -314,7 +313,7 @@ mod tests {
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let request = RewriteFilesRequest {
-            file_io: file_io,
+            file_io,
             schema: schema.clone(),
             input_file_scan_tasks: all_file_scan_tasks,
             config: Arc::new(CompactionConfig {
