@@ -27,7 +27,9 @@ use crate::{
     error::Result,
     executor::{
         InputFileScanTasks,
-        datafusion::datafusion_processor::{DataFusionTaskContext, DatafusionProcessor, FILE_PATH},
+        datafusion::datafusion_processor::{
+            DataFusionTaskContext, DatafusionProcessor, SYS_HIDDEN_FILE_PATH,
+        },
     },
 };
 
@@ -55,7 +57,10 @@ impl Rule for BigSizeDataFileWithoutPosition {
             position_delete_files,
             equality_delete_files,
         } = optimizer_context.input_file_scan_tasks;
-        if !equality_delete_files.is_empty() || position_delete_files.is_empty() || data_files.is_empty() {
+        if !equality_delete_files.is_empty()
+            || position_delete_files.is_empty()
+            || data_files.is_empty()
+        {
             return Ok(OptimizerContext {
                 input_file_scan_tasks: InputFileScanTasks {
                     data_files,
@@ -107,7 +112,7 @@ impl Rule for BigSizeDataFileWithoutPosition {
         while let Some(b) = batch.as_mut().next().await {
             let b = b?;
             let b = b
-                .column_by_name(FILE_PATH)
+                .column_by_name(SYS_HIDDEN_FILE_PATH)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
