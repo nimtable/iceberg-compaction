@@ -781,6 +781,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytemuck"
+version = "1.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9134a6ef01ce4b366b50689c94f82c14bc72bc5d0386829828a2e2752ef7958c"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2085,6 +2091,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hermit-abi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,7 +2372,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e7744e5ac03ffaee2465b532e6c5787df9cb4a9d#e7744e5ac03ffaee2465b532e6c5787df9cb4a9d"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2393,6 +2405,7 @@ dependencies = [
  "paste",
  "rand 0.8.5",
  "reqwest",
+ "roaring",
  "rust_decimal",
  "serde",
  "serde_bytes",
@@ -2400,6 +2413,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with",
+ "thrift",
  "tokio",
  "typed-builder 0.20.1",
  "url",
@@ -2410,7 +2424,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e7744e5ac03ffaee2465b532e6c5787df9cb4a9d#e7744e5ac03ffaee2465b532e6c5787df9cb4a9d"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -2423,10 +2437,9 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e7744e5ac03ffaee2465b532e6c5787df9cb4a9d#e7744e5ac03ffaee2465b532e6c5787df9cb4a9d"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "datafusion",
  "futures",
@@ -3085,6 +3098,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4161fcb6d602d4d2081af7c3a45852d875a03dd337a6bfdd6e06407b61342a43"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
@@ -4019,6 +4042,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 
 [[package]]
+name = "roaring"
+version = "0.10.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19e8d2cfa184d94d0726d650a9f4a1be7f9b76ac9fdb954219878dc00c1c1e7b"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4917,6 +4950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadpool"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
+dependencies = [
+ "num_cpus",
+]
+
+[[package]]
 name = "thrift"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4924,7 +4966,9 @@ checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
 dependencies = [
  "byteorder",
  "integer-encoding",
+ "log",
  "ordered-float 2.10.1",
+ "threadpool",
 ]
 
 [[package]]
