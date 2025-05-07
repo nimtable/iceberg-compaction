@@ -15,7 +15,7 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4
     "storage-s3",
     "storage-gcs",
 ] }
-parquet = { version = "54.3.0", features = ["async"] }
+parquet = { version = "54", features = ["async"] }
 
 # gRPC and Protocol Buffers
 prost = "0.12"
