@@ -568,21 +568,10 @@ impl EqualityDeleteMetadata {
 
 #[cfg(test)]
 mod tests {
-    use futures_async_stream::for_await;
-    use iceberg::Catalog;
-    use iceberg::scan::FileScanTask;
     use iceberg::spec::{NestedField, PrimitiveType, Schema};
-    use iceberg::table::Table;
-    use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-    use iceberg::{TableIdent, io::FileIOBuilder, transaction::Transaction};
-    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::CompactionError;
     use crate::executor::datafusion::{DataFusionTaskContextBuilder, EqualityDeleteMetadata};
-    use crate::executor::{InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse};
-    use crate::{CompactionConfig, CompactionExecutor, executor::DataFusionExecutor};
 
     #[test]
     fn test_build_equality_delete_schema() {
@@ -623,7 +612,7 @@ mod tests {
         assert_eq!(equality_delete_schema.as_struct().fields()[1].name, "name");
         assert_eq!(
             equality_delete_schema.as_struct().fields()[2].name,
-            "seq_num"
+            "sys_hidden_seq_num"
         );
         assert_eq!(highest_field_id, 3);
     }

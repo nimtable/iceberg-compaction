@@ -195,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact() {
-        let catalog: Box<dyn Catalog> = Box::new(build_catalog().await);
+        let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
         let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
         let compaction_config = Arc::new(CompactionConfig {
             batch_parallelism: Some(4),
