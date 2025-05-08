@@ -21,11 +21,11 @@ pub enum CompactionType {
 pub struct Compaction {
     pub config: Arc<CompactionConfig>,
     pub executor: Box<dyn CompactionExecutor>,
-    pub catalog: Box<dyn Catalog>,
+    pub catalog: Arc<dyn Catalog>,
 }
 
 impl Compaction {
-    pub fn new(config: Arc<CompactionConfig>, catalog: Box<dyn Catalog>) -> Self {
+    pub fn new(config: Arc<CompactionConfig>, catalog: Arc<dyn Catalog>) -> Self {
         let executor: Box<dyn CompactionExecutor> = Box::new(DataFusionExecutor::default());
         Self {
             config,
