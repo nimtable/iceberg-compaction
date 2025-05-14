@@ -33,7 +33,8 @@ impl CompactorService for CompactorServiceImpl {
         request: tonic::Request<PbRewriteFilesRequest>,
     ) -> std::result::Result<tonic::Response<PbRewriteFilesResponse>, tonic::Status> {
         let request = request.into_inner();
-        let response = DataFusionExecutor::rewrite_file_proto(request)
+        let response = DataFusionExecutor::default()
+            .rewrite_file_proto(request)
             .await
             .map_err(|e| {
                 tracing::error!("Error processing request: {:?}", e);
