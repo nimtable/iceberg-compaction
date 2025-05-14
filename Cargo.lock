@@ -2279,7 +2279,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=fd79d47#fd79d4784cba62fcc2442f47e0afd401ed9aa559"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2331,7 +2331,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=fd79d47#fd79d4784cba62fcc2442f47e0afd401ed9aa559"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -2344,7 +2344,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=46b61bf#46b61bf120c873c645482b39b2003daabfa7e6e1"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=fd79d47#fd79d4784cba62fcc2442f47e0afd401ed9aa559"
 dependencies = [
  "anyhow",
  "async-trait",
