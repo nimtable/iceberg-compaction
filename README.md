@@ -1,5 +1,6 @@
 # BergLoom  
-**High-performance Iceberg Compaction Runtime in Rust**
+
+BergLoom is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. The project name, which means "iceberg weaver," symbolizes its core function of weaving scattered Iceberg data files into an efficient and orderly data structure.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
