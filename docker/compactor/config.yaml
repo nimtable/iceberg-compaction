@@ -7,5 +7,5 @@ server:
 
 # Logging configuration
 logging:
-  level: "debug"
+  level: "info"
   format: "text"

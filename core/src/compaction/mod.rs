@@ -1,4 +1,4 @@
-use ic_codegen::compactor::RewriteFilesStat;
+use bergloom_codegen::compactor::RewriteFilesStat;
 use iceberg::spec::DataFile;
 use iceberg::{Catalog, TableIdent};
 
@@ -40,8 +40,8 @@ impl Compaction {
         }
     }
 
-    pub async fn full_compact(&self, table_id: TableIdent) -> Result<RewriteFilesStat> {
-        let table = self.catalog.load_table(&table_id).await?;
+    async fn full_compact(&self, table_ident: TableIdent) -> Result<RewriteFilesStat> {
+        let table = self.catalog.load_table(&table_ident).await?;
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
         let input_file_scan_tasks = get_tasks_from_table(table.clone()).await?;
 
@@ -68,14 +68,22 @@ impl Compaction {
         rewrite_action.add_data_files(output_data_files.clone())?;
         rewrite_action.delete_files(data_files)?;
         rewrite_action.delete_files(delete_files)?;
-        let tx = rewrite_action.apply().await?;
-        tx.commit(self.catalog.as_ref()).await?;
+        let txn = rewrite_action.apply().await?;
+        txn.commit(self.catalog.as_ref()).await?;
         Ok(RewriteFilesStat {
             rewritten_files_count: stat.rewritten_files_count,
             added_files_count: stat.added_files_count,
             rewritten_bytes: stat.rewritten_bytes,
             failed_data_files_count: stat.failed_data_files_count,
         })
+    }
+
+    pub async fn expire_snapshot(&self, table_ident: TableIdent) -> Result<()> {
+        let table = self.catalog.load_table(&table_ident).await?;
+        let txn = Transaction::new(&table);
+        let txn = txn.expire_snapshot().apply().await?;
+        txn.commit(self.catalog.as_ref()).await?;
+        Ok(())
     }
 }
 
