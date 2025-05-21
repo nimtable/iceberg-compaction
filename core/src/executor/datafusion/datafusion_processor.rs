@@ -17,7 +17,13 @@
 use std::sync::Arc;
 
 use crate::error::{CompactionError, Result};
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::{
+    execution::SendableRecordBatchStream,
+    physical_plan::{
+        ExecutionPlan, Partitioning, execute_stream_partitioned, repartition::RepartitionExec,
+    },
+    prelude::SessionContext,
+};
 use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
@@ -40,6 +46,7 @@ pub struct DatafusionProcessor {
     datafusion_task_ctx: DataFusionTaskContext,
     table_register: DatafusionTableRegister,
     batch_parallelism: usize,
+    target_partitions: usize,
     ctx: Arc<SessionContext>,
 }
 
@@ -48,6 +55,7 @@ impl DatafusionProcessor {
         ctx: Arc<SessionContext>,
         datafusion_task_ctx: DataFusionTaskContext,
         batch_parallelism: usize,
+        target_partitions: usize,
         file_io: FileIO,
     ) -> Self {
         let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
@@ -55,6 +63,7 @@ impl DatafusionProcessor {
             datafusion_task_ctx,
             table_register,
             batch_parallelism,
+            target_partitions,
             ctx,
         }
     }
@@ -104,10 +113,28 @@ impl DatafusionProcessor {
         Ok(())
     }
 
-    pub async fn execute(&mut self) -> Result<(DataFrame, Schema)> {
+    pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
         let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
-        Ok((df, self.datafusion_task_ctx.input_schema.take().unwrap()))
+        let batchs = if self.datafusion_task_ctx.need_file_path_and_pos()
+            || self.datafusion_task_ctx.need_seq_num()
+        {
+            // Hash repartition
+            df.execute_stream_partitioned().await?
+        } else {
+            // Round robin repartition(batch)
+            let physical_plan = df.create_physical_plan().await?;
+            let physical_plan: Arc<dyn ExecutionPlan + 'static> =
+                Arc::new(RepartitionExec::try_new(
+                    physical_plan,
+                    Partitioning::RoundRobinBatch(self.target_partitions),
+                )?);
+            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+        };
+        Ok((
+            batchs,
+            self.datafusion_task_ctx.input_schema.take().unwrap(),
+        ))
     }
 }
 
