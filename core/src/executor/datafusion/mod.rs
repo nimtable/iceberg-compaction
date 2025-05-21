@@ -88,12 +88,16 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_position_delete_files(position_delete_files)
             .with_equality_delete_files(equality_delete_files)
             .build_merge_on_read()?;
-        let (df, input_schema) =
-            DatafusionProcessor::new(ctx, datafusion_task_ctx, batch_parallelism, file_io.clone())
-                .execute()
-                .await?;
+        let (batchs, input_schema) = DatafusionProcessor::new(
+            ctx,
+            datafusion_task_ctx,
+            batch_parallelism,
+            target_partitions,
+            file_io.clone(),
+        )
+        .execute()
+        .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let batchs = df.execute_stream_partitioned().await?;
         let mut futures = Vec::with_capacity(batch_parallelism);
         // build iceberg writer for each partition
         for mut batch in batchs {
