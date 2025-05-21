@@ -20,7 +20,8 @@ use crate::error::{CompactionError, Result};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, Partitioning, execute_stream_partitioned, repartition::RepartitionExec,
+        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
+        repartition::RepartitionExec,
     },
     prelude::SessionContext,
 };
@@ -116,21 +117,18 @@ impl DatafusionProcessor {
     pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
         let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
-        let batchs = if self.datafusion_task_ctx.need_file_path_and_pos()
-            || self.datafusion_task_ctx.need_seq_num()
-        {
-            // Hash repartition
-            df.execute_stream_partitioned().await?
-        } else {
-            // Round robin repartition(batch)
-            let physical_plan = df.create_physical_plan().await?;
-            let physical_plan: Arc<dyn ExecutionPlan + 'static> =
-                Arc::new(RepartitionExec::try_new(
-                    physical_plan,
-                    Partitioning::RoundRobinBatch(self.target_partitions),
-                )?);
-            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-        };
+        let physical_plan = df.create_physical_plan().await?;
+        let batchs =
+            if physical_plan.output_partitioning().partition_count() != self.target_partitions {
+                let physical_plan: Arc<dyn ExecutionPlan + 'static> =
+                    Arc::new(RepartitionExec::try_new(
+                        physical_plan,
+                        Partitioning::RoundRobinBatch(self.target_partitions),
+                    )?);
+                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+            } else {
+                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+            };
         Ok((
             batchs,
             self.datafusion_task_ctx.input_schema.take().unwrap(),
