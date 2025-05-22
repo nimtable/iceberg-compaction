@@ -11,7 +11,7 @@ futures-async-stream = "0.2.9"
 tokio = { version = "1", default-features = false}
 
 # Data processing and storage
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "fd79d47", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e026f860432bbdacfa282b9d72b501230ce5ea22", features = [
     "storage-s3",
     "storage-gcs",
 ] }

@@ -11,8 +11,8 @@ datafusion = "45.0.0"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
-iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "fd79d47" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "fd79d47" }
+iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e026f860432bbdacfa282b9d72b501230ce5ea22" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e026f860432bbdacfa282b9d72b501230ce5ea22" }
 parquet = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
