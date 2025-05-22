@@ -119,6 +119,7 @@ impl DatafusionProcessor {
 
     pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
+        let schema = self.datafusion_task_ctx.input_schema.take().unwrap();
         let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
         let mut physical_plan = df.create_physical_plan().await?;
         if self.partition_spec.is_unpartitioned()
@@ -133,7 +134,12 @@ impl DatafusionProcessor {
                     .iter()
                     .map(|f| {
                         Ok(Arc::new(Column::new_with_schema(
-                            &f.name,
+                            &schema
+                                .field_by_id(f.source_id)
+                                .ok_or_else(|| {
+                                    CompactionError::Config("cannot find field".to_owned())
+                                })?
+                                .name,
                             physical_plan.schema().as_ref(),
                         )?) as Arc<dyn PhysicalExpr>)
                     })
@@ -143,10 +149,7 @@ impl DatafusionProcessor {
             physical_plan = Arc::new(RepartitionExec::try_new(physical_plan, partitioning)?);
         }
         let batchs = execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?;
-        Ok((
-            batchs,
-            self.datafusion_task_ctx.input_schema.take().unwrap(),
-        ))
+        Ok((batchs, schema))
     }
 }
 
