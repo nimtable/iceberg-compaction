@@ -18,8 +18,8 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e
 parquet = { version = "54", features = ["async"] }
 
 # gRPC and Protocol Buffers
-prost = "0.12"
-tonic = "0.11.0"
+prost = "0.13"
+tonic = "0.12.3"
 
 # Serialization
 serde = { version = "1", features = ["rc"] }
