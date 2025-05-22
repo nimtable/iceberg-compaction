@@ -20,8 +20,7 @@ use crate::error::{CompactionError, Result};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan, ExecutionPlanProperties, Partitioning
     },
     prelude::SessionContext,
 };
@@ -32,7 +31,7 @@ use iceberg::{
     spec::{NestedField, PrimitiveType, Schema, Type},
 };
 
-use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
+use super::datafusion_impl::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 
 pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
 pub const SYS_HIDDEN_FILE_PATH: &str = "sys_hidden_file_path";
