@@ -90,13 +90,6 @@ impl Compaction {
         } = DataFusionExecutor::default()
             .rewrite_files(rewrite_files_request)
             .await?;
-        // let txn = Transaction::new(&table);
-        // let mut rewrite_action = txn.rewrite_files(None, vec![])?;
-        // rewrite_action.add_data_files(output_data_files.clone())?;
-        // rewrite_action.delete_files(data_files)?;
-        // rewrite_action.delete_files(delete_files)?;
-        // let txn = rewrite_action.apply().await?;
-        // txn.commit(self.catalog.as_ref()).await?;
 
         let commit_manager = CommitManager::new(
             CommitManagerConfig::default(),
