@@ -20,7 +20,8 @@ use crate::error::{CompactionError, Result};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan, ExecutionPlanProperties, Partitioning
+        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
+        repartition::RepartitionExec,
     },
     prelude::SessionContext,
 };
