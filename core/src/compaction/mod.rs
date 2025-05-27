@@ -274,7 +274,7 @@ impl CommitManager {
             .with_max_times(self.config.max_retries as usize);
 
         operation
-            .retry(&retry_strategy)
+            .retry(retry_strategy)
             .when(|e: &iceberg::Error| matches!(e.kind(), iceberg::ErrorKind::DataInvalid))
             .await
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
