@@ -19,7 +19,6 @@ use async_trait::async_trait;
 use super::{CompactionExecutor, RewriteFilesRequest, RewriteFilesResponse};
 use crate::error::Result;
 
-#[derive(Default)]
 pub struct MockExecutor;
 
 #[async_trait]

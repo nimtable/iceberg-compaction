@@ -240,9 +240,7 @@ impl CommitManager {
             table_ident,
         }
     }
-}
 
-impl CommitManager {
     pub async fn rewrite_files(
         &self,
         data_files: impl IntoIterator<Item = DataFile>,
