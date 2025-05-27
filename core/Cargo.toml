@@ -21,5 +21,6 @@ serde_with = { workspace = true }
 sqlx = { version = "0.8.2",default-features = false, features = ["bigdecimal","chrono","json","mysql","postgres","runtime-tokio-native-tls","rust_decimal","sqlite","time","uuid",] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = "0.1"
 url = { workspace = true }
 serde_json = { workspace = true }

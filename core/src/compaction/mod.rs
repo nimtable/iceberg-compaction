@@ -41,6 +41,8 @@ use crate::executor::DataFusionExecutor;
 pub enum CompactionType {
     Full(TableIdent),
 }
+
+/// A Proxy for the compaction process, which handles the configuration, executor, and catalog.
 pub struct Compaction {
     pub config: Arc<CompactionConfig>,
     pub executor: Box<dyn CompactionExecutor>,
@@ -204,6 +206,7 @@ async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
     })
 }
 
+/// Configuration for the commit manager, including retry strategies.
 #[derive(Debug, Clone)]
 pub struct CommitManagerConfig {
     pub max_retries: u32, // This can be used to configure the backon strategy
@@ -228,6 +231,7 @@ pub struct CommitManager {
     table_ident: TableIdent,
 }
 
+/// Manages the commit process with retries
 impl CommitManager {
     pub fn new(
         config: CommitManagerConfig,
@@ -241,6 +245,7 @@ impl CommitManager {
         }
     }
 
+    /// Rewrites files in the table, handling retries and errors.
     pub async fn rewrite_files(
         &self,
         data_files: impl IntoIterator<Item = DataFile>,
@@ -261,8 +266,18 @@ impl CommitManager {
                 rewrite_action.add_data_files(data_files)?;
                 rewrite_action.delete_files(delete_files)?;
                 let txn = rewrite_action.apply().await?;
-                txn.commit(catalog.as_ref()).await?;
-                Ok(())
+                // txn.commit(catalog.as_ref()).await?;
+                match txn.commit(catalog.as_ref()).await {
+                    Ok(_) => Ok(()),
+                    Err(commit_err) => {
+                        tracing::warn!(
+                            "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
+                            table_ident,
+                            commit_err
+                        );
+                        Err(commit_err)
+                    }
+                }
             }
         };
 
@@ -273,7 +288,15 @@ impl CommitManager {
 
         operation
             .retry(retry_strategy)
-            .when(|e: &iceberg::Error| matches!(e.kind(), iceberg::ErrorKind::DataInvalid))
+            .when(|e| {
+                matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
+                    || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+            })
+            .notify(|e, d| {
+                // Notify the user about the error
+                // TODO: add metrics
+                tracing::info!("Retrying Compaction failed {:?} after {:?}", e, d);
+            })
             .await
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
     }
