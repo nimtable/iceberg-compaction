@@ -147,7 +147,7 @@ impl Compaction {
     }
 
     async fn full_compact(&self) -> Result<RewriteFilesStat> {
-        let table_lable: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
+        let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
         let now = std::time::Instant::now();
 
         let table = self.catalog.load_table(&self.table_ident).await?;
@@ -182,37 +182,37 @@ impl Compaction {
         txn.commit(self.catalog.as_ref()).await?;
         self.metrics
             .compaction_commit_counter
-            .counter(&[table_lable.clone()])
+            .counter(&[table_label.clone()])
             .increase(1);
 
         self.metrics
             .compaction_commit_duration
-            .histogram(&[table_lable.clone()])
+            .histogram(&[table_label.clone()])
             .record(commit_now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_duration
-            .histogram(&[table_lable.clone()])
+            .histogram(&[table_label.clone()])
             .record(now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_rewritten_bytes
-            .counter(&[table_lable.clone()])
+            .counter(&[table_label.clone()])
             .increase(stat.rewritten_bytes);
 
         self.metrics
             .compaction_rewritten_files_count
-            .counter(&[table_lable.clone()])
+            .counter(&[table_label.clone()])
             .increase(stat.rewritten_files_count as u64);
 
         self.metrics
             .compaction_added_files_count
-            .counter(&[table_lable.clone()])
+            .counter(&[table_label.clone()])
             .increase(stat.added_files_count as u64);
 
         self.metrics
             .compaction_failed_data_files_count
-            .counter(&[table_lable.clone()])
+            .counter(&[table_label.clone()])
             .increase(stat.failed_data_files_count as u64);
 
         Ok(RewriteFilesStat {
