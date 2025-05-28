@@ -366,9 +366,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Alternative: using the convenient constructor (for backward compatibility)
-        // let compaction = Compaction::new(compaction_config, catalog).unwrap();
-
         compaction.compact().await.unwrap();
     }
 }
