@@ -33,13 +33,13 @@ impl Metrics {
         let compaction_commit_counter = registry.register_counter_vec(
             "compaction_commit_counter".into(),
             "BergLoom compaction total commit counts".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
         );
 
         let compaction_duration = registry.register_histogram_vec_with_buckets(
             "compaction_duration".into(),
             "BergLoom compaction duration in seconds".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
             Buckets::exponential(
                 1.0, 2.0, 20, // Start at 1 second, double each bucket, up to 20 buckets
             ),
@@ -48,31 +48,31 @@ impl Metrics {
         let compaction_rewritten_bytes = registry.register_counter_vec(
             "compaction_rewritten_bytes".into(),
             "BergLoom compaction rewritten bytes".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
         );
 
         let compaction_rewritten_files_count = registry.register_counter_vec(
             "compaction_rewritten_files_count".into(),
             "BergLoom compaction rewritten files count".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
         );
 
         let compaction_added_files_count = registry.register_counter_vec(
             "compaction_added_files_count".into(),
             "BergLoom compaction added files count".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
         );
 
         let compaction_failed_data_files_count = registry.register_counter_vec(
             "compaction_failed_data_files_count".into(),
             "BergLoom compaction failed data files count".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
         );
 
         let compaction_commit_duration = registry.register_histogram_vec_with_buckets(
             "compaction_commit_duration".into(),
             "BergLoom compaction commit duration in milliseconds".into(),
-            &["table_ident"],
+            &["catalog_name", "table_ident"],
             Buckets::exponential(
                 1.0, 2.0, 20, // Start at 1 millisecond, double each bucket, up to 20 buckets
             ),

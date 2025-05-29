@@ -33,6 +33,7 @@ pub struct CompactionBuilder {
     registry: BoxedRegistry,
     table_ident: Option<TableIdent>,
     compaction_type: Option<CompactionType>,
+    catalog_name: Option<String>,
 }
 
 impl CompactionBuilder {
@@ -45,6 +46,7 @@ impl CompactionBuilder {
             registry: Box::new(NoopMetricsRegistry),
             table_ident: None,
             compaction_type: None,
+            catalog_name: None,
         }
     }
 
@@ -82,6 +84,11 @@ impl CompactionBuilder {
         self
     }
 
+    pub fn with_catalog_name(mut self, catalog_name: String) -> Self {
+        self.catalog_name = Some(catalog_name);
+        self
+    }
+
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
         let config = self.config.ok_or_else(|| {
@@ -108,6 +115,8 @@ impl CompactionBuilder {
 
         let metrics = Arc::new(Metrics::new(self.registry));
 
+        let catalog_name = self.catalog_name.unwrap_or_default();
+
         Ok(Compaction {
             config,
             executor,
@@ -115,6 +124,7 @@ impl CompactionBuilder {
             metrics,
             table_ident,
             compaction_type,
+            catalog_name,
         })
     }
 }
@@ -132,6 +142,7 @@ pub struct Compaction {
     pub metrics: Arc<Metrics>,
     pub table_ident: TableIdent,
     pub compaction_type: CompactionType,
+    pub catalog_name: String,
 }
 
 impl Compaction {
@@ -148,6 +159,8 @@ impl Compaction {
 
     async fn full_compact(&self) -> Result<RewriteFilesStat> {
         let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
+        let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
+
         let now = std::time::Instant::now();
 
         let table = self.catalog.load_table(&self.table_ident).await?;
@@ -182,22 +195,22 @@ impl Compaction {
         txn.commit(self.catalog.as_ref()).await?;
         self.metrics
             .compaction_commit_counter
-            .counter(&[table_label.clone()])
+            .counter(&[catalog_name_label.clone(), table_label.clone()])
             .increase(1);
 
         self.metrics
             .compaction_commit_duration
-            .histogram(&[table_label.clone()])
+            .histogram(&[catalog_name_label.clone(), table_label.clone()])
             .record(commit_now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_duration
-            .histogram(&[table_label.clone()])
+            .histogram(&[catalog_name_label.clone(), table_label.clone()])
             .record(now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_rewritten_bytes
-            .counter(&[table_label.clone()])
+            .counter(&[catalog_name_label.clone(), table_label.clone()])
             .increase(stat.rewritten_bytes);
 
         self.metrics
@@ -207,12 +220,12 @@ impl Compaction {
 
         self.metrics
             .compaction_added_files_count
-            .counter(&[table_label.clone()])
+            .counter(&[catalog_name_label.clone(), table_label.clone()])
             .increase(stat.added_files_count as u64);
 
         self.metrics
             .compaction_failed_data_files_count
-            .counter(&[table_label.clone()])
+            .counter(&[catalog_name_label.clone(), table_label.clone()])
             .increase(stat.failed_data_files_count as u64);
 
         Ok(RewriteFilesStat {
