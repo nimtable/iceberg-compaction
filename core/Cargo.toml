@@ -13,6 +13,7 @@ futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "fd79d47" }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "fd79d47" }
+mixtrics = "0.1.0"
 parquet = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }

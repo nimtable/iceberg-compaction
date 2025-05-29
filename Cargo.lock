@@ -551,6 +551,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",
+ "mixtrics",
  "parquet",
  "prost",
  "serde",
@@ -2823,6 +2824,16 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "mixtrics"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "749ed12bab176c8a42c13a679dd2de12876d5ad4abe7525548e31ae001a9ebbf"
+dependencies = [
+ "itertools 0.14.0",
+ "parking_lot",
 ]
 
 [[package]]
