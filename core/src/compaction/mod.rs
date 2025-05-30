@@ -456,6 +456,7 @@ impl RewriteDataFilesCommitManager {
                 let table = catalog.load_table(&table_ident).await?;
                 let txn = Transaction::new(&table);
 
+                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
                 let rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     let sequence_number = table.metadata().snapshot_by_id(starting_snapshot_id);
