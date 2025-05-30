@@ -8,13 +8,15 @@ async-stream = "0.3.5"
 async-trait = "0.1.86"
 futures = "0.3.17"
 futures-async-stream = "0.2.9"
-tokio = { version = "1", default-features = false}
+tokio = { version = "1", default-features = false }
 
 # Data processing and storage
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "e026f860432bbdacfa282b9d72b501230ce5ea22", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7c7c84c651df4763c8601b0c84245a82e29814bb", features = [
     "storage-s3",
     "storage-gcs",
 ] }
+iceberg-catalog-sql = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7c7c84c651df4763c8601b0c84245a82e29814bb" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7c7c84c651df4763c8601b0c84245a82e29814bb" }
 parquet = { version = "54", features = ["async"] }
 
 # gRPC and Protocol Buffers
@@ -24,7 +26,7 @@ tonic = "0.11.0"
 # Serialization
 serde = { version = "1", features = ["rc"] }
 serde_with = { version = "3", features = ["json"] }
-serde_json = { version = "1"}
+serde_json = { version = "1" }
 
 # Error handling
 thiserror = "2.0.11"

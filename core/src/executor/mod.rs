@@ -85,6 +85,7 @@ pub struct RewriteFilesStat {
     pub rewritten_bytes: u64,
     pub failed_data_files_count: u32,
 }
+
 pub enum ExecutorType {
     DataFusion,
     Mock,

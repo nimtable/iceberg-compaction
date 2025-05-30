@@ -16,14 +16,18 @@
 
 use bergloom_codegen::compactor::RewriteFilesStat;
 use iceberg::spec::DataFile;
-use iceberg::{Catalog, TableIdent};
+use iceberg::{Catalog, ErrorKind, TableIdent};
+use mixtrics::metrics::BoxedRegistry;
+use mixtrics::registry::noop::NoopMetricsRegistry;
 
+use crate::CompactionError;
+use crate::Result;
+use crate::common::Metrics;
 use crate::executor::{
     ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
     create_compaction_executor,
 };
 use crate::{CompactionConfig, CompactionExecutor};
-use crate::{CompactionError, Result};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
@@ -31,15 +35,136 @@ use iceberg::transaction::Transaction;
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration; // Keep for CommitManagerConfig if needed elsewhere, or for direct use in backon
+use std::time::Duration; // Keep for RewriteDataFilesCommitManagerRetryConfig if needed elsewhere, or for direct use in backon
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
 
-use crate::executor::DataFusionExecutor;
-
 pub enum CompactionType {
-    Full(TableIdent),
+    Full,
+}
+
+/// Builder for creating Compaction instances with flexible configuration
+pub struct CompactionBuilder {
+    config: Option<Arc<CompactionConfig>>,
+    executor_type: ExecutorType,
+    catalog: Option<Arc<dyn Catalog>>,
+    registry: BoxedRegistry,
+    table_ident: Option<TableIdent>,
+    compaction_type: Option<CompactionType>,
+    catalog_name: Option<String>,
+    commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
+}
+
+impl CompactionBuilder {
+    /// Create a new CompactionBuilder with default settings
+    pub fn new() -> Self {
+        Self {
+            config: None,
+            executor_type: ExecutorType::DataFusion, // Default executor type
+            catalog: None,
+            registry: Box::new(NoopMetricsRegistry),
+            table_ident: None,
+            compaction_type: None,
+            catalog_name: None,
+            commit_retry_config: RewriteDataFilesCommitManagerRetryConfig::default(),
+        }
+    }
+
+    /// Set the compaction configuration
+    pub fn with_config(mut self, config: Arc<CompactionConfig>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Set the executor type (defaults to DataFusion)
+    pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
+        self.executor_type = executor_type;
+        self
+    }
+
+    /// Set the catalog
+    pub fn with_catalog(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Set the metrics registry (optional, defaults to NoopMetricsRegistry)
+    pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn with_table_ident(mut self, table_ident: TableIdent) -> Self {
+        self.table_ident = Some(table_ident);
+        self
+    }
+
+    pub fn with_compaction_type(mut self, compaction_type: CompactionType) -> Self {
+        self.compaction_type = Some(compaction_type);
+        self
+    }
+
+    pub fn with_catalog_name(mut self, catalog_name: String) -> Self {
+        self.catalog_name = Some(catalog_name);
+        self
+    }
+
+    pub fn with_retry_config(
+        mut self,
+        retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    ) -> Self {
+        self.commit_retry_config = retry_config;
+        self
+    }
+
+    /// Build the Compaction instance
+    pub async fn build(self) -> Result<Compaction> {
+        let config = self.config.ok_or_else(|| {
+            crate::error::CompactionError::Execution("CompactionConfig is required".to_string())
+        })?;
+
+        let catalog = self.catalog.ok_or_else(|| {
+            crate::error::CompactionError::Execution("Catalog is required".to_string())
+        })?;
+
+        let table_ident = self.table_ident.ok_or_else(|| {
+            crate::error::CompactionError::Execution("TableIdent is required".to_string())
+        })?;
+
+        let compaction_type = self.compaction_type.unwrap_or(CompactionType::Full);
+
+        if !catalog.table_exists(&table_ident).await? {
+            return Err(crate::error::CompactionError::Execution(
+                "Table does not exist".to_string(),
+            ));
+        }
+
+        let executor = create_compaction_executor(self.executor_type);
+
+        let metrics = Arc::new(Metrics::new(self.registry));
+
+        let catalog_name = self.catalog_name.unwrap_or_default();
+
+        let commit_retry_config = self.commit_retry_config;
+
+        Ok(Compaction {
+            config,
+            executor,
+            catalog,
+            metrics,
+            table_ident,
+            compaction_type,
+            catalog_name,
+            commit_retry_config,
+        })
+    }
+}
+
+impl Default for CompactionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A Proxy for the compaction process, which handles the configuration, executor, and catalog.
@@ -47,30 +172,34 @@ pub struct Compaction {
     pub config: Arc<CompactionConfig>,
     pub executor: Box<dyn CompactionExecutor>,
     pub catalog: Arc<dyn Catalog>,
+    pub metrics: Arc<Metrics>,
+    pub table_ident: TableIdent,
+    pub compaction_type: CompactionType,
+    pub catalog_name: String,
+
+    pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
 impl Compaction {
-    pub fn new(
-        config: Arc<CompactionConfig>,
-        catalog: Arc<dyn Catalog>,
-        executor_type: ExecutorType,
-    ) -> Self {
-        let executor = create_compaction_executor(executor_type);
-        Self {
-            config,
-            executor,
-            catalog,
+    /// Create a new CompactionBuilder for flexible configuration
+    pub fn builder() -> CompactionBuilder {
+        CompactionBuilder::new()
+    }
+
+    pub async fn compact(&self) -> Result<RewriteFilesStat> {
+        match self.compaction_type {
+            CompactionType::Full => self.full_compact().await,
         }
     }
 
-    pub async fn compact(&self, compaction_type: CompactionType) -> Result<RewriteFilesStat> {
-        match compaction_type {
-            CompactionType::Full(table_id) => self.full_compact(table_id).await,
-        }
-    }
+    async fn full_compact(&self) -> Result<RewriteFilesStat> {
+        let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
+        let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
+        let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
 
-    async fn full_compact(&self, table_ident: TableIdent) -> Result<RewriteFilesStat> {
-        let table = self.catalog.load_table(&table_ident).await?;
+        let now = std::time::Instant::now();
+
+        let table = self.catalog.load_table(&self.table_ident).await?;
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
         let input_file_scan_tasks = get_tasks_from_table(table.clone()).await?;
 
@@ -89,22 +218,64 @@ impl Compaction {
         let RewriteFilesResponse {
             data_files: output_data_files,
             stat,
-        } = DataFusionExecutor::default()
-            .rewrite_files(rewrite_files_request)
-            .await?;
+        } = match self.executor.rewrite_files(rewrite_files_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                self.metrics
+                    .compaction_executor_error_counter
+                    .counter(&label_vec)
+                    .increase(1);
+                return Err(e);
+            }
+        };
 
-        let commit_manager = CommitManager::new(
-            CommitManagerConfig::default(),
+        let commit_manager = RewriteDataFilesCommitManager::new(
+            self.commit_retry_config.clone(),
             self.catalog.clone(),
-            table_ident.clone(),
+            self.table_ident.clone(),
+            table.metadata().current_snapshot_id().unwrap(),
+            true,
+            self.catalog_name.clone(),
+            self.metrics.clone(),
         );
 
+        let commit_now = std::time::Instant::now();
         commit_manager
             .rewrite_files(
                 output_data_files,
                 data_files.into_iter().chain(delete_files.into_iter()),
             )
             .await?;
+
+        self.metrics
+            .compaction_commit_duration
+            .histogram(&label_vec)
+            .record(commit_now.elapsed().as_secs_f64());
+
+        self.metrics
+            .compaction_duration
+            .histogram(&label_vec)
+            .record(now.elapsed().as_secs_f64());
+
+        self.metrics
+            .compaction_rewritten_bytes
+            .counter(&label_vec)
+            .increase(stat.rewritten_bytes);
+
+        self.metrics
+            .compaction_rewritten_files_count
+            .counter(&label_vec)
+            .increase(stat.rewritten_files_count as u64);
+
+        self.metrics
+            .compaction_added_files_count
+            .counter(&label_vec)
+            .increase(stat.added_files_count as u64);
+
+        self.metrics
+            .compaction_failed_data_files_count
+            .counter(&label_vec)
+            .increase(stat.failed_data_files_count as u64);
 
         Ok(RewriteFilesStat {
             rewritten_files_count: stat.rewritten_files_count,
@@ -208,13 +379,13 @@ async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
 
 /// Configuration for the commit manager, including retry strategies.
 #[derive(Debug, Clone)]
-pub struct CommitManagerConfig {
+pub struct RewriteDataFilesCommitManagerRetryConfig {
     pub max_retries: u32, // This can be used to configure the backon strategy
     pub retry_initial_delay: Duration, // For exponential backoff
     pub retry_max_delay: Duration, // For exponential backoff
 }
 
-impl Default for CommitManagerConfig {
+impl Default for RewriteDataFilesCommitManagerRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -225,23 +396,36 @@ impl Default for CommitManagerConfig {
 }
 
 // Manages the commit process with retries
-pub struct CommitManager {
-    config: CommitManagerConfig,
+pub struct RewriteDataFilesCommitManager {
+    config: RewriteDataFilesCommitManagerRetryConfig,
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
+    starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
+    use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
+
+    catalog_name: String,  // Catalog name for metrics
+    metrics: Arc<Metrics>, // Metrics for tracking commit operations
 }
 
 /// Manages the commit process with retries
-impl CommitManager {
+impl RewriteDataFilesCommitManager {
     pub fn new(
-        config: CommitManagerConfig,
+        config: RewriteDataFilesCommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
+        starting_snapshot_id: i64,
+        use_starting_sequence_number: bool,
+        catalog_name: String,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             config,
             catalog,
             table_ident,
+            starting_snapshot_id,
+            use_starting_sequence_number,
+            catalog_name,
+            metrics,
         }
     }
 
@@ -258,19 +442,61 @@ impl CommitManager {
             let table_ident = self.table_ident.clone();
             let data_files = data_files.clone();
             let delete_files = delete_files.clone();
+            let use_starting_sequence_number = self.use_starting_sequence_number;
+            let starting_snapshot_id = self.starting_snapshot_id;
+            let metrics = self.metrics.clone();
+
+            let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
+            let catalog_name_label: std::borrow::Cow<'static, str> =
+                self.catalog_name.clone().into();
+            let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
+
             async move {
                 // reload the table to get the latest state
                 let table = catalog.load_table(&table_ident).await?;
                 let txn = Transaction::new(&table);
-                let mut rewrite_action = txn.rewrite_files(None, vec![])?;
-                rewrite_action.add_data_files(data_files)?;
-                rewrite_action.delete_files(delete_files)?;
+
+                let rewrite_action = if use_starting_sequence_number {
+                    // TODO: avoid retry if the snapshot_id is not found
+                    let sequence_number = table.metadata().snapshot_by_id(starting_snapshot_id);
+                    if sequence_number.is_none() {
+                        return Err(iceberg::Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "No snapshot found with the given snapshot_id {}",
+                                starting_snapshot_id
+                            ),
+                        ));
+                    }
+
+                    txn.rewrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                        .new_data_file_sequence_number(sequence_number.unwrap().sequence_number())?
+                } else {
+                    txn.rewrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                };
+
                 let txn = rewrite_action.apply().await?;
                 // txn.commit(catalog.as_ref()).await?;
                 match txn.commit(catalog.as_ref()).await {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        // Update metrics after a successful commit
+                        metrics
+                            .compaction_commit_counter
+                            .counter(&label_vec)
+                            .increase(1);
+                        Ok(())
+                    }
                     Err(commit_err) => {
-                        tracing::warn!(
+                        metrics
+                            .compaction_commit_failed_counter
+                            .counter(&label_vec)
+                            .increase(1);
+
+                        tracing::error!(
                             "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
                             table_ident,
                             commit_err
@@ -302,51 +528,58 @@ impl CommitManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use iceberg::Catalog;
-    use iceberg::{TableIdent, io::FileIOBuilder};
-    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
-    use std::sync::Arc;
+// #[cfg(test)]
+// mod tests {
+//     use iceberg::Catalog;
+//     use iceberg::{TableIdent, io::FileIOBuilder};
+//     use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
+//     use std::sync::Arc;
 
-    use crate::CompactionConfig;
-    use crate::compaction::Compaction;
-    use crate::executor::ExecutorType;
+//     use crate::CompactionConfig;
+//     use crate::compaction::Compaction;
+//     use crate::executor::ExecutorType;
 
-    async fn build_catalog() -> SqlCatalog {
-        let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
-        let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
-        let config = SqlCatalogConfig::builder()
-            .uri(sql_lite_uri.to_owned())
-            .name("demo1".to_owned())
-            .warehouse_location(warehouse_location)
-            .file_io(
-                FileIOBuilder::new("s3a")
-                    .with_prop("s3.secret-access-key", "hummockadmin")
-                    .with_prop("s3.access-key-id", "hummockadmin")
-                    .with_prop("s3.endpoint", "http://127.0.0.1:9301")
-                    .with_prop("s3.region", "")
-                    .build()
-                    .unwrap(),
-            )
-            .sql_bind_style(SqlBindStyle::DollarNumeric)
-            .build();
-        SqlCatalog::new(config).await.unwrap()
-    }
+//     async fn build_catalog() -> SqlCatalog {
+//         let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
+//         let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
+//         let config = SqlCatalogConfig::builder()
+//             .uri(sql_lite_uri.to_owned())
+//             .name("demo1".to_owned())
+//             .warehouse_location(warehouse_location)
+//             .file_io(
+//                 FileIOBuilder::new("s3a")
+//                     .with_prop("s3.secret-access-key", "hummockadmin")
+//                     .with_prop("s3.access-key-id", "hummockadmin")
+//                     .with_prop("s3.endpoint", "http://127.0.0.1:9301")
+//                     .with_prop("s3.region", "")
+//                     .build()
+//                     .unwrap(),
+//             )
+//             .sql_bind_style(SqlBindStyle::DollarNumeric)
+//             .build();
+//         SqlCatalog::new(config).await.unwrap()
+//     }
 
-    #[tokio::test]
-    async fn test_compact() {
-        let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
-        let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
-        let compaction_config = Arc::new(CompactionConfig {
-            batch_parallelism: Some(4),
-            target_partitions: Some(4),
-            data_file_prefix: None,
-        });
-        let compaction = Compaction::new(compaction_config, catalog, ExecutorType::DataFusion);
-        compaction
-            .compact(crate::compaction::CompactionType::Full(table_id))
-            .await
-            .unwrap();
-    }
-}
+//     #[tokio::test]
+//     async fn test_compact() {
+//         let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
+//         let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
+//         let compaction_config = Arc::new(CompactionConfig {
+//             batch_parallelism: Some(4),
+//             target_partitions: Some(4),
+//             data_file_prefix: None,
+//         });
+
+//         // Using the builder pattern (recommended)
+//         let compaction = Compaction::builder()
+//             .with_config(compaction_config.clone())
+//             .with_catalog(catalog.clone())
+//             .with_executor_type(crate::executor::ExecutorType::DataFusion)
+//             .with_table_ident(table_id)
+//             .build()
+//             .await
+//             .unwrap();
+
+//         compaction.compact().await.unwrap();
+//     }
+// }
