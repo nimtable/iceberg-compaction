@@ -550,7 +550,6 @@ dependencies = [
  "futures",
  "futures-async-stream",
  "iceberg",
- "iceberg-catalog-sql",
  "iceberg-datafusion",
  "mixtrics",
  "parquet",
@@ -2284,7 +2283,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c7c84c651df4763c8601b0c84245a82e29814bb#7c7c84c651df4763c8601b0c84245a82e29814bb"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b1619c554c2922ddad00cc0564fa79eaec62af5b#b1619c554c2922ddad00cc0564fa79eaec62af5b"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2334,22 +2333,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-catalog-sql"
-version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c7c84c651df4763c8601b0c84245a82e29814bb#7c7c84c651df4763c8601b0c84245a82e29814bb"
-dependencies = [
- "async-trait",
- "iceberg",
- "serde_json",
- "sqlx",
- "typed-builder 0.20.1",
- "uuid",
-]
-
-[[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c7c84c651df4763c8601b0c84245a82e29814bb#7c7c84c651df4763c8601b0c84245a82e29814bb"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b1619c554c2922ddad00cc0564fa79eaec62af5b#b1619c554c2922ddad00cc0564fa79eaec62af5b"
 dependencies = [
  "anyhow",
  "async-trait",

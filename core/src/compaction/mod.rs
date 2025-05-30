@@ -459,8 +459,12 @@ impl RewriteDataFilesCommitManager {
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
                 let rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
-                    let sequence_number = table.metadata().snapshot_by_id(starting_snapshot_id);
-                    if sequence_number.is_none() {
+                    if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
+                        txn.rewrite_files(None, vec![])?
+                            .add_data_files(data_files)?
+                            .delete_files(delete_files)?
+                            .new_data_file_sequence_number(snapshot.sequence_number())?
+                    } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
                             format!(
@@ -469,11 +473,6 @@ impl RewriteDataFilesCommitManager {
                             ),
                         ));
                     }
-
-                    txn.rewrite_files(None, vec![])?
-                        .add_data_files(data_files)?
-                        .delete_files(delete_files)?
-                        .new_data_file_sequence_number(sequence_number.unwrap().sequence_number())?
                 } else {
                     txn.rewrite_files(None, vec![])?
                         .add_data_files(data_files)?
@@ -527,59 +526,3 @@ impl RewriteDataFilesCommitManager {
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use iceberg::Catalog;
-//     use iceberg::{TableIdent, io::FileIOBuilder};
-//     use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
-//     use std::sync::Arc;
-
-//     use crate::CompactionConfig;
-//     use crate::compaction::Compaction;
-//     use crate::executor::ExecutorType;
-
-//     async fn build_catalog() -> SqlCatalog {
-//         let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
-//         let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
-//         let config = SqlCatalogConfig::builder()
-//             .uri(sql_lite_uri.to_owned())
-//             .name("demo1".to_owned())
-//             .warehouse_location(warehouse_location)
-//             .file_io(
-//                 FileIOBuilder::new("s3a")
-//                     .with_prop("s3.secret-access-key", "hummockadmin")
-//                     .with_prop("s3.access-key-id", "hummockadmin")
-//                     .with_prop("s3.endpoint", "http://127.0.0.1:9301")
-//                     .with_prop("s3.region", "")
-//                     .build()
-//                     .unwrap(),
-//             )
-//             .sql_bind_style(SqlBindStyle::DollarNumeric)
-//             .build();
-//         SqlCatalog::new(config).await.unwrap()
-//     }
-
-//     #[tokio::test]
-//     async fn test_compact() {
-//         let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
-//         let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
-//         let compaction_config = Arc::new(CompactionConfig {
-//             batch_parallelism: Some(4),
-//             target_partitions: Some(4),
-//             data_file_prefix: None,
-//         });
-
-//         // Using the builder pattern (recommended)
-//         let compaction = Compaction::builder()
-//             .with_config(compaction_config.clone())
-//             .with_catalog(catalog.clone())
-//             .with_executor_type(crate::executor::ExecutorType::DataFusion)
-//             .with_table_ident(table_id)
-//             .build()
-//             .await
-//             .unwrap();
-
-//         compaction.compact().await.unwrap();
-//     }
-// }

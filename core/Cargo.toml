@@ -12,7 +12,6 @@ datafusion = "45.0.0"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
 iceberg-datafusion = { workspace = true }
 mixtrics = "0.1.0"
 parquet = { workspace = true }
