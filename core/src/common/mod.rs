@@ -26,6 +26,9 @@ pub struct Metrics {
     pub compaction_failed_data_files_count: BoxedCounterVec,
 
     pub compaction_commit_duration: BoxedHistogramVec,
+
+    pub compaction_commit_failed_counter: BoxedCounterVec,
+    pub compaction_executor_error_counter: BoxedCounterVec,
 }
 
 impl Metrics {
@@ -78,6 +81,18 @@ impl Metrics {
             ),
         );
 
+        let compaction_commit_failed_counter = registry.register_counter_vec(
+            "compaction_commit_failed_counter".into(),
+            "BergLoom compaction commit failed counts".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_executor_error_counter = registry.register_counter_vec(
+            "compaction_executor_error_counter".into(),
+            "BergLoom compaction executor error counts".into(),
+            &["catalog_name", "table_ident"],
+        );
+
         Self {
             compaction_commit_counter,
             compaction_duration,
@@ -86,6 +101,8 @@ impl Metrics {
             compaction_added_files_count,
             compaction_failed_data_files_count,
             compaction_commit_duration,
+            compaction_commit_failed_counter,
+            compaction_executor_error_counter,
         }
     }
 }

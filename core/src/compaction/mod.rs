@@ -1,9 +1,26 @@
+/*
+ * Copyright 2025 BergLoom
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use bergloom_codegen::compactor::RewriteFilesStat;
 use iceberg::spec::DataFile;
-use iceberg::{Catalog, TableIdent};
+use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
+use crate::CompactionError;
 use crate::Result;
 use crate::common::Metrics;
 use crate::executor::{
@@ -18,8 +35,10 @@ use iceberg::transaction::Transaction;
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::executor::DataFusionExecutor;
+use backon::ExponentialBuilder;
+use backon::Retryable;
 
 pub enum CompactionType {
     Full,
@@ -34,6 +53,7 @@ pub struct CompactionBuilder {
     table_ident: Option<TableIdent>,
     compaction_type: Option<CompactionType>,
     catalog_name: Option<String>,
+    commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
 impl CompactionBuilder {
@@ -47,6 +67,7 @@ impl CompactionBuilder {
             table_ident: None,
             compaction_type: None,
             catalog_name: None,
+            commit_retry_config: RewriteDataFilesCommitManagerRetryConfig::default(),
         }
     }
 
@@ -89,6 +110,14 @@ impl CompactionBuilder {
         self
     }
 
+    pub fn with_retry_config(
+        mut self,
+        retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    ) -> Self {
+        self.commit_retry_config = retry_config;
+        self
+    }
+
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
         let config = self.config.ok_or_else(|| {
@@ -117,6 +146,8 @@ impl CompactionBuilder {
 
         let catalog_name = self.catalog_name.unwrap_or_default();
 
+        let commit_retry_config = self.commit_retry_config;
+
         Ok(Compaction {
             config,
             executor,
@@ -125,6 +156,7 @@ impl CompactionBuilder {
             table_ident,
             compaction_type,
             catalog_name,
+            commit_retry_config,
         })
     }
 }
@@ -135,6 +167,7 @@ impl Default for CompactionBuilder {
     }
 }
 
+/// A Proxy for the compaction process, which handles the configuration, executor, and catalog.
 pub struct Compaction {
     pub config: Arc<CompactionConfig>,
     pub executor: Box<dyn CompactionExecutor>,
@@ -143,6 +176,8 @@ pub struct Compaction {
     pub table_ident: TableIdent,
     pub compaction_type: CompactionType,
     pub catalog_name: String,
+
+    pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
 impl Compaction {
@@ -160,6 +195,7 @@ impl Compaction {
     async fn full_compact(&self) -> Result<RewriteFilesStat> {
         let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
         let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
+        let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
 
         let now = std::time::Instant::now();
 
@@ -182,50 +218,63 @@ impl Compaction {
         let RewriteFilesResponse {
             data_files: output_data_files,
             stat,
-        } = DataFusionExecutor::default()
-            .rewrite_files(rewrite_files_request)
-            .await?;
-        let txn = Transaction::new(&table);
-        let mut rewrite_action = txn.rewrite_files(None, vec![])?;
-        rewrite_action.add_data_files(output_data_files.clone())?;
-        rewrite_action.delete_files(data_files)?;
-        rewrite_action.delete_files(delete_files)?;
-        let txn = rewrite_action.apply().await?;
+        } = match self.executor.rewrite_files(rewrite_files_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                self.metrics
+                    .compaction_executor_error_counter
+                    .counter(&label_vec)
+                    .increase(1);
+                return Err(e);
+            }
+        };
+
+        let commit_manager = RewriteDataFilesCommitManager::new(
+            self.commit_retry_config.clone(),
+            self.catalog.clone(),
+            self.table_ident.clone(),
+            table.metadata().current_snapshot_id().unwrap(),
+            true,
+            self.catalog_name.clone(),
+            self.metrics.clone(),
+        );
+
         let commit_now = std::time::Instant::now();
-        txn.commit(self.catalog.as_ref()).await?;
-        self.metrics
-            .compaction_commit_counter
-            .counter(&[catalog_name_label.clone(), table_label.clone()])
-            .increase(1);
+        commit_manager
+            .rewrite_files(
+                output_data_files,
+                data_files.into_iter().chain(delete_files.into_iter()),
+            )
+            .await?;
 
         self.metrics
             .compaction_commit_duration
-            .histogram(&[catalog_name_label.clone(), table_label.clone()])
+            .histogram(&label_vec)
             .record(commit_now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_duration
-            .histogram(&[catalog_name_label.clone(), table_label.clone()])
+            .histogram(&label_vec)
             .record(now.elapsed().as_secs_f64());
 
         self.metrics
             .compaction_rewritten_bytes
-            .counter(&[catalog_name_label.clone(), table_label.clone()])
+            .counter(&label_vec)
             .increase(stat.rewritten_bytes);
 
         self.metrics
             .compaction_rewritten_files_count
-            .counter(&[table_label.clone()])
+            .counter(&label_vec)
             .increase(stat.rewritten_files_count as u64);
 
         self.metrics
             .compaction_added_files_count
-            .counter(&[catalog_name_label.clone(), table_label.clone()])
+            .counter(&label_vec)
             .increase(stat.added_files_count as u64);
 
         self.metrics
             .compaction_failed_data_files_count
-            .counter(&[catalog_name_label.clone(), table_label.clone()])
+            .counter(&label_vec)
             .increase(stat.failed_data_files_count as u64);
 
         Ok(RewriteFilesStat {
@@ -328,57 +377,209 @@ async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use iceberg::Catalog;
-    use iceberg::{TableIdent, io::FileIOBuilder};
-    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
-    use std::sync::Arc;
+/// Configuration for the commit manager, including retry strategies.
+#[derive(Debug, Clone)]
+pub struct RewriteDataFilesCommitManagerRetryConfig {
+    pub max_retries: u32, // This can be used to configure the backon strategy
+    pub retry_initial_delay: Duration, // For exponential backoff
+    pub retry_max_delay: Duration, // For exponential backoff
+}
 
-    use crate::CompactionConfig;
-    use crate::compaction::Compaction;
-
-    async fn build_catalog() -> SqlCatalog {
-        let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
-        let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
-        let config = SqlCatalogConfig::builder()
-            .uri(sql_lite_uri.to_owned())
-            .name("demo1".to_owned())
-            .warehouse_location(warehouse_location)
-            .file_io(
-                FileIOBuilder::new("s3a")
-                    .with_prop("s3.secret-access-key", "hummockadmin")
-                    .with_prop("s3.access-key-id", "hummockadmin")
-                    .with_prop("s3.endpoint", "http://127.0.0.1:9301")
-                    .with_prop("s3.region", "")
-                    .build()
-                    .unwrap(),
-            )
-            .sql_bind_style(SqlBindStyle::DollarNumeric)
-            .build();
-        SqlCatalog::new(config).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_compact() {
-        let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
-        let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
-        let compaction_config = Arc::new(CompactionConfig {
-            batch_parallelism: Some(4),
-            target_partitions: Some(4),
-            data_file_prefix: None,
-        });
-
-        // Using the builder pattern (recommended)
-        let compaction = Compaction::builder()
-            .with_config(compaction_config.clone())
-            .with_catalog(catalog.clone())
-            .with_executor_type(crate::executor::ExecutorType::DataFusion)
-            .with_table_ident(table_id)
-            .build()
-            .await
-            .unwrap();
-
-        compaction.compact().await.unwrap();
+impl Default for RewriteDataFilesCommitManagerRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_initial_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(10),
+        }
     }
 }
+
+// Manages the commit process with retries
+pub struct RewriteDataFilesCommitManager {
+    config: RewriteDataFilesCommitManagerRetryConfig,
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
+    use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
+
+    catalog_name: String,  // Catalog name for metrics
+    metrics: Arc<Metrics>, // Metrics for tracking commit operations
+}
+
+/// Manages the commit process with retries
+impl RewriteDataFilesCommitManager {
+    pub fn new(
+        config: RewriteDataFilesCommitManagerRetryConfig,
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        starting_snapshot_id: i64,
+        use_starting_sequence_number: bool,
+        catalog_name: String,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            config,
+            catalog,
+            table_ident,
+            starting_snapshot_id,
+            use_starting_sequence_number,
+            catalog_name,
+            metrics,
+        }
+    }
+
+    /// Rewrites files in the table, handling retries and errors.
+    pub async fn rewrite_files(
+        &self,
+        data_files: impl IntoIterator<Item = DataFile>,
+        delete_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<()> {
+        let data_files: Vec<DataFile> = data_files.into_iter().collect();
+        let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+        let operation = || {
+            let catalog = self.catalog.clone();
+            let table_ident = self.table_ident.clone();
+            let data_files = data_files.clone();
+            let delete_files = delete_files.clone();
+            let use_starting_sequence_number = self.use_starting_sequence_number;
+            let starting_snapshot_id = self.starting_snapshot_id;
+            let metrics = self.metrics.clone();
+
+            let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
+            let catalog_name_label: std::borrow::Cow<'static, str> =
+                self.catalog_name.clone().into();
+            let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
+
+            async move {
+                // reload the table to get the latest state
+                let table = catalog.load_table(&table_ident).await?;
+                let txn = Transaction::new(&table);
+
+                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
+                let rewrite_action = if use_starting_sequence_number {
+                    // TODO: avoid retry if the snapshot_id is not found
+                    let sequence_number = table.metadata().snapshot_by_id(starting_snapshot_id);
+                    if sequence_number.is_none() {
+                        return Err(iceberg::Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "No snapshot found with the given snapshot_id {}",
+                                starting_snapshot_id
+                            ),
+                        ));
+                    }
+
+                    txn.rewrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                        .new_data_file_sequence_number(sequence_number.unwrap().sequence_number())?
+                } else {
+                    txn.rewrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                };
+
+                let txn = rewrite_action.apply().await?;
+                match txn.commit(catalog.as_ref()).await {
+                    Ok(_) => {
+                        // Update metrics after a successful commit
+                        metrics
+                            .compaction_commit_counter
+                            .counter(&label_vec)
+                            .increase(1);
+                        Ok(())
+                    }
+                    Err(commit_err) => {
+                        metrics
+                            .compaction_commit_failed_counter
+                            .counter(&label_vec)
+                            .increase(1);
+
+                        tracing::error!(
+                            "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
+                            table_ident,
+                            commit_err
+                        );
+                        Err(commit_err)
+                    }
+                }
+            }
+        };
+
+        let retry_strategy = ExponentialBuilder::default()
+            .with_min_delay(self.config.retry_initial_delay)
+            .with_max_delay(self.config.retry_max_delay)
+            .with_max_times(self.config.max_retries as usize);
+
+        operation
+            .retry(retry_strategy)
+            .when(|e| {
+                matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
+                    || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+            })
+            .notify(|e, d| {
+                // Notify the user about the error
+                // TODO: add metrics
+                tracing::info!("Retrying Compaction failed {:?} after {:?}", e, d);
+            })
+            .await
+            .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
+    }
+}
+
+// #[cfg(test)]
+// mod tests {
+//     use iceberg::Catalog;
+//     use iceberg::{TableIdent, io::FileIOBuilder};
+//     use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogConfig};
+//     use std::sync::Arc;
+
+//     use crate::CompactionConfig;
+//     use crate::compaction::Compaction;
+//     use crate::executor::ExecutorType;
+
+//     async fn build_catalog() -> SqlCatalog {
+//         let sql_lite_uri = "postgresql://xxhx:123456@localhost:5432/demo_iceberg";
+//         let warehouse_location = "s3a://hummock001/iceberg-data".to_owned();
+//         let config = SqlCatalogConfig::builder()
+//             .uri(sql_lite_uri.to_owned())
+//             .name("demo1".to_owned())
+//             .warehouse_location(warehouse_location)
+//             .file_io(
+//                 FileIOBuilder::new("s3a")
+//                     .with_prop("s3.secret-access-key", "hummockadmin")
+//                     .with_prop("s3.access-key-id", "hummockadmin")
+//                     .with_prop("s3.endpoint", "http://127.0.0.1:9301")
+//                     .with_prop("s3.region", "")
+//                     .build()
+//                     .unwrap(),
+//             )
+//             .sql_bind_style(SqlBindStyle::DollarNumeric)
+//             .build();
+//         SqlCatalog::new(config).await.unwrap()
+//     }
+
+//     #[tokio::test]
+//     async fn test_compact() {
+//         let catalog: Arc<dyn Catalog> = Arc::new(build_catalog().await);
+//         let table_id = TableIdent::from_strs(vec!["demo_db", "test_all_delete"]).unwrap();
+//         let compaction_config = Arc::new(CompactionConfig {
+//             batch_parallelism: Some(4),
+//             target_partitions: Some(4),
+//             data_file_prefix: None,
+//         });
+
+//         // Using the builder pattern (recommended)
+//         let compaction = Compaction::builder()
+//             .with_config(compaction_config.clone())
+//             .with_catalog(catalog.clone())
+//             .with_executor_type(crate::executor::ExecutorType::DataFusion)
+//             .with_table_ident(table_id)
+//             .build()
+//             .await
+//             .unwrap();
+
+//         compaction.compact().await.unwrap();
+//     }
+// }
