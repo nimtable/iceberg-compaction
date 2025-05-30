@@ -35,7 +35,7 @@ use iceberg::transaction::Transaction;
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration; // Keep for RewriteDataFilesCommitManagerRetryConfig if needed elsewhere, or for direct use in backon
+use std::time::Duration;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
@@ -480,7 +480,6 @@ impl RewriteDataFilesCommitManager {
                 };
 
                 let txn = rewrite_action.apply().await?;
-                // txn.commit(catalog.as_ref()).await?;
                 match txn.commit(catalog.as_ref()).await {
                     Ok(_) => {
                         // Update metrics after a successful commit
