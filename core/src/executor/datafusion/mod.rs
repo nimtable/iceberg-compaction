@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::{error::Result, executor::data_file_size_writer};
 /*
  * Copyright 2025 BergLoom
  *
@@ -47,8 +47,6 @@ use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
-const DEFAULT_PREFIX: &str = "10";
-
 #[derive(Default)]
 pub struct DataFusionExecutor {}
 
@@ -63,14 +61,8 @@ impl CompactionExecutor for DataFusionExecutor {
             dir_path,
             partition_spec,
         } = request;
-        let batch_parallelism = config.batch_parallelism.unwrap_or(4);
-        let target_partitions = config.target_partitions.unwrap_or(4);
-        let data_file_prefix = config
-            .data_file_prefix
-            .clone()
-            .unwrap_or(DEFAULT_PREFIX.to_owned());
         let mut session_config = SessionConfig::new();
-        session_config = session_config.with_target_partitions(target_partitions);
+        session_config = session_config.with_target_partitions(config.target_partitions);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
         let mut stat = RewriteFilesStat::default();
@@ -91,19 +83,20 @@ impl CompactionExecutor for DataFusionExecutor {
         let (batchs, input_schema) = DatafusionProcessor::new(
             ctx,
             datafusion_task_ctx,
-            batch_parallelism,
-            target_partitions,
+            config.batch_parallelism,
+            config.target_partitions,
             file_io.clone(),
         )
         .execute()
         .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(batch_parallelism);
+        let mut futures = Vec::with_capacity(config.batch_parallelism);
         // build iceberg writer for each partition
         for mut batch in batchs {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
-            let data_file_prefix = data_file_prefix.clone();
+            let data_file_prefix = (&config.data_file_prefix).clone();
+            let max_file_size = config.max_file_size;
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
             let future: JoinHandle<
@@ -115,6 +108,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     schema,
                     file_io,
                     partition_spec,
+                    max_file_size,
                 )
                 .await?;
                 while let Some(b) = batch.as_mut().next().await {
@@ -155,6 +149,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
+        max_file_size: usize,
     ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
@@ -173,12 +168,14 @@ impl DataFusionExecutor {
         );
         let data_file_builder =
             DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
+        let data_file_size_writer =
+            data_file_size_writer::DataFileSizeWriterBuilder::new(data_file_builder, max_file_size);
         let iceberg_output_writer = if partition_spec.fields().is_empty() {
-            Box::new(data_file_builder.build().await?) as Box<dyn IcebergWriter>
+            Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
         } else {
             Box::new(
                 FanoutPartitionWriterBuilder::new(
-                    data_file_builder,
+                    data_file_size_writer,
                     partition_spec.clone(),
                     schema,
                 )?

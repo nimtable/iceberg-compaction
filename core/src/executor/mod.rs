@@ -26,6 +26,7 @@ use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
 pub use mock::MockExecutor;
+pub mod data_file_size_writer;
 pub mod datafusion;
 use crate::error::Result;
 use bergloom_codegen::compactor::RewriteFilesRequest as PbRewriteFilesRequest;
