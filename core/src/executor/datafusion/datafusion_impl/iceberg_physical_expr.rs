@@ -132,8 +132,7 @@ impl IcebergTransformPhysicalExpr {
         index: usize,
         transform: Transform,
     ) -> datafusion::error::Result<Self> {
-        let transform =
-            create_transform_function(&transform).map_err(|err| to_datafusion_error(err))?;
+        let transform = create_transform_function(&transform).map_err(to_datafusion_error)?;
         Ok(Self {
             name,
             index,
@@ -157,7 +156,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("v1", DataType::Int32, false)]);
         let v1 = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(v1.clone())]).unwrap();
-        let expr = IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Identity).unwrap();
+        let expr =
+            IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Identity).unwrap();
         let result = expr.evaluate(&batch).unwrap();
         match result {
             datafusion::logical_expr::ColumnarValue::Array(array) => {
@@ -173,7 +173,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("v1", DataType::Int32, false)]);
         let v1 = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(v1.clone())]).unwrap();
-        let expr = IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Bucket(4)).unwrap();
+        let expr =
+            IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Bucket(4)).unwrap();
         let result = expr.evaluate(&batch).unwrap();
         match result {
             datafusion::logical_expr::ColumnarValue::Array(array) => {
@@ -192,7 +193,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("v1", DataType::Int32, false)]);
         let v1 = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(v1.clone())]).unwrap();
-        let expr = IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Truncate(3)).unwrap();
+        let expr =
+            IcebergTransformPhysicalExpr::new("v1".to_string(), 0, Transform::Truncate(3)).unwrap();
         let result = expr.evaluate(&batch).unwrap();
         match result {
             datafusion::logical_expr::ColumnarValue::Array(array) => {

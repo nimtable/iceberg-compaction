@@ -14,13 +14,17 @@
  * limitations under the License.
  */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::error::{CompactionError, Result};
+use crate::{
+    error::{CompactionError, Result},
+    executor::datafusion::datafusion_impl::iceberg_physical_expr::IcebergTransformPhysicalExpr,
+};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
+        ExecutionPlan, ExecutionPlanProperties, Partitioning, PhysicalExpr,
+        execute_stream_partitioned, expressions::col, projection::ProjectionExec,
         repartition::RepartitionExec,
     },
     prelude::SessionContext,
@@ -68,7 +72,7 @@ impl DatafusionProcessor {
             batch_parallelism,
             target_partitions,
             ctx,
-            partition_spec
+            partition_spec,
         }
     }
 
@@ -117,28 +121,77 @@ impl DatafusionProcessor {
         Ok(())
     }
 
-    async fn re_partition(&self, physical_plan: Arc<dyn ExecutionPlan + 'static>) -> Result<()> {
-        match self.partition_spec.fields(). {
-
+    async fn re_partition(
+        &self,
+        physical_plan: Arc<dyn ExecutionPlan + 'static>,
+    ) -> Result<Arc<dyn ExecutionPlan + 'static>> {
+        if (self.partition_spec.is_unpartitioned())
+            || self
+                .partition_spec
+                .fields()
+                .iter()
+                .any(|f| matches!(f.transform, iceberg::spec::Transform::Unknown))
+        {
+            if physical_plan.output_partitioning().partition_count() != self.target_partitions {
+                return Ok(Arc::new(RepartitionExec::try_new(
+                    physical_plan,
+                    Partitioning::RoundRobinBatch(self.target_partitions),
+                )?));
+            } else {
+                return Ok(physical_plan);
+            }
         }
-        Ok(())
-    } 
+        // add partition spec fields to the physical plan
+        let mut fields_id_by_name: HashMap<String, usize> = HashMap::default();
+        let mut exprs = vec![];
+        let schema = physical_plan.schema();
+        for (index, field) in schema.fields().iter().enumerate() {
+            fields_id_by_name.insert(field.name().clone(), index);
+            exprs.push((col(field.name(), &schema)?, field.name().to_string()));
+        }
+        let mut add_name = vec![];
+        let mut add_exprs = vec![];
+        for f in self.partition_spec.fields() {
+            let physical_expr = IcebergTransformPhysicalExpr::new(
+                f.name.clone(),
+                *fields_id_by_name.get(&f.name).ok_or_else(|| {
+                    CompactionError::Config(format!("Field {} not found in schema", f.name))
+                })?,
+                f.transform,
+            )?;
+            add_name.push(format!("_partition_spec_{}", f.name));
+            add_exprs.push((
+                Arc::new(physical_expr) as Arc<dyn PhysicalExpr>,
+                format!("_partition_spec_{}", f.name),
+            ));
+        }
+        let old_exprs = exprs.clone();
+        exprs.extend(add_exprs);
+        let physical_plan = Arc::new(ProjectionExec::try_new(exprs, physical_plan)?);
+        // repartition the physical plan
+        let schema = physical_plan.schema();
+        let hash_shuffle_exprs = add_name
+            .iter()
+            .map(|name| Ok(col(name, &schema)?))
+            .collect::<Result<Vec<_>>>()?;
+
+        let physical_plan = Arc::new(RepartitionExec::try_new(
+            physical_plan,
+            Partitioning::Hash(hash_shuffle_exprs, self.target_partitions),
+        )?);
+
+        // remove the partition spec fields from the output schema
+        let physical_plan = Arc::new(ProjectionExec::try_new(old_exprs, physical_plan)?);
+
+        Ok(physical_plan)
+    }
 
     pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
         let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
-        let batchs =
-            if physical_plan.output_partitioning().partition_count() != self.target_partitions {
-                let physical_plan: Arc<dyn ExecutionPlan + 'static> =
-                    Arc::new(RepartitionExec::try_new(
-                        physical_plan,
-                        Partitioning::RoundRobinBatch(self.target_partitions),
-                    )?);
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-            } else {
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-            };
+        let physical_plan = self.re_partition(physical_plan).await?;
+        let batchs = execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?;
         Ok((
             batchs,
             self.datafusion_task_ctx.input_schema.take().unwrap(),
