@@ -29,7 +29,7 @@ use iceberg::{
     arrow::schema_to_arrow_schema,
     io::FileIO,
     scan::FileScanTask,
-    spec::{NestedField, PrimitiveType, Schema, Type},
+    spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type},
 };
 
 use super::datafusion_impl::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
@@ -46,6 +46,7 @@ const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
 pub struct DatafusionProcessor {
     datafusion_task_ctx: DataFusionTaskContext,
     table_register: DatafusionTableRegister,
+    partition_spec: Arc<PartitionSpec>,
     batch_parallelism: usize,
     target_partitions: usize,
     ctx: Arc<SessionContext>,
@@ -58,6 +59,7 @@ impl DatafusionProcessor {
         batch_parallelism: usize,
         target_partitions: usize,
         file_io: FileIO,
+        partition_spec: Arc<PartitionSpec>,
     ) -> Self {
         let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
         Self {
@@ -66,6 +68,7 @@ impl DatafusionProcessor {
             batch_parallelism,
             target_partitions,
             ctx,
+            partition_spec
         }
     }
 
@@ -113,6 +116,13 @@ impl DatafusionProcessor {
         }
         Ok(())
     }
+
+    async fn re_partition(&self, physical_plan: Arc<dyn ExecutionPlan + 'static>) -> Result<()> {
+        match self.partition_spec.fields(). {
+
+        }
+        Ok(())
+    } 
 
     pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
