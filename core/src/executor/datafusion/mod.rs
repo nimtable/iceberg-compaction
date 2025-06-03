@@ -96,7 +96,7 @@ impl CompactionExecutor for DataFusionExecutor {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
             let data_file_prefix = (&config.data_file_prefix).clone();
-            let max_file_size = config.max_file_size;
+            let target_file_size = config.target_file_size;
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
             let future: JoinHandle<
@@ -108,7 +108,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     schema,
                     file_io,
                     partition_spec,
-                    max_file_size,
+                    target_file_size,
                 )
                 .await?;
                 while let Some(b) = batch.as_mut().next().await {
@@ -149,7 +149,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
-        max_file_size: usize,
+        target_file_size: usize,
     ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
@@ -168,8 +168,10 @@ impl DataFusionExecutor {
         );
         let data_file_builder =
             DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-        let data_file_size_writer =
-            data_file_size_writer::DataFileSizeWriterBuilder::new(data_file_builder, max_file_size);
+        let data_file_size_writer = data_file_size_writer::DataFileSizeWriterBuilder::new(
+            data_file_builder,
+            target_file_size,
+        );
         let iceberg_output_writer = if partition_spec.fields().is_empty() {
             Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
         } else {

@@ -28,8 +28,8 @@ pub struct CompactionConfig {
     pub target_partitions: usize,
     #[serde(default = "default_data_file_prefix")]
     pub data_file_prefix: String,
-    #[serde(default = "default_max_file_size")]
-    pub max_file_size: usize,
+    #[serde(default = "default_target_file_size")]
+    pub target_file_size: usize,
 }
 fn default_batch_parallelism() -> usize {
     4
@@ -40,6 +40,6 @@ fn default_target_partitions() -> usize {
 fn default_data_file_prefix() -> String {
     DEFAULT_PREFIX.to_string()
 }
-fn default_max_file_size() -> usize {
+fn default_target_file_size() -> usize {
     1024 * 1024 * 1024 // 1 GB
 }
