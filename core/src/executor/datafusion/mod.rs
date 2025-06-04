@@ -1,4 +1,3 @@
-use crate::{error::Result, executor::data_file_size_writer};
 /*
  * Copyright 2025 BergLoom
  *
@@ -15,6 +14,7 @@ use crate::{error::Result, executor::data_file_size_writer};
  * limitations under the License.
  */
 
+use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
 use ::datafusion::{
     parquet::file::properties::WriterProperties,
     prelude::{SessionConfig, SessionContext},
@@ -168,7 +168,7 @@ impl DataFusionExecutor {
         );
         let data_file_builder =
             DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-        let data_file_size_writer = data_file_size_writer::DataFileSizeWriterBuilder::new(
+        let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
             data_file_builder,
             target_file_size,
         );
