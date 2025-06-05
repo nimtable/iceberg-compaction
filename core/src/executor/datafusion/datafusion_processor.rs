@@ -116,7 +116,7 @@ impl DatafusionProcessor {
         self.register_tables(datafusion_task_ctx)?;
         let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
-        let batchs = if physical_plan.output_partitioning().partition_count()
+        let batches = if physical_plan.output_partitioning().partition_count()
             != self.config.target_partitions
         {
             let physical_plan: Arc<dyn ExecutionPlan + 'static> =
@@ -128,7 +128,7 @@ impl DatafusionProcessor {
         } else {
             execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
         };
-        Ok((batchs, input_schema))
+        Ok((batches, input_schema))
     }
 }
 

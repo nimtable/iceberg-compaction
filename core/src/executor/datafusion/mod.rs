@@ -66,13 +66,13 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_schema(schema)
             .with_input_data_files(input_file_scan_tasks)
             .build_merge_on_read()?;
-        let (batchs, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
+        let (batches, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
             .execute(datafusion_task_ctx)
             .await?;
         let arc_input_schema = Arc::new(input_schema);
         let mut futures = Vec::with_capacity(config.batch_parallelism);
         // build iceberg writer for each partition
-        for mut batch in batchs {
+        for mut batch in batches {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
             let data_file_prefix = config.data_file_prefix.clone();

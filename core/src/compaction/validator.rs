@@ -114,28 +114,28 @@ impl CompactionValidator {
             self.output_datafusion_task_ctx.take().ok_or_else(|| {
                 CompactionError::Unexpected("Output datafusion task context is not set".to_owned())
             })?;
-        let (mut input_batchs, _) = self
+        let (mut input_batches, _) = self
             .datafusion_processor
             .execute(input_datafusion_task_ctx)
             .await?;
-        let (mut output_batchs, _) = self
+        let (mut output_batches, _) = self
             .datafusion_processor
             .execute(output_datafusion_task_ctx)
             .await?;
 
         // The target partitions is 1, so we expect only one batch for both input and output.
-        if input_batchs.len() != output_batchs.len() || input_batchs.len() != 1 {
+        if input_batches.len() != output_batches.len() || input_batches.len() != 1 {
             return Err(CompactionError::CompactionValidator(format!(
-                "Input and output batchs length mismatch: {} != {} != 1 catalog {} table_ident {}",
-                input_batchs.len(),
-                output_batchs.len(),
+                "Input and output batches length mismatch: {} != {} != 1 catalog {} table_ident {}",
+                input_batches.len(),
+                output_batches.len(),
                 self.catalog_name,
                 self.table_ident
             )));
         }
 
-        let mut input_batch = input_batchs.pop().unwrap();
-        let mut output_batch = output_batchs.pop().unwrap();
+        let mut input_batch = input_batches.pop().unwrap();
+        let mut output_batch = output_batches.pop().unwrap();
 
         let mut input_stream = input_batch.as_mut();
         let mut output_stream = output_batch.as_mut();
@@ -147,7 +147,7 @@ impl CompactionValidator {
                     let output_batch = output_batch?;
                     if input_batch != output_batch {
                         return Err(CompactionError::CompactionValidator(format!(
-                            "Input and output batchs mismatch: {:?} != {:?} catalog {} table_ident {}",
+                            "Input and output batches mismatch: {:?} != {:?} catalog {} table_ident {}",
                             input_batch, output_batch, self.catalog_name, self.table_ident,
                         )));
                     }
@@ -157,7 +157,7 @@ impl CompactionValidator {
                 }
                 _ => {
                     return Err(CompactionError::CompactionValidator(format!(
-                        "Input and output batchs length mismatch catalog {} table_ident {}",
+                        "Input and output batches length mismatch catalog {} table_ident {}",
                         self.catalog_name, self.table_ident
                     )));
                 }

@@ -23,7 +23,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 use crate::CompactionError;
 use crate::Result;
 use crate::common::Metrics;
-use crate::compaction_test::CompactionValidator;
+use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
     ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
     create_compaction_executor,
@@ -40,6 +40,8 @@ use std::time::Duration;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
+
+mod validator;
 
 pub enum CompactionType {
     Full,
