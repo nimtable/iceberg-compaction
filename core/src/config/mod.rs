@@ -17,10 +17,29 @@
 use serde::Deserialize;
 use serde_with::serde_as;
 
+const DEFAULT_PREFIX: &str = "10";
+
 #[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct CompactionConfig {
-    pub batch_parallelism: Option<usize>,
-    pub target_partitions: Option<usize>,
-    pub data_file_prefix: Option<String>,
+    #[serde(default = "default_batch_parallelism")]
+    pub batch_parallelism: usize,
+    #[serde(default = "default_target_partitions")]
+    pub target_partitions: usize,
+    #[serde(default = "default_data_file_prefix")]
+    pub data_file_prefix: String,
+    #[serde(default = "default_target_file_size")]
+    pub target_file_size: usize,
+}
+fn default_batch_parallelism() -> usize {
+    4
+}
+fn default_target_partitions() -> usize {
+    4
+}
+fn default_data_file_prefix() -> String {
+    DEFAULT_PREFIX.to_string()
+}
+fn default_target_file_size() -> usize {
+    1024 * 1024 * 1024 // 1 GB
 }
