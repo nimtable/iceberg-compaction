@@ -23,7 +23,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 use crate::CompactionError;
 use crate::Result;
 use crate::common::Metrics;
-use crate::compaction_test::CompactionTester;
+use crate::compaction_test::CompactionValidator;
 use crate::executor::{
     ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
     create_compaction_executor,
@@ -181,6 +181,12 @@ pub struct Compaction {
     pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
+struct CompacitonResult {
+    stats: RewriteFilesStat,
+
+    compaction_validator: Option<CompactionValidator>,
+}
+
 impl Compaction {
     /// Create a new CompactionBuilder for flexible configuration
     pub fn builder() -> CompactionBuilder {
@@ -188,12 +194,28 @@ impl Compaction {
     }
 
     pub async fn compact(&self) -> Result<RewriteFilesStat> {
-        match self.compaction_type {
-            CompactionType::Full => self.full_compact().await,
+        let CompacitonResult {
+            stats,
+            compaction_validator,
+        } = match self.compaction_type {
+            CompactionType::Full => self.full_compact().await?,
+        };
+
+        // validate
+        if let Some(mut compaction_validator) = compaction_validator {
+            compaction_validator.validate().await?;
+
+            // Todo: log the successful validation with more context
+            tracing::info!(
+                "Compaction validation completed successfully for table '{}'",
+                self.table_ident
+            );
         }
+
+        Ok(stats)
     }
 
-    async fn full_compact(&self) -> Result<RewriteFilesStat> {
+    async fn full_compact(&self) -> Result<CompacitonResult> {
         let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
         let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
         let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
@@ -206,6 +228,8 @@ impl Compaction {
 
         let file_io = table.file_io().clone();
         let schema = table.metadata().current_schema();
+        let basic_schema_id = schema.schema_id();
+        // TODO: support check partition spec
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let rewrite_files_request = RewriteFilesRequest {
@@ -238,6 +262,7 @@ impl Compaction {
             true,
             self.catalog_name.clone(),
             self.metrics.clone(),
+            basic_schema_id,
         );
 
         let commit_now = std::time::Instant::now();
@@ -278,24 +303,31 @@ impl Compaction {
             .counter(&label_vec)
             .increase(stat.failed_data_files_count as u64);
 
-        if self.config.validate_compaction {
-            let mut compaction_tester = CompactionTester::new(
-                input_file_scan_tasks,
-                output_data_files,
-                schema.clone(),
-                self.config.clone(),
-                file_io,
-                table,
+        let compaction_validator = if self.config.validate_compaction {
+            Some(
+                CompactionValidator::new(
+                    input_file_scan_tasks,
+                    output_data_files,
+                    self.config.clone(),
+                    schema.clone(),
+                    table.metadata().current_schema().clone(),
+                    table,
+                    self.catalog_name.clone(),
+                )
+                .await?,
             )
-            .await?;
-            compaction_tester.validate().await?;
-        }
+        } else {
+            None
+        };
 
-        Ok(RewriteFilesStat {
-            rewritten_files_count: stat.rewritten_files_count,
-            added_files_count: stat.added_files_count,
-            rewritten_bytes: stat.rewritten_bytes,
-            failed_data_files_count: stat.failed_data_files_count,
+        Ok(CompacitonResult {
+            stats: RewriteFilesStat {
+                rewritten_files_count: stat.rewritten_files_count,
+                added_files_count: stat.added_files_count,
+                rewritten_bytes: stat.rewritten_bytes,
+                failed_data_files_count: stat.failed_data_files_count,
+            },
+            compaction_validator,
         })
     }
 
@@ -419,9 +451,12 @@ pub struct RewriteDataFilesCommitManager {
 
     catalog_name: String,  // Catalog name for metrics
     metrics: Arc<Metrics>, // Metrics for tracking commit operations
+
+    basic_schema_id: i32, // Schema ID for the table, used for validation
 }
 
 /// Manages the commit process with retries
+#[allow(clippy::too_many_arguments)]
 impl RewriteDataFilesCommitManager {
     pub fn new(
         config: RewriteDataFilesCommitManagerRetryConfig,
@@ -431,6 +466,7 @@ impl RewriteDataFilesCommitManager {
         use_starting_sequence_number: bool,
         catalog_name: String,
         metrics: Arc<Metrics>,
+        basic_schema_id: i32,
     ) -> Self {
         Self {
             config,
@@ -440,6 +476,7 @@ impl RewriteDataFilesCommitManager {
             use_starting_sequence_number,
             catalog_name,
             metrics,
+            basic_schema_id,
         }
     }
 
@@ -468,6 +505,18 @@ impl RewriteDataFilesCommitManager {
             async move {
                 // reload the table to get the latest state
                 let table = catalog.load_table(&table_ident).await?;
+
+                let schema_id = table.metadata().current_schema().schema_id();
+                if schema_id != self.basic_schema_id {
+                    return Err(iceberg::Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Schema ID mismatch: expected {}, found {}",
+                            self.basic_schema_id, schema_id
+                        ),
+                    ));
+                }
+
                 let txn = Transaction::new(&table);
 
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite

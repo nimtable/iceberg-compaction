@@ -254,7 +254,7 @@ impl<'a> SqlBuilder<'a> {
     /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(self) -> Result<String> {
         let data_file_table_name = self.data_file_table_name.as_ref().ok_or_else(|| {
-            CompactionError::Config("Data file table name is not provided".to_string())
+            CompactionError::Execution("Data file table name is not provided".to_string())
         })?;
         // Start with a basic SELECT query from the data file table
         let mut sql = format!(
@@ -268,7 +268,7 @@ impl<'a> SqlBuilder<'a> {
         if self.need_file_path_and_pos {
             let position_delete_table_name =
                 self.position_delete_table_name.as_ref().ok_or_else(|| {
-                    CompactionError::Config(
+                    CompactionError::Execution(
                         "Position delete table name is not provided".to_string(),
                     )
                 })?;
@@ -513,7 +513,7 @@ impl DataFusionTaskContextBuilder {
             let field = self
                 .schema
                 .field_by_id(*id)
-                .ok_or_else(|| CompactionError::Config("equality_ids not found".to_owned()))?;
+                .ok_or_else(|| CompactionError::Execution("equality_ids not found".to_owned()))?;
             equality_delete_fields.push(field.clone());
         }
         *highest_field_id += 1;
