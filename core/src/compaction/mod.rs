@@ -226,7 +226,7 @@ impl Compaction {
 
         let table = self.catalog.load_table(&self.table_ident).await?;
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
-        let input_file_scan_tasks = get_tasks_from_table(table.clone()).await?;
+        let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?);
 
         let file_io = table.file_io().clone();
         let schema = table.metadata().current_schema();
@@ -237,13 +237,17 @@ impl Compaction {
         let rewrite_files_request = RewriteFilesRequest {
             file_io: file_io.clone(),
             schema: schema.clone(),
-            input_file_scan_tasks: input_file_scan_tasks.clone(),
+            input_file_scan_tasks: if self.config.validate_compaction {
+                input_file_scan_tasks.clone().unwrap()
+            } else {
+                input_file_scan_tasks.take().unwrap()
+            },
             config: self.config.clone(),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
         };
         let RewriteFilesResponse {
-            data_files: output_data_files,
+            data_files: mut output_data_files,
             stat,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
@@ -268,7 +272,12 @@ impl Compaction {
         );
 
         let commit_now = std::time::Instant::now();
-        let table = commit_manager
+        let output_data_files = if self.config.validate_compaction {
+            output_data_files.clone()
+        } else {
+            std::mem::take(&mut output_data_files)
+        };
+        let committed_table = commit_manager
             .rewrite_files(
                 output_data_files.clone(),
                 data_files.into_iter().chain(delete_files.into_iter()),
@@ -308,12 +317,12 @@ impl Compaction {
         let compaction_validator = if self.config.validate_compaction {
             Some(
                 CompactionValidator::new(
-                    input_file_scan_tasks,
+                    input_file_scan_tasks.unwrap(),
                     output_data_files,
                     self.config.clone(),
                     schema.clone(),
                     table.metadata().current_schema().clone(),
-                    table,
+                    committed_table,
                     self.catalog_name.clone(),
                 )
                 .await?,
