@@ -19,6 +19,7 @@
 
 pub mod common;
 pub mod compaction;
+pub mod compaction_test;
 pub mod config;
 pub mod error;
 pub mod executor;

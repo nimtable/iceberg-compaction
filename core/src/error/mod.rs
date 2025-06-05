@@ -32,6 +32,9 @@ pub enum CompactionError {
 
     #[error("DataFusion error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
+
+    #[error("Compaction test failed: {0}")]
+    CompactionTest(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

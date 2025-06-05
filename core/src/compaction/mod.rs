@@ -23,6 +23,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 use crate::CompactionError;
 use crate::Result;
 use crate::common::Metrics;
+use crate::compaction_test::CompactionTester;
 use crate::executor::{
     ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse,
     create_compaction_executor,
@@ -208,9 +209,9 @@ impl Compaction {
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let rewrite_files_request = RewriteFilesRequest {
-            file_io,
+            file_io: file_io.clone(),
             schema: schema.clone(),
-            input_file_scan_tasks,
+            input_file_scan_tasks: input_file_scan_tasks.clone(),
             config: self.config.clone(),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
@@ -240,9 +241,9 @@ impl Compaction {
         );
 
         let commit_now = std::time::Instant::now();
-        commit_manager
+        let table = commit_manager
             .rewrite_files(
-                output_data_files,
+                output_data_files.clone(),
                 data_files.into_iter().chain(delete_files.into_iter()),
             )
             .await?;
@@ -276,6 +277,19 @@ impl Compaction {
             .compaction_failed_data_files_count
             .counter(&label_vec)
             .increase(stat.failed_data_files_count as u64);
+
+        if self.config.validate_compaction {
+            let mut compaction_tester = CompactionTester::new(
+                input_file_scan_tasks,
+                output_data_files,
+                schema.clone(),
+                self.config.clone(),
+                file_io,
+                table,
+            )
+            .await?;
+            compaction_tester.validate().await?;
+        }
 
         Ok(RewriteFilesStat {
             rewritten_files_count: stat.rewritten_files_count,
@@ -434,7 +448,7 @@ impl RewriteDataFilesCommitManager {
         &self,
         data_files: impl IntoIterator<Item = DataFile>,
         delete_files: impl IntoIterator<Item = DataFile>,
-    ) -> Result<()> {
+    ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
         let operation = || {
@@ -481,13 +495,13 @@ impl RewriteDataFilesCommitManager {
 
                 let txn = rewrite_action.apply().await?;
                 match txn.commit(catalog.as_ref()).await {
-                    Ok(_) => {
+                    Ok(table) => {
                         // Update metrics after a successful commit
                         metrics
                             .compaction_commit_counter
                             .counter(&label_vec)
                             .increase(1);
-                        Ok(())
+                        Ok(table)
                     }
                     Err(commit_err) => {
                         metrics
