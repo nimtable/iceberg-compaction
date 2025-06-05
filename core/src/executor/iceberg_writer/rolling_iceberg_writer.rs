@@ -32,6 +32,8 @@ pub struct RollingIcebergWriter<B, D> {
     target_file_size: usize,
     /// Collected data files that have been closed.
     data_files: Vec<DataFile>,
+    /// Current written size of the active file.
+    current_written_size: usize,
 }
 
 #[async_trait::async_trait]
@@ -43,19 +45,21 @@ where
     /// Write a RecordBatch. If the current file size plus the new batch size
     /// exceeds the target, close the current file and start a new one.
     async fn write(&mut self, input: RecordBatch) -> Result<()> {
-        let current_written_size = self.inner_writer.current_written_size();
+        let input_size = input.get_array_memory_size();
         // If adding this batch would exceed the target file size, close current file and start a new one.
         if need_build_new_file(
-            current_written_size,
-            input.get_array_memory_size(),
+            self.current_written_size,
+            input_size,
             self.target_file_size,
         ) {
             let data_files = self.inner_writer.close().await?;
             self.data_files.extend(data_files);
             self.inner_writer = self.inner_writer_builder.clone().build().await?;
+            self.current_written_size = 0;
         }
         // Write the batch to the current writer.
         self.inner_writer.write(input).await?;
+        self.current_written_size += input_size;
         Ok(())
     }
 
@@ -121,6 +125,7 @@ where
             inner_writer: self.inner_builder.build().await?,
             target_file_size: self.target_file_size,
             data_files: Vec::new(),
+            current_written_size: 0,
         })
     }
 }
