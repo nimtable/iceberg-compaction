@@ -44,8 +44,7 @@ use crate::CompactionError;
 use super::{CompactionExecutor, InputFileScanTasks, RewriteFilesStat};
 pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
-pub mod file_scan_task_table_provider;
-pub mod iceberg_file_task_scan;
+pub mod datafusion_impl;
 
 #[derive(Default)]
 pub struct DataFusionExecutor {}
@@ -86,6 +85,7 @@ impl CompactionExecutor for DataFusionExecutor {
             config.batch_parallelism,
             config.target_partitions,
             file_io.clone(),
+            partition_spec.clone(),
         )
         .execute()
         .await?;
