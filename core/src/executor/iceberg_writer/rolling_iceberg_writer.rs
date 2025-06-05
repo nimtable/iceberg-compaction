@@ -47,11 +47,7 @@ where
     async fn write(&mut self, input: RecordBatch) -> Result<()> {
         let input_size = input.get_array_memory_size();
         // If adding this batch would exceed the target file size, close current file and start a new one.
-        if need_build_new_file(
-            self.current_written_size,
-            input_size,
-            self.target_file_size,
-        ) {
+        if need_build_new_file(self.current_written_size, input_size, self.target_file_size) {
             let data_files = self.inner_writer.close().await?;
             self.data_files.extend(data_files);
             self.inner_writer = self.inner_writer_builder.clone().build().await?;
