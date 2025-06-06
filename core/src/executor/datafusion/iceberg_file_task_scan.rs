@@ -227,32 +227,39 @@ async fn get_batch_stream(
     read_file_parallelism: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let (chunk_tx, mut chunk_rx) = mpsc::channel(read_file_parallelism);
+    let task_ctxs = {
+        file_scan_tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.data_file_path.clone(),
+                    task.data_file_content,
+                    task.sequence_number,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
     tokio::spawn(async move {
-        let result = futures::stream::iter(file_scan_tasks)
-            .map(Ok::<FileScanTask, DataFusionError>)
-            .try_for_each_concurrent(Some(read_file_parallelism), |task| {
+        let result = futures::stream::iter(file_scan_tasks.into_iter().enumerate())
+            .map(Ok::<(usize, FileScanTask), DataFusionError>)
+            .try_for_each_concurrent(Some(read_file_parallelism), |(index, task)| {
                 let value = file_io.clone();
                 let chunk_tx = chunk_tx.clone();
                 async move {
-                    let file_path = task.data_file_path.clone();
-                    let data_file_content = task.data_file_content;
-                    let sequence_number = task.sequence_number;
                     let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
                     let arrow_reader_builder = ArrowReaderBuilder::new(value.clone());
-                    let batch_stream = arrow_reader_builder
+                    let mut batch_stream = arrow_reader_builder
                         .build()
                         .read(task_stream)
                         .await
                         .map_err(to_datafusion_error)?;
-                    chunk_tx
-                        .send(Ok((
-                            batch_stream,
-                            file_path,
-                            data_file_content,
-                            sequence_number,
-                        )))
-                        .await
-                        .map_err(|err| DataFusionError::Internal(err.to_string()))?;
+                    while let Some(batch) = batch_stream.next().await {
+                        chunk_tx
+                            .send(Ok((batch, index)))
+                            .await
+                            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
+                    }
                     Ok(())
                 }
             })
@@ -265,14 +272,14 @@ async fn get_batch_stream(
     let stream = try_stream! {
             let mut index_start = 0;
             while let Some(result) = chunk_rx.recv().await {
-                let (mut batch_stream,file_path,data_file_content,sequence_number) = result?;
-                while let Some(batch) = batch_stream.next().await {
+                let (batch,index) = result?;
                     let mut batch = batch.map_err(to_datafusion_error)?;
+                    let (file_path,data_file_content,sequence_number) = &task_ctxs[index];
                     let batch = match data_file_content {
                         iceberg::spec::DataContentType::Data => {
                             // add sequence number if needed
                             if need_seq_num {
-                                batch = add_seq_num_into_batch(batch, sequence_number)?;
+                                batch = add_seq_num_into_batch(batch, *sequence_number)?;
                             }
                             // add file path and position if needed
                             if need_file_path_and_pos {
@@ -285,11 +292,10 @@ async fn get_batch_stream(
                             batch
                         },
                         iceberg::spec::DataContentType::EqualityDeletes => {
-                            add_seq_num_into_batch(batch, sequence_number)?
+                            add_seq_num_into_batch(batch, *sequence_number)?
                         },
                     };
                     yield batch;
-                }
             }
     };
     Ok(Box::pin(stream))
