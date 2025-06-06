@@ -237,7 +237,7 @@ impl Compaction {
         let rewrite_files_request = RewriteFilesRequest {
             file_io: file_io.clone(),
             schema: schema.clone(),
-            input_file_scan_tasks: if self.config.validate_compaction {
+            input_file_scan_tasks: if self.config.enable_validate_compaction {
                 input_file_scan_tasks.clone().unwrap()
             } else {
                 input_file_scan_tasks.take().unwrap()
@@ -272,7 +272,7 @@ impl Compaction {
         );
 
         let commit_now = std::time::Instant::now();
-        let output_data_files = if self.config.validate_compaction {
+        let output_data_files = if self.config.enable_validate_compaction {
             output_data_files.clone()
         } else {
             std::mem::take(&mut output_data_files)
@@ -314,7 +314,7 @@ impl Compaction {
             .counter(&label_vec)
             .increase(stat.failed_data_files_count as u64);
 
-        let compaction_validator = if self.config.validate_compaction {
+        let compaction_validator = if self.config.enable_validate_compaction {
             Some(
                 CompactionValidator::new(
                     input_file_scan_tasks.unwrap(),
@@ -467,6 +467,7 @@ pub struct RewriteDataFilesCommitManager {
 }
 
 /// Manages the commit process with retries
+// TODO: Refactor this argument to use a more structured approach
 #[allow(clippy::too_many_arguments)]
 impl RewriteDataFilesCommitManager {
     pub fn new(

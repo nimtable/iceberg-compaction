@@ -20,7 +20,8 @@ use serde_with::serde_as;
 const DEFAULT_PREFIX: &str = "10";
 const DEFAULT_BATCH_PARALLELISM: usize = 4;
 const DEFAULT_TARGET_PARTITIONS: usize = 4;
-const DEFAULT_TARGET_FILE_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
+const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+const DEFAULT_VALIDATE_COMPACTION: bool = false;
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -28,8 +29,8 @@ pub struct CompactionConfig {
     pub batch_parallelism: usize,
     pub target_partitions: usize,
     pub data_file_prefix: String,
-    pub target_file_size: usize,
-    pub validate_compaction: bool,
+    pub target_file_size: u64,
+    pub enable_validate_compaction: bool,
 }
 
 impl CompactionConfig {
@@ -43,8 +44,8 @@ pub struct CompactionConfigBuilder {
     batch_parallelism: Option<usize>,
     target_partitions: Option<usize>,
     data_file_prefix: Option<String>,
-    target_file_size: Option<usize>,
-    validate_compaction: Option<bool>,
+    target_file_size: Option<u64>,
+    enable_validate_compaction: Option<bool>,
 }
 
 impl CompactionConfigBuilder {
@@ -63,13 +64,13 @@ impl CompactionConfigBuilder {
         self
     }
 
-    pub fn target_file_size(mut self, value: usize) -> Self {
+    pub fn target_file_size(mut self, value: u64) -> Self {
         self.target_file_size = Some(value);
         self
     }
 
-    pub fn validate_compaction(mut self, value: bool) -> Self {
-        self.validate_compaction = Some(value);
+    pub fn enable_validate_compaction(mut self, value: bool) -> Self {
+        self.enable_validate_compaction = Some(value);
         self
     }
 
@@ -79,7 +80,9 @@ impl CompactionConfigBuilder {
             target_partitions: self.target_partitions.unwrap_or(DEFAULT_TARGET_PARTITIONS),
             data_file_prefix: self.data_file_prefix.unwrap_or(DEFAULT_PREFIX.to_owned()),
             target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
-            validate_compaction: self.validate_compaction.unwrap_or(false),
+            enable_validate_compaction: self
+                .enable_validate_compaction
+                .unwrap_or(DEFAULT_VALIDATE_COMPACTION),
         }
     }
 }

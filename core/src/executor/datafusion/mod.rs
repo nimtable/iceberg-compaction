@@ -129,7 +129,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
-        target_file_size: usize,
+        target_file_size: u64,
     ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
