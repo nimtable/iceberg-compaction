@@ -705,7 +705,6 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             true,
-            ,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
         assert!(sql.contains(&format!(
