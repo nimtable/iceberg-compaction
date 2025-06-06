@@ -265,8 +265,8 @@ async fn get_batch_stream(
     let stream = try_stream! {
             let mut index_start = 0;
             while let Some(result) = chunk_rx.recv().await {
-                let (mut batch,file_path,data_file_content,sequence_number) = result?;
-                while let Some(batch) = batch.next().await {
+                let (mut batch_stream,file_path,data_file_content,sequence_number) = result?;
+                while let Some(batch) = batch_stream.next().await {
                     let mut batch = batch.map_err(to_datafusion_error)?;
                     let batch = match data_file_content {
                         iceberg::spec::DataContentType::Data => {
