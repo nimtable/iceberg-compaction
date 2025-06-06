@@ -581,7 +581,6 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_join_names,
             false,
-            false,
         );
         assert_eq!(
             builder.build_merge_on_read_sql().unwrap(),
@@ -605,7 +604,6 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_join_names,
             true,
-            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
@@ -640,7 +638,6 @@ mod tests {
             Some(POSITION_DELETE_TABLE.to_owned()),
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
-            false,
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -677,7 +674,6 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             false,
-            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
         assert!(sql.contains(&format!(
@@ -709,7 +705,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             true,
-            false,
+            ,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
         assert!(sql.contains(&format!(
@@ -768,7 +764,6 @@ mod tests {
             Some(POSITION_DELETE_TABLE.to_owned()),
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
-            false,
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -850,7 +845,6 @@ mod tests {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
-            need_order: false,
         };
 
         let equality_ids = vec![1, 2];
