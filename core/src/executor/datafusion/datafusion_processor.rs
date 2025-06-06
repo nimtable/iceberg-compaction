@@ -221,9 +221,6 @@ struct SqlBuilder<'a> {
 
     /// Flag indicating if position delete files are needed
     need_file_path_and_pos: bool,
-
-    /// Flag indicating if order is needed
-    need_order: bool,
 }
 
 impl<'a> SqlBuilder<'a> {
@@ -234,7 +231,6 @@ impl<'a> SqlBuilder<'a> {
         data_file_table_name: Option<String>,
         equality_delete_metadatas: &'a Vec<EqualityDeleteMetadata>,
         need_file_path_and_pos: bool,
-        need_order: bool,
     ) -> Self {
         Self {
             project_names,
@@ -242,7 +238,6 @@ impl<'a> SqlBuilder<'a> {
             data_file_table_name,
             equality_delete_metadatas,
             need_file_path_and_pos,
-            need_order,
         }
     }
 
@@ -305,17 +300,6 @@ impl<'a> SqlBuilder<'a> {
             }
         }
 
-        if self.need_order {
-            sql.push_str(&format!(
-                " ORDER BY {}",
-                self.project_names
-                    .iter()
-                    .map(|name| format!("{}.{}", data_file_table_name, name))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-        }
-
         Ok(sql)
     }
 }
@@ -336,7 +320,6 @@ pub struct DataFusionTaskContextBuilder {
     data_files: Vec<FileScanTask>,
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
-    need_order: bool,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -364,11 +347,6 @@ impl DataFusionTaskContextBuilder {
 
     pub fn with_equality_delete_files(mut self, equality_delete_files: Vec<FileScanTask>) -> Self {
         self.equality_delete_files = equality_delete_files;
-        self
-    }
-
-    pub fn with_need_order(mut self, need_order: bool) -> Self {
-        self.need_order = need_order;
         self
     }
 
@@ -478,7 +456,6 @@ impl DataFusionTaskContextBuilder {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             need_file_path_and_pos,
-            self.need_order,
         );
         let exec_sql = sql_builder.build_merge_on_read_sql()?;
 
@@ -538,7 +515,6 @@ impl DataFusionTaskContext {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
-            need_order: false,
         })
     }
 

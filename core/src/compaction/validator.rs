@@ -79,12 +79,10 @@ impl CompactionValidator {
         let input_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(input_schema)
             .with_input_data_files(input_file_scan_tasks)
-            .with_need_order(true)
             .build_merge_on_read()?;
         let output_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(output_schema)
             .with_data_files(output_file_scan_tasks)
-            .with_need_order(true)
             .build_merge_on_read()?;
 
         let validator_config = Arc::new(
