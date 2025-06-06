@@ -22,6 +22,7 @@ use std::vec;
 
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -41,6 +42,42 @@ use tokio::sync::mpsc;
 
 use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
 
+const MIN_BATCH_SIZE: usize = 512;
+
+struct RecordBatchBuffer {
+    buffer: Vec<RecordBatch>,
+    current_rows: usize,
+}
+
+impl RecordBatchBuffer {
+    fn new() -> Self {
+        Self { buffer: vec![], current_rows: 0 }
+    }
+
+    fn add(&mut self, batch: RecordBatch)-> Result<Option<RecordBatch>,DataFusionError> {
+        let result = if self.current_rows + batch.num_rows() > MIN_BATCH_SIZE {
+            let batches: Vec<_> = self.buffer.drain(..).collect();
+            let combined = concat_batches(&batch.schema(), &batches)?;
+            self.current_rows = 0;
+            Some(combined)
+        } else {
+            None
+        };
+        self.current_rows += batch.num_rows();
+        self.buffer.push(batch);
+        Ok(result)
+    }
+
+    fn finish(mut self) -> Result<Option<RecordBatch>,DataFusionError> {
+        let batches: Vec<_> = self.buffer.drain(..).collect();
+        if !batches.is_empty() {
+            let combined = concat_batches(&batches[0].schema(), &batches)?;
+            Ok(Some(combined))
+        }else{
+            Ok(None)
+        }
+    }
+}
 /// An execution plan for scanning iceberg file scan tasks
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
@@ -227,7 +264,7 @@ async fn get_batch_stream(
     read_file_parallelism: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let (chunk_tx, mut chunk_rx) = mpsc::channel(read_file_parallelism);
-    let task_ctxs = {
+    let mut task_ctxs = {
         file_scan_tasks
             .iter()
             .map(|task| {
@@ -235,6 +272,7 @@ async fn get_batch_stream(
                     task.data_file_path.clone(),
                     task.data_file_content,
                     task.sequence_number,
+                    0
                 )
             })
             .collect::<Vec<_>>()
@@ -270,11 +308,11 @@ async fn get_batch_stream(
     });
 
     let stream = try_stream! {
-            let mut index_start = 0;
+        let mut record_batch_buffer = RecordBatchBuffer::new();
             while let Some(result) = chunk_rx.recv().await {
                 let (batch,index) = result?;
                     let mut batch = batch.map_err(to_datafusion_error)?;
-                    let (file_path,data_file_content,sequence_number) = &task_ctxs[index];
+                    let (file_path,data_file_content,sequence_number,index_start) = &mut task_ctxs[index];
                     let batch = match data_file_content {
                         iceberg::spec::DataContentType::Data => {
                             // add sequence number if needed
@@ -283,8 +321,8 @@ async fn get_batch_stream(
                             }
                             // add file path and position if needed
                             if need_file_path_and_pos {
-                                batch = add_file_path_pos_into_batch(batch, file_path.as_str(), index_start)?;
-                                index_start += batch.num_rows() as i64;
+                                batch = add_file_path_pos_into_batch(batch, file_path.as_str(), *index_start)?;
+                                *index_start += batch.num_rows() as i64;
                             }
                             batch
                         }
@@ -295,7 +333,12 @@ async fn get_batch_stream(
                             add_seq_num_into_batch(batch, *sequence_number)?
                         },
                     };
-                    yield batch;
+                    if let Some(batch) = record_batch_buffer.add(batch)? {
+                        yield batch;
+                    }
+            }
+            if let Some(batch) = record_batch_buffer.finish()? {
+                yield batch;
             }
     };
     Ok(Box::pin(stream))
