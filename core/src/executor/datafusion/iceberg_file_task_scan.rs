@@ -23,7 +23,7 @@ use std::vec;
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -37,6 +37,7 @@ use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
+use tokio::sync::mpsc;
 
 use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
 
@@ -50,6 +51,7 @@ pub(crate) struct IcebergFileTaskScan {
     file_io: FileIO,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
+    read_file_parallelism: usize,
 }
 
 impl IcebergFileTaskScan {
@@ -63,6 +65,7 @@ impl IcebergFileTaskScan {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
+        read_file_parallelism: usize,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -82,6 +85,7 @@ impl IcebergFileTaskScan {
             file_io: file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
+            read_file_parallelism,
         }
     }
 
@@ -203,6 +207,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
             self.file_scan_tasks_group[partition].clone(),
             self.need_seq_num,
             self.need_file_path_and_pos,
+            self.read_file_parallelism,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -219,44 +224,73 @@ async fn get_batch_stream(
     file_scan_tasks: Vec<FileScanTask>,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
+    read_file_parallelism: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
-    let stream = try_stream! {
-        for task in file_scan_tasks {
-            let file_path = task.data_file_path.clone();
-            let data_file_content = task.data_file_content;
-            let sequence_number = task.sequence_number;
-            let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone());
-            let mut batch_stream = arrow_reader_builder.build()
-                .read(task_stream)
-                .await
-                .map_err(to_datafusion_error)?;
-            let mut index_start = 0;
-            while let Some(batch) = batch_stream.next().await {
-                let mut batch = batch.map_err(to_datafusion_error)?;
-                let batch = match data_file_content {
-                    iceberg::spec::DataContentType::Data => {
-                        // add sequence number if needed
-                        if need_seq_num {
-                            batch = add_seq_num_into_batch(batch, sequence_number)?;
-                        }
-                        // add file path and position if needed
-                        if need_file_path_and_pos {
-                            batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
-                            index_start += batch.num_rows() as i64;
-                        }
-                        batch
-                    }
-                    iceberg::spec::DataContentType::PositionDeletes => {
-                        batch
-                    },
-                    iceberg::spec::DataContentType::EqualityDeletes => {
-                        add_seq_num_into_batch(batch, sequence_number)?
-                    },
-                };
-                yield batch;
-            }
+    let (chunk_tx, mut chunk_rx) = mpsc::channel(100);
+    tokio::spawn(async move {
+        let result = futures::stream::iter(file_scan_tasks)
+            .map(Ok::<FileScanTask, DataFusionError>)
+            .try_for_each_concurrent(Some(read_file_parallelism), |task| {
+                let value = file_io.clone();
+                let chunk_tx = chunk_tx.clone();
+                async move {
+                    let file_path = task.data_file_path.clone();
+                    let data_file_content = task.data_file_content;
+                    let sequence_number = task.sequence_number;
+                    let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
+                    let arrow_reader_builder = ArrowReaderBuilder::new(value.clone());
+                    let batch_stream = arrow_reader_builder
+                        .build()
+                        .read(task_stream)
+                        .await
+                        .map_err(to_datafusion_error)?;
+                    chunk_tx
+                        .send(Ok((
+                            batch_stream,
+                            file_path,
+                            data_file_content,
+                            sequence_number,
+                        )))
+                        .await
+                        .map_err(|err| DataFusionError::Internal(err.to_string()))?;
+                    Ok(())
+                }
+            })
+            .await;
+        if let Err(error) = result {
+            let _ = chunk_tx.send(Err(error)).await;
         }
+    });
+
+    let stream = try_stream! {
+            let mut index_start = 0;
+            while let Some(result) = chunk_rx.recv().await {
+                let (mut batch,file_path,data_file_content,sequence_number) = result?;
+                while let Some(batch) = batch.next().await {
+                    let mut batch = batch.map_err(to_datafusion_error)?;
+                    let batch = match data_file_content {
+                        iceberg::spec::DataContentType::Data => {
+                            // add sequence number if needed
+                            if need_seq_num {
+                                batch = add_seq_num_into_batch(batch, sequence_number)?;
+                            }
+                            // add file path and position if needed
+                            if need_file_path_and_pos {
+                                batch = add_file_path_pos_into_batch(batch, file_path.as_str(), index_start)?;
+                                index_start += batch.num_rows() as i64;
+                            }
+                            batch
+                        }
+                        iceberg::spec::DataContentType::PositionDeletes => {
+                            batch
+                        },
+                        iceberg::spec::DataContentType::EqualityDeletes => {
+                            add_seq_num_into_batch(batch, sequence_number)?
+                        },
+                    };
+                    yield batch;
+                }
+            }
     };
     Ok(Box::pin(stream))
 }
