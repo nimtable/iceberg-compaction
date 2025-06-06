@@ -260,15 +260,19 @@ impl Compaction {
             }
         };
 
+        let consistency_params = CommitConsistencyParams {
+            starting_snapshot_id: table.metadata().current_snapshot_id().unwrap(),
+            use_starting_sequence_number: true,
+            basic_schema_id,
+        };
+
         let commit_manager = RewriteDataFilesCommitManager::new(
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
-            table.metadata().current_snapshot_id().unwrap(),
-            true,
             self.catalog_name.clone(),
             self.metrics.clone(),
-            basic_schema_id,
+            consistency_params,
         );
 
         let commit_now = std::time::Instant::now();
@@ -466,29 +470,31 @@ pub struct RewriteDataFilesCommitManager {
     basic_schema_id: i32, // Schema ID for the table, used for validation
 }
 
+pub struct CommitConsistencyParams {
+    pub starting_snapshot_id: i64,
+    pub use_starting_sequence_number: bool,
+    pub basic_schema_id: i32,
+}
+
 /// Manages the commit process with retries
-// TODO: Refactor this argument to use a more structured approach
-#[allow(clippy::too_many_arguments)]
 impl RewriteDataFilesCommitManager {
     pub fn new(
         config: RewriteDataFilesCommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
-        starting_snapshot_id: i64,
-        use_starting_sequence_number: bool,
         catalog_name: String,
         metrics: Arc<Metrics>,
-        basic_schema_id: i32,
+        consistency_params: CommitConsistencyParams,
     ) -> Self {
         Self {
             config,
             catalog,
             table_ident,
-            starting_snapshot_id,
-            use_starting_sequence_number,
+            starting_snapshot_id: consistency_params.starting_snapshot_id,
+            use_starting_sequence_number: consistency_params.use_starting_sequence_number,
             catalog_name,
             metrics,
-            basic_schema_id,
+            basic_schema_id: consistency_params.basic_schema_id,
         }
     }
 
