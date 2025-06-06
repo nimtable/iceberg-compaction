@@ -226,7 +226,7 @@ async fn get_batch_stream(
     need_file_path_and_pos: bool,
     read_file_parallelism: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
-    let (chunk_tx, mut chunk_rx) = mpsc::channel(100);
+    let (chunk_tx, mut chunk_rx) = mpsc::channel(read_file_parallelism);
     tokio::spawn(async move {
         let result = futures::stream::iter(file_scan_tasks)
             .map(Ok::<FileScanTask, DataFusionError>)
