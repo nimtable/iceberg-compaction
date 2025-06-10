@@ -22,8 +22,9 @@ use std::vec;
 
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -39,6 +40,46 @@ use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_pre
 use iceberg_datafusion::to_datafusion_error;
 
 use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
+
+pub const RECORD_BATCH_SIZE: usize = 1024;
+
+struct RecordBatchBuffer {
+    buffer: Vec<RecordBatch>,
+    current_rows: usize,
+}
+
+impl RecordBatchBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: vec![],
+            current_rows: 0,
+        }
+    }
+
+    fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
+        let result = if self.current_rows + batch.num_rows() > RECORD_BATCH_SIZE {
+            let batches: Vec<_> = self.buffer.drain(..).collect();
+            let combined = concat_batches(&batch.schema(), &batches)?;
+            self.current_rows = 0;
+            Some(combined)
+        } else {
+            None
+        };
+        self.current_rows += batch.num_rows();
+        self.buffer.push(batch);
+        Ok(result)
+    }
+
+    fn finish(mut self) -> Result<Option<RecordBatch>, DataFusionError> {
+        let batches: Vec<_> = self.buffer.drain(..).collect();
+        if !batches.is_empty() {
+            let combined = concat_batches(&batches[0].schema(), &batches)?;
+            Ok(Some(combined))
+        } else {
+            Ok(None)
+        }
+    }
+}
 
 /// An execution plan for scanning iceberg file scan tasks
 #[derive(Debug)]
@@ -221,12 +262,13 @@ async fn get_batch_stream(
     need_file_path_and_pos: bool,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let stream = try_stream! {
+        let mut record_batch_buffer = RecordBatchBuffer::new();
         for task in file_scan_tasks {
             let file_path = task.data_file_path.clone();
             let data_file_content = task.data_file_content;
             let sequence_number = task.sequence_number;
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone());
+            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone()).with_batch_size(RECORD_BATCH_SIZE);
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
                 .await
@@ -254,8 +296,13 @@ async fn get_batch_stream(
                         add_seq_num_into_batch(batch, sequence_number)?
                     },
                 };
-                yield batch;
+                if let Some(batch) = record_batch_buffer.add(batch)? {
+                    yield batch;
+                }
             }
+        }
+        if let Some(batch) = record_batch_buffer.finish()? {
+            yield batch;
         }
     };
     Ok(Box::pin(stream))

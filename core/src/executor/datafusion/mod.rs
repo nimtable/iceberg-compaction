@@ -14,7 +14,13 @@
  * limitations under the License.
  */
 
-use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
+use crate::{
+    error::Result,
+    executor::{
+        datafusion::iceberg_file_task_scan::RECORD_BATCH_SIZE,
+        iceberg_writer::rolling_iceberg_writer,
+    },
+};
 use ::datafusion::{
     parquet::file::properties::WriterProperties,
     prelude::{SessionConfig, SessionContext},
@@ -62,7 +68,9 @@ impl CompactionExecutor for DataFusionExecutor {
             partition_spec,
         } = request;
         let mut session_config = SessionConfig::new();
-        session_config = session_config.with_target_partitions(config.target_partitions);
+        session_config = session_config
+            .with_target_partitions(config.target_partitions)
+            .with_batch_size(RECORD_BATCH_SIZE);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
         let mut stat = RewriteFilesStat::default();
@@ -95,7 +103,7 @@ impl CompactionExecutor for DataFusionExecutor {
         for mut batch in batchs {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
-            let data_file_prefix = (&config.data_file_prefix).clone();
+            let data_file_prefix = config.data_file_prefix.clone();
             let target_file_size = config.target_file_size;
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
