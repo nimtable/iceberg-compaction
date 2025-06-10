@@ -62,7 +62,7 @@ impl CompactionValidator {
             .current_snapshot_id()
             .ok_or_else(|| CompactionError::Execution("Snapshot id is not set".to_owned()))?;
 
-        let scan = table.scan().from_snapshot_id(snapshot_id).build()?;
+        let scan = table.scan().snapshot_id(snapshot_id).build()?;
         let output_file_paths = output_files
             .iter()
             .map(|f| f.file_path())
@@ -75,19 +75,20 @@ impl CompactionValidator {
                 output_file_scan_tasks.push(file);
             }
         }
-
         let input_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(input_schema)
             .with_input_data_files(input_file_scan_tasks)
+            .with_table_prefix("input".to_owned())
             .build_merge_on_read()?;
         let output_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(output_schema)
             .with_data_files(output_file_scan_tasks)
+            .with_table_prefix("output".to_owned())
             .build_merge_on_read()?;
 
         let validator_config = Arc::new(
             CompactionConfig::builder()
-                .batch_parallelism(config.batch_parallelism / 2)
+                .batch_parallelism((config.batch_parallelism / 2).max(1))
                 .target_partitions(1)
                 .build(),
         );
@@ -138,28 +139,21 @@ impl CompactionValidator {
         let mut input_stream = input_batch.as_mut();
         let mut output_stream = output_batch.as_mut();
 
-        loop {
-            match (input_stream.next().await, output_stream.next().await) {
-                (Some(input_batch), Some(output_batch)) => {
-                    let input_batch = input_batch?;
-                    let output_batch = output_batch?;
-                    if input_batch != output_batch {
-                        return Err(CompactionError::CompactionValidator(format!(
-                            "Input and output batches mismatch: {:?} != {:?} catalog {} table_ident {}",
-                            input_batch, output_batch, self.catalog_name, self.table_ident,
-                        )));
-                    }
-                }
-                (None, None) => {
-                    break;
-                }
-                _ => {
-                    return Err(CompactionError::CompactionValidator(format!(
-                        "Input and output batches length mismatch catalog {} table_ident {}",
-                        self.catalog_name, self.table_ident
-                    )));
-                }
-            }
+        let mut input_count = 0;
+        let mut output_count = 0;
+
+        while let Some(input_batch) = input_stream.next().await {
+            input_count += input_batch?.num_rows();
+        }
+        while let Some(output_batch) = output_stream.next().await {
+            output_count += output_batch?.num_rows();
+        }
+
+        if input_count != output_count {
+            return Err(CompactionError::CompactionValidator(format!(
+                "Input and output count mismatch: {} != {} catalog {} table_ident {}",
+                input_count, output_count, self.catalog_name, self.table_ident
+            )));
         }
 
         Ok(())

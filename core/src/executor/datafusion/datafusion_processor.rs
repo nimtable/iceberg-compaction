@@ -71,7 +71,7 @@ impl DatafusionProcessor {
             self.table_register.register_data_table_provider(
                 &datafile_schema,
                 datafusion_task_ctx.data_files.take().unwrap(),
-                DATA_FILE_TABLE,
+                &format!("{}_{}", datafusion_task_ctx.table_prefix, DATA_FILE_TABLE),
                 datafusion_task_ctx.need_seq_num(),
                 datafusion_task_ctx.need_file_path_and_pos(),
                 self.config.batch_parallelism,
@@ -82,7 +82,10 @@ impl DatafusionProcessor {
             self.table_register.register_delete_table_provider(
                 &position_delete_schema,
                 datafusion_task_ctx.position_delete_files.take().unwrap(),
-                POSITION_DELETE_TABLE,
+                &format!(
+                    "{}_{}",
+                    datafusion_task_ctx.table_prefix, POSITION_DELETE_TABLE
+                ),
                 self.config.batch_parallelism,
             )?;
         }
@@ -99,7 +102,10 @@ impl DatafusionProcessor {
                 self.table_register.register_delete_table_provider(
                     &equality_delete_schema,
                     file_scan_tasks,
-                    &equality_delete_table_name,
+                    &format!(
+                        "{}_{}",
+                        datafusion_task_ctx.table_prefix, equality_delete_table_name
+                    ),
                     self.config.batch_parallelism,
                 )?;
             }
@@ -313,6 +319,7 @@ pub struct DataFusionTaskContext {
     pub(crate) position_delete_schema: Option<Schema>,
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
     pub(crate) exec_sql: String,
+    pub(crate) table_prefix: String,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -320,11 +327,17 @@ pub struct DataFusionTaskContextBuilder {
     data_files: Vec<FileScanTask>,
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
+    table_prefix: String,
 }
 
 impl DataFusionTaskContextBuilder {
     pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = schema;
+        self
+    }
+
+    pub fn with_table_prefix(mut self, table_prefix: String) -> Self {
+        self.table_prefix = table_prefix;
         self
     }
 
@@ -452,8 +465,8 @@ impl DataFusionTaskContextBuilder {
 
         let sql_builder = SqlBuilder::new(
             &project_names,
-            Some(POSITION_DELETE_TABLE.to_owned()),
-            Some(DATA_FILE_TABLE.to_owned()),
+            Some(format!("{}_{}", self.table_prefix, POSITION_DELETE_TABLE)),
+            Some(format!("{}_{}", self.table_prefix, DATA_FILE_TABLE)),
             &equality_delete_metadatas,
             need_file_path_and_pos,
         );
@@ -476,6 +489,7 @@ impl DataFusionTaskContextBuilder {
                 None
             },
             exec_sql,
+            table_prefix: self.table_prefix,
         })
     }
 
@@ -515,6 +529,7 @@ impl DataFusionTaskContext {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         })
     }
 
@@ -844,6 +859,7 @@ mod tests {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         };
 
         let equality_ids = vec![1, 2];

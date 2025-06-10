@@ -46,6 +46,7 @@ where
     /// exceeds the target, close the current file and start a new one.
     async fn write(&mut self, input: RecordBatch) -> Result<()> {
         let input_size = input.get_array_memory_size();
+
         // If adding this batch would exceed the target file size, close current file and start a new one.
         if need_build_new_file(
             self.current_written_size,
