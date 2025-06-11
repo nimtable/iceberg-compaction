@@ -54,9 +54,8 @@ pub struct DatafusionProcessor {
 }
 
 impl DatafusionProcessor {
-    pub fn new(file_io: FileIO, config: Arc<CompactionConfig>) -> Self {
-        let mut session_config = SessionConfig::new();
-        session_config = session_config
+    pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
+        let session_config = SessionConfig::new()
             .with_target_partitions(config.target_partitions)
             .with_batch_size(config.max_record_batch_rows);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
@@ -125,7 +124,7 @@ impl DatafusionProcessor {
     }
 
     pub async fn execute(
-        &mut self,
+        &self,
         mut datafusion_task_ctx: DataFusionTaskContext,
     ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         let input_schema = datafusion_task_ctx.input_schema.take().unwrap();

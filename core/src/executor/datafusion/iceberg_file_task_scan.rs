@@ -58,27 +58,42 @@ impl RecordBatchBuffer {
     }
 
     fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
-        let result = if self.current_rows + batch.num_rows() > self.max_record_batch_rows {
-            let batches: Vec<_> = self.buffer.drain(..).collect();
-            let combined = concat_batches(&batch.schema(), &batches)?;
-            self.current_rows = 0;
-            Some(combined)
-        } else {
-            None
-        };
+        // Case 1: New batch itself is large enough and buffer is empty or too small to be significant
+        if batch.num_rows() >= self.max_record_batch_rows && self.buffer.is_empty() {
+            // Buffer was empty, yield current large batch directly
+            return Ok(Some(batch));
+        }
+
+        // Case 2: Buffer will overflow with the new batch
+        if !self.buffer.is_empty()
+            && (self.current_rows + batch.num_rows() > self.max_record_batch_rows)
+        {
+            let combined = self.finish_internal()?; // Drain and combine buffer
+            self.current_rows = batch.num_rows();
+            self.buffer.push(batch); // Add current batch to now-empty buffer
+            return Ok(combined); // Return the combined batch from buffer
+        }
+
+        // Case 3: Buffer has space
         self.current_rows += batch.num_rows();
         self.buffer.push(batch);
-        Ok(result)
+        Ok(None)
+    }
+
+    // Helper to drain and combine buffer, used by add and finish
+    fn finish_internal(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+        let schema_to_use = self.buffer[0].schema();
+        let batches_to_combine: Vec<_> = self.buffer.drain(..).collect();
+        let combined = concat_batches(&schema_to_use, &batches_to_combine)?;
+        self.current_rows = 0;
+        Ok(Some(combined))
     }
 
     fn finish(mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        let batches: Vec<_> = self.buffer.drain(..).collect();
-        if !batches.is_empty() {
-            let combined = concat_batches(&batches[0].schema(), &batches)?;
-            Ok(Some(combined))
-        } else {
-            Ok(None)
-        }
+        self.finish_internal()
     }
 }
 
@@ -399,6 +414,7 @@ pub fn get_column_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, SchemaBuilder};
     use iceberg::scan::FileScanTask;
     use iceberg::spec::{DataContentType, Schema};
     use std::sync::Arc;
@@ -514,5 +530,215 @@ mod tests {
 
             assert_eq!(groups, groups_2);
         }
+    }
+
+    use datafusion::arrow::array::Int32Array;
+
+    // Helper function to create a RecordBatch with a single Int32 column and specified number of rows
+    fn create_test_batch(num_rows: usize, schema_opt: Option<ArrowSchemaRef>) -> RecordBatch {
+        // Renamed schema to schema_opt for clarity
+        let schema = schema_opt.unwrap_or_else(|| {
+            let mut builder = SchemaBuilder::new();
+            builder.push(Field::new(
+                "a",
+                ArrowDataType::Int32, // Use ArrowDataType explicitly
+                false,
+            ));
+            Arc::new(builder.finish()) // Use builder.finish() to get the Schema
+        });
+        let arr = Arc::new(Int32Array::from_iter_values(0..num_rows as i32));
+        RecordBatch::try_new(schema, vec![arr]).unwrap()
+    }
+
+    // ... existing tests for split_n_vecs ...
+
+    #[test]
+    fn test_record_batch_buffer_empty_buffer_large_batch() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let large_batch = create_test_batch(max_rows, None); // Exactly max_rows
+
+        // Case 1: New batch is large and buffer is empty. Yield new batch directly.
+        let result = buffer.add(large_batch.clone()).unwrap();
+        assert!(result.is_some(), "Should yield the large batch");
+        assert_eq!(result.unwrap().num_rows(), max_rows);
+        assert_eq!(buffer.current_rows, 0, "Buffer current_rows should be 0");
+        assert!(buffer.buffer.is_empty(), "Buffer should be empty");
+
+        let large_batch_over = create_test_batch(max_rows + 10, None); // Over max_rows
+        let result_over = buffer.add(large_batch_over.clone()).unwrap();
+        assert!(result_over.is_some(), "Should yield the large batch");
+        assert_eq!(result_over.unwrap().num_rows(), max_rows + 10);
+        assert_eq!(buffer.current_rows, 0);
+        assert!(buffer.buffer.is_empty());
+    }
+
+    #[test]
+    fn test_record_batch_buffer_overflow_and_yield() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+
+        // Add some initial batches that don't fill the buffer
+        let batch1 = create_test_batch(30, None);
+        let batch1_rows = batch1.num_rows();
+        assert!(buffer.add(batch1).unwrap().is_none());
+        assert_eq!(buffer.current_rows, batch1_rows);
+        assert_eq!(buffer.buffer.len(), 1);
+
+        let batch2 = create_test_batch(40, None);
+        let batch2_rows = batch2.num_rows();
+        assert!(buffer.add(batch2).unwrap().is_none());
+        assert_eq!(buffer.current_rows, batch1_rows + batch2_rows); // 30 + 40 = 70
+        assert_eq!(buffer.buffer.len(), 2);
+
+        // Add a batch that will cause an overflow
+        let batch3 = create_test_batch(50, None); // 70 + 50 = 120 > 100
+        let batch3_rows = batch3.num_rows();
+        let result = buffer.add(batch3.clone()).unwrap();
+
+        // Case 2: Buffer is not empty and adding new batch would overflow.
+        // Yield combined content of current buffer, then add new batch to now-empty buffer.
+        assert!(
+            result.is_some(),
+            "Should yield the combined batch from buffer"
+        );
+        assert_eq!(
+            result.unwrap().num_rows(),
+            batch1_rows + batch2_rows, // 70 rows
+            "Yielded batch should have rows from batch1 and batch2"
+        );
+        assert_eq!(
+            buffer.current_rows, batch3_rows,
+            "Buffer current_rows should be batch3's rows"
+        );
+        assert_eq!(
+            buffer.buffer.len(),
+            1,
+            "Buffer should now contain only batch3"
+        );
+        assert_eq!(buffer.buffer[0].num_rows(), batch3_rows);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_add_to_buffer_no_yield() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+
+        let batch1 = create_test_batch(30, None);
+        let batch1_rows = batch1.num_rows();
+        // Case 3: Buffer has space
+        assert!(buffer.add(batch1).unwrap().is_none());
+        assert_eq!(buffer.current_rows, batch1_rows);
+        assert_eq!(buffer.buffer.len(), 1);
+
+        let batch2 = create_test_batch(40, None);
+        let batch2_rows = batch2.num_rows();
+        assert!(buffer.add(batch2).unwrap().is_none());
+        assert_eq!(buffer.current_rows, batch1_rows + batch2_rows);
+        assert_eq!(buffer.buffer.len(), 2);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_finish_with_remaining() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+
+        let batch1 = create_test_batch(30, None);
+        let batch1_rows = batch1.num_rows();
+        buffer.add(batch1).unwrap();
+
+        let batch2 = create_test_batch(40, None);
+        let batch2_rows = batch2.num_rows();
+        buffer.add(batch2).unwrap();
+
+        let result = buffer.finish().unwrap();
+        assert!(result.is_some(), "Finish should yield remaining batches");
+        assert_eq!(result.unwrap().num_rows(), batch1_rows + batch2_rows);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_finish_empty() {
+        let max_rows = 100;
+        let buffer = RecordBatchBuffer::new(max_rows);
+        let result = buffer.finish().unwrap();
+        assert!(result.is_none(), "Finish on empty buffer should yield None");
+    }
+
+    #[test]
+    fn test_record_batch_buffer_add_multiple_then_overflow() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+
+        // Add batches that sum up to less than max_rows
+        buffer.add(create_test_batch(20, None)).unwrap(); // current_rows = 20
+        buffer.add(create_test_batch(30, None)).unwrap(); // current_rows = 50
+        buffer.add(create_test_batch(40, None)).unwrap(); // current_rows = 90
+        assert_eq!(buffer.current_rows, 90);
+        assert_eq!(buffer.buffer.len(), 3);
+
+        // Add a batch that causes overflow
+        let overflow_batch = create_test_batch(25, None); // 90 + 25 = 115 > 100
+        let overflow_batch_rows = overflow_batch.num_rows();
+        let yielded_batch = buffer.add(overflow_batch.clone()).unwrap();
+
+        assert!(yielded_batch.is_some());
+        assert_eq!(
+            yielded_batch.unwrap().num_rows(),
+            90,
+            "Should yield the 90 rows from buffer"
+        );
+        assert_eq!(
+            buffer.current_rows, overflow_batch_rows,
+            "Buffer should have rows of the new batch"
+        );
+        assert_eq!(buffer.buffer.len(), 1);
+        assert_eq!(buffer.buffer[0].num_rows(), overflow_batch_rows);
+
+        // Finish the buffer
+        let final_batch = buffer.finish().unwrap();
+        assert!(final_batch.is_some());
+        assert_eq!(final_batch.unwrap().num_rows(), overflow_batch_rows);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_add_batch_exactly_fills_then_overflows() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+
+        buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
+        // This batch makes current_rows exactly max_rows
+        let exact_fill_batch = create_test_batch(50, None);
+        assert!(buffer.add(exact_fill_batch).unwrap().is_none()); // 50 + 50 = 100. No yield yet.
+        assert_eq!(buffer.current_rows, 100);
+        assert_eq!(buffer.buffer.len(), 2);
+
+        // Next batch will cause overflow
+        let overflow_batch = create_test_batch(10, None);
+        let overflow_batch_rows = overflow_batch.num_rows();
+        let yielded_batch = buffer.add(overflow_batch.clone()).unwrap();
+
+        assert!(yielded_batch.is_some());
+        assert_eq!(
+            yielded_batch.unwrap().num_rows(),
+            100,
+            "Should yield the 100 rows"
+        );
+        assert_eq!(buffer.current_rows, overflow_batch_rows);
+        assert_eq!(buffer.buffer.len(), 1);
+        assert_eq!(buffer.buffer[0].num_rows(), overflow_batch_rows);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_add_to_empty_buffer_small_batch() {
+        let max_rows = 100;
+        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let small_batch = create_test_batch(10, None);
+        let small_batch_rows = small_batch.num_rows();
+
+        // Case 3: Buffer was empty and new batch is not "large".
+        let result = buffer.add(small_batch).unwrap();
+        assert!(result.is_none(), "Should not yield the small batch");
+        assert_eq!(buffer.current_rows, small_batch_rows);
+        assert_eq!(buffer.buffer.len(), 1);
     }
 }

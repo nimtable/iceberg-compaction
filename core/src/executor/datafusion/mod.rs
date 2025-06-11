@@ -65,7 +65,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_schema(schema)
             .with_input_data_files(input_file_scan_tasks)
             .build_merge_on_read()?;
-        let (batches, input_schema) = DatafusionProcessor::new(file_io.clone(), config.clone())
+        let (batches, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
             .execute(datafusion_task_ctx)
             .await?;
         let arc_input_schema = Arc::new(input_schema);

@@ -99,7 +99,7 @@ impl CompactionValidator {
         );
 
         let datafusion_processor =
-            DatafusionProcessor::new(table.file_io().clone(), validator_config);
+            DatafusionProcessor::new(validator_config, table.file_io().clone());
 
         Ok(Self {
             datafusion_processor,
