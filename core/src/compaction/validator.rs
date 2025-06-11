@@ -67,19 +67,24 @@ impl CompactionValidator {
             .iter()
             .map(|f| f.file_path())
             .collect::<HashSet<_>>();
+
         let mut output_file_scan_tasks_full_table = scan.plan_files().await?;
         let mut output_file_scan_tasks = vec![];
+
         while let Some(file) = output_file_scan_tasks_full_table.as_mut().next().await {
             let file = file?;
             if output_file_paths.contains(file.data_file_path()) {
                 output_file_scan_tasks.push(file);
             }
         }
+
+        // TODO: we can only select a single column for count validation
         let input_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(input_schema)
             .with_input_data_files(input_file_scan_tasks)
             .with_table_prefix("input".to_owned())
             .build_merge_on_read()?;
+
         let output_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(output_schema)
             .with_data_files(output_file_scan_tasks)
@@ -88,8 +93,8 @@ impl CompactionValidator {
 
         let validator_config = Arc::new(
             CompactionConfig::builder()
-                .batch_parallelism((config.batch_parallelism / 2).max(1)) // for two tasks
-                .target_partitions((config.target_partitions / 2).max(1))
+                .batch_parallelism(config.batch_parallelism)
+                .target_partitions(config.target_partitions)
                 .build(),
         );
 
@@ -106,6 +111,8 @@ impl CompactionValidator {
     }
 
     pub async fn validate(&mut self) -> Result<()> {
+        let now = std::time::Instant::now();
+
         let input_datafusion_task_ctx = self.input_datafusion_task_ctx.take().ok_or_else(|| {
             CompactionError::Unexpected("Input datafusion task context is not set".to_owned())
         })?;
@@ -144,6 +151,13 @@ impl CompactionValidator {
                 total_input_rows, total_output_rows, self.catalog_name, self.table_ident
             )));
         }
+
+        tracing::info!(
+            "Compaction validation completed for catalog '{}' table_ident '{}' in {} seconds",
+            self.catalog_name,
+            self.table_ident,
+            now.elapsed().as_secs_f64()
+        );
 
         Ok(())
     }
