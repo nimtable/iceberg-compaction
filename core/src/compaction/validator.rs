@@ -88,8 +88,8 @@ impl CompactionValidator {
 
         let validator_config = Arc::new(
             CompactionConfig::builder()
-                .batch_parallelism((config.batch_parallelism / 2).max(1))
-                .target_partitions(1)
+                .batch_parallelism((config.batch_parallelism / 2).max(1)) // for two tasks
+                .target_partitions((config.target_partitions / 2).max(1))
                 .build(),
         );
 
@@ -113,46 +113,35 @@ impl CompactionValidator {
             self.output_datafusion_task_ctx.take().ok_or_else(|| {
                 CompactionError::Unexpected("Output datafusion task context is not set".to_owned())
             })?;
-        let (mut input_batches, _) = self
+        let (mut input_batches_streams, _) = self
             .datafusion_processor
             .execute(input_datafusion_task_ctx)
             .await?;
-        let (mut output_batches, _) = self
+        let (mut output_batches_streams, _) = self
             .datafusion_processor
             .execute(output_datafusion_task_ctx)
             .await?;
 
-        // The target partitions is 1, so we expect only one batch for both input and output.
-        if input_batches.len() != output_batches.len() || input_batches.len() != 1 {
+        let mut total_input_rows = 0;
+        for stream_result in input_batches_streams.iter_mut() {
+            // Iterate over each stream
+            while let Some(batch_result) = stream_result.as_mut().next().await {
+                total_input_rows += batch_result?.num_rows();
+            }
+        }
+
+        let mut total_output_rows = 0;
+        for stream_result in output_batches_streams.iter_mut() {
+            // Iterate over each stream
+            while let Some(batch_result) = stream_result.as_mut().next().await {
+                total_output_rows += batch_result?.num_rows();
+            }
+        }
+
+        if total_input_rows != total_output_rows {
             return Err(CompactionError::CompactionValidator(format!(
-                "Input and output batches length mismatch: {} != {} != 1 catalog {} table_ident {}",
-                input_batches.len(),
-                output_batches.len(),
-                self.catalog_name,
-                self.table_ident
-            )));
-        }
-
-        let mut input_batch = input_batches.pop().unwrap();
-        let mut output_batch = output_batches.pop().unwrap();
-
-        let mut input_stream = input_batch.as_mut();
-        let mut output_stream = output_batch.as_mut();
-
-        let mut input_count = 0;
-        let mut output_count = 0;
-
-        while let Some(input_batch) = input_stream.next().await {
-            input_count += input_batch?.num_rows();
-        }
-        while let Some(output_batch) = output_stream.next().await {
-            output_count += output_batch?.num_rows();
-        }
-
-        if input_count != output_count {
-            return Err(CompactionError::CompactionValidator(format!(
-                "Input and output count mismatch: {} != {} catalog {} table_ident {}",
-                input_count, output_count, self.catalog_name, self.table_ident
+                "Input and output row count mismatch: {} != {} for catalog '{}' table_ident '{}'",
+                total_input_rows, total_output_rows, self.catalog_name, self.table_ident
             )));
         }
 
