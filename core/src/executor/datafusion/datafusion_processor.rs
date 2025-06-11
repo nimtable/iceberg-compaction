@@ -16,7 +16,10 @@
 
 use std::sync::Arc;
 
-use crate::error::{CompactionError, Result};
+use crate::{
+    CompactionConfig,
+    error::{CompactionError, Result},
+};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
@@ -46,7 +49,6 @@ const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
 pub struct DatafusionProcessor {
     datafusion_task_ctx: DataFusionTaskContext,
     table_register: DatafusionTableRegister,
-    batch_parallelism: usize,
     target_partitions: usize,
     ctx: Arc<SessionContext>,
 }
@@ -55,16 +57,19 @@ impl DatafusionProcessor {
     pub fn new(
         ctx: Arc<SessionContext>,
         datafusion_task_ctx: DataFusionTaskContext,
-        batch_parallelism: usize,
-        target_partitions: usize,
         file_io: FileIO,
+        config: &CompactionConfig,
     ) -> Self {
-        let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
+        let table_register = DatafusionTableRegister::new(
+            file_io,
+            ctx.clone(),
+            config.batch_parallelism,
+            config.max_record_batch_rows,
+        );
         Self {
             datafusion_task_ctx,
             table_register,
-            batch_parallelism,
-            target_partitions,
+            target_partitions: config.target_partitions,
             ctx,
         }
     }
@@ -73,11 +78,12 @@ impl DatafusionProcessor {
         if let Some(datafile_schema) = self.datafusion_task_ctx.data_file_schema.take() {
             self.table_register.register_data_table_provider(
                 &datafile_schema,
-                self.datafusion_task_ctx.data_files.take().unwrap(),
+                self.datafusion_task_ctx.data_files.take().ok_or_else(|| {
+                    CompactionError::Unexpected("Data files are not set".to_owned())
+                })?,
                 DATA_FILE_TABLE,
                 self.datafusion_task_ctx.need_seq_num(),
                 self.datafusion_task_ctx.need_file_path_and_pos(),
-                self.batch_parallelism,
             )?;
         }
 
@@ -88,9 +94,10 @@ impl DatafusionProcessor {
                 self.datafusion_task_ctx
                     .position_delete_files
                     .take()
-                    .unwrap(),
+                    .ok_or_else(|| {
+                        CompactionError::Unexpected("Position delete files are not set".to_owned())
+                    })?,
                 POSITION_DELETE_TABLE,
-                self.batch_parallelism,
             )?;
         }
 
@@ -107,7 +114,6 @@ impl DatafusionProcessor {
                     &equality_delete_schema,
                     file_scan_tasks,
                     &equality_delete_table_name,
-                    self.batch_parallelism,
                 )?;
             }
         }
@@ -117,21 +123,27 @@ impl DatafusionProcessor {
     pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         self.register_tables()?;
         let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
-        let physical_plan = df.create_physical_plan().await?;
-        let batchs =
+        let physical_plan = df.create_physical_plan().await?; // Original physical plan
+
+        // Conditionally create a new physical_plan if repartitioning is needed
+        let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
             if physical_plan.output_partitioning().partition_count() != self.target_partitions {
-                let physical_plan: Arc<dyn ExecutionPlan + 'static> =
-                    Arc::new(RepartitionExec::try_new(
-                        physical_plan,
-                        Partitioning::RoundRobinBatch(self.target_partitions),
-                    )?);
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+                Arc::new(RepartitionExec::try_new(
+                    physical_plan, // Consumes the original physical_plan
+                    Partitioning::RoundRobinBatch(self.target_partitions),
+                )?)
             } else {
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+                physical_plan // Use the original physical_plan
             };
+
+        let batchs = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
+
         Ok((
             batchs,
-            self.datafusion_task_ctx.input_schema.take().unwrap(),
+            self.datafusion_task_ctx
+                .input_schema
+                .take()
+                .ok_or_else(|| CompactionError::Unexpected("Input schema is not set".to_owned()))?,
         ))
     }
 }
@@ -139,11 +151,24 @@ impl DatafusionProcessor {
 pub struct DatafusionTableRegister {
     file_io: FileIO,
     ctx: Arc<SessionContext>,
+
+    batch_parallelism: usize,
+    max_record_batch_rows: usize,
 }
 
 impl DatafusionTableRegister {
-    pub fn new(file_io: FileIO, ctx: Arc<SessionContext>) -> Self {
-        DatafusionTableRegister { file_io, ctx }
+    pub fn new(
+        file_io: FileIO,
+        ctx: Arc<SessionContext>,
+        batch_parallelism: usize,
+        max_record_batch_rows: usize,
+    ) -> Self {
+        DatafusionTableRegister {
+            file_io,
+            ctx,
+            batch_parallelism,
+            max_record_batch_rows,
+        }
     }
 
     pub fn register_data_table_provider(
@@ -153,7 +178,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         self.register_table_provider_impl(
             schema,
@@ -161,7 +185,6 @@ impl DatafusionTableRegister {
             table_name,
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
         )
     }
 
@@ -170,19 +193,10 @@ impl DatafusionTableRegister {
         schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
-        batch_parallelism: usize,
     ) -> Result<()> {
-        self.register_table_provider_impl(
-            schema,
-            file_scan_tasks,
-            table_name,
-            false,
-            false,
-            batch_parallelism,
-        )
+        self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register_table_provider_impl(
         &self,
         schema: &Schema,
@@ -190,7 +204,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
@@ -199,12 +212,13 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
+            self.batch_parallelism,
+            self.max_record_batch_rows,
         );
 
         self.ctx
-            .register_table(table_name, Arc::new(data_file_table_provider))
-            .unwrap();
+            .register_table(table_name, Arc::new(data_file_table_provider))?;
+
         Ok(())
     }
 }

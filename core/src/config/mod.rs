@@ -30,16 +30,38 @@ pub struct CompactionConfig {
     pub data_file_prefix: String,
     #[serde(default = "default_target_file_size")]
     pub target_file_size: usize,
+    #[serde(default = "default_max_record_batch_rows")]
+    pub max_record_batch_rows: usize,
 }
+
 fn default_batch_parallelism() -> usize {
     4
 }
+
 fn default_target_partitions() -> usize {
     4
 }
+
 fn default_data_file_prefix() -> String {
     DEFAULT_PREFIX.to_string()
 }
+
 fn default_target_file_size() -> usize {
     1024 * 1024 * 1024 // 1 GB
+}
+
+fn default_max_record_batch_rows() -> usize {
+    1024
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            batch_parallelism: default_batch_parallelism(),
+            target_partitions: default_target_partitions(),
+            data_file_prefix: default_data_file_prefix(),
+            target_file_size: default_target_file_size(),
+            max_record_batch_rows: default_max_record_batch_rows(),
+        }
+    }
 }

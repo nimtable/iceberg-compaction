@@ -14,13 +14,7 @@
  * limitations under the License.
  */
 
-use crate::{
-    error::Result,
-    executor::{
-        datafusion::iceberg_file_task_scan::RECORD_BATCH_SIZE,
-        iceberg_writer::rolling_iceberg_writer,
-    },
-};
+use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
 use ::datafusion::{
     parquet::file::properties::WriterProperties,
     prelude::{SessionConfig, SessionContext},
@@ -70,7 +64,7 @@ impl CompactionExecutor for DataFusionExecutor {
         let mut session_config = SessionConfig::new();
         session_config = session_config
             .with_target_partitions(config.target_partitions)
-            .with_batch_size(RECORD_BATCH_SIZE);
+            .with_batch_size(config.max_record_batch_rows);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
         let mut stat = RewriteFilesStat::default();
@@ -88,15 +82,10 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_position_delete_files(position_delete_files)
             .with_equality_delete_files(equality_delete_files)
             .build_merge_on_read()?;
-        let (batchs, input_schema) = DatafusionProcessor::new(
-            ctx,
-            datafusion_task_ctx,
-            config.batch_parallelism,
-            config.target_partitions,
-            file_io.clone(),
-        )
-        .execute()
-        .await?;
+        let (batchs, input_schema) =
+            DatafusionProcessor::new(ctx, datafusion_task_ctx, file_io.clone(), &config)
+                .execute()
+                .await?;
         let arc_input_schema = Arc::new(input_schema);
         let mut futures = Vec::with_capacity(config.batch_parallelism);
         // build iceberg writer for each partition
