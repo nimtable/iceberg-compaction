@@ -16,14 +16,18 @@
 
 use std::sync::Arc;
 
-use crate::error::{CompactionError, Result};
+use crate::{
+    CompactionConfig,
+    error::{CompactionError, Result},
+    executor::InputFileScanTasks,
+};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
         repartition::RepartitionExec,
     },
-    prelude::SessionContext,
+    prelude::{SessionConfig, SessionContext},
 };
 use iceberg::{
     arrow::schema_to_arrow_schema,
@@ -44,58 +48,50 @@ const POSITION_DELETE_TABLE: &str = "position_delete_table";
 const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
 
 pub struct DatafusionProcessor {
-    datafusion_task_ctx: DataFusionTaskContext,
     table_register: DatafusionTableRegister,
-    batch_parallelism: usize,
-    target_partitions: usize,
     ctx: Arc<SessionContext>,
+    config: Arc<CompactionConfig>,
 }
 
 impl DatafusionProcessor {
-    pub fn new(
-        ctx: Arc<SessionContext>,
-        datafusion_task_ctx: DataFusionTaskContext,
-        batch_parallelism: usize,
-        target_partitions: usize,
-        file_io: FileIO,
-    ) -> Self {
+    pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
+        let mut session_config = SessionConfig::new();
+        session_config = session_config.with_target_partitions(config.target_partitions);
+        let ctx = Arc::new(SessionContext::new_with_config(session_config));
         let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
         Self {
-            datafusion_task_ctx,
             table_register,
-            batch_parallelism,
-            target_partitions,
             ctx,
+            config,
         }
     }
 
-    pub fn register_tables(&mut self) -> Result<()> {
-        if let Some(datafile_schema) = self.datafusion_task_ctx.data_file_schema.take() {
+    pub fn register_tables(&self, mut datafusion_task_ctx: DataFusionTaskContext) -> Result<()> {
+        if let Some(datafile_schema) = datafusion_task_ctx.data_file_schema.take() {
             self.table_register.register_data_table_provider(
                 &datafile_schema,
-                self.datafusion_task_ctx.data_files.take().unwrap(),
-                DATA_FILE_TABLE,
-                self.datafusion_task_ctx.need_seq_num(),
-                self.datafusion_task_ctx.need_file_path_and_pos(),
-                self.batch_parallelism,
+                datafusion_task_ctx.data_files.take().unwrap(),
+                &format!("{}_{}", datafusion_task_ctx.table_prefix, DATA_FILE_TABLE),
+                datafusion_task_ctx.need_seq_num(),
+                datafusion_task_ctx.need_file_path_and_pos(),
+                self.config.batch_parallelism,
             )?;
         }
 
-        if let Some(position_delete_schema) = self.datafusion_task_ctx.position_delete_schema.take()
-        {
+        if let Some(position_delete_schema) = datafusion_task_ctx.position_delete_schema.take() {
             self.table_register.register_delete_table_provider(
                 &position_delete_schema,
-                self.datafusion_task_ctx
-                    .position_delete_files
-                    .take()
-                    .unwrap(),
-                POSITION_DELETE_TABLE,
-                self.batch_parallelism,
+                datafusion_task_ctx.position_delete_files.take().unwrap(),
+                &format!(
+                    "{}_{}",
+                    datafusion_task_ctx.table_prefix, POSITION_DELETE_TABLE
+                ),
+                self.config.batch_parallelism,
             )?;
         }
 
         if let Some(equality_delete_metadatas) =
-            self.datafusion_task_ctx.equality_delete_metadatas.take()
+            datafusion_task_ctx.equality_delete_metadatas.take()
         {
             for EqualityDeleteMetadata {
                 equality_delete_schema,
@@ -106,33 +102,39 @@ impl DatafusionProcessor {
                 self.table_register.register_delete_table_provider(
                     &equality_delete_schema,
                     file_scan_tasks,
-                    &equality_delete_table_name,
-                    self.batch_parallelism,
+                    &format!(
+                        "{}_{}",
+                        datafusion_task_ctx.table_prefix, equality_delete_table_name
+                    ),
+                    self.config.batch_parallelism,
                 )?;
             }
         }
         Ok(())
     }
 
-    pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
-        self.register_tables()?;
-        let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
+    pub async fn execute(
+        &self,
+        mut datafusion_task_ctx: DataFusionTaskContext,
+    ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
+        let input_schema = datafusion_task_ctx.input_schema.take().unwrap();
+        let exec_sql = datafusion_task_ctx.exec_sql.clone();
+        self.register_tables(datafusion_task_ctx)?;
+        let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
-        let batchs =
-            if physical_plan.output_partitioning().partition_count() != self.target_partitions {
-                let physical_plan: Arc<dyn ExecutionPlan + 'static> =
-                    Arc::new(RepartitionExec::try_new(
-                        physical_plan,
-                        Partitioning::RoundRobinBatch(self.target_partitions),
-                    )?);
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-            } else {
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-            };
-        Ok((
-            batchs,
-            self.datafusion_task_ctx.input_schema.take().unwrap(),
-        ))
+        let batches = if physical_plan.output_partitioning().partition_count()
+            != self.config.target_partitions
+        {
+            let physical_plan: Arc<dyn ExecutionPlan + 'static> =
+                Arc::new(RepartitionExec::try_new(
+                    physical_plan,
+                    Partitioning::RoundRobinBatch(self.config.target_partitions),
+                )?);
+            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+        } else {
+            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+        };
+        Ok((batches, input_schema))
     }
 }
 
@@ -253,7 +255,7 @@ impl<'a> SqlBuilder<'a> {
     /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(self) -> Result<String> {
         let data_file_table_name = self.data_file_table_name.as_ref().ok_or_else(|| {
-            CompactionError::Config("Data file table name is not provided".to_string())
+            CompactionError::Execution("Data file table name is not provided".to_string())
         })?;
         // Start with a basic SELECT query from the data file table
         let mut sql = format!(
@@ -267,7 +269,7 @@ impl<'a> SqlBuilder<'a> {
         if self.need_file_path_and_pos {
             let position_delete_table_name =
                 self.position_delete_table_name.as_ref().ok_or_else(|| {
-                    CompactionError::Config(
+                    CompactionError::Execution(
                         "Position delete table name is not provided".to_string(),
                     )
                 })?;
@@ -317,6 +319,7 @@ pub struct DataFusionTaskContext {
     pub(crate) position_delete_schema: Option<Schema>,
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
     pub(crate) exec_sql: String,
+    pub(crate) table_prefix: String,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -324,6 +327,7 @@ pub struct DataFusionTaskContextBuilder {
     data_files: Vec<FileScanTask>,
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
+    table_prefix: String,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -332,7 +336,19 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_datafile(mut self, data_files: Vec<FileScanTask>) -> Self {
+    pub fn with_table_prefix(mut self, table_prefix: String) -> Self {
+        self.table_prefix = table_prefix;
+        self
+    }
+
+    pub fn with_input_data_files(mut self, input_file_scan_tasks: InputFileScanTasks) -> Self {
+        self.data_files = input_file_scan_tasks.data_files;
+        self.position_delete_files = input_file_scan_tasks.position_delete_files;
+        self.equality_delete_files = input_file_scan_tasks.equality_delete_files;
+        self
+    }
+
+    pub fn with_data_files(mut self, data_files: Vec<FileScanTask>) -> Self {
         self.data_files = data_files;
         self
     }
@@ -449,8 +465,8 @@ impl DataFusionTaskContextBuilder {
 
         let sql_builder = SqlBuilder::new(
             &project_names,
-            Some(POSITION_DELETE_TABLE.to_owned()),
-            Some(DATA_FILE_TABLE.to_owned()),
+            Some(format!("{}_{}", self.table_prefix, POSITION_DELETE_TABLE)),
+            Some(format!("{}_{}", self.table_prefix, DATA_FILE_TABLE)),
             &equality_delete_metadatas,
             need_file_path_and_pos,
         );
@@ -473,6 +489,7 @@ impl DataFusionTaskContextBuilder {
                 None
             },
             exec_sql,
+            table_prefix: self.table_prefix,
         })
     }
 
@@ -487,7 +504,7 @@ impl DataFusionTaskContextBuilder {
             let field = self
                 .schema
                 .field_by_id(*id)
-                .ok_or_else(|| CompactionError::Config("equality_ids not found".to_owned()))?;
+                .ok_or_else(|| CompactionError::Execution("equality_ids not found".to_owned()))?;
             equality_delete_fields.push(field.clone());
         }
         *highest_field_id += 1;
@@ -512,6 +529,7 @@ impl DataFusionTaskContext {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         })
     }
 
@@ -841,6 +859,7 @@ mod tests {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         };
 
         let equality_ids = vec![1, 2];
