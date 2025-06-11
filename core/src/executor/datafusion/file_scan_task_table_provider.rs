@@ -92,7 +92,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.need_seq_num,
             self.need_file_path_and_pos,
             self.batch_parallelism,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
