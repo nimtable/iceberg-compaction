@@ -33,7 +33,10 @@ pub enum CompactionError {
     #[error("DataFusion error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
 
-    #[error("Unexpected error: {0}")]
+    #[error("Compaction validator failed: {0}")]
+    CompactionValidator(String),
+
+    #[error("Compaction unexpected failed: {0}")]
     Unexpected(String),
 }
 
