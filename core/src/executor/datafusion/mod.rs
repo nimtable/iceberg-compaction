@@ -58,7 +58,7 @@ impl CompactionExecutor for DataFusionExecutor {
             dir_path,
             partition_spec,
         } = request;
-        
+
         let mut stat = RewriteFilesStat::default();
         let rewritten_files_count = input_file_scan_tasks.input_files_count();
 
