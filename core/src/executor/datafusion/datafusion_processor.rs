@@ -55,10 +55,16 @@ pub struct DatafusionProcessor {
 
 impl DatafusionProcessor {
     pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
-        let mut session_config = SessionConfig::new();
-        session_config = session_config.with_target_partitions(config.target_partitions);
+        let session_config = SessionConfig::new()
+            .with_target_partitions(config.target_partitions)
+            .with_batch_size(config.max_record_batch_rows);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
-        let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
+        let table_register = DatafusionTableRegister::new(
+            file_io,
+            ctx.clone(),
+            config.batch_parallelism,
+            config.max_record_batch_rows,
+        );
         Self {
             table_register,
             ctx,
@@ -70,23 +76,28 @@ impl DatafusionProcessor {
         if let Some(datafile_schema) = datafusion_task_ctx.data_file_schema.take() {
             self.table_register.register_data_table_provider(
                 &datafile_schema,
-                datafusion_task_ctx.data_files.take().unwrap(),
+                datafusion_task_ctx.data_files.take().ok_or_else(|| {
+                    CompactionError::Unexpected("Data files are not set".to_owned())
+                })?,
                 &format!("{}_{}", datafusion_task_ctx.table_prefix, DATA_FILE_TABLE),
                 datafusion_task_ctx.need_seq_num(),
                 datafusion_task_ctx.need_file_path_and_pos(),
-                self.config.batch_parallelism,
             )?;
         }
 
         if let Some(position_delete_schema) = datafusion_task_ctx.position_delete_schema.take() {
             self.table_register.register_delete_table_provider(
                 &position_delete_schema,
-                datafusion_task_ctx.position_delete_files.take().unwrap(),
+                datafusion_task_ctx
+                    .position_delete_files
+                    .take()
+                    .ok_or_else(|| {
+                        CompactionError::Unexpected("Position delete files are not set".to_owned())
+                    })?,
                 &format!(
                     "{}_{}",
                     datafusion_task_ctx.table_prefix, POSITION_DELETE_TABLE
                 ),
-                self.config.batch_parallelism,
             )?;
         }
 
@@ -106,7 +117,6 @@ impl DatafusionProcessor {
                         "{}_{}",
                         datafusion_task_ctx.table_prefix, equality_delete_table_name
                     ),
-                    self.config.batch_parallelism,
                 )?;
             }
         }
@@ -120,20 +130,25 @@ impl DatafusionProcessor {
         let input_schema = datafusion_task_ctx.input_schema.take().unwrap();
         let exec_sql = datafusion_task_ctx.exec_sql.clone();
         self.register_tables(datafusion_task_ctx)?;
+
         let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
-        let batches = if physical_plan.output_partitioning().partition_count()
-            != self.config.target_partitions
-        {
-            let physical_plan: Arc<dyn ExecutionPlan + 'static> =
+
+        // Conditionally create a new physical_plan if repartitioning is needed
+        let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
+            if physical_plan.output_partitioning().partition_count()
+                != self.config.target_partitions
+            {
                 Arc::new(RepartitionExec::try_new(
-                    physical_plan,
+                    physical_plan, // Consumes the original physical_plan
                     Partitioning::RoundRobinBatch(self.config.target_partitions),
-                )?);
-            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-        } else {
-            execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
-        };
+                )?)
+            } else {
+                physical_plan // Use the original physical_plan
+            };
+
+        let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
+
         Ok((batches, input_schema))
     }
 }
@@ -141,11 +156,24 @@ impl DatafusionProcessor {
 pub struct DatafusionTableRegister {
     file_io: FileIO,
     ctx: Arc<SessionContext>,
+
+    batch_parallelism: usize,
+    max_record_batch_rows: usize,
 }
 
 impl DatafusionTableRegister {
-    pub fn new(file_io: FileIO, ctx: Arc<SessionContext>) -> Self {
-        DatafusionTableRegister { file_io, ctx }
+    pub fn new(
+        file_io: FileIO,
+        ctx: Arc<SessionContext>,
+        batch_parallelism: usize,
+        max_record_batch_rows: usize,
+    ) -> Self {
+        DatafusionTableRegister {
+            file_io,
+            ctx,
+            batch_parallelism,
+            max_record_batch_rows,
+        }
     }
 
     pub fn register_data_table_provider(
@@ -155,7 +183,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         self.register_table_provider_impl(
             schema,
@@ -163,7 +190,6 @@ impl DatafusionTableRegister {
             table_name,
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
         )
     }
 
@@ -172,19 +198,10 @@ impl DatafusionTableRegister {
         schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
-        batch_parallelism: usize,
     ) -> Result<()> {
-        self.register_table_provider_impl(
-            schema,
-            file_scan_tasks,
-            table_name,
-            false,
-            false,
-            batch_parallelism,
-        )
+        self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register_table_provider_impl(
         &self,
         schema: &Schema,
@@ -192,7 +209,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
@@ -201,12 +217,13 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
+            self.batch_parallelism,
+            self.max_record_batch_rows,
         );
 
         self.ctx
-            .register_table(table_name, Arc::new(data_file_table_provider))
-            .unwrap();
+            .register_table(table_name, Arc::new(data_file_table_provider))?;
+
         Ok(())
     }
 }

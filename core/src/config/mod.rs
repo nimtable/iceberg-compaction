@@ -22,6 +22,7 @@ const DEFAULT_BATCH_PARALLELISM: usize = 4;
 const DEFAULT_TARGET_PARTITIONS: usize = 4;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 const DEFAULT_VALIDATE_COMPACTION: bool = false;
+const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -31,6 +32,7 @@ pub struct CompactionConfig {
     pub data_file_prefix: String,
     pub target_file_size: u64,
     pub enable_validate_compaction: bool,
+    pub max_record_batch_rows: usize,
 }
 
 impl CompactionConfig {
@@ -46,6 +48,7 @@ pub struct CompactionConfigBuilder {
     data_file_prefix: Option<String>,
     target_file_size: Option<u64>,
     enable_validate_compaction: Option<bool>,
+    max_record_batch_rows: Option<usize>,
 }
 
 impl CompactionConfigBuilder {
@@ -74,6 +77,11 @@ impl CompactionConfigBuilder {
         self
     }
 
+    pub fn max_record_batch_rows(mut self, value: usize) -> Self {
+        self.max_record_batch_rows = Some(value);
+        self
+    }
+
     pub fn build(self) -> CompactionConfig {
         CompactionConfig {
             batch_parallelism: self.batch_parallelism.unwrap_or(DEFAULT_BATCH_PARALLELISM),
@@ -83,6 +91,9 @@ impl CompactionConfigBuilder {
             enable_validate_compaction: self
                 .enable_validate_compaction
                 .unwrap_or(DEFAULT_VALIDATE_COMPACTION),
+            max_record_batch_rows: self
+                .max_record_batch_rows
+                .unwrap_or(DEFAULT_MAX_RECORD_BATCH_ROWS),
         }
     }
 }
