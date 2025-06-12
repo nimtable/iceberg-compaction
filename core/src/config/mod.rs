@@ -87,6 +87,11 @@ impl CompactionConfigBuilder {
         self
     }
 
+    pub fn write_parquet_properties(mut self, properties: WriterProperties) -> Self {
+        self.write_parquet_properties = Some(properties);
+        self
+    }
+
     pub fn build(self) -> CompactionConfig {
         CompactionConfig {
             batch_parallelism: self.batch_parallelism.unwrap_or(DEFAULT_BATCH_PARALLELISM),
