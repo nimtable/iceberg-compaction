@@ -549,6 +549,7 @@ dependencies = [
  "backon",
  "bergloom-codegen",
  "datafusion",
+ "derive_builder",
  "futures",
  "futures-async-stream",
  "iceberg",
