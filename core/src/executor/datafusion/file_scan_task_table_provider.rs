@@ -38,6 +38,7 @@ pub struct IcebergFileScanTaskTableProvider {
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     batch_parallelism: usize,
+    max_record_batch_rows: usize,
 }
 impl IcebergFileScanTaskTableProvider {
     pub fn new(
@@ -47,6 +48,7 @@ impl IcebergFileScanTaskTableProvider {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
+        max_record_batch_rows: usize,
     ) -> Self {
         Self {
             file_scan_tasks,
@@ -55,6 +57,7 @@ impl IcebergFileScanTaskTableProvider {
             need_seq_num,
             need_file_path_and_pos,
             batch_parallelism,
+            max_record_batch_rows,
         }
     }
 }
@@ -92,6 +95,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.need_seq_num,
             self.need_file_path_and_pos,
             self.batch_parallelism,
+            self.max_record_batch_rows,
         )?))
     }
 
