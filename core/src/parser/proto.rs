@@ -1,6 +1,12 @@
 use std::sync::Arc;
 
 use crate::error::Result;
+use bergloom_codegen::compactor::literal;
+use bergloom_codegen::compactor::nested_field_descriptor::FieldType;
+use bergloom_codegen::compactor::primitive_literal::KindLiteral;
+use bergloom_codegen::compactor::primitive_literal::KindWithoutInnerLiteral;
+use bergloom_codegen::compactor::primitive_type::Kind;
+use bergloom_codegen::compactor::primitive_type::KindWithoutInner;
 use bergloom_codegen::compactor::DataFile;
 use bergloom_codegen::compactor::FileIoBuilder;
 use bergloom_codegen::compactor::FileScanTaskDescriptor;
@@ -16,22 +22,16 @@ use bergloom_codegen::compactor::RewriteFilesStat as PbRewriteFilesStat;
 use bergloom_codegen::compactor::SchemaDescriptor;
 use bergloom_codegen::compactor::StructLiteralDescriptor;
 use bergloom_codegen::compactor::Transform;
-use bergloom_codegen::compactor::literal;
-use bergloom_codegen::compactor::nested_field_descriptor::FieldType;
-use bergloom_codegen::compactor::primitive_literal::KindLiteral;
-use bergloom_codegen::compactor::primitive_literal::KindWithoutInnerLiteral;
-use bergloom_codegen::compactor::primitive_type::Kind;
-use bergloom_codegen::compactor::primitive_type::KindWithoutInner;
 use iceberg::spec::DataContentType;
 use iceberg::spec::NestedField;
 use iceberg::spec::Type;
 use iceberg::{scan::FileScanTask, spec::Schema};
 
-use crate::CompactionConfig;
-use crate::CompactionError;
 use crate::executor::InputFileScanTasks;
 use crate::executor::RewriteFilesRequest;
 use crate::executor::RewriteFilesResponse;
+use crate::CompactionConfig;
+use crate::CompactionError;
 
 pub struct PbRewriteFilesRequestDecoder {
     rewrite_file_request_proto: PbRewriteFilesRequest,

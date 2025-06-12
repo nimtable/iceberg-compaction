@@ -17,15 +17,15 @@
 use std::sync::Arc;
 
 use crate::{
-    CompactionConfig,
     error::{CompactionError, Result},
     executor::InputFileScanTasks,
+    CompactionConfig,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -403,7 +403,7 @@ impl DataFusionTaskContextBuilder {
     // build data fusion task context
     pub fn build_merge_on_read(self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
-        // Build scheam for position delete file, file_path + pos
+        // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
         // Build schema for equality delete file, equality_ids + seq_num
         let mut equality_ids: Option<Vec<i32>> = None;
