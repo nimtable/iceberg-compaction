@@ -75,20 +75,20 @@ impl CompactionExecutor for DataFusionExecutor {
         for mut batch in batches {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
-            let data_file_prefix = config.data_file_prefix.clone();
-            let target_file_size = config.target_file_size;
+            let config = config.clone();
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
                 let mut data_file_writer = Self::build_iceberg_writer(
-                    data_file_prefix,
+                    config.data_file_prefix.clone(),
                     dir_path,
                     schema,
                     file_io,
                     partition_spec,
-                    target_file_size,
+                    config.target_file_size,
+                    config.write_parquet_properties.clone(),
                 )
                 .await?;
                 while let Some(b) = batch.as_mut().next().await {
@@ -130,6 +130,7 @@ impl DataFusionExecutor {
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
         target_file_size: u64,
+        write_parquet_properties: WriterProperties,
     ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
@@ -140,12 +141,13 @@ impl DataFusionExecutor {
         );
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
+            write_parquet_properties,
             schema.clone(),
             file_io,
             location_generator,
             file_name_generator,
         );
+
         let data_file_builder =
             DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
         let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(

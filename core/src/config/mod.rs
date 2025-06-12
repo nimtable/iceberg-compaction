@@ -14,17 +14,16 @@
  * limitations under the License.
  */
 
+use parquet::{basic::Compression, file::properties::WriterProperties};
 use serde::Deserialize;
-use serde_with::serde_as;
 
-const DEFAULT_PREFIX: &str = "10";
+const DEFAULT_PREFIX: &str = "bergloom";
 const DEFAULT_BATCH_PARALLELISM: usize = 4;
 const DEFAULT_TARGET_PARTITIONS: usize = 4;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 const DEFAULT_VALIDATE_COMPACTION: bool = false;
 const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 
-#[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct CompactionConfig {
     pub batch_parallelism: usize,
@@ -33,6 +32,10 @@ pub struct CompactionConfig {
     pub target_file_size: u64,
     pub enable_validate_compaction: bool,
     pub max_record_batch_rows: usize,
+
+    #[serde(skip)]
+    // FIXME: this is a workaround for serde not supporting default values for WriterProperties
+    pub write_parquet_properties: WriterProperties,
 }
 
 impl CompactionConfig {
@@ -49,6 +52,8 @@ pub struct CompactionConfigBuilder {
     target_file_size: Option<u64>,
     enable_validate_compaction: Option<bool>,
     max_record_batch_rows: Option<usize>,
+
+    write_parquet_properties: Option<WriterProperties>,
 }
 
 impl CompactionConfigBuilder {
@@ -94,6 +99,14 @@ impl CompactionConfigBuilder {
             max_record_batch_rows: self
                 .max_record_batch_rows
                 .unwrap_or(DEFAULT_MAX_RECORD_BATCH_ROWS),
+            write_parquet_properties: self.write_parquet_properties.unwrap_or_else(|| {
+                WriterProperties::builder()
+                    .set_compression(Compression::SNAPPY)
+                    .set_created_by(
+                        concat!("bergloom version ", env!("CARGO_PKG_VERSION")).to_owned(),
+                    )
+                    .build()
+            }),
         }
     }
 }
