@@ -77,10 +77,7 @@ impl IcebergFileTaskScan {
                         .iter()
                         .filter_map(|name| task.schema().field_id_by_name(name))
                         .collect::<Vec<_>>();
-                    let new_schema = task
-                        .schema()
-                        .clone()
-                        .into_builder()
+                    let new_schema = iceberg::spec::Schema::builder()
                         .with_fields(
                             projection
                                 .iter()
