@@ -3,10 +3,6 @@ name = "bergloom-service-compactor"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "compactor-server"
-path = "src/bin/main.rs"
-
 [dependencies]
 async-trait = "0.1.86"
 bergloom-codegen = { workspace = true }
@@ -18,3 +14,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[[bin]]
+name = "compactor-server"
+path = "src/bin/main.rs"

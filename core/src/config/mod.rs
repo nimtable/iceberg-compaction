@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use derive_builder::Builder;
 use parquet::{basic::Compression, file::properties::WriterProperties};
 use serde::Deserialize;
 
@@ -24,89 +25,31 @@ const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 const DEFAULT_VALIDATE_COMPACTION: bool = false;
 const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 
-#[derive(Debug, Deserialize)]
+// Helper function for the default WriterProperties
+fn default_writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_created_by(concat!("bergloom version ", env!("CARGO_PKG_VERSION")).to_owned())
+        .build()
+}
+
+#[derive(Builder, Debug, Deserialize, Default, Clone)]
 pub struct CompactionConfig {
+    #[builder(default = "DEFAULT_BATCH_PARALLELISM")]
     pub batch_parallelism: usize,
+    #[builder(default = "DEFAULT_TARGET_PARTITIONS")]
     pub target_partitions: usize,
+    #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size: u64,
+    #[builder(default = "DEFAULT_VALIDATE_COMPACTION")]
     pub enable_validate_compaction: bool,
+    #[builder(default = "DEFAULT_MAX_RECORD_BATCH_ROWS")]
     pub max_record_batch_rows: usize,
 
     #[serde(skip)]
     // FIXME: this is a workaround for serde not supporting default values for WriterProperties
+    #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
-}
-
-impl CompactionConfig {
-    pub fn builder() -> CompactionConfigBuilder {
-        CompactionConfigBuilder::default()
-    }
-}
-
-#[derive(Default)]
-pub struct CompactionConfigBuilder {
-    batch_parallelism: Option<usize>,
-    target_partitions: Option<usize>,
-    data_file_prefix: Option<String>,
-    target_file_size: Option<u64>,
-    enable_validate_compaction: Option<bool>,
-    max_record_batch_rows: Option<usize>,
-
-    write_parquet_properties: Option<WriterProperties>,
-}
-
-impl CompactionConfigBuilder {
-    pub fn batch_parallelism(mut self, value: usize) -> Self {
-        self.batch_parallelism = Some(value);
-        self
-    }
-
-    pub fn target_partitions(mut self, value: usize) -> Self {
-        self.target_partitions = Some(value);
-        self
-    }
-
-    pub fn data_file_prefix(mut self, value: String) -> Self {
-        self.data_file_prefix = Some(value);
-        self
-    }
-
-    pub fn target_file_size(mut self, value: u64) -> Self {
-        self.target_file_size = Some(value);
-        self
-    }
-
-    pub fn enable_validate_compaction(mut self, value: bool) -> Self {
-        self.enable_validate_compaction = Some(value);
-        self
-    }
-
-    pub fn max_record_batch_rows(mut self, value: usize) -> Self {
-        self.max_record_batch_rows = Some(value);
-        self
-    }
-
-    pub fn build(self) -> CompactionConfig {
-        CompactionConfig {
-            batch_parallelism: self.batch_parallelism.unwrap_or(DEFAULT_BATCH_PARALLELISM),
-            target_partitions: self.target_partitions.unwrap_or(DEFAULT_TARGET_PARTITIONS),
-            data_file_prefix: self.data_file_prefix.unwrap_or(DEFAULT_PREFIX.to_owned()),
-            target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
-            enable_validate_compaction: self
-                .enable_validate_compaction
-                .unwrap_or(DEFAULT_VALIDATE_COMPACTION),
-            max_record_batch_rows: self
-                .max_record_batch_rows
-                .unwrap_or(DEFAULT_MAX_RECORD_BATCH_ROWS),
-            write_parquet_properties: self.write_parquet_properties.unwrap_or_else(|| {
-                WriterProperties::builder()
-                    .set_compression(Compression::SNAPPY)
-                    .set_created_by(
-                        concat!("bergloom version ", env!("CARGO_PKG_VERSION")).to_owned(),
-                    )
-                    .build()
-            }),
-        }
-    }
 }

@@ -25,6 +25,7 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, Schema};
 use iceberg::table::Table;
 
+use crate::config::CompactionConfigBuilder;
 use crate::error::Result;
 use crate::executor::InputFileScanTasks;
 use crate::executor::datafusion::datafusion_processor::{
@@ -92,10 +93,11 @@ impl CompactionValidator {
             .build_merge_on_read()?;
 
         let validator_config = Arc::new(
-            CompactionConfig::builder()
+            CompactionConfigBuilder::default()
                 .batch_parallelism(config.batch_parallelism)
                 .target_partitions(config.target_partitions)
-                .build(),
+                .build()
+                .map_err(|e| CompactionError::Config(e.to_string()))?,
         );
 
         let datafusion_processor =
