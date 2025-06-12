@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-bergloom-codegen = { workspace = true }
 backon = "1.2.0"
+bergloom-codegen = { workspace = true }
 datafusion = "45.0.0"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
@@ -17,6 +17,7 @@ mixtrics = "0.1.0"
 parquet = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_with = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
@@ -34,4 +35,3 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
 url = { workspace = true }
-serde_json = { workspace = true }

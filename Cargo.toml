@@ -1,14 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["core", "codegen", "services/compactor"]
+members = ["codegen", "core", "services/compactor"]
 
 [workspace.dependencies]
 # Async runtime and utilities
 async-stream = "0.3.5"
 async-trait = "0.1.86"
+bergloom-codegen = { path = "./codegen" }
+
+# Local workspace members
+bergloom-core = { path = "./core" }
+bergloom-service-compactor = { path = "./services/compactor" }
 futures = "0.3.17"
 futures-async-stream = "0.2.9"
-tokio = { version = "1", default-features = false }
 
 # Data processing and storage
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "9e9fe2645eac71170b18ad9a71c8430d94c2206f", features = [
@@ -20,23 +24,19 @@ parquet = { version = "54", features = ["async"] }
 
 # gRPC and Protocol Buffers
 prost = { version = "0.13" }
-tonic = { version = "0.12" }
 
 prost-build = { version = "0.13" }
-tonic-build = { version = "0.12" }
 
 # Serialization
 serde = { version = "1", features = ["rc"] }
-serde_with = { version = "3", features = ["json"] }
 serde_json = { version = "1" }
+serde_with = { version = "3", features = ["json"] }
 
 # Error handling
 thiserror = "2.0.11"
+tokio = { version = "1", default-features = false }
+tonic = { version = "0.12" }
+tonic-build = { version = "0.12" }
 
 # Utilities
 url = "2"
-
-# Local workspace members
-bergloom-core = { path = "./core" }
-bergloom-codegen = { path = "./codegen" }
-bergloom-service-compactor = { path = "./services/compactor" }
