@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use bergloom_codegen::compactor::RewriteFilesStat;
 use iceberg::spec::DataFile;
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
@@ -24,7 +23,7 @@ use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
     create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
-    RewriteFilesResponse,
+    RewriteFilesResponse, RewriteFilesStat,
 };
 use crate::CompactionError;
 use crate::Result;
