@@ -282,12 +282,35 @@ impl<'a> SqlBuilder<'a> {
             CompactionError::Execution("Data file table name is not provided".to_string())
         })?;
 
+        // Determine which hidden columns are needed for join conditions
+        let need_seq_num = !self.equality_delete_metadatas.is_empty();
+        let need_file_path_and_pos = self.need_file_path_and_pos;
+
+        // Build the complete column list including hidden columns for internal queries
+        let mut internal_columns = self.project_names.clone();
+        if need_seq_num {
+            internal_columns.push(SYS_HIDDEN_SEQ_NUM.to_string());
+        }
+        if need_file_path_and_pos {
+            internal_columns.push(SYS_HIDDEN_FILE_PATH.to_string());
+            internal_columns.push(SYS_HIDDEN_POS.to_string());
+        }
+
         // Start with a basic SELECT query from the data file table
-        let mut query = format!(
-            "SELECT {} FROM {}",
-            self.project_names.join(", "),
-            data_file_table_name
-        );
+        // If we need hidden columns for joins, select them here
+        let mut query = if need_seq_num || need_file_path_and_pos {
+            format!(
+                "SELECT {} FROM {}",
+                internal_columns.join(", "),
+                data_file_table_name
+            )
+        } else {
+            format!(
+                "SELECT {} FROM {}",
+                self.project_names.join(", "),
+                data_file_table_name
+            )
+        };
 
         // Add position delete join if needed
         // This excludes rows that have been deleted by position
@@ -313,7 +336,7 @@ impl<'a> SqlBuilder<'a> {
 
             query = format!(
                 "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
-                self.project_names.join(", "),
+                internal_columns.join(", "), // Include hidden columns in outer SELECT
                 position_delete_table_name,
                 query,
                 data_file_table_name,
@@ -353,13 +376,22 @@ impl<'a> SqlBuilder<'a> {
 
                 query = format!(
                     "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
-                    self.project_names.join(", "),
+                    internal_columns.join(", "), // Include hidden columns in outer SELECT
                     eq_table_name,
                     query,
                     data_file_table_name,
                     full_condition
                 );
             }
+        }
+
+        // Final SELECT to return only the project columns (without hidden columns)
+        if need_seq_num || need_file_path_and_pos {
+            query = format!(
+                "SELECT {} FROM ({}) AS final_result",
+                self.project_names.join(", "),
+                query
+            );
         }
 
         Ok(query)
@@ -601,10 +633,14 @@ impl DataFusionTaskContext {
     }
 
     pub fn need_file_path_and_pos(&self) -> bool {
+        // Must be consistent with builder logic: !self.position_delete_files.is_empty()
+        // We check if position_delete_schema exists, which is set only when position deletes are present
         self.position_delete_schema.is_some()
     }
 
     pub fn need_seq_num(&self) -> bool {
+        // Must be consistent with builder logic: !equality_delete_metadatas.is_empty()
+        // We check if equality_delete_metadatas exists and is not empty
         self.equality_delete_metadatas
             .as_ref()
             .is_some_and(|v| !v.is_empty())
@@ -1021,5 +1057,263 @@ mod tests {
 
         let join_names = meta.equality_delete_join_names();
         assert_eq!(join_names, vec!["id", "name"]);
+    }
+
+    /// Test that verifies the fix for nested table alias issue in SQL generation
+    ///
+    /// This test ensures that when we have both position deletes and equality deletes,
+    /// the generated SQL correctly includes hidden columns in all nested subqueries,
+    /// preventing the "No field named _data_file_table.sys_hidden_seq_num" error.
+    #[test]
+    fn test_nested_table_alias_hidden_columns_fix() {
+        let project_names = vec![
+            "id".to_owned(),
+            "item_name".to_owned(),
+            "description".to_owned(),
+        ];
+
+        // Create equality delete metadata that requires sys_hidden_seq_num
+        let equality_delete_metadata = EqualityDeleteMetadata::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::new(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                        true,
+                    )),
+                    Arc::new(NestedField::new(
+                        4,
+                        SYS_HIDDEN_SEQ_NUM,
+                        Type::Primitive(PrimitiveType::Long),
+                        true,
+                    )),
+                ])
+                .build()
+                .unwrap(),
+            "_equality_delete_table_0".to_string(),
+        );
+
+        let equality_delete_metadatas = vec![equality_delete_metadata];
+
+        // Test scenario: BOTH position deletes AND equality deletes
+        // This creates the most complex nested SQL structure
+        let builder = SqlBuilder::new(
+            &project_names,
+            Some("_position_delete_table".to_string()),
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            true, // need_file_path_and_pos = true (triggers position delete logic)
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        // Verify the SQL structure is correct:
+
+        // 1. Should have a final outer SELECT that only returns project columns
+        assert!(sql.starts_with("SELECT id, item_name, description FROM ("));
+        assert!(sql.ends_with(") AS final_result"));
+
+        // 2. All inner SELECT statements should include the necessary hidden columns
+        // Count occurrences of SELECT statements that include hidden columns
+        let select_with_hidden_cols = sql.matches("SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos").count();
+        assert_eq!(
+            select_with_hidden_cols, 3,
+            "Should have 3 SELECT statements with hidden columns (one for each table level)"
+        );
+
+        // 3. Join conditions should reference hidden columns correctly
+        assert!(sql.contains(
+            "_data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num"
+        ));
+        assert!(sql.contains(
+            "_data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path"
+        ));
+        assert!(
+            sql.contains("_data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos")
+        );
+
+        // 4. Should have proper RIGHT ANTI JOIN structure
+        assert_eq!(
+            sql.matches("RIGHT ANTI JOIN").count(),
+            2,
+            "Should have 2 RIGHT ANTI JOIN operations"
+        );
+
+        // 5. Should have proper table aliases
+        assert_eq!(
+            sql.matches("AS _data_file_table").count(),
+            2,
+            "Should have 2 table aliases for _data_file_table"
+        );
+
+        // 6. Verify the nested structure is logical
+        // The SQL should follow this pattern:
+        // SELECT project_cols FROM (
+        //   SELECT all_cols FROM equality_table RIGHT ANTI JOIN (
+        //     SELECT all_cols FROM position_table RIGHT ANTI JOIN (
+        //       SELECT all_cols FROM original_data_table
+        //     ) AS data_table ON position_conditions
+        //   ) AS data_table ON equality_conditions
+        // ) AS final_result
+
+        let parts: Vec<&str> = sql.split("RIGHT ANTI JOIN").collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "SQL should split into 3 parts by RIGHT ANTI JOIN"
+        );
+
+        // The innermost part should select from the original data table
+        assert!(parts[2].contains("FROM _data_file_table) AS _data_file_table"));
+
+        // The middle part should involve position delete table
+        assert!(parts[1].contains("FROM _position_delete_table"));
+
+        // The outermost part should involve equality delete table
+        assert!(parts[0].contains("FROM _equality_delete_table_0"));
+    }
+
+    /// Test that verifies SQL generation works correctly with only equality deletes
+    ///
+    /// This is a simpler case but still important to verify that hidden columns
+    /// are properly handled when there's only one level of nesting.
+    #[test]
+    fn test_equality_deletes_only_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+
+        let equality_delete_metadata = EqualityDeleteMetadata::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::new(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                        true,
+                    )),
+                    Arc::new(NestedField::new(
+                        3,
+                        SYS_HIDDEN_SEQ_NUM,
+                        Type::Primitive(PrimitiveType::Long),
+                        true,
+                    )),
+                ])
+                .build()
+                .unwrap(),
+            "_equality_delete_table_0".to_string(),
+        );
+
+        let equality_delete_metadatas = vec![equality_delete_metadata];
+
+        // Test scenario: ONLY equality deletes (no position deletes)
+        let builder = SqlBuilder::new(
+            &project_names,
+            None, // No position delete table
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            false, // need_file_path_and_pos = false
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        // Verify the SQL structure:
+
+        // 1. Should have final SELECT that only returns project columns
+        assert!(sql.starts_with("SELECT id, name FROM ("));
+        assert!(sql.ends_with(") AS final_result"));
+
+        // 2. Inner SELECT should include sys_hidden_seq_num but not file path/pos columns
+        assert!(sql.contains("SELECT id, name, sys_hidden_seq_num FROM _equality_delete_table_0"));
+        assert!(sql.contains("SELECT id, name, sys_hidden_seq_num FROM _data_file_table"));
+        assert!(!sql.contains("sys_hidden_file_path"));
+        assert!(!sql.contains("sys_hidden_pos"));
+
+        // 3. Join condition should reference the sequence number correctly
+        assert!(sql.contains(
+            "_data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num"
+        ));
+
+        // 4. Should have exactly one RIGHT ANTI JOIN
+        assert_eq!(sql.matches("RIGHT ANTI JOIN").count(), 1);
+    }
+
+    /// Test that verifies SQL generation works correctly with only position deletes
+    ///
+    /// This tests the case where we need file path and position columns but not sequence numbers.
+    #[test]
+    fn test_position_deletes_only_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![]; // No equality deletes
+
+        // Test scenario: ONLY position deletes (no equality deletes)
+        let builder = SqlBuilder::new(
+            &project_names,
+            Some("_position_delete_table".to_string()),
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            true, // need_file_path_and_pos = true
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        // Verify the SQL structure:
+
+        // 1. Should have final SELECT that only returns project columns
+        assert!(sql.starts_with("SELECT id, name FROM ("));
+        assert!(sql.ends_with(") AS final_result"));
+
+        // 2. Inner SELECT should include file path/pos columns but not sequence number
+        assert!(sql.contains(
+            "SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table"
+        ));
+        assert!(sql.contains(
+            "SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table"
+        ));
+        assert!(!sql.contains("sys_hidden_seq_num"));
+
+        // 3. Join conditions should reference file path and position correctly
+        assert!(sql.contains(
+            "_data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path"
+        ));
+        assert!(
+            sql.contains("_data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos")
+        );
+
+        // 4. Should have exactly one RIGHT ANTI JOIN
+        assert_eq!(sql.matches("RIGHT ANTI JOIN").count(), 1);
+    }
+
+    /// Test that verifies SQL generation works correctly with no deletes
+    ///
+    /// This is the simplest case - should not add any hidden columns or wrap in final_result.
+    #[test]
+    fn test_no_deletes_no_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![]; // No equality deletes
+
+        // Test scenario: NO deletes at all
+        let builder = SqlBuilder::new(
+            &project_names,
+            None, // No position delete table
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            false, // need_file_path_and_pos = false
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        // Verify the SQL structure:
+
+        // 1. Should be a simple SELECT without any nesting
+        assert_eq!(sql, "SELECT id, name FROM _data_file_table");
+
+        // 2. Should not contain any hidden columns
+        assert!(!sql.contains("sys_hidden_seq_num"));
+        assert!(!sql.contains("sys_hidden_file_path"));
+        assert!(!sql.contains("sys_hidden_pos"));
+
+        // 3. Should not have any JOIN operations
+        assert!(!sql.contains("JOIN"));
+        assert!(!sql.contains("final_result"));
     }
 }
