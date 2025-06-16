@@ -7,7 +7,10 @@ use futures::lock::Mutex;
 use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, TableUpdate};
+use iceberg::{
+    Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
+    TableIdent, TableUpdate,
+};
 use itertools::Itertools;
 use uuid::Uuid;
 
@@ -156,12 +159,18 @@ impl Catalog for MemoryCatalog {
                 let location_prefix = match namespace_properties.get(LOCATION) {
                     Some(namespace_location) => Ok(namespace_location.clone()),
                     None => match self.warehouse_location.clone() {
-                        Some(warehouse_location) => Ok(format!("{}/{}", warehouse_location, namespace_ident.join("/"))),
-                        None => Err(Error::new(ErrorKind::Unexpected,
+                        Some(warehouse_location) => Ok(format!(
+                            "{}/{}",
+                            warehouse_location,
+                            namespace_ident.join("/")
+                        )),
+                        None => Err(Error::new(
+                            ErrorKind::Unexpected,
                             format!(
                                 "Cannot create table {:?}. No default path is set, please specify a location when creating a table.",
                                 &table_ident
-                            )))
+                            ),
+                        )),
                     },
                 }?;
 
@@ -256,8 +265,9 @@ impl Catalog for MemoryCatalog {
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
 
-        let current_metadata_location = root_namespace_state.get_existing_table_location(commit.identifier())?;
-        
+        let current_metadata_location =
+            root_namespace_state.get_existing_table_location(commit.identifier())?;
+
         // Load current metadata
         let input_file = self.file_io.new_input(current_metadata_location)?;
         let current_metadata_content = input_file.read().await?;
@@ -267,14 +277,15 @@ impl Catalog for MemoryCatalog {
         // In a real implementation, we would properly apply the commit operations
         let mut metadata_builder = TableMetadataBuilder::new_from_metadata(current_metadata, None);
 
-
         for update in commit.take_updates() {
             match update {
-                TableUpdate::AddSnapshot{ snapshot}=> {
+                TableUpdate::AddSnapshot { snapshot } => {
                     metadata_builder = metadata_builder.add_snapshot(snapshot)?;
-
-                },
-                TableUpdate::SetSnapshotRef{ref_name, reference} => {
+                }
+                TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference,
+                } => {
                     metadata_builder = metadata_builder.set_ref(&ref_name, reference)?;
                 }
                 _ => {
@@ -287,7 +298,12 @@ impl Catalog for MemoryCatalog {
         let new_metadata = metadata_builder
             .assign_uuid(uuid::Uuid::new_v4())
             .build()
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build metadata: {}", e)))?
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to build metadata: {}", e),
+                )
+            })?
             .metadata;
 
         // Generate new metadata location
@@ -298,16 +314,17 @@ impl Catalog for MemoryCatalog {
             new_metadata.format_version(),
             Uuid::new_v4()
         );
-        
+
         // Write new metadata
         self.file_io
             .new_output(&new_metadata_location)?
             .write(serde_json::to_vec(&new_metadata)?.into())
             .await?;
-        
+
         // Update the table location in namespace state
-        root_namespace_state.update_table_location(commit.identifier(), new_metadata_location.clone())?;
-        
+        root_namespace_state
+            .update_table_location(commit.identifier(), new_metadata_location.clone())?;
+
         // Build and return the updated table
         Table::builder()
             .file_io(self.file_io.clone())
@@ -316,4 +333,4 @@ impl Catalog for MemoryCatalog {
             .identifier(commit.identifier().clone())
             .build()
     }
-} 
+}
