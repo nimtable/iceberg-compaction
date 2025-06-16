@@ -702,7 +702,7 @@ mod tests {
             builder.build_merge_on_read_sql().unwrap(),
             format!(
                 "SELECT {} FROM {}",
-                project_names.join(", "), // 更新测试以匹配新格式
+                project_names.join(", "),
                 DATA_FILE_TABLE
             )
         );
