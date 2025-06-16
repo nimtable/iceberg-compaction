@@ -606,3 +606,159 @@ impl RewriteDataFilesCommitManager {
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::io::FileIOBuilder;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::writer::file_writer::location_generator::{DefaultLocationGenerator, DefaultFileNameGenerator};
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder};
+    use iceberg::transaction::Transaction;
+    use crate::memory_catalog::MemoryCatalog;
+    use tempfile::TempDir;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use parquet::file::properties::WriterProperties;
+    use iceberg::arrow::schema_to_arrow_schema;
+
+    fn temp_path() -> String {
+        let temp_dir = TempDir::new().unwrap();
+        temp_dir.path().to_str().unwrap().to_string()
+    }
+
+    fn new_memory_catalog() -> impl Catalog {
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let warehouse_location = temp_path();
+        MemoryCatalog::new(file_io, Some(warehouse_location))
+    }
+
+    async fn create_namespace<C: Catalog>(catalog: &C, namespace_ident: &NamespaceIdent) {
+        let _ = catalog
+            .create_namespace(namespace_ident, HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    fn simple_table_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ).into(),
+                NestedField::required(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                ).into()
+            ])
+            .build()
+            .unwrap()
+    }
+
+    async fn create_table<C: Catalog>(catalog: &C, table_ident: &TableIdent) {
+        let _ = catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn create_test_record_batch(iceberg_schema: &Schema) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        
+        // Convert iceberg schema to arrow schema to ensure field ID consistency
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+            ],
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_memory_catalog_write_and_commit() {
+        let catalog = new_memory_catalog();
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let table_schema = table.metadata().current_schema();
+        
+        // Create a FileIO for writing
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        
+        // Set up writer
+        let temp_dir = temp_path();
+        let location_generator = DefaultLocationGenerator {
+            dir_path: temp_dir,
+        };
+
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "data".to_string(),
+            Some("test".to_string()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table_schema.clone(),
+            file_io,
+            location_generator,
+            file_name_generator,
+        );
+
+        let data_file_writer_builder = DataFileWriterBuilder::new(
+            parquet_writer_builder,
+            None,
+            table.metadata().default_partition_spec().spec_id(),
+        );
+
+        let mut writer = data_file_writer_builder.build().await.unwrap();
+
+        // Create test data
+        let record_batch = create_test_record_batch(table_schema.as_ref());
+
+        // Write data
+        writer.write(record_batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        // Start transaction and commit
+        let transaction = Transaction::new(&table);
+        let rewrite_files = transaction.rewrite_files(None, vec![]).unwrap();
+        let rewrite_files = rewrite_files.add_data_files(data_files).unwrap();
+        let transaction = rewrite_files.apply().await.unwrap();
+        
+        // Commit the transaction
+        let updated_table = transaction.commit(&catalog).await.unwrap();
+        
+        // Verify the snapshot was created
+        let snapshots = updated_table.metadata().snapshots();
+        assert!(snapshots.len() > 0, "Should have at least one snapshot");
+        
+        let latest_snapshot = updated_table.metadata().current_snapshot().unwrap();
+
+        // Verify we can load the table again and see the data
+        let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
+        let current_snapshot = reloaded_table.metadata().current_snapshot().unwrap();
+        assert_eq!(current_snapshot.snapshot_id(), latest_snapshot.snapshot_id());
+    }
+}

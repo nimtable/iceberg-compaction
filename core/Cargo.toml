@@ -14,6 +14,8 @@ futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
+itertools = "0.13.0"
+tempfile = "3.8"
 mixtrics = "0.1.0"
 parquet = { workspace = true }
 prost = { workspace = true }
@@ -36,3 +38,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
 url = { workspace = true }
+uuid = "1.0"

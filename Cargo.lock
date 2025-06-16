@@ -554,6 +554,7 @@ dependencies = [
  "futures-async-stream",
  "iceberg",
  "iceberg-datafusion",
+ "itertools 0.13.0",
  "mixtrics",
  "parquet",
  "prost",
@@ -561,10 +562,12 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -5413,7 +5416,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
