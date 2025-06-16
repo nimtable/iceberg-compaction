@@ -24,7 +24,7 @@ use crate::{
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        displayable, execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
         ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
@@ -122,10 +122,22 @@ impl DatafusionProcessor {
         self.register_tables(datafusion_task_ctx)?;
 
         let df = self.ctx.sql(&exec_sql).await?;
+        tracing::info!(
+            "Executing DataFusion Logical Plan: {}",
+            df.logical_plan().display()
+        );
         let physical_plan = df.create_physical_plan().await?;
 
-        tracing::info!("Executing DataFusion SQL: {}", exec_sql);
-        tracing::info!("Executing Physical plan: {:?}", physical_plan);
+        tracing::info!("Executing DataFusion SQL {}", exec_sql);
+        tracing::info!(
+            "Executing DataFusion Physical plan displayable ident: {}",
+            displayable(physical_plan.as_ref()).indent(true)
+        );
+
+        tracing::info!(
+            "Executing DataFusion Physical graphviz {}",
+            displayable(physical_plan.as_ref()).graphviz()
+        );
 
         // Conditionally create a new physical_plan if repartitioning is needed
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
