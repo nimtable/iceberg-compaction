@@ -24,7 +24,7 @@ use crate::{
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        displayable, execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
         ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
@@ -119,25 +119,11 @@ impl DatafusionProcessor {
     ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         let input_schema = datafusion_task_ctx.input_schema.take().unwrap();
         let exec_sql = datafusion_task_ctx.exec_sql.clone();
+
         self.register_tables(datafusion_task_ctx)?;
 
         let df = self.ctx.sql(&exec_sql).await?;
-        tracing::info!(
-            "Executing DataFusion Logical Plan: {}",
-            df.logical_plan().display()
-        );
         let physical_plan = df.create_physical_plan().await?;
-
-        tracing::info!("Executing DataFusion SQL {}", exec_sql);
-        tracing::info!(
-            "Executing DataFusion Physical plan displayable ident: {}",
-            displayable(physical_plan.as_ref()).indent(true)
-        );
-
-        tracing::info!(
-            "Executing DataFusion Physical graphviz {}",
-            displayable(physical_plan.as_ref()).graphviz()
-        );
 
         // Conditionally create a new physical_plan if repartitioning is needed
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
@@ -145,11 +131,11 @@ impl DatafusionProcessor {
                 != self.config.target_partitions
             {
                 Arc::new(RepartitionExec::try_new(
-                    physical_plan, // Consumes the original physical_plan
+                    physical_plan.clone(),
                     Partitioning::RoundRobinBatch(self.config.target_partitions),
                 )?)
             } else {
-                physical_plan // Use the original physical_plan
+                physical_plan
             };
 
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
@@ -286,6 +272,7 @@ impl<'a> SqlBuilder<'a> {
             self.project_names.join(","),
             data_file_table_name
         );
+        let current_table_alias = data_file_table_name.clone();
 
         // Add position delete join if needed
         // This excludes rows that have been deleted by position
@@ -298,24 +285,31 @@ impl<'a> SqlBuilder<'a> {
                 })?;
 
             let pos_join_conditions = format!(
-                "{data_file_table_name}.{SYS_HIDDEN_FILE_PATH} = {position_delete_table_name}.{SYS_HIDDEN_FILE_PATH} AND {data_file_table_name}.{SYS_HIDDEN_POS} = {position_delete_table_name}.{SYS_HIDDEN_POS}"
+                "{}.{} = {}.{} AND {}.{} = {}.{}",
+                current_table_alias,
+                SYS_HIDDEN_FILE_PATH,
+                position_delete_table_name,
+                SYS_HIDDEN_FILE_PATH,
+                current_table_alias,
+                SYS_HIDDEN_POS,
+                position_delete_table_name,
+                SYS_HIDDEN_POS
             );
 
             query = format!(
-                "SELECT {} FROM {} RIGHT ANTI JOIN {} ON {}",
+                "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
                 self.project_names.join(","),
                 position_delete_table_name,
-                data_file_table_name,
+                query,
+                current_table_alias,
                 pos_join_conditions
-            )
+            );
         }
 
         // Add equality delete join if needed
         // This excludes rows that match the equality conditions in the delete files
         if !self.equality_delete_metadatas.is_empty() {
             for eq_meta in self.equality_delete_metadatas {
-                // // Add sequence number comparison if needed
-                // // This ensures that only newer deletes are applied
                 let eq_table_name = &eq_meta.equality_delete_table_name;
                 let eq_join_conditions = eq_meta
                     .equality_delete_join_names()
@@ -323,25 +317,32 @@ impl<'a> SqlBuilder<'a> {
                     .map(|col_name| {
                         format!(
                             "{}.{} = {}.{}",
-                            eq_table_name, col_name, data_file_table_name, col_name
+                            eq_table_name, col_name, current_table_alias, col_name
                         )
                     })
                     .collect::<Vec<String>>()
                     .join(" AND ");
 
+                // Only add sequence number condition if we have equality deletes
+                // (which means the data file table should have the seq_num column)
                 let seq_condition = format!(
                     "{}.{} < {}.{}",
-                    data_file_table_name, SYS_HIDDEN_SEQ_NUM, eq_table_name, SYS_HIDDEN_SEQ_NUM
+                    current_table_alias, SYS_HIDDEN_SEQ_NUM, eq_table_name, SYS_HIDDEN_SEQ_NUM
                 );
 
+                let full_condition = if eq_join_conditions.is_empty() {
+                    seq_condition
+                } else {
+                    format!("{} AND {}", eq_join_conditions, seq_condition)
+                };
+
                 query = format!(
-                    "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {} AND {}",
+                    "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
                     self.project_names.join(", "),
                     eq_table_name,
                     query,
-                    data_file_table_name,
-                    eq_join_conditions,
-                    seq_condition
+                    current_table_alias,
+                    full_condition
                 );
             }
         }
@@ -355,6 +356,7 @@ pub struct DataFusionTaskContext {
     pub(crate) input_schema: Option<Schema>,
     pub(crate) data_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_files: Option<Vec<FileScanTask>>,
+    #[allow(unused)]
     pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_schema: Option<Schema>,
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
@@ -511,6 +513,7 @@ impl DataFusionTaskContextBuilder {
             &equality_delete_metadatas,
             need_file_path_and_pos,
         );
+
         let exec_sql = sql_builder.build_merge_on_read_sql()?;
 
         Ok(DataFusionTaskContext {
@@ -581,7 +584,7 @@ impl DataFusionTaskContext {
     }
 
     pub fn need_seq_num(&self) -> bool {
-        self.equality_delete_files
+        self.equality_delete_metadatas
             .as_ref()
             .is_some_and(|v| !v.is_empty())
     }
@@ -699,10 +702,7 @@ mod tests {
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        assert!(sql.contains(&format!(
-            "FROM {} RIGHT ANTI JOIN {}",
-            POSITION_DELETE_TABLE, DATA_FILE_TABLE
-        )));
+        assert!(sql.contains(&format!("FROM {} RIGHT ANTI JOIN", POSITION_DELETE_TABLE)));
         assert!(sql.contains(&format!(
             "{}.{} = {}.{} AND {}.{} = {}.{}",
             DATA_FILE_TABLE,
