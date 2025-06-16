@@ -124,6 +124,9 @@ impl DatafusionProcessor {
         let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
 
+        tracing::info!("Executing DataFusion SQL: {}", exec_sql);
+        tracing::info!("Executing Physical plan: {:?}", physical_plan);
+
         // Conditionally create a new physical_plan if repartitioning is needed
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
             if physical_plan.output_partitioning().partition_count()
