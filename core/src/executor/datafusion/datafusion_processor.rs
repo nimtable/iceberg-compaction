@@ -520,8 +520,16 @@ impl DataFusionTaskContextBuilder {
             data_file_schema: Some(data_file_schema),
             input_schema: Some(input_schema),
             data_files: Some(self.data_files),
-            position_delete_files: Some(self.position_delete_files),
-            equality_delete_files: Some(self.equality_delete_files),
+            position_delete_files: if need_file_path_and_pos {
+                Some(self.position_delete_files)
+            } else {
+                None
+            },
+            equality_delete_files: if need_seq_num {
+                Some(self.equality_delete_files)
+            } else {
+                None
+            },
             position_delete_schema: if need_file_path_and_pos {
                 Some(position_delete_schema)
             } else {
@@ -578,9 +586,7 @@ impl DataFusionTaskContext {
     }
 
     pub fn need_file_path_and_pos(&self) -> bool {
-        self.position_delete_files
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
+        self.position_delete_schema.is_some()
     }
 
     pub fn need_seq_num(&self) -> bool {
