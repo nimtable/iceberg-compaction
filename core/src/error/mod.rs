@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use datafusion::error;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -32,6 +33,9 @@ pub enum CompactionError {
 
     #[error("DataFusion error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
+
+    #[error("Test error: {0}")]
+    Test(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

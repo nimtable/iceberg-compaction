@@ -13,11 +13,15 @@ futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
 mixtrics = "0.1.0"
 parquet = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
+port_scanner = { workspace = true }
+ctor = { workspace = true }
+rand = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
 	"chrono",

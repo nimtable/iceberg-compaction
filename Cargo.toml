@@ -16,7 +16,11 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b
     "storage-gcs",
 ] }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b1619c554c2922ddad00cc0564fa79eaec62af5b" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b1619c554c2922ddad00cc0564fa79eaec62af5b" }
 parquet = { version = "54", features = ["async"] }
+port_scanner = "0.1.5"
+ctor = "0.2.8"
+rand = "0.9.1"
 
 # gRPC and Protocol Buffers
 prost = "0.12"

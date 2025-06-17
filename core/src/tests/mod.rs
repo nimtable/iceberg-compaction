@@ -14,4 +14,59 @@
  * limitations under the License.
  */
 
-pub mod test_util;
+use crate::tests::{docker_compose::get_rest_catalog, generator::FileGeneratorBuilder};
+use iceberg::{spec::{NestedField, PrimitiveType, Schema, Type}, transaction::Transaction, Catalog, NamespaceIdent, TableCreation};
+use crate::error::Result;
+use std::{collections::HashMap, sync::Arc};
+
+pub mod docker_compose;
+pub mod generator;
+
+pub async fn build_test_iceberg_table() -> Result<()> {
+    let catalog = get_rest_catalog().await;
+    let schema = Schema::builder().with_fields(vec![
+        Arc::new(NestedField::new(1,"id", Type::Primitive(PrimitiveType::Int), false)),
+        Arc::new(NestedField::new(2,"name", Type::Primitive(PrimitiveType::String), false)),
+    ]).build()?;
+    let table_creation = TableCreation::builder()
+        .name("t1".to_string())
+        .schema(schema.clone())
+        .build();
+    let namespace_ident = NamespaceIdent::new("namespace".to_owned());
+    catalog.create_namespace(&namespace_ident, HashMap::default()).await?;
+    let table = catalog.create_table(&namespace_ident, table_creation).await?;
+    let mut file_generator = FileGeneratorBuilder::new().schema(Arc::new(schema)).build()?;
+    let commit_data_files = file_generator.generate().await?;
+    let mut data_files = Vec::new();
+    let mut position_delete_files = Vec::new();
+    let mut equality_delete_files = Vec::new();
+    for data_file in commit_data_files {
+        match data_file.content_type() {
+            iceberg::spec::DataContentType::Data => data_files.push(data_file),
+            iceberg::spec::DataContentType::PositionDeletes => position_delete_files.push(data_file),
+            iceberg::spec::DataContentType::EqualityDeletes => equality_delete_files.push(data_file),
+        }
+    }
+    let mut txn = Transaction::new(&table);
+    let mut fast_append_action = txn.fast_append(Some(rand::random::<i64>()), None, vec![])?;
+    fast_append_action.add_data_files(data_files)?.add_data_files(position_delete_files)?;
+    fast_append_action.apply().await?.commit(&catalog).await?;
+
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let mut txn = Transaction::new(&table);
+    let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id()), None, vec![])?;
+    fast_append_action.add_data_files(equality_delete_files)?;
+    fast_append_action.apply().await?.commit(&catalog).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_build_test_iceberg_table() {
+        build_test_iceberg_table().await.unwrap();
+    }
+}

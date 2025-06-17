@@ -102,7 +102,7 @@ impl CompactionExecutor for DataFusionExecutor {
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
-                let mut data_file_writer = Self::build_iceberg_writer(
+                let mut data_file_writer = build_iceberg_data_file_writer(
                     data_file_prefix,
                     dir_path,
                     schema,
@@ -142,49 +142,58 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
-impl DataFusionExecutor {
-    async fn build_iceberg_writer(
-        data_file_prefix: String,
-        dir_path: String,
-        schema: Arc<Schema>,
-        file_io: FileIO,
-        partition_spec: Arc<PartitionSpec>,
-        target_file_size: usize,
-    ) -> Result<Box<dyn IcebergWriter>> {
-        let location_generator = DefaultLocationGenerator { dir_path };
-        let unique_uuid_suffix = Uuid::now_v7();
-        let file_name_generator = DefaultFileNameGenerator::new(
-            data_file_prefix,
-            Some(unique_uuid_suffix.to_string()),
-            iceberg::spec::DataFileFormat::Parquet,
-        );
+pub async fn build_iceberg_data_file_writer(
+    data_file_prefix: String,
+    dir_path: String,
+    schema: Arc<Schema>,
+    file_io: FileIO,
+    partition_spec: Arc<PartitionSpec>,
+    target_file_size: usize,
+) -> Result<Box<dyn IcebergWriter>> {
+    let parquet_writer_builder =
+        build_parquet_writer(data_file_prefix, dir_path, schema.clone(), file_io).await?;
+    let data_file_builder =
+        DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
+    let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
+        data_file_builder,
+        target_file_size,
+    );
+    let iceberg_output_writer = if partition_spec.fields().is_empty() {
+        Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
+    } else {
+        Box::new(
+            FanoutPartitionWriterBuilder::new(
+                data_file_size_writer,
+                partition_spec.clone(),
+                schema,
+            )?
+            .build()
+            .await?,
+        ) as Box<dyn IcebergWriter>
+    };
+    Ok(iceberg_output_writer)
+}
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            schema.clone(),
-            file_io,
-            location_generator,
-            file_name_generator,
-        );
-        let data_file_builder =
-            DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-        let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
-            data_file_builder,
-            target_file_size,
-        );
-        let iceberg_output_writer = if partition_spec.fields().is_empty() {
-            Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
-        } else {
-            Box::new(
-                FanoutPartitionWriterBuilder::new(
-                    data_file_size_writer,
-                    partition_spec.clone(),
-                    schema,
-                )?
-                .build()
-                .await?,
-            ) as Box<dyn IcebergWriter>
-        };
-        Ok(iceberg_output_writer)
-    }
+pub async fn build_parquet_writer(
+    data_file_prefix: String,
+    dir_path: String,
+    schema: Arc<Schema>,
+    file_io: FileIO,
+) -> Result<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>> {
+    let location_generator = DefaultLocationGenerator { dir_path };
+    let unique_uuid_suffix = Uuid::now_v7();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        data_file_prefix,
+        Some(unique_uuid_suffix.to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        schema.clone(),
+        file_io,
+        location_generator,
+        file_name_generator,
+    );
+    Ok(parquet_writer_builder)
 }
