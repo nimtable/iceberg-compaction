@@ -641,17 +641,6 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn temp_path() -> String {
-        let temp_dir = TempDir::new().unwrap();
-        temp_dir.path().to_str().unwrap().to_string()
-    }
-
-    fn new_memory_catalog() -> impl Catalog {
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        let warehouse_location = temp_path();
-        MemoryCatalog::new(file_io, Some(warehouse_location))
-    }
-
     async fn create_namespace<C: Catalog>(catalog: &C, namespace_ident: &NamespaceIdent) {
         let _ = catalog
             .create_namespace(namespace_ident, HashMap::new())
@@ -718,7 +707,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_commit_and_compaction() {
-        let catalog = new_memory_catalog();
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
         let namespace_ident = NamespaceIdent::new("test_namespace".into());
         create_namespace(&catalog, &namespace_ident).await;
 
@@ -729,12 +724,8 @@ mod tests {
         let table = catalog.load_table(&table_ident).await.unwrap();
         let table_schema = table.metadata().current_schema();
 
-        // Create a FileIO for writing
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-
         // Set up writer
-        let temp_dir = temp_path();
-        let location_generator = DefaultLocationGenerator { dir_path: temp_dir };
+        let location_generator = DefaultLocationGenerator { dir_path: warehouse_location };
 
         let file_name_generator = DefaultFileNameGenerator::new(
             "data".to_string(),
@@ -745,7 +736,7 @@ mod tests {
         let parquet_writer_builder = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
             table_schema.clone(),
-            file_io,
+            table.file_io().clone(),
             location_generator,
             file_name_generator,
         );
@@ -883,6 +874,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(rewrite_files_stat.rewritten_files_count == 3);
+        assert_eq!(rewrite_files_stat.rewritten_files_count, 3);
     }
 }
