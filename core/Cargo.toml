@@ -13,6 +13,7 @@ derive_builder = "0.20"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-memory = { workspace = true }
 iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
 tempfile = "3.8"

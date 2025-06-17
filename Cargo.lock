@@ -553,6 +553,7 @@ dependencies = [
  "futures",
  "futures-async-stream",
  "iceberg",
+ "iceberg-catalog-memory",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -2240,7 +2241,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=9e9fe2645eac71170b18ad9a71c8430d94c2206f#9e9fe2645eac71170b18ad9a71c8430d94c2206f"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=02899a5a9b70a173518cfe765cc82fb408e8784c#02899a5a9b70a173518cfe765cc82fb408e8784c"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2290,9 +2291,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-memory"
+version = "0.4.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=02899a5a9b70a173518cfe765cc82fb408e8784c#02899a5a9b70a173518cfe765cc82fb408e8784c"
+dependencies = [
+ "async-trait",
+ "futures",
+ "iceberg",
+ "itertools 0.13.0",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=9e9fe2645eac71170b18ad9a71c8430d94c2206f#9e9fe2645eac71170b18ad9a71c8430d94c2206f"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=02899a5a9b70a173518cfe765cc82fb408e8784c#02899a5a9b70a173518cfe765cc82fb408e8784c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5416,7 +5430,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

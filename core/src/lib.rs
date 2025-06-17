@@ -22,7 +22,6 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod executor;
-pub mod memory_catalog;
 pub mod parser;
 
 pub use config::CompactionConfig;

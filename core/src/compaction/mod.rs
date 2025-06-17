@@ -611,7 +611,6 @@ impl RewriteDataFilesCommitManager {
 mod tests {
     use crate::compaction::CompactionBuilder;
     use crate::config::CompactionConfigBuilder;
-    use crate::memory_catalog::MemoryCatalog;
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
@@ -638,6 +637,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use iceberg_catalog_memory::MemoryCatalog;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_catalog_write_and_commit() {
+    async fn test_write_commit_and_compaction() {
         let catalog = new_memory_catalog();
         let namespace_ident = NamespaceIdent::new("test_namespace".into());
         create_namespace(&catalog, &namespace_ident).await;
@@ -883,6 +883,6 @@ mod tests {
             .await
             .unwrap();
 
-        println!("Compaction completed with stats: {:?}", rewrite_files_stat);
+        assert!(rewrite_files_stat.rewritten_files_count == 3);
     }
 }
