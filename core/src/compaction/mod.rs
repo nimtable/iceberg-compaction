@@ -616,6 +616,7 @@ mod tests {
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::table::Table;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -634,10 +635,11 @@ mod tests {
         IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg_catalog_memory::MemoryCatalog;
+    use itertools::Itertools;
     use parquet::file::properties::WriterProperties;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use iceberg_catalog_memory::MemoryCatalog;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -682,13 +684,10 @@ mod tests {
             .unwrap();
     }
 
-    fn create_test_record_batch_with_pos(
-        iceberg_schema: &Schema,
-        insert_or_del: bool,
-    ) -> RecordBatch {
+    fn create_test_record_batch_with_pos(iceberg_schema: &Schema, insert: bool) -> RecordBatch {
         let id_array = Int32Array::from(vec![1, 2, 3]);
         let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
-        let op = if insert_or_del { INSERT_OP } else { DELETE_OP };
+        let op = if insert { INSERT_OP } else { DELETE_OP };
         let pos_array = Int32Array::from(vec![op, op, op]);
 
         // Convert iceberg schema to arrow schema to ensure field ID consistency
@@ -705,27 +704,17 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn test_write_commit_and_compaction() {
-        // Create a temporary directory for the warehouse location
-        let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        // Create a memory catalog with the file IO and warehouse location
-        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
-
-        let namespace_ident = NamespaceIdent::new("test_namespace".into());
-        create_namespace(&catalog, &namespace_ident).await;
-
-        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
-        create_table(&catalog, &table_ident).await;
-
-        // Load the table
-        let table = catalog.load_table(&table_ident).await.unwrap();
+    async fn build_equality_delta_writer(
+        table: &Table,
+        warehouse_location: String,
+        unique_column_ids: Vec<i32>,
+    ) -> impl IcebergWriter {
         let table_schema = table.metadata().current_schema();
 
         // Set up writer
-        let location_generator = DefaultLocationGenerator { dir_path: warehouse_location };
+        let location_generator = DefaultLocationGenerator {
+            dir_path: warehouse_location,
+        };
 
         let file_name_generator = DefaultFileNameGenerator::new(
             "data".to_string(),
@@ -746,10 +735,10 @@ mod tests {
             None,
             table.metadata().default_partition_spec().spec_id(),
         );
-        let unique_column_ids = vec![1];
+
         let config = EqualityDeleteWriterConfig::new(
             unique_column_ids.clone(),
-            table.metadata().current_schema().clone(),
+            table_schema.clone(),
             None,
             0,
         )
@@ -757,15 +746,17 @@ mod tests {
 
         let unique_uuid_suffix = Uuid::now_v7();
 
+        let equality_delete_fields = unique_column_ids
+            .iter()
+            .map(|id| table_schema.field_by_id(*id).unwrap().clone())
+            .collect_vec();
+
         let equality_delete_builder = EqualityDeleteFileWriterBuilder::new(
             ParquetWriterBuilder::new(
                 WriterProperties::new(),
                 Arc::new(
-                    iceberg::spec::Schema::builder()
-                        .with_fields(vec![
-                            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
-                                .into(),
-                        ])
+                    Schema::builder()
+                        .with_fields(equality_delete_fields)
                         .build()
                         .unwrap(),
                 ),
@@ -804,45 +795,56 @@ mod tests {
             unique_column_ids,
         );
 
-        let mut writer = delta_builder.build().await.unwrap();
+        delta_builder.build().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_commit_and_compaction() {
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        let unique_column_ids = vec![1];
+        let mut writer =
+            build_equality_delta_writer(&table, warehouse_location.clone(), unique_column_ids)
+                .await;
+
+        let insert_batch = create_test_record_batch_with_pos(&simple_table_schema_with_pos(), true);
+
+        let delete_batch =
+            create_test_record_batch_with_pos(&simple_table_schema_with_pos(), false);
 
         // Write data (insert): generate data files
-        writer
-            .write(create_test_record_batch_with_pos(
-                &simple_table_schema_with_pos(),
-                true,
-            ))
-            .await
-            .unwrap();
+        writer.write(insert_batch.clone()).await.unwrap();
 
         // Write data (delete) generate position delete files
-        writer
-            .write(create_test_record_batch_with_pos(
-                &simple_table_schema_with_pos(),
-                false,
-            ))
-            .await
-            .unwrap();
+        writer.write(delete_batch).await.unwrap();
 
         // Write data (insert) generate data files
-        writer
-            .write(create_test_record_batch_with_pos(
-                &simple_table_schema_with_pos(),
-                false,
-            ))
-            .await
-            .unwrap();
+        writer.write(insert_batch).await.unwrap();
 
         let data_files = writer.close().await.unwrap();
 
         // Start transaction and commit
         let transaction = Transaction::new(&table);
-        let rewrite_files = transaction.rewrite_files(None, vec![]).unwrap();
-        let rewrite_files = rewrite_files.add_data_files(data_files).unwrap();
-        let transaction = rewrite_files.apply().await.unwrap();
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(data_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
 
         // Commit the transaction
-        let updated_table = transaction.commit(&catalog).await.unwrap();
+        let updated_table = tx.commit(&catalog).await.unwrap();
 
         // Verify the snapshot was created
         let snapshots = updated_table.metadata().snapshots();
@@ -874,6 +876,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rewrite_files_stat.rewritten_files_count, 3);
+        assert_eq!(rewrite_files_stat.rewritten_files_count, 2);
     }
 }
