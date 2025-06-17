@@ -81,7 +81,7 @@ fn calculate_partition_file_concurrency(
 
     // Log warning if user configured too high concurrency
     if base_concurrency > MAX_CONCURRENT_FILES_PER_PARTITION {
-        eprintln!(
+        tracing::warn!(
             "Warning: Configured file_scan_concurrency may be too high. \
              Using conservative limit of {} concurrent files per partition to prevent S3 timeouts. \
              Consider reducing file_scan_concurrency from {} to {}.",

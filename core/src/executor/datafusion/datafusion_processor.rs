@@ -54,7 +54,7 @@ impl DatafusionProcessor {
         // Validate configuration and warn about potential issues
         let warnings = config.validate();
         for warning in warnings {
-            eprintln!("Configuration Warning: {}", warning);
+            tracing::warn!("Configuration Warning: {}", warning);
         }
 
         let session_config = SessionConfig::new()
