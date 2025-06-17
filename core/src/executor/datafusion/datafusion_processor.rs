@@ -286,6 +286,15 @@ impl<'a> SqlBuilder<'a> {
         let need_seq_num = !self.equality_delete_metadatas.is_empty();
         let need_file_path_and_pos = self.need_file_path_and_pos;
 
+        // Early return for simple case: no deletes at all
+        if !need_seq_num && !need_file_path_and_pos {
+            return Ok(format!(
+                "SELECT {} FROM {}",
+                self.project_names.join(", "),
+                data_file_table_name
+            ));
+        }
+
         // Build the complete column list including hidden columns for internal queries
         let mut internal_columns = self.project_names.clone();
         if need_seq_num {
@@ -296,21 +305,12 @@ impl<'a> SqlBuilder<'a> {
             internal_columns.push(SYS_HIDDEN_POS.to_string());
         }
 
-        // Start with a basic SELECT query from the data file table
-        // If we need hidden columns for joins, select them here
-        let mut query = if need_seq_num || need_file_path_and_pos {
-            format!(
-                "SELECT {} FROM {}",
-                internal_columns.join(", "),
-                data_file_table_name
-            )
-        } else {
-            format!(
-                "SELECT {} FROM {}",
-                self.project_names.join(", "),
-                data_file_table_name
-            )
-        };
+        // Start with a SELECT query that includes all necessary columns
+        let mut query = format!(
+            "SELECT {} FROM {}",
+            internal_columns.join(", "),
+            data_file_table_name
+        );
 
         // Add position delete join if needed
         // This excludes rows that have been deleted by position
