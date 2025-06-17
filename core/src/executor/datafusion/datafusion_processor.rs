@@ -51,6 +51,12 @@ pub struct DatafusionProcessor {
 
 impl DatafusionProcessor {
     pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
+        // Validate configuration and warn about potential issues
+        let warnings = config.validate();
+        for warning in warnings {
+            eprintln!("Configuration Warning: {}", warning);
+        }
+
         let session_config = SessionConfig::new()
             .with_target_partitions(config.target_partitions)
             .with_batch_size(config.max_record_batch_rows);
@@ -60,6 +66,7 @@ impl DatafusionProcessor {
             ctx.clone(),
             config.batch_parallelism,
             config.max_record_batch_rows,
+            config.file_scan_concurrency,
         );
         Self {
             table_register,
@@ -149,6 +156,7 @@ pub struct DatafusionTableRegister {
 
     batch_parallelism: usize,
     max_record_batch_rows: usize,
+    file_scan_concurrency: usize,
 }
 
 impl DatafusionTableRegister {
@@ -157,12 +165,14 @@ impl DatafusionTableRegister {
         ctx: Arc<SessionContext>,
         batch_parallelism: usize,
         max_record_batch_rows: usize,
+        file_scan_concurrency: usize,
     ) -> Self {
         DatafusionTableRegister {
             file_io,
             ctx,
             batch_parallelism,
             max_record_batch_rows,
+            file_scan_concurrency,
         }
     }
 
@@ -209,6 +219,7 @@ impl DatafusionTableRegister {
             need_file_path_and_pos,
             self.batch_parallelism,
             self.max_record_batch_rows,
+            self.file_scan_concurrency,
         );
 
         self.ctx

@@ -39,6 +39,7 @@ pub struct IcebergFileScanTaskTableProvider {
     need_file_path_and_pos: bool,
     batch_parallelism: usize,
     max_record_batch_rows: usize,
+    file_scan_concurrency: usize,
 }
 impl IcebergFileScanTaskTableProvider {
     pub fn new(
@@ -49,6 +50,7 @@ impl IcebergFileScanTaskTableProvider {
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
         max_record_batch_rows: usize,
+        file_scan_concurrency: usize,
     ) -> Self {
         Self {
             file_scan_tasks,
@@ -58,6 +60,7 @@ impl IcebergFileScanTaskTableProvider {
             need_file_path_and_pos,
             batch_parallelism,
             max_record_batch_rows,
+            file_scan_concurrency,
         }
     }
 }
@@ -78,7 +81,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
     /// Scans the iceberg file scan tasks
     ///
     /// This function creates an execution plan for scanning the iceberg file scan tasks.
-    /// It uses the IcebergFileTaskScan struct to create the execution plan.    
+    /// It uses the IcebergFileTaskScan struct to create the execution plan.
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -96,6 +99,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.need_file_path_and_pos,
             self.batch_parallelism,
             self.max_record_batch_rows,
+            self.file_scan_concurrency,
         )))
     }
 

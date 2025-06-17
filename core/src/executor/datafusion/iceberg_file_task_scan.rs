@@ -31,7 +31,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
@@ -40,6 +40,59 @@ use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_pre
 use iceberg_datafusion::to_datafusion_error;
 
 use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
+
+/// Calculate optimal file concurrency for each partition based on configuration
+///
+/// This function implements safety measures to prevent S3 connection timeout issues:
+/// 1. Limits maximum concurrent connections per partition
+/// 2. Ensures fair distribution across partitions
+/// 3. Prevents overwhelming S3 service with too many simultaneous connections
+///
+/// # Arguments
+/// * `total_file_scan_concurrency` - Total concurrent file reads across all partitions
+/// * `batch_parallelism` - Number of partitions (parallel batches)
+/// * `file_count_in_partition` - Number of files in this specific partition
+///
+/// # Returns
+/// The optimal concurrency for this partition, ensuring:
+/// 1. Fair distribution of concurrency across partitions
+/// 2. Not exceeding the number of files in this partition
+/// 3. Conservative limits to prevent S3 connection timeouts
+fn calculate_partition_file_concurrency(
+    total_file_scan_concurrency: usize,
+    batch_parallelism: usize,
+    file_count_in_partition: usize,
+) -> usize {
+    if file_count_in_partition == 0 {
+        return 0;
+    }
+
+    // Calculate base concurrency per partition
+    let base_concurrency = total_file_scan_concurrency / batch_parallelism.max(1);
+
+    // Apply conservative limits to prevent S3 connection timeout issues
+    const MAX_CONCURRENT_FILES_PER_PARTITION: usize = 8; // Conservative limit
+
+    // Ensure at least 1 concurrent read per partition (if files exist)
+    // But limit to prevent S3 connection issues
+    let safe_concurrency = base_concurrency
+        .clamp(1, MAX_CONCURRENT_FILES_PER_PARTITION)
+        .min(file_count_in_partition);
+
+    // Log warning if user configured too high concurrency
+    if base_concurrency > MAX_CONCURRENT_FILES_PER_PARTITION {
+        eprintln!(
+            "Warning: Configured file_scan_concurrency may be too high. \
+             Using conservative limit of {} concurrent files per partition to prevent S3 timeouts. \
+             Consider reducing file_scan_concurrency from {} to {}.",
+            MAX_CONCURRENT_FILES_PER_PARTITION,
+            total_file_scan_concurrency,
+            MAX_CONCURRENT_FILES_PER_PARTITION * batch_parallelism
+        );
+    }
+
+    safe_concurrency
+}
 
 struct RecordBatchBuffer {
     buffer: Vec<RecordBatch>,
@@ -108,6 +161,7 @@ pub(crate) struct IcebergFileTaskScan {
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
+    file_scan_concurrency: usize,
 }
 
 impl IcebergFileTaskScan {
@@ -122,6 +176,7 @@ impl IcebergFileTaskScan {
         need_file_path_and_pos: bool,
         batch_parallelism: usize,
         max_record_batch_rows: usize,
+        file_scan_concurrency: usize,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -142,6 +197,7 @@ impl IcebergFileTaskScan {
             need_seq_num,
             need_file_path_and_pos,
             max_record_batch_rows,
+            file_scan_concurrency,
         }
     }
 
@@ -258,12 +314,20 @@ impl ExecutionPlan for IcebergFileTaskScan {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let file_scan_tasks = &self.file_scan_tasks_group[partition];
+        let partition_concurrency = calculate_partition_file_concurrency(
+            self.file_scan_concurrency,
+            self.file_scan_tasks_group.len(), // batch_parallelism
+            file_scan_tasks.len(),
+        );
+
         let fut = get_batch_stream(
             self.file_io.clone(),
-            self.file_scan_tasks_group[partition].clone(),
+            file_scan_tasks.clone(),
             self.need_seq_num,
             self.need_file_path_and_pos,
             self.max_record_batch_rows,
+            partition_concurrency,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -275,55 +339,84 @@ impl ExecutionPlan for IcebergFileTaskScan {
 }
 
 /// Gets a stream of record batches from a list of file scan tasks
+///
+/// TODO: Add better S3 connection management to prevent timeout issues:
+/// - Implement connection pooling with proper lifecycle management
+/// - Add retry logic at the individual batch level (not stream level)
+/// - Consider implementing backpressure to prevent too many idle connections
+/// - Add monitoring for connection timeouts and appropriate logging
 async fn get_batch_stream(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
+    partition_file_concurrency: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let stream = try_stream! {
         let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
-        for task in file_scan_tasks {
+
+        // Create concurrent streams for all file tasks
+        let file_streams = futures::stream::iter(file_scan_tasks.into_iter().map(|task| {
+            let file_io = file_io.clone();
             let file_path = task.data_file_path.clone();
             let data_file_content = task.data_file_content;
             let sequence_number = task.sequence_number;
-            let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone()).with_batch_size(max_record_batch_rows);
-            let mut batch_stream = arrow_reader_builder.build()
-                .read(task_stream)
-                .await
-                .map_err(to_datafusion_error)?;
-            let mut index_start = 0;
-            while let Some(batch) = batch_stream.next().await {
-                let mut batch = batch.map_err(to_datafusion_error)?;
-                let batch = match data_file_content {
-                    iceberg::spec::DataContentType::Data => {
-                        // add sequence number if needed
-                        if need_seq_num {
-                            batch = add_seq_num_into_batch(batch, sequence_number)?;
+
+            async move {
+                let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
+                let arrow_reader_builder = ArrowReaderBuilder::new(file_io).with_batch_size(max_record_batch_rows);
+                let batch_stream = arrow_reader_builder.build()
+                    .read(task_stream)
+                    .await
+                    .map_err(to_datafusion_error)?;
+
+                // Transform the stream to add metadata
+                let mut index_start = 0i64;
+                let transformed_stream = batch_stream.map(move |batch_result| {
+                    let batch = batch_result.map_err(to_datafusion_error)?;
+                    let current_index = index_start;
+                    index_start += batch.num_rows() as i64;
+
+                    let processed_batch = match data_file_content {
+                        iceberg::spec::DataContentType::Data => {
+                            let mut batch = batch;
+                            // add sequence number if needed
+                            if need_seq_num {
+                                batch = add_seq_num_into_batch(batch, sequence_number)?;
+                            }
+                            // add file path and position if needed
+                            if need_file_path_and_pos {
+                                batch = add_file_path_pos_into_batch(batch, &file_path, current_index)?;
+                            }
+                            batch
                         }
-                        // add file path and position if needed
-                        if need_file_path_and_pos {
-                            batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
-                            index_start += batch.num_rows() as i64;
-                        }
-                        batch
-                    }
-                    iceberg::spec::DataContentType::PositionDeletes => {
-                        batch
-                    },
-                    iceberg::spec::DataContentType::EqualityDeletes => {
-                        add_seq_num_into_batch(batch, sequence_number)?
-                    },
-                };
-                if let Some(batch) = record_batch_buffer.add(batch)? {
-                    yield batch;
-                }
+                        iceberg::spec::DataContentType::PositionDeletes => {
+                            batch
+                        },
+                        iceberg::spec::DataContentType::EqualityDeletes => {
+                            add_seq_num_into_batch(batch, sequence_number)?
+                        },
+                    };
+                    Ok::<RecordBatch, DataFusionError>(processed_batch)
+                });
+
+                Ok::<_, DataFusionError>(transformed_stream.boxed())
+            }
+        }))
+        .buffer_unordered(partition_file_concurrency) // Use calculated concurrency for this partition
+        .try_flatten();
+
+        // Process batches as they come from concurrent file streams
+        pin_mut!(file_streams);
+        while let Some(batch) = file_streams.try_next().await? {
+            if let Some(buffered_batch) = record_batch_buffer.add(batch)? {
+                yield buffered_batch;
             }
         }
-        if let Some(batch) = record_batch_buffer.finish()? {
-            yield batch;
+
+        if let Some(final_batch) = record_batch_buffer.finish()? {
+            yield final_batch;
         }
     };
     Ok(Box::pin(stream))
@@ -550,8 +643,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![arr]).unwrap()
     }
 
-    // ... existing tests for split_n_vecs ...
-
     #[test]
     fn test_record_batch_buffer_empty_buffer_large_batch() {
         let max_rows = 100;
@@ -740,5 +831,29 @@ mod tests {
         assert!(result.is_none(), "Should not yield the small batch");
         assert_eq!(buffer.current_rows, small_batch_rows);
         assert_eq!(buffer.buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_calculate_partition_file_concurrency() {
+        // Test with no files
+        assert_eq!(calculate_partition_file_concurrency(8, 4, 0), 0);
+
+        // Test normal distribution: 8 total concurrency, 4 partitions = 2 per partition
+        assert_eq!(calculate_partition_file_concurrency(8, 4, 10), 2);
+        assert_eq!(calculate_partition_file_concurrency(8, 4, 2), 2);
+        assert_eq!(calculate_partition_file_concurrency(8, 4, 1), 1); // Limited by file count
+
+        // Test safety limits: should be capped at MAX_CONCURRENT_FILES_PER_PARTITION (8)
+        assert_eq!(calculate_partition_file_concurrency(64, 4, 20), 8); // 64/4=16, but capped at 8
+        assert_eq!(calculate_partition_file_concurrency(100, 1, 50), 8); // 100/1=100, but capped at 8
+
+        // Test edge cases
+        assert_eq!(calculate_partition_file_concurrency(1, 4, 10), 1); // At least 1 per partition
+        assert_eq!(calculate_partition_file_concurrency(16, 2, 5), 5); // Limited by file count
+        assert_eq!(calculate_partition_file_concurrency(16, 1, 10), 8); // Single partition, but capped
+
+        // Test uneven distribution
+        assert_eq!(calculate_partition_file_concurrency(7, 4, 10), 1); // 7/4 = 1 (floor)
+        assert_eq!(calculate_partition_file_concurrency(9, 4, 10), 2); // 9/4 = 2 (floor)
     }
 }

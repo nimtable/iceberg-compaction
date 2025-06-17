@@ -24,6 +24,9 @@ const DEFAULT_TARGET_PARTITIONS: usize = 4;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 const DEFAULT_VALIDATE_COMPACTION: bool = false;
 const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
+const DEFAULT_FILE_SCAN_CONCURRENCY: usize = 8;
+// Conservative limit to avoid S3 connection timeout issues
+const MAX_RECOMMENDED_FILE_SCAN_CONCURRENCY: usize = 32;
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -47,9 +50,40 @@ pub struct CompactionConfig {
     pub enable_validate_compaction: bool,
     #[builder(default = "DEFAULT_MAX_RECORD_BATCH_ROWS")]
     pub max_record_batch_rows: usize,
+    #[builder(default = "DEFAULT_FILE_SCAN_CONCURRENCY")]
+    pub file_scan_concurrency: usize,
 
     #[serde(skip)]
     // FIXME: this is a workaround for serde not supporting default values for WriterProperties
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
+}
+
+impl CompactionConfig {
+    /// Validates the configuration and provides warnings for potential issues
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // Check for S3 connection timeout risks
+        if self.file_scan_concurrency > MAX_RECOMMENDED_FILE_SCAN_CONCURRENCY {
+            warnings.push(format!(
+                "file_scan_concurrency ({}) is higher than recommended maximum ({}). \
+                 This may cause S3 connection timeout issues. Consider reducing it.",
+                self.file_scan_concurrency, MAX_RECOMMENDED_FILE_SCAN_CONCURRENCY
+            ));
+        }
+
+        // Check for reasonable batch_parallelism vs file_scan_concurrency ratio
+        let files_per_partition = self.file_scan_concurrency / self.batch_parallelism.max(1);
+        if files_per_partition > 8 {
+            warnings.push(format!(
+                "Current configuration may create {} concurrent files per partition. \
+                 Consider increasing batch_parallelism or reducing file_scan_concurrency \
+                 to prevent S3 connection timeout issues.",
+                files_per_partition
+            ));
+        }
+
+        warnings
+    }
 }
