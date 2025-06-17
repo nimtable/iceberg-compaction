@@ -15,12 +15,12 @@ futures = "0.3.17"
 futures-async-stream = "0.2.9"
 
 # Data processing and storage
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02899a5a9b70a173518cfe765cc82fb408e8784c", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b", features = [
     "storage-s3",
     "storage-gcs",
 ] }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02899a5a9b70a173518cfe765cc82fb408e8784c" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02899a5a9b70a173518cfe765cc82fb408e8784c" }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
 parquet = { version = "54", features = ["async"] }
 
 # gRPC and Protocol Buffers
