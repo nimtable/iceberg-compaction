@@ -273,8 +273,6 @@ impl Catalog for MemoryCatalog {
         let current_metadata_content = input_file.read().await?;
         let current_metadata = serde_json::from_slice::<TableMetadata>(&current_metadata_content)?;
 
-        // For our test purposes, we'll create a simple updated metadata
-        // In a real implementation, we would properly apply the commit operations
         let mut metadata_builder = TableMetadataBuilder::new_from_metadata(current_metadata, None);
 
         for update in commit.take_updates() {

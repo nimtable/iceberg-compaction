@@ -609,6 +609,8 @@ impl RewriteDataFilesCommitManager {
 
 #[cfg(test)]
 mod tests {
+    use crate::compaction::CompactionBuilder;
+    use crate::config::CompactionConfigBuilder;
     use crate::memory_catalog::MemoryCatalog;
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -864,5 +866,23 @@ mod tests {
             current_snapshot.snapshot_id(),
             latest_snapshot.snapshot_id()
         );
+
+        let rewrite_files_stat = CompactionBuilder::new()
+            .with_catalog(Arc::new(catalog))
+            .with_table_ident(table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .enable_validate_compaction(true)
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap()
+            .compact()
+            .await
+            .unwrap();
+
+        println!("Compaction completed with stats: {:?}", rewrite_files_stat);
     }
 }
