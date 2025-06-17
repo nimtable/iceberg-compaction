@@ -553,7 +553,9 @@ dependencies = [
  "futures",
  "futures-async-stream",
  "iceberg",
+ "iceberg-catalog-memory",
  "iceberg-datafusion",
+ "itertools 0.13.0",
  "mixtrics",
  "parquet",
  "prost",
@@ -561,10 +563,12 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2237,7 +2241,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=9e9fe2645eac71170b18ad9a71c8430d94c2206f#9e9fe2645eac71170b18ad9a71c8430d94c2206f"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2287,9 +2291,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-memory"
+version = "0.4.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+dependencies = [
+ "async-trait",
+ "futures",
+ "iceberg",
+ "itertools 0.13.0",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=9e9fe2645eac71170b18ad9a71c8430d94c2206f#9e9fe2645eac71170b18ad9a71c8430d94c2206f"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
 dependencies = [
  "anyhow",
  "async-trait",

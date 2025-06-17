@@ -16,8 +16,8 @@
 
 use bergloom_codegen::compactor::compactor_service_server::CompactorService;
 use bergloom_codegen::compactor::{EchoRequest, EchoResponse};
-use bergloom_core::executor::DataFusionExecutor;
 use bergloom_core::CompactionExecutor;
+use bergloom_core::executor::DataFusionExecutor;
 
 use bergloom_codegen::compactor::{
     RewriteFilesRequest as PbRewriteFilesRequest, RewriteFilesResponse as PbRewriteFilesResponse,
