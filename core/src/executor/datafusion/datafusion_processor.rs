@@ -759,18 +759,11 @@ mod tests {
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        assert!(sql.contains(&format!("FROM {} RIGHT ANTI JOIN", POSITION_DELETE_TABLE)));
-        assert!(sql.contains(&format!(
-            "{}.{} = {}.{} AND {}.{} = {}.{}",
-            DATA_FILE_TABLE,
-            SYS_HIDDEN_FILE_PATH,
-            POSITION_DELETE_TABLE,
-            SYS_HIDDEN_FILE_PATH,
-            DATA_FILE_TABLE,
-            SYS_HIDDEN_POS,
-            POSITION_DELETE_TABLE,
-            SYS_HIDDEN_POS
-        )));
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS final_result",
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with equality delete files
@@ -799,14 +792,12 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!(
-            "FROM {} RIGHT ANTI JOIN",
-            equality_delete_table_name
-        )));
-        assert!(sql.contains(&format!(
-            "{}.id = {}.id",
-            equality_delete_table_name, DATA_FILE_TABLE
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with equality delete files AND sequence number comparison
@@ -836,9 +827,12 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!(
-            "{DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {equality_delete_table_name}.{SYS_HIDDEN_SEQ_NUM}",
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with both position AND equality delete files
@@ -867,30 +861,12 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!("FROM {} RIGHT ANTI JOIN", POSITION_DELETE_TABLE)));
-        assert!(sql.contains(&format!(
-            "FROM {} RIGHT ANTI JOIN",
-            equality_delete_table_name
-        )));
-        assert!(sql.contains(&format!(
-            "{}.{} = {}.{} AND {}.{} = {}.{}",
-            DATA_FILE_TABLE,
-            SYS_HIDDEN_FILE_PATH,
-            POSITION_DELETE_TABLE,
-            SYS_HIDDEN_FILE_PATH,
-            DATA_FILE_TABLE,
-            SYS_HIDDEN_POS,
-            POSITION_DELETE_TABLE,
-            SYS_HIDDEN_POS
-        )));
-        assert!(sql.contains(&format!(
-            "{}.id = {}.id",
-            equality_delete_table_name, DATA_FILE_TABLE
-        )));
-        assert!(sql.contains(&format!(
-            "{}.{} < {}.{}",
-            DATA_FILE_TABLE, SYS_HIDDEN_SEQ_NUM, equality_delete_table_name, SYS_HIDDEN_SEQ_NUM
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name, POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with multiple equality delete files
@@ -936,38 +912,11 @@ mod tests {
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        // Check that the SQL contains the RIGHT ANTI JOIN for both equality delete tables
-        // The first equality delete table should be in the outermost query
-        assert!(sql.contains(&format!(
-            "FROM {} RIGHT ANTI JOIN",
-            equality_delete_table_name_2
-        )));
-
-        // The second equality delete table should be in a nested subquery
-        assert!(sql.contains(&format!(
-            "FROM {} RIGHT ANTI JOIN",
-            equality_delete_table_name_1
-        )));
-
-        // Check that the join conditions for equality delete tables are correct
-        assert!(sql.contains(&format!(
-            "{}.id = {}.id",
-            equality_delete_table_name_1, DATA_FILE_TABLE
-        )));
-        assert!(sql.contains(&format!(
-            "{}.name = {}.name",
-            equality_delete_table_name_2, DATA_FILE_TABLE
-        )));
-
-        // Check that the sequence number comparison is present for both equality delete tables
-        assert!(sql.contains(&format!(
-            "{}.{} < {}.{}",
-            DATA_FILE_TABLE, SYS_HIDDEN_SEQ_NUM, equality_delete_table_name_1, SYS_HIDDEN_SEQ_NUM
-        )));
-        assert!(sql.contains(&format!(
-            "{}.{} < {}.{}",
-            DATA_FILE_TABLE, SYS_HIDDEN_SEQ_NUM, equality_delete_table_name_2, SYS_HIDDEN_SEQ_NUM
-        )));
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS {} ON {}.name = {}.name AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name_2, equality_delete_table_name_1, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_1, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_1, DATA_FILE_TABLE, equality_delete_table_name_2, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_2
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     #[test]
@@ -1108,70 +1057,8 @@ mod tests {
 
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        // Verify the SQL structure is correct:
-
-        // 1. Should have a final outer SELECT that only returns project columns
-        assert!(sql.starts_with("SELECT id, item_name, description FROM ("));
-        assert!(sql.ends_with(") AS final_result"));
-
-        // 2. All inner SELECT statements should include the necessary hidden columns
-        // Count occurrences of SELECT statements that include hidden columns
-        let select_with_hidden_cols = sql.matches("SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos").count();
-        assert_eq!(
-            select_with_hidden_cols, 3,
-            "Should have 3 SELECT statements with hidden columns (one for each table level)"
-        );
-
-        // 3. Join conditions should reference hidden columns correctly
-        assert!(sql.contains(
-            "_data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num"
-        ));
-        assert!(sql.contains(
-            "_data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path"
-        ));
-        assert!(
-            sql.contains("_data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos")
-        );
-
-        // 4. Should have proper RIGHT ANTI JOIN structure
-        assert_eq!(
-            sql.matches("RIGHT ANTI JOIN").count(),
-            2,
-            "Should have 2 RIGHT ANTI JOIN operations"
-        );
-
-        // 5. Should have proper table aliases
-        assert_eq!(
-            sql.matches("AS _data_file_table").count(),
-            2,
-            "Should have 2 table aliases for _data_file_table"
-        );
-
-        // 6. Verify the nested structure is logical
-        // The SQL should follow this pattern:
-        // SELECT project_cols FROM (
-        //   SELECT all_cols FROM equality_table RIGHT ANTI JOIN (
-        //     SELECT all_cols FROM position_table RIGHT ANTI JOIN (
-        //       SELECT all_cols FROM original_data_table
-        //     ) AS data_table ON position_conditions
-        //   ) AS data_table ON equality_conditions
-        // ) AS final_result
-
-        let parts: Vec<&str> = sql.split("RIGHT ANTI JOIN").collect();
-        assert_eq!(
-            parts.len(),
-            3,
-            "SQL should split into 3 parts by RIGHT ANTI JOIN"
-        );
-
-        // The innermost part should select from the original data table
-        assert!(parts[2].contains("FROM _data_file_table) AS _data_file_table"));
-
-        // The middle part should involve position delete table
-        assert!(parts[1].contains("FROM _position_delete_table"));
-
-        // The outermost part should involve equality delete table
-        assert!(parts[0].contains("FROM _equality_delete_table_0"));
+        let expected_sql = "SELECT id, item_name, description FROM (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _equality_delete_table_0 RIGHT ANTI JOIN (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table RIGHT ANTI JOIN (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table) AS _data_file_table ON _data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path AND _data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos) AS _data_file_table ON _equality_delete_table_0.id = _data_file_table.id AND _data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num) AS final_result";
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test that verifies SQL generation works correctly with only equality deletes
@@ -1216,25 +1103,8 @@ mod tests {
 
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        // Verify the SQL structure:
-
-        // 1. Should have final SELECT that only returns project columns
-        assert!(sql.starts_with("SELECT id, name FROM ("));
-        assert!(sql.ends_with(") AS final_result"));
-
-        // 2. Inner SELECT should include sys_hidden_seq_num but not file path/pos columns
-        assert!(sql.contains("SELECT id, name, sys_hidden_seq_num FROM _equality_delete_table_0"));
-        assert!(sql.contains("SELECT id, name, sys_hidden_seq_num FROM _data_file_table"));
-        assert!(!sql.contains("sys_hidden_file_path"));
-        assert!(!sql.contains("sys_hidden_pos"));
-
-        // 3. Join condition should reference the sequence number correctly
-        assert!(sql.contains(
-            "_data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num"
-        ));
-
-        // 4. Should have exactly one RIGHT ANTI JOIN
-        assert_eq!(sql.matches("RIGHT ANTI JOIN").count(), 1);
+        let expected_sql = "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM _equality_delete_table_0 RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM _data_file_table) AS _data_file_table ON _equality_delete_table_0.id = _data_file_table.id AND _data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num) AS final_result";
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test that verifies SQL generation works correctly with only position deletes
@@ -1256,31 +1126,8 @@ mod tests {
 
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        // Verify the SQL structure:
-
-        // 1. Should have final SELECT that only returns project columns
-        assert!(sql.starts_with("SELECT id, name FROM ("));
-        assert!(sql.ends_with(") AS final_result"));
-
-        // 2. Inner SELECT should include file path/pos columns but not sequence number
-        assert!(sql.contains(
-            "SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table"
-        ));
-        assert!(sql.contains(
-            "SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table"
-        ));
-        assert!(!sql.contains("sys_hidden_seq_num"));
-
-        // 3. Join conditions should reference file path and position correctly
-        assert!(sql.contains(
-            "_data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path"
-        ));
-        assert!(
-            sql.contains("_data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos")
-        );
-
-        // 4. Should have exactly one RIGHT ANTI JOIN
-        assert_eq!(sql.matches("RIGHT ANTI JOIN").count(), 1);
+        let expected_sql = "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table) AS _data_file_table ON _data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path AND _data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos) AS final_result";
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test that verifies SQL generation works correctly with no deletes
@@ -1302,18 +1149,7 @@ mod tests {
 
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        // Verify the SQL structure:
-
-        // 1. Should be a simple SELECT without any nesting
-        assert_eq!(sql, "SELECT id, name FROM _data_file_table");
-
-        // 2. Should not contain any hidden columns
-        assert!(!sql.contains("sys_hidden_seq_num"));
-        assert!(!sql.contains("sys_hidden_file_path"));
-        assert!(!sql.contains("sys_hidden_pos"));
-
-        // 3. Should not have any JOIN operations
-        assert!(!sql.contains("JOIN"));
-        assert!(!sql.contains("final_result"));
+        let expected_sql = "SELECT id, name FROM _data_file_table";
+        assert_eq!(sql, expected_sql);
     }
 }
