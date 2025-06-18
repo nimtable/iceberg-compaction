@@ -16,7 +16,6 @@ iceberg = { workspace = true }
 iceberg-catalog-memory = { workspace = true }
 iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
-tempfile = "3.8"
 mixtrics = "0.1.0"
 parquet = { workspace = true }
 prost = { workspace = true }
@@ -35,6 +34,7 @@ sqlx = { version = "0.8.2", default-features = false, features = [
 	"time",
 	"uuid",
 ] }
+tempfile = "3.8"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
