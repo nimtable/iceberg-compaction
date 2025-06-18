@@ -52,6 +52,13 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 
+const DEFAULT_DATA_FILE_ROW_COUNT: usize = 10000;
+const DEFAULT_EQUALITY_DELETE_ROW_COUNT: usize = 200;
+const DEFAULT_POSITION_DELETE_ROW_COUNT: usize = 300;
+const DEFAULT_DATA_FILE_NUM: usize = 10;
+const DEFAULT_BATCH_SIZE: usize = 512;
+const DEFAULT_STRING_LENGTH: usize = 16;
+
 pub type EqualityDeleteDeltaWriterBuilder = EqualityDeltaWriterBuilder<
     DataFileWriterBuilder<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
     SortPositionDeleteWriterBuilder<
@@ -158,7 +165,7 @@ impl RecordBatchGenerator {
                 )) as ArrayRef,
                 datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(
                     (0..batch_size)
-                        .map(|_| generate_string(16))
+                        .map(|_| generate_string(DEFAULT_STRING_LENGTH))
                         .collect::<Vec<String>>(),
                 )) as ArrayRef,
                 _ => unimplemented!("Unsupported data type: {:?}", field.data_type()),
@@ -237,12 +244,12 @@ impl FileGeneratorBuilder {
     }
 
     pub fn build(self) -> Result<FileGenerator> {
-        let data_file_row_count = self.data_file_row_count.unwrap_or(10000);
-        let equality_delete_row_count = self.equality_delete_row_count.unwrap_or(200);
-        let position_delete_row_count = self.position_delete_row_count.unwrap_or(300);
-        let data_file_num = self.data_file_num.unwrap_or(10);
+        let data_file_row_count = self.data_file_row_count.unwrap_or(DEFAULT_DATA_FILE_ROW_COUNT);
+        let equality_delete_row_count = self.equality_delete_row_count.unwrap_or(DEFAULT_EQUALITY_DELETE_ROW_COUNT);
+        let position_delete_row_count = self.position_delete_row_count.unwrap_or(DEFAULT_POSITION_DELETE_ROW_COUNT);
+        let data_file_num = self.data_file_num.unwrap_or(DEFAULT_DATA_FILE_NUM);
         let schema = self.schema.unwrap();
-        let batch_size = self.batch_size.unwrap_or(512);
+        let batch_size = self.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
         let writer_config = self.writer_config.unwrap();
         FileGenerator::new(
             data_file_row_count,

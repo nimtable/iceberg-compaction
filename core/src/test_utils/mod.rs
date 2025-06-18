@@ -29,8 +29,12 @@ use std::{collections::HashMap, sync::Arc};
 pub mod docker_compose;
 pub mod generator;
 
-pub async fn build_test_iceberg_table() -> Result<()> {
-    let catalog = get_rest_catalog().await;
+const TABLE_NAME: &str = "t1";
+const NAMESPACE_NAME: &str = "namespace";
+const DATA_FILE_PREFIX: &str = "test_berg_loom";
+const DATA_SUBDIR: &str = "/data";
+
+pub fn get_test_schema() -> Result<Schema> {
     let schema = Schema::builder()
         .with_fields(vec![
             Arc::new(NestedField::new(
@@ -47,11 +51,17 @@ pub async fn build_test_iceberg_table() -> Result<()> {
             )),
         ])
         .build()?;
+    Ok(schema)
+}
+
+pub async fn build_test_iceberg_table() -> Result<()> {
+    let catalog = get_rest_catalog().await;
+    let schema = get_test_schema()?;
     let table_creation = TableCreation::builder()
-        .name("t1".to_string())
+        .name(TABLE_NAME.to_string())
         .schema(schema.clone())
         .build();
-    let namespace_ident = NamespaceIdent::new("namespace".to_owned());
+    let namespace_ident = NamespaceIdent::new(NAMESPACE_NAME.to_owned());
     catalog
         .create_namespace(&namespace_ident, HashMap::default())
         .await?;
@@ -59,9 +69,9 @@ pub async fn build_test_iceberg_table() -> Result<()> {
         .create_table(&namespace_ident, table_creation)
         .await?;
     let writer_config = WriterConfig {
-        data_file_prefix: "test_berg_loom".to_owned(),
+        data_file_prefix: DATA_FILE_PREFIX.to_owned(),
         file_io: table.file_io().clone(),
-        dir_path: format!("{}{}", table.metadata().location(), "/data"),
+        dir_path: format!("{}{}", table.metadata().location(), DATA_SUBDIR),
         equality_ids: vec![1],
     };
     let mut file_generator = FileGeneratorBuilder::new()

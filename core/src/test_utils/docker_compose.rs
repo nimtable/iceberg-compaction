@@ -24,6 +24,25 @@ use port_scanner::scan_port_addr;
 // Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 
 const REST_CATALOG_PORT: u16 = 8181;
+const REST_SERVICE: &str = "rest";
+const MINIO_SERVICE: &str = "minio";
+
+const AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
+const AWS_REGION: &str = "AWS_REGION";
+const MINIO_API_PORT: &str = "MINIO_API_PORT";
+
+const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
+const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
+const S3_REGION: &str = "s3.region";
+const S3_ENDPOINT: &str = "s3.endpoint";
+
+const DEFAULT_ADMIN: &str = "admin";
+const DEFAULT_PASSWORD: &str = "password";
+const DEFAULT_REGION: &str = "us-east-1";
+const DEFAULT_MINIO_PORT: &str = "9000";
+const DEFAULT_PLATFORM_ENV: &str = "DOCKER_DEFAULT_PLATFORM";
+
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
 #[ctor]
@@ -47,31 +66,31 @@ pub async fn get_rest_catalog() -> RestCatalog {
     let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
         let docker_compose = guard.as_ref().unwrap();
-        let aws_access_key_id = docker_compose.get_container_env_value("rest", "AWS_ACCESS_KEY_ID");
+        let aws_access_key_id = docker_compose.get_container_env_value(REST_SERVICE, AWS_ACCESS_KEY_ID);
         let aws_secret_access_key =
-            docker_compose.get_container_env_value("rest", "AWS_SECRET_ACCESS_KEY");
-        let aws_region = docker_compose.get_container_env_value("rest", "AWS_REGION");
-        let minio_ip = docker_compose.get_container_ip("minio");
+            docker_compose.get_container_env_value(REST_SERVICE, AWS_SECRET_ACCESS_KEY);
+        let aws_region = docker_compose.get_container_env_value(REST_SERVICE, AWS_REGION);
+        let minio_ip = docker_compose.get_container_ip(MINIO_SERVICE);
         let minio_port = docker_compose
-            .get_container_env_value("minio", "MINIO_API_PORT")
-            .unwrap_or("9000".to_string());
+            .get_container_env_value(MINIO_SERVICE, MINIO_API_PORT)
+            .unwrap_or(DEFAULT_MINIO_PORT.to_string());
         let aws_endpoint = format!("http://{}:{}", minio_ip, minio_port);
         let props = HashMap::from([
             (
-                "s3.access-key-id".to_string(),
-                aws_access_key_id.unwrap_or("admin".to_string()),
+                S3_ACCESS_KEY_ID.to_string(),
+                aws_access_key_id.unwrap_or(DEFAULT_ADMIN.to_string()),
             ),
             (
-                "s3.secret-access-key".to_string(),
-                aws_secret_access_key.unwrap_or("password".to_string()),
+                S3_SECRET_ACCESS_KEY.to_string(),
+                aws_secret_access_key.unwrap_or(DEFAULT_PASSWORD.to_string()),
             ),
             (
-                "s3.region".to_string(),
-                aws_region.unwrap_or("us-east-1".to_string()),
+                S3_REGION.to_string(),
+                aws_region.unwrap_or(DEFAULT_REGION.to_string()),
             ),
-            ("s3.endpoint".to_string(), aws_endpoint),
+            (S3_ENDPOINT.to_string(), aws_endpoint),
         ]);
-        let rest_catalog_ip = docker_compose.get_container_ip("rest");
+        let rest_catalog_ip = docker_compose.get_container_ip(REST_SERVICE);
         (rest_catalog_ip, props)
     };
 
@@ -129,7 +148,7 @@ impl DockerCompose {
         let mut cmd = Command::new("docker");
         cmd.current_dir(&self.docker_compose_dir);
 
-        cmd.env("DOCKER_DEFAULT_PLATFORM", Self::get_os_arch());
+        cmd.env(DEFAULT_PLATFORM_ENV, Self::get_os_arch());
 
         cmd.args(vec![
             "compose",
@@ -178,7 +197,7 @@ impl DockerCompose {
         let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
         let mut cmd = Command::new("docker");
         cmd.arg("inspect")
-            .arg("-f")
+            .arg("--format")
             .arg("{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
             .arg(&container_name);
 
@@ -198,7 +217,7 @@ impl DockerCompose {
         let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
         let mut cmd = Command::new("docker");
         cmd.arg("inspect")
-            .arg("-f")
+            .arg("--format")
             .arg("{{range .Config.Env}}{{.}}{{\"\\n\"}}{{end}}")
             .arg(&container_name);
 
