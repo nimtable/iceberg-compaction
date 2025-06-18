@@ -95,7 +95,7 @@ impl CompactionExecutor for DataFusionExecutor {
         for mut batch in batchs {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
-            let data_file_prefix = (&config.data_file_prefix).clone();
+            let data_file_prefix = config.data_file_prefix.clone();
             let target_file_size = config.target_file_size;
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
@@ -151,7 +151,7 @@ pub async fn build_iceberg_data_file_writer(
     target_file_size: usize,
 ) -> Result<Box<dyn IcebergWriter>> {
     let parquet_writer_builder =
-        build_parquet_writer(data_file_prefix, dir_path, schema.clone(), file_io).await?;
+        build_parquet_writer_builder(data_file_prefix, dir_path, schema.clone(), file_io).await?;
     let data_file_builder =
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
@@ -174,7 +174,7 @@ pub async fn build_iceberg_data_file_writer(
     Ok(iceberg_output_writer)
 }
 
-pub async fn build_parquet_writer(
+pub async fn build_parquet_writer_builder(
     data_file_prefix: String,
     dir_path: String,
     schema: Arc<Schema>,

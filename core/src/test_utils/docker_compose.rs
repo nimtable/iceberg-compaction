@@ -15,14 +15,13 @@
  */
 
 use core::net::{IpAddr, SocketAddr};
-use std::{process::Command, sync::RwLock};
+use std::{collections::HashMap, process::Command, sync::RwLock};
 
 use ctor::{ctor, dtor};
-use datafusion::arrow::{array::RecordBatch, datatypes::Schema};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use port_scanner::scan_port_addr;
 
-/// Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
+// Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 
 const REST_CATALOG_PORT: u16 = 8181;
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
@@ -31,7 +30,7 @@ static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 fn before_all() {
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
     let docker_compose = DockerCompose::new(
-        &module_path!().replace("::", "__").replace('.', "_"),
+        module_path!().replace("::", "__").replace('.', "_"),
         format!("{}/testdata", env!("CARGO_MANIFEST_DIR")),
     );
     docker_compose.up();
@@ -41,14 +40,39 @@ fn before_all() {
 #[dtor]
 fn after_all() {
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
-    guard.take().map(|d| d.down());
+    if let Some(d) = guard.take() { d.down() }
 }
 
 pub async fn get_rest_catalog() -> RestCatalog {
-    let rest_catalog_ip = {
+    let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
         let docker_compose = guard.as_ref().unwrap();
-        docker_compose.get_container_ip("rest")
+        let aws_access_key_id = docker_compose.get_container_env_value("rest", "AWS_ACCESS_KEY_ID");
+        let aws_secret_access_key =
+            docker_compose.get_container_env_value("rest", "AWS_SECRET_ACCESS_KEY");
+        let aws_region = docker_compose.get_container_env_value("rest", "AWS_REGION");
+        let minio_ip = docker_compose.get_container_ip("minio");
+        let minio_port = docker_compose
+            .get_container_env_value("minio", "MINIO_API_PORT")
+            .unwrap_or("9000".to_string());
+        let aws_endpoint = format!("http://{}:{}", minio_ip, minio_port);
+        let props = HashMap::from([
+            (
+                "s3.access-key-id".to_string(),
+                aws_access_key_id.unwrap_or("admin".to_string()),
+            ),
+            (
+                "s3.secret-access-key".to_string(),
+                aws_secret_access_key.unwrap_or("password".to_string()),
+            ),
+            (
+                "s3.region".to_string(),
+                aws_region.unwrap_or("us-east-1".to_string()),
+            ),
+            ("s3.endpoint".to_string(), aws_endpoint),
+        ]);
+        let rest_catalog_ip = docker_compose.get_container_ip("rest");
+        (rest_catalog_ip, props)
     };
 
     let rest_socket_addr = SocketAddr::new(rest_catalog_ip, REST_CATALOG_PORT);
@@ -59,6 +83,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
 
     let config = RestCatalogConfig::builder()
         .uri(format!("http://{}", rest_socket_addr))
+        .props(props)
         .build();
     RestCatalog::new(config)
 }
@@ -167,6 +192,45 @@ impl DockerCompose {
                 panic!("Failed to parse IP for {container_name}")
             }
         }
+    }
+
+    pub fn get_container_env(&self, service_name: impl AsRef<str>) -> Vec<(String, String)> {
+        let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
+        let mut cmd = Command::new("docker");
+        cmd.arg("inspect")
+            .arg("-f")
+            .arg("{{range .Config.Env}}{{.}}{{\"\\n\"}}{{end}}")
+            .arg(&container_name);
+
+        let env_output = get_cmd_output(cmd, format!("Get container env of {container_name}"));
+
+        let env_vars: Vec<(String, String)> = env_output
+            .trim()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        env_vars
+    }
+
+    pub fn get_container_env_value(
+        &self,
+        service_name: impl AsRef<str>,
+        env_key: impl AsRef<str>,
+    ) -> Option<String> {
+        let env_vars = self.get_container_env(service_name);
+        env_vars
+            .into_iter()
+            .find(|(key, _)| key == env_key.as_ref())
+            .map(|(_, value)| value)
     }
 }
 

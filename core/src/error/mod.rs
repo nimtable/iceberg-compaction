@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use datafusion::error;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
