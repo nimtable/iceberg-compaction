@@ -1,0 +1,15 @@
+[package]
+name = "m"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bergloom-core = { git = "https://github.com/nimtable/BergLoom.git", rev = "06e77294fa2640aea2233a9a70984e476b04a813" }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b", features = [
+    "storage-s3",
+    "storage-gcs",
+] }
+parquet = { version = "54", features = ["async"] }
+tokio = { version = "1", default-features = false }
+tempfile = "3.8"
