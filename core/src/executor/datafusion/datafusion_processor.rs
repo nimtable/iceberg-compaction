@@ -45,6 +45,35 @@ pub const SYS_HIDDEN_FILE_PATH: &str = "sys_hidden_file_path";
 pub const SYS_HIDDEN_POS: &str = "sys_hidden_pos";
 const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS];
 
+/// 执行计划统计汇总结构
+#[derive(Debug, Default)]
+struct PlanSummary {
+    node_count: usize,
+    total_partitions: usize,
+    total_fields: usize,
+    total_rows: usize,
+    total_size_mb: f64,
+    root_plan_name: String,
+    has_exact_rows: bool,
+    has_inexact_rows: bool,
+}
+
+impl PlanSummary {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn format_total_rows(&self) -> String {
+        if self.has_exact_rows && !self.has_inexact_rows {
+            format!("{}", self.total_rows)
+        } else if self.has_inexact_rows {
+            format!("~{}", self.total_rows)
+        } else {
+            "unknown".to_string()
+        }
+    }
+}
+
 /// DataFusion processor for Iceberg compaction with merge-on-read optimization
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
@@ -69,13 +98,13 @@ impl DatafusionProcessor {
             .with_repartition_joins(true)
             .with_repartition_aggregations(true)
             .with_repartition_windows(true)
-            // 🚀 内存和执行优化
-            .with_collect_statistics(false); // 关闭统计收集减少开销
+            // 🚀 启用统计收集用于诊断
+            .with_collect_statistics(true);
 
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
         tracing::info!(
-            "🔧 DataFusion Config - Target partitions: {}, Batch size: {}, Coalesce: enabled, Optimizations: enabled",
+            "🔧 DataFusion Config - Target partitions: {}, Batch size: {}, Coalesce: enabled, Statistics: enabled, Optimizations: enabled",
             config.target_partitions,
             config.max_record_batch_rows
         );
@@ -186,6 +215,9 @@ impl DatafusionProcessor {
             original_partitions, configured_target_partitions, configured_batch_parallelism
         );
 
+        // 🔍 执行计划详细分析（默认开启统计收集用于诊断）
+        self.analyze_physical_plan_statistics(&physical_plan);
+
         // 4. 执行计划优化和重分区
         let execute_start = Instant::now();
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
@@ -207,9 +239,12 @@ impl DatafusionProcessor {
                 physical_plan
             };
 
-        let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
+        let batches = execute_stream_partitioned(plan_to_execute.clone(), self.ctx.task_ctx())?;
         let execute_time = execute_start.elapsed();
         let total_time = execution_start.elapsed();
+
+        // 🔍 分析执行度量（默认开启统计收集用于诊断）
+        self.analyze_execution_metrics(&plan_to_execute);
 
         // 🎯 DataFusion 诊断总结
         let register_percent = (register_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
@@ -236,6 +271,106 @@ impl DatafusionProcessor {
         );
 
         Ok((batches, input_schema))
+    }
+
+    /// 分析 DataFusion 物理执行计划的统计信息
+    fn analyze_physical_plan_statistics(&self, plan: &Arc<dyn ExecutionPlan>) {
+        // 递归分析执行计划树的统计信息，收集汇总数据
+        let mut summary = PlanSummary::new();
+        self.collect_plan_statistics(plan, &mut summary);
+
+        // 输出单条总结日志
+        tracing::info!(
+            "📊 PHYSICAL PLAN ANALYSIS - Nodes: {} | Total Partitions: {} | Total Fields: {} | Est. Rows: {} | Est. Size: {:.1}MB | Plan: {}",
+            summary.node_count,
+            summary.total_partitions,
+            summary.total_fields,
+            summary.format_total_rows(),
+            summary.total_size_mb,
+            summary.root_plan_name
+        );
+    }
+
+    /// 递归收集执行计划节点的统计信息
+    fn collect_plan_statistics(&self, plan: &Arc<dyn ExecutionPlan>, summary: &mut PlanSummary) {
+        summary.node_count += 1;
+
+        // 记录根节点名称
+        if summary.root_plan_name.is_empty() {
+            summary.root_plan_name = plan.name().to_string();
+        }
+
+        // 获取分区信息
+        let partitioning = plan.output_partitioning();
+        let partition_count = partitioning.partition_count();
+        summary.total_partitions += partition_count;
+
+        // 获取输出schema信息
+        let schema = plan.schema();
+        let field_count = schema.fields().len();
+        summary.total_fields += field_count;
+
+        // 尝试获取统计信息
+        if let Ok(stats) = plan.statistics() {
+            // 处理行数统计
+            match &stats.num_rows {
+                datafusion::common::stats::Precision::Exact(num_rows) => {
+                    summary.total_rows += *num_rows;
+                    summary.has_exact_rows = true;
+                }
+                datafusion::common::stats::Precision::Inexact(num_rows) => {
+                    summary.total_rows += *num_rows;
+                    summary.has_inexact_rows = true;
+                }
+                _ => {}
+            }
+
+            // 处理大小统计
+            match &stats.total_byte_size {
+                datafusion::common::stats::Precision::Exact(total_size) => {
+                    summary.total_size_mb += *total_size as f64 / 1024.0 / 1024.0;
+                }
+                datafusion::common::stats::Precision::Inexact(total_size) => {
+                    summary.total_size_mb += *total_size as f64 / 1024.0 / 1024.0;
+                }
+                _ => {}
+            }
+        }
+
+        // 递归分析子节点
+        for child in plan.children() {
+            self.collect_plan_statistics(&child, summary);
+        }
+    }
+
+    /// 分析 DataFusion 执行度量 - 简化版本
+    fn analyze_execution_metrics(&self, plan: &Arc<dyn ExecutionPlan>) {
+        tracing::info!("📊 DataFusion Execution Metrics Analysis:");
+        self.collect_plan_metrics_simple(plan, 0);
+    }
+
+    /// 简化的度量收集方法
+    fn collect_plan_metrics_simple(&self, plan: &Arc<dyn ExecutionPlan>, depth: usize) {
+        let indent = "  ".repeat(depth);
+        let plan_name = plan.name();
+
+        // 获取执行度量 - 简化处理，只记录存在性
+        if let Some(metrics) = plan.metrics() {
+            let metric_count = metrics.iter().count();
+            if metric_count > 0 {
+                tracing::info!(
+                    "📊 {}Metrics for {}: {} metric entries collected",
+                    indent,
+                    plan_name,
+                    metric_count
+                );
+            }
+        }
+
+        // 递归处理子节点
+        for child in plan.children() {
+            self.collect_plan_metrics_simple(&child, depth + 1);
+        }
     }
 }
 
@@ -844,7 +979,7 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS final_result",
-            POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE
+            POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE
         );
         assert_eq!(sql, expected_sql);
     }
