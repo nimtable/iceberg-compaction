@@ -224,6 +224,12 @@ impl Compaction {
         let now = std::time::Instant::now();
 
         let table = self.catalog.load_table(&self.table_ident).await?;
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(CompacitonResult {
+                stats: RewriteFilesStat::default(),
+                compaction_validator: None,
+            });
+        }
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
         let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?);
 
