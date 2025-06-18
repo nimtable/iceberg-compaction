@@ -17,7 +17,9 @@
 use std::any::Any;
 use std::collections::BinaryHeap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::vec;
 
 use async_stream::try_stream;
@@ -38,6 +40,7 @@ use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
+use tokio; // 添加 tokio 导入
 
 use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
 
@@ -70,24 +73,29 @@ fn calculate_partition_file_concurrency(
     // Calculate base concurrency per partition
     let base_concurrency = total_file_scan_concurrency / batch_parallelism.max(1);
 
-    // Apply conservative limits to prevent S3 connection timeout issues
-    const MAX_CONCURRENT_FILES_PER_PARTITION: usize = 8; // Conservative limit
+    // 🔥 关键修改：大幅提高并发限制
+    const MAX_CONCURRENT_FILES_PER_PARTITION: usize = 32; // 从8提高到32
+    const MIN_CONCURRENT_FILES_PER_PARTITION: usize = 2; // 确保最小并发度
 
-    // Ensure at least 1 concurrent read per partition (if files exist)
-    // But limit to prevent S3 connection issues
+    // Ensure proper concurrency range
     let safe_concurrency = base_concurrency
-        .clamp(1, MAX_CONCURRENT_FILES_PER_PARTITION)
+        .clamp(
+            MIN_CONCURRENT_FILES_PER_PARTITION,
+            MAX_CONCURRENT_FILES_PER_PARTITION,
+        )
         .min(file_count_in_partition);
 
-    // Log warning if user configured too high concurrency
-    if base_concurrency > MAX_CONCURRENT_FILES_PER_PARTITION {
+    // 详细诊断日志
+    tracing::info!(
+        "🔧 Partition concurrency calculation - Total scan concurrency: {}, Partitions: {}, Files in partition: {}, Base per partition: {}, Final concurrency: {}",
+        total_file_scan_concurrency, batch_parallelism, file_count_in_partition, base_concurrency, safe_concurrency
+    );
+
+    // 警告：如果并发度太低，可能影响性能
+    if safe_concurrency < 8 {
         tracing::warn!(
-            "Warning: Configured file_scan_concurrency may be too high. \
-             Using conservative limit of {} concurrent files per partition to prevent S3 timeouts. \
-             Consider reducing file_scan_concurrency from {} to {}.",
-            MAX_CONCURRENT_FILES_PER_PARTITION,
-            total_file_scan_concurrency,
-            MAX_CONCURRENT_FILES_PER_PARTITION * batch_parallelism
+            "⚠️  Low file concurrency detected ({}) - consider increasing file_scan_concurrency from {} to {}",
+            safe_concurrency, total_file_scan_concurrency, batch_parallelism * 16
         );
     }
 
@@ -353,26 +361,98 @@ async fn get_batch_stream(
     max_record_batch_rows: usize,
     partition_file_concurrency: usize,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let total_files = file_scan_tasks.len();
+    let diagnostics = BottleneckDiagnostics::new();
+    let active_file_counter = Arc::new(AtomicUsize::new(0));
+
+    tracing::info!(
+        "🚀 Starting file scan - Files: {}, Concurrency: {}, Target batch size: {}",
+        total_files,
+        partition_file_concurrency,
+        max_record_batch_rows
+    );
+
+    // 启动实时监控
+    let diag_clone = diagnostics.clone();
+    let counter_clone = active_file_counter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            interval.tick().await;
+            let current_files = counter_clone.load(Ordering::Relaxed);
+
+            // 更新最大并发文件数
+            loop {
+                let current_max = diag_clone.max_concurrent_files.load(Ordering::Relaxed);
+                if current_files <= current_max {
+                    break;
+                }
+                if diag_clone
+                    .max_concurrent_files
+                    .compare_exchange_weak(
+                        current_max,
+                        current_files,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+
+            tracing::info!("📊 Real-time: {} files reading concurrently", current_files);
+
+            // 🚨 实时警告
+            if current_files < partition_file_concurrency / 2 {
+                tracing::warn!(
+                    "⚠️  File concurrency low: {}/{}",
+                    current_files,
+                    partition_file_concurrency
+                );
+            }
+        }
+    });
+
     let stream = try_stream! {
         let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+        let mut batch_count = 0;
+        let start_time = Instant::now();
 
-        // Create concurrent streams for all file tasks
-        let file_streams = futures::stream::iter(file_scan_tasks.into_iter().map(|task| {
+        // Create concurrent streams for all file tasks with diagnostics
+        let file_streams = futures::stream::iter(file_scan_tasks.into_iter().enumerate().map(|(file_idx, task)| {
             let file_io = file_io.clone();
             let file_path = task.data_file_path.clone();
             let data_file_content = task.data_file_content;
             let sequence_number = task.sequence_number;
+            let file_size = task.length;
+            let diagnostics = diagnostics.clone();
+            let active_counter = active_file_counter.clone();
 
             async move {
+                // 📈 开始文件读取
+                active_counter.fetch_add(1, Ordering::Relaxed);
+                let file_start = Instant::now();
+
+                tracing::debug!("📂 Starting file {}: {:.2}MB", file_idx, file_size as f64 / 1024.0 / 1024.0);
+
+                // 1. 文件打开阶段 - 纯I/O
+                let open_start = Instant::now();
                 let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
                 let arrow_reader_builder = ArrowReaderBuilder::new(file_io).with_batch_size(max_record_batch_rows);
                 let batch_stream = arrow_reader_builder.build()
                     .read(task_stream)
                     .await
                     .map_err(to_datafusion_error)?;
+                let open_time = open_start.elapsed();
+
+                // 2. 数据读取和处理阶段
+                let read_start = Instant::now();
+                let mut processed_batches = Vec::new();
+                let mut total_rows = 0;
+                let mut index_start = 0i64;
 
                 // Transform the stream to add metadata
-                let mut index_start = 0i64;
                 let transformed_stream = batch_stream.map(move |batch_result| {
                     let batch = batch_result.map_err(to_datafusion_error)?;
                     let current_index = index_start;
@@ -401,23 +481,78 @@ async fn get_batch_stream(
                     Ok::<RecordBatch, DataFusionError>(processed_batch)
                 });
 
-                Ok::<_, DataFusionError>(transformed_stream.boxed())
+                // 收集所有批次
+                pin_mut!(transformed_stream);
+                while let Some(batch) = transformed_stream.try_next().await? {
+                    total_rows += batch.num_rows();
+                    processed_batches.push(batch);
+                }
+
+                let read_time = read_start.elapsed();
+                let total_file_time = file_start.elapsed();
+                active_counter.fetch_sub(1, Ordering::Relaxed);
+
+                // 📊 更新诊断数据
+                diagnostics.file_open_time.fetch_add(open_time.as_nanos() as u64, Ordering::Relaxed);
+                diagnostics.total_io_wait_time.fetch_add((open_time + read_time).as_nanos() as u64, Ordering::Relaxed);
+                diagnostics.time_in_file_read.fetch_add(total_file_time.as_nanos() as u64, Ordering::Relaxed);
+
+                // 🔍 单文件分析
+                let file_size_mb = file_size as f64 / 1024.0 / 1024.0;
+                let throughput = file_size_mb / total_file_time.as_secs_f64();
+
+                let open_percent = (open_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
+                let read_percent = (read_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
+
+                tracing::debug!(
+                    "📁 File {}: {:.1}MB, {:.1}MB/s, {} rows, {} batches | Open: {:.1}%, Read: {:.1}%",
+                    file_idx, file_size_mb, throughput, total_rows, processed_batches.len(),
+                    open_percent, read_percent
+                );
+
+                // 🚨 单文件瓶颈检测
+                if throughput < 10.0 {
+                    tracing::warn!("🐌 Very slow file {}: {:.1}MB/s", file_idx, throughput);
+                }
+                if open_percent > 50.0 {
+                    tracing::warn!("🐌 Slow file open {}: {:.1}% of time", file_idx, open_percent);
+                }
+
+                Ok::<Vec<RecordBatch>, DataFusionError>(processed_batches)
             }
         }))
-        .buffer_unordered(partition_file_concurrency) // Use calculated concurrency for this partition
-        .try_flatten();
+        .buffer_unordered(partition_file_concurrency); // Use calculated concurrency for this partition
 
         // Process batches as they come from concurrent file streams
         pin_mut!(file_streams);
-        while let Some(batch) = file_streams.try_next().await? {
-            if let Some(buffered_batch) = record_batch_buffer.add(batch)? {
-                yield buffered_batch;
+        while let Some(batches_result) = file_streams.try_next().await? {
+            for batch in batches_result {
+                let buffer_start = Instant::now();
+                if let Some(buffered_batch) = record_batch_buffer.add(batch)? {
+                    batch_count += 1;
+                    let buffer_time = buffer_start.elapsed();
+                    diagnostics.time_in_buffer_ops.fetch_add(buffer_time.as_nanos() as u64, Ordering::Relaxed);
+
+                    tracing::debug!("📦 Produced batch {}: {} rows", batch_count, buffered_batch.num_rows());
+                    yield buffered_batch;
+                }
             }
         }
 
         if let Some(final_batch) = record_batch_buffer.finish()? {
+            batch_count += 1;
+            tracing::debug!("📦 Final batch {}: {} rows", batch_count, final_batch.num_rows());
             yield final_batch;
         }
+
+        let total_time = start_time.elapsed();
+        tracing::info!(
+            "📊 Partition complete - {} files, {} batches produced in {:?}",
+            total_files, batch_count, total_time
+        );
+
+        // 🎯 最终诊断
+        diagnostics.diagnose_bottleneck();
     };
     Ok(Box::pin(stream))
 }
@@ -504,6 +639,78 @@ pub fn get_column_names(
     })
 }
 
+/// 瓶颈诊断工具，用于精确识别性能瓶颈
+#[derive(Debug)]
+pub struct BottleneckDiagnostics {
+    // 并行度指标
+    max_concurrent_files: AtomicUsize,
+    max_concurrent_partitions: AtomicUsize,
+
+    // I/O指标
+    total_io_wait_time: AtomicU64,
+    total_cpu_time: AtomicU64,
+    file_open_time: AtomicU64,
+
+    // 时间分布
+    time_in_file_read: AtomicU64,
+    time_in_datafusion: AtomicU64,
+    time_in_buffer_ops: AtomicU64,
+
+    start_time: Instant,
+}
+
+impl BottleneckDiagnostics {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            max_concurrent_files: AtomicUsize::new(0),
+            max_concurrent_partitions: AtomicUsize::new(0),
+            total_io_wait_time: AtomicU64::new(0),
+            total_cpu_time: AtomicU64::new(0),
+            file_open_time: AtomicU64::new(0),
+            time_in_file_read: AtomicU64::new(0),
+            time_in_datafusion: AtomicU64::new(0),
+            time_in_buffer_ops: AtomicU64::new(0),
+            start_time: Instant::now(),
+        })
+    }
+
+    pub fn diagnose_bottleneck(&self) {
+        let total_time = self.start_time.elapsed().as_nanos() as u64;
+        let io_time = self.total_io_wait_time.load(Ordering::Relaxed);
+        let cpu_time = self.total_cpu_time.load(Ordering::Relaxed);
+        let file_read_time = self.time_in_file_read.load(Ordering::Relaxed);
+        let datafusion_time = self.time_in_datafusion.load(Ordering::Relaxed);
+
+        let max_files = self.max_concurrent_files.load(Ordering::Relaxed);
+        let max_partitions = self.max_concurrent_partitions.load(Ordering::Relaxed);
+
+        // 时间分布分析
+        let io_percent = (io_time as f64 / total_time as f64) * 100.0;
+        let cpu_percent = (cpu_time as f64 / total_time as f64) * 100.0;
+        let file_read_percent = (file_read_time as f64 / total_time as f64) * 100.0;
+        let datafusion_percent = (datafusion_time as f64 / total_time as f64) * 100.0;
+
+        // 🎯 关键诊断逻辑
+        let bottleneck_analysis = if io_percent > 60.0 {
+            "PRIMARY BOTTLENECK: I/O BOUND - Storage/Network too slow"
+        } else if max_files < 16 {
+            "PRIMARY BOTTLENECK: LOW FILE CONCURRENCY - increase file_scan_concurrency"
+        } else if max_partitions < 8 {
+            "PRIMARY BOTTLENECK: LOW DATAFUSION PARALLELISM - check target_partitions"
+        } else if datafusion_percent < 30.0 {
+            "PRIMARY BOTTLENECK: DATAFUSION UNDERUTILIZED - query optimization needed"
+        } else {
+            "No obvious bottleneck - performance balanced"
+        };
+
+        // 🔍 单条日志包含所有诊断信息
+        tracing::info!(
+            "🔍 BOTTLENECK DIAGNOSIS - Time: I/O {:.1}%, CPU {:.1}%, FileRead {:.1}%, DataFusion {:.1}% | Parallelism: MaxFiles {}, MaxPartitions {} | Result: {}",
+            io_percent, cpu_percent, file_read_percent, datafusion_percent,
+            max_files, max_partitions, bottleneck_analysis
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,19 +1048,20 @@ mod tests {
         // Test normal distribution: 8 total concurrency, 4 partitions = 2 per partition
         assert_eq!(calculate_partition_file_concurrency(8, 4, 10), 2);
         assert_eq!(calculate_partition_file_concurrency(8, 4, 2), 2);
-        assert_eq!(calculate_partition_file_concurrency(8, 4, 1), 1); // Limited by file count
+        assert_eq!(calculate_partition_file_concurrency(8, 4, 1), 2); // At least MIN_CONCURRENT_FILES_PER_PARTITION (2)
 
-        // Test safety limits: should be capped at MAX_CONCURRENT_FILES_PER_PARTITION (8)
-        assert_eq!(calculate_partition_file_concurrency(64, 4, 20), 8); // 64/4=16, but capped at 8
-        assert_eq!(calculate_partition_file_concurrency(100, 1, 50), 8); // 100/1=100, but capped at 8
+        // Test safety limits: should be capped at MAX_CONCURRENT_FILES_PER_PARTITION (32)
+        assert_eq!(calculate_partition_file_concurrency(64, 4, 20), 16); // 64/4=16, within limit
+        assert_eq!(calculate_partition_file_concurrency(200, 4, 50), 32); // 200/4=50, but capped at 32
+        assert_eq!(calculate_partition_file_concurrency(100, 1, 50), 32); // 100/1=100, but capped at 32
 
         // Test edge cases
-        assert_eq!(calculate_partition_file_concurrency(1, 4, 10), 1); // At least 1 per partition
+        assert_eq!(calculate_partition_file_concurrency(1, 4, 10), 2); // At least MIN_CONCURRENT_FILES_PER_PARTITION (2)
         assert_eq!(calculate_partition_file_concurrency(16, 2, 5), 5); // Limited by file count
-        assert_eq!(calculate_partition_file_concurrency(16, 1, 10), 8); // Single partition, but capped
+        assert_eq!(calculate_partition_file_concurrency(16, 1, 10), 10); // Single partition, limited by file count
 
         // Test uneven distribution
-        assert_eq!(calculate_partition_file_concurrency(7, 4, 10), 1); // 7/4 = 1 (floor)
-        assert_eq!(calculate_partition_file_concurrency(9, 4, 10), 2); // 9/4 = 2 (floor)
+        assert_eq!(calculate_partition_file_concurrency(7, 4, 10), 2); // 7/4 = 1, but at least 2
+        assert_eq!(calculate_partition_file_concurrency(9, 4, 10), 2); // 9/4 = 2
     }
 }

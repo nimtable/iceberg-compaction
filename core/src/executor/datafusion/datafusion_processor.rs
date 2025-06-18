@@ -15,6 +15,7 @@
  */
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{
     error::{CompactionError, Result},
@@ -59,15 +60,31 @@ impl DatafusionProcessor {
             tracing::warn!("Configuration Warning: {}", warning);
         }
 
+        // 🚀 优化 DataFusion 配置以提高性能
         let session_config = SessionConfig::new()
             .with_target_partitions(config.target_partitions)
-            .with_batch_size(config.max_record_batch_rows);
+            .with_batch_size(config.max_record_batch_rows) // 使用用户配置的批次大小
+            // 🔥 关键优化：启用批次合并和重分区
+            .with_coalesce_batches(true)
+            .with_repartition_joins(true)
+            .with_repartition_aggregations(true)
+            .with_repartition_windows(true)
+            // 🚀 内存和执行优化
+            .with_collect_statistics(false); // 关闭统计收集减少开销
+
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
+
+        tracing::info!(
+            "🔧 DataFusion Config - Target partitions: {}, Batch size: {}, Coalesce: enabled, Optimizations: enabled",
+            config.target_partitions,
+            config.max_record_batch_rows
+        );
+
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
             config.batch_parallelism,
-            config.max_record_batch_rows,
+            config.max_record_batch_rows, // 使用用户配置的批次大小
             config.file_scan_concurrency,
         );
         Self {
@@ -137,31 +154,86 @@ impl DatafusionProcessor {
         &self,
         mut datafusion_task_ctx: DataFusionTaskContext,
     ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
+        let execution_start = Instant::now();
+
         let input_schema = datafusion_task_ctx
             .input_schema
             .take()
             .ok_or_else(|| CompactionError::Unexpected("Input schema is not set".to_owned()))?;
         let exec_sql = datafusion_task_ctx.exec_sql.clone();
 
+        // 1. 表注册阶段监控
+        let register_start = Instant::now();
+        tracing::info!("📊 Starting DataFusion table registration");
         self.register_tables(datafusion_task_ctx)?;
+        let register_time = register_start.elapsed();
+
+        // 2. 查询规划阶段监控
+        let plan_start = Instant::now();
+        tracing::debug!("🔍 Executing SQL: {}", exec_sql);
 
         let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
+        let plan_time = plan_start.elapsed();
 
-        // Conditionally create a new physical_plan if repartitioning is needed
+        // 3. 分析执行计划的并行度 - 关键检查点
+        let original_partitions = physical_plan.output_partitioning().partition_count();
+        let configured_target_partitions = self.config.target_partitions;
+        let configured_batch_parallelism = self.config.batch_parallelism;
+
+        tracing::info!(
+            "📋 DataFusion Plan Analysis - Original partitions: {}, Target partitions: {}, Batch parallelism: {}",
+            original_partitions, configured_target_partitions, configured_batch_parallelism
+        );
+
+        // 4. 执行计划优化和重分区
+        let execute_start = Instant::now();
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
-            if physical_plan.output_partitioning().partition_count()
-                != self.config.target_partitions
-            {
+            if original_partitions != configured_target_partitions {
+                tracing::info!(
+                    "🔄 Repartitioning from {} to {} partitions",
+                    original_partitions,
+                    configured_target_partitions
+                );
                 Arc::new(RepartitionExec::try_new(
                     physical_plan,
-                    Partitioning::RoundRobinBatch(self.config.target_partitions),
+                    Partitioning::RoundRobinBatch(configured_target_partitions),
                 )?)
             } else {
+                tracing::info!(
+                    "✅ No repartitioning needed, using {} partitions",
+                    original_partitions
+                );
                 physical_plan
             };
 
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
+        let execute_time = execute_start.elapsed();
+        let total_time = execution_start.elapsed();
+
+        // 🎯 DataFusion 诊断总结
+        let register_percent = (register_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+        let plan_percent = (plan_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+        let execute_percent = (execute_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+
+        // 瓶颈分析
+        let datafusion_analysis = if register_time.as_millis() > 5000 {
+            "BOTTLENECK: Table registration too slow"
+        } else if plan_time.as_millis() > 2000 {
+            "BOTTLENECK: Query planning too slow"
+        } else if original_partitions == 1 && configured_target_partitions > 1 {
+            "BOTTLENECK: Single partition execution plan"
+        } else if original_partitions < configured_target_partitions / 2 {
+            "WARNING: Low partition utilization"
+        } else {
+            "DataFusion execution optimal"
+        };
+
+        tracing::info!(
+            "🔍 DATAFUSION DIAGNOSIS - Timing: Register {:.1}%, Plan {:.1}%, Execute {:.1}% | Partitions: {} -> {} | BatchStreams: {} | Analysis: {}",
+            register_percent, plan_percent, execute_percent,
+            original_partitions, configured_target_partitions, batches.len(), datafusion_analysis
+        );
 
         Ok((batches, input_schema))
     }
