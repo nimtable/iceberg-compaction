@@ -19,14 +19,14 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
+    RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;
@@ -182,7 +182,7 @@ pub struct Compaction {
     pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
-struct CompacitonResult {
+struct CompactionResult {
     stats: RewriteFilesStat,
 
     compaction_validator: Option<CompactionValidator>,
@@ -195,7 +195,7 @@ impl Compaction {
     }
 
     pub async fn compact(&self) -> Result<RewriteFilesStat> {
-        let CompacitonResult {
+        let CompactionResult {
             stats,
             compaction_validator,
         } = match self.compaction_type {
@@ -216,7 +216,7 @@ impl Compaction {
         Ok(stats)
     }
 
-    async fn full_compact(&self) -> Result<CompacitonResult> {
+    async fn full_compact(&self) -> Result<CompactionResult> {
         let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
         let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
         let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
@@ -225,7 +225,7 @@ impl Compaction {
 
         let table = self.catalog.load_table(&self.table_ident).await?;
         if table.metadata().current_snapshot().is_none() {
-            return Ok(CompacitonResult {
+            return Ok(CompactionResult {
                 stats: RewriteFilesStat::default(),
                 compaction_validator: None,
             });
@@ -340,7 +340,7 @@ impl Compaction {
             None
         };
 
-        Ok(CompacitonResult {
+        Ok(CompactionResult {
             stats: RewriteFilesStat {
                 rewritten_files_count: stat.rewritten_files_count,
                 added_files_count: stat.added_files_count,
@@ -628,17 +628,17 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
     };
     use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;
