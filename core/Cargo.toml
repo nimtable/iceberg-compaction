@@ -34,7 +34,7 @@ sqlx = { version = "0.8.2", default-features = false, features = [
 	"time",
 	"uuid",
 ] }
-tempfile = "3.8"
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"

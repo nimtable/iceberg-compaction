@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["codegen", "core", "services/compactor"]
+members = ["codegen", "core", "examples/memory-catalog", "services/compactor"]
 
 [workspace.dependencies]
 # Async runtime and utilities
@@ -40,4 +40,5 @@ tonic = { version = "0.12" }
 tonic-build = { version = "0.12" }
 
 # Utilities
+tempfile = "3.8"
 url = "2"

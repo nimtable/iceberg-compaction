@@ -572,6 +572,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bergloom-example"
+version = "0.1.0"
+dependencies = [
+ "bergloom-core",
+ "iceberg",
+ "iceberg-catalog-memory",
+ "parquet",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bergloom-service-compactor"
 version = "0.1.0"
 dependencies = [
