@@ -16,14 +16,18 @@
 
 use std::sync::Arc;
 
-use crate::error::{CompactionError, Result};
+use crate::{
+    error::{CompactionError, Result},
+    executor::InputFileScanTasks,
+    CompactionConfig,
+};
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning,
     },
-    prelude::SessionContext,
+    prelude::{SessionConfig, SessionContext},
 };
 use iceberg::{
     arrow::schema_to_arrow_schema,
@@ -34,68 +38,70 @@ use iceberg::{
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 
+// System hidden columns used for Iceberg merge-on-read operations
 pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
 pub const SYS_HIDDEN_FILE_PATH: &str = "sys_hidden_file_path";
 pub const SYS_HIDDEN_POS: &str = "sys_hidden_pos";
 const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS];
 
-const DATA_FILE_TABLE: &str = "data_file_table";
-const POSITION_DELETE_TABLE: &str = "position_delete_table";
-const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
-
+/// DataFusion processor for Iceberg compaction with merge-on-read optimization
 pub struct DatafusionProcessor {
-    datafusion_task_ctx: DataFusionTaskContext,
     table_register: DatafusionTableRegister,
-    batch_parallelism: usize,
-    target_partitions: usize,
     ctx: Arc<SessionContext>,
+    config: Arc<CompactionConfig>,
 }
 
 impl DatafusionProcessor {
-    pub fn new(
-        ctx: Arc<SessionContext>,
-        datafusion_task_ctx: DataFusionTaskContext,
-        batch_parallelism: usize,
-        target_partitions: usize,
-        file_io: FileIO,
-    ) -> Self {
-        let table_register = DatafusionTableRegister::new(file_io, ctx.clone());
+    pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
+        let session_config = SessionConfig::new()
+            .with_target_partitions(config.target_partitions)
+            .with_batch_size(config.max_record_batch_rows);
+        let ctx = Arc::new(SessionContext::new_with_config(session_config));
+        let table_register = DatafusionTableRegister::new(
+            file_io,
+            ctx.clone(),
+            config.batch_parallelism,
+            config.max_record_batch_rows,
+        );
         Self {
-            datafusion_task_ctx,
             table_register,
-            batch_parallelism,
-            target_partitions,
             ctx,
+            config,
         }
     }
 
-    pub fn register_tables(&mut self) -> Result<()> {
-        if let Some(datafile_schema) = self.datafusion_task_ctx.data_file_schema.take() {
+    /// Registers all necessary tables (data files, position deletes, equality deletes) with DataFusion
+    pub fn register_tables(&self, mut datafusion_task_ctx: DataFusionTaskContext) -> Result<()> {
+        // Register data file table if present
+        if let Some(datafile_schema) = datafusion_task_ctx.data_file_schema.take() {
             self.table_register.register_data_table_provider(
                 &datafile_schema,
-                self.datafusion_task_ctx.data_files.take().unwrap(),
-                DATA_FILE_TABLE,
-                self.datafusion_task_ctx.need_seq_num(),
-                self.datafusion_task_ctx.need_file_path_and_pos(),
-                self.batch_parallelism,
+                datafusion_task_ctx.data_files.take().ok_or_else(|| {
+                    CompactionError::Unexpected("Data files are not set".to_owned())
+                })?,
+                &datafusion_task_ctx.data_file_table_name(),
+                datafusion_task_ctx.need_seq_num(),
+                datafusion_task_ctx.need_file_path_and_pos(),
             )?;
         }
 
-        if let Some(position_delete_schema) = self.datafusion_task_ctx.position_delete_schema.take()
-        {
+        // Register position delete table if present
+        if let Some(position_delete_schema) = datafusion_task_ctx.position_delete_schema.take() {
             self.table_register.register_delete_table_provider(
                 &position_delete_schema,
-                self.datafusion_task_ctx
+                datafusion_task_ctx
                     .position_delete_files
                     .take()
-                    .unwrap(),
-                POSITION_DELETE_TABLE,
-                self.batch_parallelism,
+                    .ok_or_else(|| {
+                        CompactionError::Unexpected("Position delete files are not set".to_owned())
+                    })?,
+                &datafusion_task_ctx.position_delete_table_name(),
             )?;
         }
 
+        // Register equality delete tables if present
         if let Some(equality_delete_metadatas) =
-            self.datafusion_task_ctx.equality_delete_metadatas.take()
+            datafusion_task_ctx.equality_delete_metadatas.take()
         {
             for EqualityDeleteMetadata {
                 equality_delete_schema,
@@ -107,43 +113,74 @@ impl DatafusionProcessor {
                     &equality_delete_schema,
                     file_scan_tasks,
                     &equality_delete_table_name,
-                    self.batch_parallelism,
                 )?;
             }
         }
         Ok(())
     }
 
-    pub async fn execute(&mut self) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
-        self.register_tables()?;
-        let df = self.ctx.sql(&self.datafusion_task_ctx.exec_sql).await?;
+    /// Executes the compaction query using DataFusion
+    ///
+    /// This method:
+    /// 1. Registers all necessary tables with DataFusion
+    /// 2. Creates and executes the merge-on-read SQL query
+    /// 3. Applies repartitioning if needed for optimal parallelism
+    /// 4. Returns streaming result batches and the input schema
+    pub async fn execute(
+        &self,
+        mut datafusion_task_ctx: DataFusionTaskContext,
+    ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
+        let input_schema = datafusion_task_ctx
+            .input_schema
+            .take()
+            .ok_or_else(|| CompactionError::Unexpected("Input schema is not set".to_owned()))?;
+        let exec_sql = datafusion_task_ctx.exec_sql.clone();
+
+        self.register_tables(datafusion_task_ctx)?;
+
+        let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
-        let batchs =
-            if physical_plan.output_partitioning().partition_count() != self.target_partitions {
-                let physical_plan: Arc<dyn ExecutionPlan + 'static> =
-                    Arc::new(RepartitionExec::try_new(
-                        physical_plan,
-                        Partitioning::RoundRobinBatch(self.target_partitions),
-                    )?);
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+
+        // Conditionally create a new physical_plan if repartitioning is needed
+        let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
+            if physical_plan.output_partitioning().partition_count()
+                != self.config.target_partitions
+            {
+                Arc::new(RepartitionExec::try_new(
+                    physical_plan,
+                    Partitioning::RoundRobinBatch(self.config.target_partitions),
+                )?)
             } else {
-                execute_stream_partitioned(physical_plan, self.ctx.task_ctx())?
+                physical_plan
             };
-        Ok((
-            batchs,
-            self.datafusion_task_ctx.input_schema.take().unwrap(),
-        ))
+
+        let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
+
+        Ok((batches, input_schema))
     }
 }
 
 pub struct DatafusionTableRegister {
     file_io: FileIO,
     ctx: Arc<SessionContext>,
+
+    batch_parallelism: usize,
+    max_record_batch_rows: usize,
 }
 
 impl DatafusionTableRegister {
-    pub fn new(file_io: FileIO, ctx: Arc<SessionContext>) -> Self {
-        DatafusionTableRegister { file_io, ctx }
+    pub fn new(
+        file_io: FileIO,
+        ctx: Arc<SessionContext>,
+        batch_parallelism: usize,
+        max_record_batch_rows: usize,
+    ) -> Self {
+        DatafusionTableRegister {
+            file_io,
+            ctx,
+            batch_parallelism,
+            max_record_batch_rows,
+        }
     }
 
     pub fn register_data_table_provider(
@@ -153,7 +190,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         self.register_table_provider_impl(
             schema,
@@ -161,7 +197,6 @@ impl DatafusionTableRegister {
             table_name,
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
         )
     }
 
@@ -170,19 +205,10 @@ impl DatafusionTableRegister {
         schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
-        batch_parallelism: usize,
     ) -> Result<()> {
-        self.register_table_provider_impl(
-            schema,
-            file_scan_tasks,
-            table_name,
-            false,
-            false,
-            batch_parallelism,
-        )
+        self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register_table_provider_impl(
         &self,
         schema: &Schema,
@@ -190,7 +216,6 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
@@ -199,12 +224,13 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
+            self.batch_parallelism,
+            self.max_record_batch_rows,
         );
 
         self.ctx
-            .register_table(table_name, Arc::new(data_file_table_provider))
-            .unwrap();
+            .register_table(table_name, Arc::new(data_file_table_provider))?;
+
         Ok(())
     }
 }
@@ -253,12 +279,36 @@ impl<'a> SqlBuilder<'a> {
     /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(self) -> Result<String> {
         let data_file_table_name = self.data_file_table_name.as_ref().ok_or_else(|| {
-            CompactionError::Config("Data file table name is not provided".to_string())
+            CompactionError::Execution("Data file table name is not provided".to_string())
         })?;
-        // Start with a basic SELECT query from the data file table
-        let mut sql = format!(
+
+        // Determine which hidden columns are needed for join conditions
+        let need_seq_num = !self.equality_delete_metadatas.is_empty();
+        let need_file_path_and_pos = self.need_file_path_and_pos;
+
+        // Early return for simple case: no deletes at all
+        if !need_seq_num && !need_file_path_and_pos {
+            return Ok(format!(
+                "SELECT {} FROM {}",
+                self.project_names.join(", "),
+                data_file_table_name
+            ));
+        }
+
+        // Build the complete column list including hidden columns for internal queries
+        let mut internal_columns = self.project_names.clone();
+        if need_seq_num {
+            internal_columns.push(SYS_HIDDEN_SEQ_NUM.to_string());
+        }
+        if need_file_path_and_pos {
+            internal_columns.push(SYS_HIDDEN_FILE_PATH.to_string());
+            internal_columns.push(SYS_HIDDEN_POS.to_string());
+        }
+
+        // Start with a SELECT query that includes all necessary columns
+        let mut query = format!(
             "SELECT {} FROM {}",
-            self.project_names.join(","),
+            internal_columns.join(", "),
             data_file_table_name
         );
 
@@ -267,44 +317,84 @@ impl<'a> SqlBuilder<'a> {
         if self.need_file_path_and_pos {
             let position_delete_table_name =
                 self.position_delete_table_name.as_ref().ok_or_else(|| {
-                    CompactionError::Config(
+                    CompactionError::Execution(
                         "Position delete table name is not provided".to_string(),
                     )
                 })?;
-            sql.push_str(&format!(
-                    " LEFT ANTI JOIN {position_delete_table_name} ON {data_file_table_name}.{SYS_HIDDEN_FILE_PATH} = {position_delete_table_name}.{SYS_HIDDEN_FILE_PATH} AND {data_file_table_name}.{SYS_HIDDEN_POS} = {position_delete_table_name}.{SYS_HIDDEN_POS}",
-                ));
+
+            let pos_join_conditions = format!(
+                "{}.{} = {}.{} AND {}.{} = {}.{}",
+                data_file_table_name,
+                SYS_HIDDEN_FILE_PATH,
+                position_delete_table_name,
+                SYS_HIDDEN_FILE_PATH,
+                data_file_table_name,
+                SYS_HIDDEN_POS,
+                position_delete_table_name,
+                SYS_HIDDEN_POS
+            );
+
+            query = format!(
+                "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
+                internal_columns.join(", "), // Include hidden columns in outer SELECT
+                position_delete_table_name,
+                query,
+                data_file_table_name,
+                pos_join_conditions
+            );
         }
 
         // Add equality delete join if needed
         // This excludes rows that match the equality conditions in the delete files
         if !self.equality_delete_metadatas.is_empty() {
-            for metadata in self.equality_delete_metadatas {
-                // LEFT ANTI JOIN ON equality delete table
-                sql.push_str(&format!(
-                    " LEFT ANTI JOIN {} ON {}",
-                    metadata.equality_delete_table_name,
-                    metadata
-                        .equality_delete_join_names()
-                        .iter()
-                        .map(|name| format!(
-                            "{data_file_table_name}.{name} = {}.{name}",
-                            metadata.equality_delete_table_name
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" AND ")
-                ));
+            for eq_meta in self.equality_delete_metadatas {
+                let eq_table_name = &eq_meta.equality_delete_table_name;
+                let eq_join_conditions = eq_meta
+                    .equality_delete_join_names()
+                    .iter()
+                    .map(|col_name| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            eq_table_name, col_name, data_file_table_name, col_name
+                        )
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" AND ");
 
-                // Add sequence number comparison if needed
-                // This ensures that only newer deletes are applied
-                sql.push_str(&format!(
-                    " AND {data_file_table_name}.{SYS_HIDDEN_SEQ_NUM} < {}.{SYS_HIDDEN_SEQ_NUM}",
-                    metadata.equality_delete_table_name
-                ));
+                // Only add sequence number condition if we have equality deletes
+                // (which means the data file table should have the seq_num column)
+                let seq_condition = format!(
+                    "{}.{} < {}.{}",
+                    data_file_table_name, SYS_HIDDEN_SEQ_NUM, eq_table_name, SYS_HIDDEN_SEQ_NUM
+                );
+
+                let full_condition = if eq_join_conditions.is_empty() {
+                    seq_condition
+                } else {
+                    format!("{} AND {}", eq_join_conditions, seq_condition)
+                };
+
+                query = format!(
+                    "SELECT {} FROM {} RIGHT ANTI JOIN ({}) AS {} ON {}",
+                    internal_columns.join(", "), // Include hidden columns in outer SELECT
+                    eq_table_name,
+                    query,
+                    data_file_table_name,
+                    full_condition
+                );
             }
         }
 
-        Ok(sql)
+        // Final SELECT to return only the project columns (without hidden columns)
+        if need_seq_num || need_file_path_and_pos {
+            query = format!(
+                "SELECT {} FROM ({}) AS final_result",
+                self.project_names.join(", "),
+                query
+            );
+        }
+
+        Ok(query)
     }
 }
 
@@ -313,10 +403,12 @@ pub struct DataFusionTaskContext {
     pub(crate) input_schema: Option<Schema>,
     pub(crate) data_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_files: Option<Vec<FileScanTask>>,
+    #[allow(unused)]
     pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_schema: Option<Schema>,
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
     pub(crate) exec_sql: String,
+    pub(crate) table_prefix: String,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -324,6 +416,7 @@ pub struct DataFusionTaskContextBuilder {
     data_files: Vec<FileScanTask>,
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
+    table_prefix: String,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -332,7 +425,19 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_datafile(mut self, data_files: Vec<FileScanTask>) -> Self {
+    pub fn with_table_prefix(mut self, table_prefix: String) -> Self {
+        self.table_prefix = table_prefix;
+        self
+    }
+
+    pub fn with_input_data_files(mut self, input_file_scan_tasks: InputFileScanTasks) -> Self {
+        self.data_files = input_file_scan_tasks.data_files;
+        self.position_delete_files = input_file_scan_tasks.position_delete_files;
+        self.equality_delete_files = input_file_scan_tasks.equality_delete_files;
+        self
+    }
+
+    pub fn with_data_files(mut self, data_files: Vec<FileScanTask>) -> Self {
         self.data_files = data_files;
         self
     }
@@ -368,15 +473,14 @@ impl DataFusionTaskContextBuilder {
     }
 
     // build data fusion task context
-    pub fn build_merge_on_read(self) -> Result<DataFusionTaskContext> {
+    pub fn build(self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
-        // Build scheam for position delete file, file_path + pos
+        // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
         // Build schema for equality delete file, equality_ids + seq_num
         let mut equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
-        let mut table_idx = 0;
-        for task in &self.equality_delete_files {
+        for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
             if equality_ids
                 .as_ref()
                 .is_none_or(|ids| !ids.eq(&task.equality_ids))
@@ -384,13 +488,13 @@ impl DataFusionTaskContextBuilder {
                 // If ids are different or not assigned, create a new metadata
                 let equality_delete_schema =
                     self.build_equality_delete_schema(&task.equality_ids, &mut highest_field_id)?;
-                let equality_delete_table_name = format!("{}_{}", EQUALITY_DELETE_TABLE, table_idx);
+                let equality_delete_table_name =
+                    table_name::build_equality_delete_table_name(&self.table_prefix, table_idx);
                 equality_delete_metadatas.push(EqualityDeleteMetadata::new(
                     equality_delete_schema,
                     equality_delete_table_name,
                 ));
                 equality_ids = Some(task.equality_ids.clone());
-                table_idx += 1;
             }
 
             // Add the file scan task to the last metadata
@@ -449,19 +553,30 @@ impl DataFusionTaskContextBuilder {
 
         let sql_builder = SqlBuilder::new(
             &project_names,
-            Some(POSITION_DELETE_TABLE.to_owned()),
-            Some(DATA_FILE_TABLE.to_owned()),
+            Some(table_name::build_position_delete_table_name(
+                &self.table_prefix,
+            )),
+            Some(table_name::build_data_file_table_name(&self.table_prefix)),
             &equality_delete_metadatas,
             need_file_path_and_pos,
         );
+
         let exec_sql = sql_builder.build_merge_on_read_sql()?;
 
         Ok(DataFusionTaskContext {
             data_file_schema: Some(data_file_schema),
             input_schema: Some(input_schema),
             data_files: Some(self.data_files),
-            position_delete_files: Some(self.position_delete_files),
-            equality_delete_files: Some(self.equality_delete_files),
+            position_delete_files: if need_file_path_and_pos {
+                Some(self.position_delete_files)
+            } else {
+                None
+            },
+            equality_delete_files: if need_seq_num {
+                Some(self.equality_delete_files)
+            } else {
+                None
+            },
             position_delete_schema: if need_file_path_and_pos {
                 Some(position_delete_schema)
             } else {
@@ -473,6 +588,7 @@ impl DataFusionTaskContextBuilder {
                 None
             },
             exec_sql,
+            table_prefix: self.table_prefix,
         })
     }
 
@@ -487,7 +603,7 @@ impl DataFusionTaskContextBuilder {
             let field = self
                 .schema
                 .field_by_id(*id)
-                .ok_or_else(|| CompactionError::Config("equality_ids not found".to_owned()))?;
+                .ok_or_else(|| CompactionError::Execution("equality_ids not found".to_owned()))?;
             equality_delete_fields.push(field.clone());
         }
         *highest_field_id += 1;
@@ -512,19 +628,34 @@ impl DataFusionTaskContext {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         })
     }
 
     pub fn need_file_path_and_pos(&self) -> bool {
-        self.position_delete_files
+        // Must be consistent with builder logic: !self.position_delete_files.is_empty()
+        // We check if position_delete_schema exists, which is set only when position deletes are present
+        self.position_delete_schema.is_some()
+    }
+
+    pub fn need_seq_num(&self) -> bool {
+        // Must be consistent with builder logic: !equality_delete_metadatas.is_empty()
+        // We check if equality_delete_metadatas exists and is not empty
+        self.equality_delete_metadatas
             .as_ref()
             .is_some_and(|v| !v.is_empty())
     }
 
-    pub fn need_seq_num(&self) -> bool {
-        self.equality_delete_files
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
+    pub fn data_file_table_name(&self) -> String {
+        table_name::build_data_file_table_name(&self.table_prefix)
+    }
+
+    pub fn position_delete_table_name(&self) -> String {
+        table_name::build_position_delete_table_name(&self.table_prefix)
+    }
+
+    pub fn equality_delete_table_name(&self, table_idx: usize) -> String {
+        table_name::build_equality_delete_table_name(&self.table_prefix, table_idx)
     }
 }
 
@@ -560,8 +691,32 @@ impl EqualityDeleteMetadata {
     }
 }
 
+mod table_name {
+    pub const DATA_FILE_TABLE: &str = "data_file_table";
+    pub const POSITION_DELETE_TABLE: &str = "position_delete_table";
+    pub const EQUALITY_DELETE_TABLE: &str = "equality_delete_table";
+
+    pub fn build_data_file_table_name(table_prefix: &str) -> String {
+        format!("{}_{}", table_prefix, DATA_FILE_TABLE)
+    }
+
+    pub fn build_position_delete_table_name(table_prefix: &str) -> String {
+        format!("{}_{}", table_prefix, POSITION_DELETE_TABLE)
+    }
+
+    // Builds the equality delete table name with a prefix and index
+    // index is used to differentiate multiple equality delete tables (schema)
+    pub fn build_equality_delete_table_name(table_prefix: &str, table_idx: usize) -> String {
+        format!("{}_{}_{}", table_prefix, EQUALITY_DELETE_TABLE, table_idx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::executor::datafusion::datafusion_processor::table_name::{
+        DATA_FILE_TABLE, POSITION_DELETE_TABLE,
+    };
+
     use super::*;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
@@ -583,7 +738,7 @@ mod tests {
             builder.build_merge_on_read_sql().unwrap(),
             format!(
                 "SELECT {} FROM {}",
-                project_names.join(","),
+                project_names.join(", "),
                 DATA_FILE_TABLE
             )
         );
@@ -604,12 +759,17 @@ mod tests {
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}",
-        )));
-        assert!(sql.contains(&format!(
-            "{POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}.{SYS_HIDDEN_FILE_PATH} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_FILE_PATH} AND {DATA_FILE_TABLE}.{SYS_HIDDEN_POS} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_POS}",
-        )));
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS final_result",
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with equality delete files
@@ -638,12 +798,18 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {equality_delete_table_name} ON {DATA_FILE_TABLE}",
-        )));
-        assert!(sql.contains(&format!(
-            "{equality_delete_table_name} ON {DATA_FILE_TABLE}.id = {equality_delete_table_name}.id",
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with equality delete files AND sequence number comparison
@@ -673,9 +839,18 @@ mod tests {
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!(
-            "{DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {equality_delete_table_name}.{SYS_HIDDEN_SEQ_NUM}",
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with both position AND equality delete files
@@ -704,21 +879,24 @@ mod tests {
             true,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}"
-        )));
-        assert!(sql.contains(&format!(
-            "LEFT ANTI JOIN {equality_delete_table_name} ON {DATA_FILE_TABLE}",
-        )));
-        assert!(sql.contains(&format!(
-            "{POSITION_DELETE_TABLE} ON {DATA_FILE_TABLE}.{SYS_HIDDEN_FILE_PATH} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_FILE_PATH} AND {DATA_FILE_TABLE}.{SYS_HIDDEN_POS} = {POSITION_DELETE_TABLE}.{SYS_HIDDEN_POS}",
-        )));
-        assert!(sql.contains(&format!(
-            "{equality_delete_table_name} ON {DATA_FILE_TABLE}.id = {equality_delete_table_name}.id",
-        )));
-        assert!(sql.contains(&format!(
-            "{DATA_FILE_TABLE}.{SYS_HIDDEN_SEQ_NUM} < {equality_delete_table_name}.{SYS_HIDDEN_SEQ_NUM}",
-        )));
+
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     /// Test building SQL with multiple equality delete files
@@ -744,9 +922,9 @@ mod tests {
             EqualityDeleteMetadata::new(
                 Schema::builder()
                     .with_fields(vec![Arc::new(NestedField::new(
-                        1,
-                        "id",
-                        Type::Primitive(PrimitiveType::Int),
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
                         true,
                     ))])
                     .build()
@@ -764,54 +942,23 @@ mod tests {
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
-        assert!(sql.contains(
-            &("LEFT ANTI JOIN ".to_owned()
-                + &equality_delete_table_name_1
-                + " ON "
-                + DATA_FILE_TABLE)
-        ));
-        assert!(sql.contains(
-            &("LEFT ANTI JOIN ".to_owned()
-                + &equality_delete_table_name_2
-                + " ON "
-                + DATA_FILE_TABLE)
-        ));
-        assert!(sql.contains(
-            &(equality_delete_table_name_1.clone()
-                + " ON "
-                + DATA_FILE_TABLE
-                + ".id = "
-                + &equality_delete_table_name_1
-                + ".id")
-        ));
-        assert!(sql.contains(
-            &(equality_delete_table_name_2.clone()
-                + " ON "
-                + DATA_FILE_TABLE
-                + ".id = "
-                + &equality_delete_table_name_2
-                + ".id")
-        ));
-
-        // Check that the sequence number comparison is present for both equality delete tables
-        assert!(sql.contains(
-            &(DATA_FILE_TABLE.to_owned()
-                + "."
-                + SYS_HIDDEN_SEQ_NUM
-                + " < "
-                + &equality_delete_table_name_1
-                + "."
-                + SYS_HIDDEN_SEQ_NUM)
-        ));
-        assert!(sql.contains(
-            &(DATA_FILE_TABLE.to_owned()
-                + "."
-                + SYS_HIDDEN_SEQ_NUM
-                + " < "
-                + &equality_delete_table_name_2
-                + "."
-                + SYS_HIDDEN_SEQ_NUM)
-        ));
+        let expected_sql = format!(
+            "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS {} ON {}.name = {}.name AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
+            equality_delete_table_name_2,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_2,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_2
+        );
+        assert_eq!(sql, expected_sql);
     }
 
     #[test]
@@ -841,6 +988,7 @@ mod tests {
             data_files: vec![],
             position_delete_files: vec![],
             equality_delete_files: vec![],
+            table_prefix: "".to_owned(),
         };
 
         let equality_ids = vec![1, 2];
@@ -900,5 +1048,150 @@ mod tests {
 
         let join_names = meta.equality_delete_join_names();
         assert_eq!(join_names, vec!["id", "name"]);
+    }
+
+    /// Test that verifies the fix for nested table alias issue in SQL generation
+    ///
+    /// This test ensures that when we have both position deletes and equality deletes,
+    /// the generated SQL correctly includes hidden columns in all nested subqueries,
+    /// preventing the "No field named _data_file_table.sys_hidden_seq_num" error.
+    #[test]
+    fn test_nested_table_alias_hidden_columns_fix() {
+        let project_names = vec![
+            "id".to_owned(),
+            "item_name".to_owned(),
+            "description".to_owned(),
+        ];
+
+        // Create equality delete metadata that requires sys_hidden_seq_num
+        let equality_delete_metadata = EqualityDeleteMetadata::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::new(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                        true,
+                    )),
+                    Arc::new(NestedField::new(
+                        4,
+                        SYS_HIDDEN_SEQ_NUM,
+                        Type::Primitive(PrimitiveType::Long),
+                        true,
+                    )),
+                ])
+                .build()
+                .unwrap(),
+            "_equality_delete_table_0".to_string(),
+        );
+
+        let equality_delete_metadatas = vec![equality_delete_metadata];
+
+        // Test scenario: BOTH position deletes AND equality deletes
+        // This creates the most complex nested SQL structure
+        let builder = SqlBuilder::new(
+            &project_names,
+            Some("_position_delete_table".to_string()),
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            true, // need_file_path_and_pos = true (triggers position delete logic)
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        let expected_sql = "SELECT id, item_name, description FROM (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _equality_delete_table_0 RIGHT ANTI JOIN (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table RIGHT ANTI JOIN (SELECT id, item_name, description, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table) AS _data_file_table ON _data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path AND _data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos) AS _data_file_table ON _equality_delete_table_0.id = _data_file_table.id AND _data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num) AS final_result";
+        assert_eq!(sql, expected_sql);
+    }
+
+    /// Test that verifies SQL generation works correctly with only equality deletes
+    ///
+    /// This is a simpler case but still important to verify that hidden columns
+    /// are properly handled when there's only one level of nesting.
+    #[test]
+    fn test_equality_deletes_only_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+
+        let equality_delete_metadata = EqualityDeleteMetadata::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::new(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                        true,
+                    )),
+                    Arc::new(NestedField::new(
+                        3,
+                        SYS_HIDDEN_SEQ_NUM,
+                        Type::Primitive(PrimitiveType::Long),
+                        true,
+                    )),
+                ])
+                .build()
+                .unwrap(),
+            "_equality_delete_table_0".to_string(),
+        );
+
+        let equality_delete_metadatas = vec![equality_delete_metadata];
+
+        // Test scenario: ONLY equality deletes (no position deletes)
+        let builder = SqlBuilder::new(
+            &project_names,
+            None, // No position delete table
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            false, // need_file_path_and_pos = false
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        let expected_sql = "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM _equality_delete_table_0 RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM _data_file_table) AS _data_file_table ON _equality_delete_table_0.id = _data_file_table.id AND _data_file_table.sys_hidden_seq_num < _equality_delete_table_0.sys_hidden_seq_num) AS final_result";
+        assert_eq!(sql, expected_sql);
+    }
+
+    /// Test that verifies SQL generation works correctly with only position deletes
+    ///
+    /// This tests the case where we need file path and position columns but not sequence numbers.
+    #[test]
+    fn test_position_deletes_only_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![]; // No equality deletes
+
+        // Test scenario: ONLY position deletes (no equality deletes)
+        let builder = SqlBuilder::new(
+            &project_names,
+            Some("_position_delete_table".to_string()),
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            true, // need_file_path_and_pos = true
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        let expected_sql = "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _position_delete_table RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM _data_file_table) AS _data_file_table ON _data_file_table.sys_hidden_file_path = _position_delete_table.sys_hidden_file_path AND _data_file_table.sys_hidden_pos = _position_delete_table.sys_hidden_pos) AS final_result";
+        assert_eq!(sql, expected_sql);
+    }
+
+    /// Test that verifies SQL generation works correctly with no deletes
+    ///
+    /// This is the simplest case - should not add any hidden columns or wrap in final_result.
+    #[test]
+    fn test_no_deletes_no_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![]; // No equality deletes
+
+        // Test scenario: NO deletes at all
+        let builder = SqlBuilder::new(
+            &project_names,
+            None, // No position delete table
+            Some("_data_file_table".to_string()),
+            &equality_delete_metadatas,
+            false, // need_file_path_and_pos = false
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        let expected_sql = "SELECT id, name FROM _data_file_table";
+        assert_eq!(sql, expected_sql);
     }
 }

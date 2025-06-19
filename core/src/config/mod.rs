@@ -14,32 +14,42 @@
  * limitations under the License.
  */
 
+use derive_builder::Builder;
+use parquet::{basic::Compression, file::properties::WriterProperties};
 use serde::Deserialize;
-use serde_with::serde_as;
 
-const DEFAULT_PREFIX: &str = "10";
+const DEFAULT_PREFIX: &str = "bergloom";
+const DEFAULT_BATCH_PARALLELISM: usize = 4;
+const DEFAULT_TARGET_PARTITIONS: usize = 4;
+const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+const DEFAULT_VALIDATE_COMPACTION: bool = false;
+const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 
-#[serde_as]
-#[derive(Debug, Deserialize)]
+// Helper function for the default WriterProperties
+fn default_writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_created_by(concat!("bergloom version ", env!("CARGO_PKG_VERSION")).to_owned())
+        .build()
+}
+
+#[derive(Builder, Debug, Deserialize, Default, Clone)]
 pub struct CompactionConfig {
-    #[serde(default = "default_batch_parallelism")]
+    #[builder(default = "DEFAULT_BATCH_PARALLELISM")]
     pub batch_parallelism: usize,
-    #[serde(default = "default_target_partitions")]
+    #[builder(default = "DEFAULT_TARGET_PARTITIONS")]
     pub target_partitions: usize,
-    #[serde(default = "default_data_file_prefix")]
+    #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
-    #[serde(default = "default_target_file_size")]
-    pub target_file_size: usize,
-}
-fn default_batch_parallelism() -> usize {
-    4
-}
-fn default_target_partitions() -> usize {
-    4
-}
-fn default_data_file_prefix() -> String {
-    DEFAULT_PREFIX.to_string()
-}
-fn default_target_file_size() -> usize {
-    1024 * 1024 * 1024 // 1 GB
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size: u64,
+    #[builder(default = "DEFAULT_VALIDATE_COMPACTION")]
+    pub enable_validate_compaction: bool,
+    #[builder(default = "DEFAULT_MAX_RECORD_BATCH_ROWS")]
+    pub max_record_batch_rows: usize,
+
+    #[serde(skip)]
+    // FIXME: this is a workaround for serde not supporting default values for WriterProperties
+    #[builder(default = "default_writer_properties()")]
+    pub write_parquet_properties: WriterProperties,
 }

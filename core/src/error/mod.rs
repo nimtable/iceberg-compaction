@@ -35,6 +35,12 @@ pub enum CompactionError {
 
     #[error("Test error: {0}")]
     Test(String),
+
+    #[error("Compaction validator failed: {0}")]
+    CompactionValidator(String),
+
+    #[error("Compaction unexpected failed: {0}")]
+    Unexpected(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

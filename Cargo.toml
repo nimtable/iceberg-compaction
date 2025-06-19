@@ -1,43 +1,48 @@
 [workspace]
 resolver = "2"
-members = ["core", "codegen", "services/compactor"]
+members = ["codegen", "core", "examples/memory-catalog", "services/compactor"]
 
 [workspace.dependencies]
 # Async runtime and utilities
 async-stream = "0.3.5"
 async-trait = "0.1.86"
-futures = "0.3.17"
-futures-async-stream = "0.2.9"
-tokio = { version = "1", default-features = false }
-
-# Data processing and storage
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b1619c554c2922ddad00cc0564fa79eaec62af5b", features = [
-    "storage-s3",
-    "storage-gcs",
-] }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b1619c554c2922ddad00cc0564fa79eaec62af5b" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "b1619c554c2922ddad00cc0564fa79eaec62af5b" }
-parquet = { version = "54", features = ["async"] }
-port_scanner = "0.1.5"
-ctor = "0.2.8"
-rand = "0.9.1"
-
-# gRPC and Protocol Buffers
-prost = "0.12"
-tonic = "0.11.0"
-
-# Serialization
-serde = { version = "1", features = ["rc"] }
-serde_with = { version = "3", features = ["json"] }
-serde_json = { version = "1" }
-
-# Error handling
-thiserror = "2.0.11"
-
-# Utilities
-url = "2"
+bergloom-codegen = { path = "./codegen" }
 
 # Local workspace members
 bergloom-core = { path = "./core" }
-bergloom-codegen = { path = "./codegen" }
 bergloom-service-compactor = { path = "./services/compactor" }
+futures = "0.3.17"
+futures-async-stream = "0.2.9"
+
+# Data processing and storage
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b", features = [
+    "storage-s3",
+    "storage-gcs",
+] }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
+rand = "0.9.1"
+port_scanner = "0.1.5"
+ctor = "0.2.8"
+parquet = { version = "54", features = ["async"] }
+
+# gRPC and Protocol Buffers
+prost = { version = "0.13" }
+
+prost-build = { version = "0.13" }
+
+# Serialization
+serde = { version = "1", features = ["rc"] }
+serde_json = { version = "1" }
+serde_with = { version = "3", features = ["json"] }
+
+# Error handling
+thiserror = "2.0.11"
+tokio = { version = "1", default-features = false }
+tonic = { version = "0.12" }
+tonic-build = { version = "0.12" }
+
+# Utilities
+tempfile = "3.8"
+url = "2"

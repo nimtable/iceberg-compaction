@@ -45,6 +45,8 @@ const DEFAULT_PLATFORM_ENV: &str = "DOCKER_DEFAULT_PLATFORM";
 
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
+/// Constructor function that runs automatically when the module is loaded.
+/// Initializes and starts the Docker Compose environment for testing.
 #[ctor]
 fn before_all() {
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
@@ -56,12 +58,20 @@ fn before_all() {
     guard.replace(docker_compose);
 }
 
+/// Destructor function that runs automatically when the module is unloaded.
+/// Cleans up the Docker Compose environment.
 #[dtor]
 fn after_all() {
     let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
     if let Some(d) = guard.take() { d.down() }
 }
 
+/// Creates and returns a configured REST Catalog instance.
+/// 
+/// This function:
+/// 1. Retrieves necessary configuration from Docker containers
+/// 2. Waits for the REST Catalog service to be ready
+/// 3. Creates and returns a configured RestCatalog instance
 pub async fn get_rest_catalog() -> RestCatalog {
     let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
@@ -113,6 +123,11 @@ struct DockerCompose {
 }
 
 impl DockerCompose {
+    /// Creates a new DockerCompose instance.
+    /// 
+    /// # Arguments
+    /// * `project_name` - The Docker Compose project name
+    /// * `docker_compose_dir` - The directory path containing docker-compose files
     fn new(project_name: impl ToString, docker_compose_dir: impl ToString) -> Self {
         Self {
             project_name: project_name.to_string(),
@@ -120,6 +135,10 @@ impl DockerCompose {
         }
     }
 
+    /// Gets the current system's OS and architecture information.
+    /// 
+    /// # Returns
+    /// A string in the format "os/arch", e.g., "linux/amd64"
     fn get_os_arch() -> String {
         let mut cmd = Command::new("docker");
         cmd.arg("info")
@@ -144,6 +163,7 @@ impl DockerCompose {
         }
     }
 
+    /// Starts the Docker Compose services.
     pub fn up(&self) {
         let mut cmd = Command::new("docker");
         cmd.current_dir(&self.docker_compose_dir);
@@ -171,6 +191,7 @@ impl DockerCompose {
         )
     }
 
+    /// Stops and cleans up the Docker Compose services.
     pub fn down(&self) {
         let mut cmd = Command::new("docker");
         cmd.current_dir(&self.docker_compose_dir);
@@ -193,6 +214,16 @@ impl DockerCompose {
         )
     }
 
+    /// Gets the IP address of a specified service container.
+    /// 
+    /// # Arguments
+    /// * `service_name` - The name of the service
+    /// 
+    /// # Returns
+    /// The IP address of the container
+    /// 
+    /// # Panics
+    /// Panics if unable to retrieve or parse the IP address
     pub fn get_container_ip(&self, service_name: impl AsRef<str>) -> IpAddr {
         let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
         let mut cmd = Command::new("docker");
@@ -213,6 +244,13 @@ impl DockerCompose {
         }
     }
 
+    /// Gets all environment variables from a specified service container.
+    /// 
+    /// # Arguments
+    /// * `service_name` - The name of the service
+    /// 
+    /// # Returns
+    /// A vector of key-value pairs representing environment variables
     pub fn get_container_env(&self, service_name: impl AsRef<str>) -> Vec<(String, String)> {
         let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
         let mut cmd = Command::new("docker");
@@ -240,6 +278,14 @@ impl DockerCompose {
         env_vars
     }
 
+    /// Gets the value of a specific environment variable from a service container.
+    /// 
+    /// # Arguments
+    /// * `service_name` - The name of the service
+    /// * `env_key` - The environment variable key name
+    /// 
+    /// # Returns
+    /// Some(value) if the environment variable is found, None otherwise
     pub fn get_container_env_value(
         &self,
         service_name: impl AsRef<str>,
@@ -253,6 +299,14 @@ impl DockerCompose {
     }
 }
 
+/// Executes a command and checks the execution result.
+/// 
+/// # Arguments
+/// * `cmd` - The command to execute
+/// * `desc` - A description of the command for logging purposes
+/// 
+/// # Panics
+/// Panics if the command execution fails
 pub fn run_command(mut cmd: Command, desc: impl ToString) {
     let desc = desc.to_string();
     tracing::info!("Starting to {}, command: {:?}", &desc, cmd);
@@ -264,6 +318,14 @@ pub fn run_command(mut cmd: Command, desc: impl ToString) {
     }
 }
 
+/// Executes a command and returns the result without panicking.
+/// 
+/// # Arguments
+/// * `cmd` - The command to execute
+/// * `desc` - A description of the command for logging purposes
+/// 
+/// # Returns
+/// Ok(stdout) on success, Err(error_message) on failure
 pub fn get_cmd_output_result(mut cmd: Command, desc: impl ToString) -> Result<String, String> {
     let desc = desc.to_string();
     tracing::info!("Starting to {}, command: {:?}", &desc, cmd);
@@ -281,6 +343,17 @@ pub fn get_cmd_output_result(mut cmd: Command, desc: impl ToString) -> Result<St
     }
 }
 
+/// Executes a command and returns the output, panicking on failure.
+/// 
+/// # Arguments
+/// * `cmd` - The command to execute
+/// * `desc` - A description of the command for logging purposes
+/// 
+/// # Returns
+/// The standard output of the command
+/// 
+/// # Panics
+/// Panics if the command execution fails
 pub fn get_cmd_output(cmd: Command, desc: impl ToString) -> String {
     let result = get_cmd_output_result(cmd, desc);
     match result {

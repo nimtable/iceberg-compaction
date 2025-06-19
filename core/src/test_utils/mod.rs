@@ -17,7 +17,7 @@
 use crate::error::Result;
 use crate::test_utils::{
     docker_compose::get_rest_catalog,
-    generator::{FileGeneratorBuilder, WriterConfig},
+    generator::{FileGenerator, FileGeneratorConfig, WriterConfig},
 };
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation,
@@ -74,10 +74,8 @@ pub async fn build_test_iceberg_table() -> Result<()> {
         dir_path: format!("{}{}", table.metadata().location(), DATA_SUBDIR),
         equality_ids: vec![1],
     };
-    let mut file_generator = FileGeneratorBuilder::new()
-        .schema(Arc::new(schema))
-        .writer_config(writer_config)
-        .build()?;
+    let config = FileGeneratorConfig::new(Arc::new(schema), writer_config);
+    let mut file_generator = FileGenerator::new(config)?;
     let commit_data_files = file_generator.generate().await?;
     let mut data_files = Vec::new();
     let mut position_delete_files = Vec::new();
