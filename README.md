@@ -1,6 +1,6 @@
-# iceberg-compact
+# Apache Iceberg™ Compaction
 
-iceberg-compact is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. This tool specializes in compacting Apache Iceberg tables efficiently and safely.
+The Apache Iceberg™ Compaction project is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. This tool specializes in compacting Apache Iceberg tables efficiently and safely.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
