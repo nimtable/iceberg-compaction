@@ -1,18 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["codegen", "core", "examples/memory-catalog", "services/compactor"]
+members = ["core", "examples/memory-catalog"]
 
 [workspace.dependencies]
 # Async runtime and utilities
 async-stream = "0.3.5"
 async-trait = "0.1.86"
-bergloom-codegen = { path = "./codegen" }
 
 # Local workspace members
-bergloom-core = { path = "./core" }
-bergloom-service-compactor = { path = "./services/compactor" }
 futures = "0.3.17"
 futures-async-stream = "0.2.9"
+iceberg-compact-core = { path = "./core" }
 
 # Data processing and storage
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b", features = [
@@ -23,11 +21,6 @@ iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
 parquet = { version = "54", features = ["async"] }
 
-# gRPC and Protocol Buffers
-prost = { version = "0.13" }
-
-prost-build = { version = "0.13" }
-
 # Serialization
 serde = { version = "1", features = ["rc"] }
 serde_json = { version = "1" }
@@ -36,8 +29,6 @@ serde_with = { version = "3", features = ["json"] }
 # Error handling
 thiserror = "2.0.11"
 tokio = { version = "1", default-features = false }
-tonic = { version = "0.12" }
-tonic-build = { version = "0.12" }
 
 # Utilities
 tempfile = "3.8"

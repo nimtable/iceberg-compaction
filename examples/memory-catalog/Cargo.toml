@@ -1,12 +1,12 @@
 [package]
-name = "bergloom-example"
+name = "iceberg-compact-example"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bergloom-core = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-memory = { workspace = true }
+iceberg-compact-core = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

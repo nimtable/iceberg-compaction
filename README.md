@@ -1,6 +1,6 @@
-# BergLoom
+# iceberg-compact
 
-BergLoom is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. The project name, which means "iceberg weaver," symbolizes its core function of weaving scattered Iceberg data files into an efficient and orderly data structure.
+iceberg-compact is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. This tool specializes in compacting Apache Iceberg tables efficiently and safely.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -22,7 +22,7 @@ BergLoom is a high-performance Iceberg table compaction runtime built on Rust, o
 
 ### Memory Catalog Example
 
-We provide a complete working example using an in-memory catalog. This example demonstrates how to use BergLoom for Iceberg table compaction:
+We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compact for Iceberg table compaction:
 
 ```bash
 # Navigate to the example directory
@@ -35,7 +35,7 @@ cargo run
 The example includes:
 - Setting up an in-memory Iceberg catalog
 - Creating a sample table.
-- Performing table compaction using BergLoom
+- Performing table compaction using iceberg-compact
 
 For more details, see the [memory-catalog example](./examples/memory-catalog/).
 
