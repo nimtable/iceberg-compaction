@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compact
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,7 @@ use async_trait::async_trait;
 use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
-use crate::parser::proto::RewriteFilesResponseProtoEncoder;
-use crate::{config::CompactionConfig, parser::proto::PbRewriteFilesRequestDecoder};
+use crate::config::CompactionConfig;
 use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
@@ -29,23 +28,11 @@ pub use mock::MockExecutor;
 pub mod datafusion;
 pub mod iceberg_writer;
 use crate::error::Result;
-use bergloom_codegen::compactor::RewriteFilesRequest as PbRewriteFilesRequest;
-use bergloom_codegen::compactor::RewriteFilesResponse as PbRewriteFilesResponse;
 pub use datafusion::DataFusionExecutor;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {
     async fn rewrite_files(&self, request: RewriteFilesRequest) -> Result<RewriteFilesResponse>;
-
-    async fn rewrite_file_proto(
-        &self,
-        request: PbRewriteFilesRequest,
-    ) -> Result<PbRewriteFilesResponse> {
-        let request = PbRewriteFilesRequestDecoder::new(request).decode()?;
-        let response = self.rewrite_files(request).await?;
-        let response = RewriteFilesResponseProtoEncoder::new(response).encode();
-        Ok(response)
-    }
 }
 
 pub struct RewriteFilesRequest {
