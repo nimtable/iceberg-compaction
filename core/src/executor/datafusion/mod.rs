@@ -131,8 +131,14 @@ pub async fn build_iceberg_data_file_writer(
     target_file_size: u64,
     write_parquet_properties: WriterProperties,
 ) -> Result<Box<dyn IcebergWriter>> {
-    let parquet_writer_builder =
-        build_parquet_writer_builder(data_file_prefix, dir_path, schema.clone(), file_io, write_parquet_properties).await?;
+    let parquet_writer_builder = build_parquet_writer_builder(
+        data_file_prefix,
+        dir_path,
+        schema.clone(),
+        file_io,
+        write_parquet_properties,
+    )
+    .await?;
     let data_file_builder =
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(

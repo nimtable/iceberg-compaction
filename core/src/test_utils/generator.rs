@@ -20,6 +20,7 @@ use iceberg::{
     arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
     io::FileIO,
     spec::{DataFile, Schema},
+    table::Table,
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::{
@@ -59,6 +60,8 @@ const DEFAULT_POSITION_DELETE_ROW_COUNT: usize = 300;
 const DEFAULT_DATA_FILE_NUM: usize = 10;
 const DEFAULT_BATCH_SIZE: usize = 512;
 const DEFAULT_STRING_LENGTH: usize = 16;
+const DEFAULT_DATA_FILE_PREFIX: &str = "test_berg_loom";
+const DEFAULT_DATA_SUBDIR: &str = "/data";
 
 pub type EqualityDeleteDeltaWriterBuilder = EqualityDeltaWriterBuilder<
     DataFileWriterBuilder<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
@@ -78,7 +81,7 @@ pub struct RecordBatchGenerator {
 
 impl RecordBatchGenerator {
     /// Creates a new RecordBatchGenerator with specified parameters
-    /// 
+    ///
     /// # Arguments
     /// * `num_rows` - Total number of rows to generate across all batches
     /// * `batch_size` - Number of rows per batch
@@ -92,7 +95,7 @@ impl RecordBatchGenerator {
     }
 
     /// Generates record batches asynchronously as a stream
-    /// 
+    ///
     /// This method yields record batches of the specified batch size until
     /// all rows have been generated. The last batch may contain fewer rows
     /// if the total number of rows is not evenly divisible by batch size.
@@ -115,10 +118,10 @@ impl RecordBatchGenerator {
     }
 
     /// Generates a single record batch with random data
-    /// 
+    ///
     /// # Arguments
     /// * `batch_size` - Number of rows to generate in this batch
-    /// 
+    ///
     /// # Returns
     /// A RecordBatch containing randomly generated data according to the schema
     pub fn generate_batch(&self, batch_size: usize) -> Result<RecordBatch> {
@@ -196,10 +199,10 @@ impl RecordBatchGenerator {
 }
 
 /// Generates a random string of variable length up to the specified maximum
-/// 
+///
 /// # Arguments
 /// * `len` - Maximum length of the generated string
-/// 
+///
 /// # Returns
 /// A randomly generated alphanumeric string
 pub fn generate_string(len: usize) -> String {
@@ -222,30 +225,25 @@ pub struct FileGeneratorConfig {
     pub position_delete_row_count: usize,
     /// Total number of data files to generate
     pub data_file_num: usize,
-    /// Iceberg schema for the generated data
-    pub schema: Arc<Schema>,
     /// Number of rows per batch during generation
     pub batch_size: usize,
-    /// Configuration for file writers
-    pub writer_config: WriterConfig,
+}
+
+impl Default for FileGeneratorConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileGeneratorConfig {
-    /// Creates a new FileGeneratorConfig with the provided schema and writer_config
-    /// All other fields will use default values
-    /// 
-    /// # Arguments
-    /// * `schema` - Iceberg schema for the generated data
-    /// * `writer_config` - Configuration for file writers
-    pub fn new(schema: Arc<Schema>, writer_config: WriterConfig) -> Self {
+    /// Creates a new FileGeneratorConfig with default settings
+    pub fn new() -> Self {
         Self {
             data_file_row_count: DEFAULT_DATA_FILE_ROW_COUNT,
             equality_delete_row_count: DEFAULT_EQUALITY_DELETE_ROW_COUNT,
             position_delete_row_count: DEFAULT_POSITION_DELETE_ROW_COUNT,
             data_file_num: DEFAULT_DATA_FILE_NUM,
-            schema,
             batch_size: DEFAULT_BATCH_SIZE,
-            writer_config,
         }
     }
 
@@ -283,6 +281,8 @@ impl FileGeneratorConfig {
 pub struct FileGenerator {
     pub record_batch_generator: RecordBatchGenerator,
     pub config: FileGeneratorConfig,
+    pub schema: Arc<Schema>,
+    pub writer_config: WriterConfig,
 }
 
 #[derive(Clone)]
@@ -293,16 +293,37 @@ pub struct WriterConfig {
     pub equality_ids: Vec<i32>,
 }
 
+impl WriterConfig {
+    /// Creates a new WriterConfig from a table with default settings
+    ///
+    /// # Arguments
+    /// * `table` - The Iceberg table to use for configuration
+    pub fn new(table: &Table) -> Self {
+        Self {
+            data_file_prefix: DEFAULT_DATA_FILE_PREFIX.to_owned(),
+            file_io: table.file_io().clone(),
+            dir_path: format!("{}{}", table.metadata().location(), DEFAULT_DATA_SUBDIR),
+            equality_ids: vec![1],
+        }
+    }
+}
+
 impl FileGenerator {
     /// Creates a new FileGenerator with the specified configuration
-    /// 
+    ///
     /// # Arguments
     /// * `config` - Configuration for file generation
-    /// 
+    /// * `schema` - Iceberg schema for the generated data
+    /// * `writer_config` - Configuration for file writers
+    ///
     /// # Returns
     /// A configured FileGenerator instance
-    pub fn new(config: FileGeneratorConfig) -> Result<Self> {
-        let arrow_schema = schema_to_arrow_schema(&config.schema)?;
+    pub fn new(
+        config: FileGeneratorConfig,
+        schema: Arc<Schema>,
+        writer_config: WriterConfig,
+    ) -> Result<Self> {
+        let arrow_schema = schema_to_arrow_schema(&schema)?;
         let record_batch_generator = RecordBatchGenerator::new(
             config.data_file_row_count * config.data_file_num,
             config.batch_size,
@@ -311,16 +332,18 @@ impl FileGenerator {
         Ok(Self {
             record_batch_generator,
             config,
+            schema,
+            writer_config,
         })
     }
 
     /// Builds an equality delete delta writer builder for managing different types of writes
-    /// 
+    ///
     /// This method creates a writer builder that can handle:
     /// - Data file writes
     /// - Position delete writes  
     /// - Equality delete writes
-    /// 
+    ///
     /// # Returns
     /// A configured EqualityDeleteDeltaWriterBuilder
     async fn build_equality_delete_delta_writer_builder(
@@ -331,11 +354,11 @@ impl FileGenerator {
             dir_path,
             file_io,
             equality_ids,
-        } = self.config.writer_config.clone();
+        } = self.writer_config.clone();
         let parquet_writer_builder = build_parquet_writer_builder(
             data_file_prefix.clone(),
             dir_path.clone(),
-            self.config.schema.clone(),
+            self.schema.clone(),
             file_io.clone(),
             WriterProperties::default(),
         )
@@ -357,7 +380,7 @@ impl FileGenerator {
             None,
         );
         let equality_delete_writer_config =
-            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.config.schema.clone(), None, 0)?;
+            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone(), None, 0)?;
         let parquet_writer_builder = build_parquet_writer_builder(
             data_file_prefix.clone(),
             dir_path.clone(),
@@ -370,7 +393,7 @@ impl FileGenerator {
         .await?;
         let equality_delete_file_writer_builder = EqualityDeleteFileWriterBuilder::new(
             parquet_writer_builder.clone(),
-            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.config.schema.clone(), None, 0)?,
+            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone(), None, 0)?,
         );
 
         let iceberg_writer_builder = EqualityDeltaWriterBuilder::new(
@@ -383,15 +406,15 @@ impl FileGenerator {
     }
 
     /// Generates data files with random data, equality deletes, and position deletes
-    /// 
+    ///
     /// This method orchestrates the generation of:
     /// 1. Data files with random records
     /// 2. Equality delete files that mark certain records for deletion
     /// 3. Position delete files that mark specific row positions for deletion
-    /// 
+    ///
     /// The generation process creates batches of data and applies delete operations
     /// at specified rates to simulate real-world data patterns.
-    /// 
+    ///
     /// # Returns
     /// A vector of DataFile objects representing the generated files
     pub async fn generate(&mut self) -> Result<Vec<DataFile>> {
@@ -402,14 +425,16 @@ impl FileGenerator {
         let mut equality_delete_delta_writer =
             equality_delete_delta_writer_builder.clone().build().await?;
 
-        let equality_delete_rate = self.config.data_file_row_count / self.config.equality_delete_row_count + 1;
-        let position_delete_rate = self.config.data_file_row_count / self.config.position_delete_row_count + 1;
+        let equality_delete_rate =
+            self.config.data_file_row_count / self.config.equality_delete_row_count + 1;
+        let position_delete_rate =
+            self.config.data_file_row_count / self.config.position_delete_row_count + 1;
 
         let mut data_file_num = 0;
 
         let mut stream = self.record_batch_generator.generate().boxed();
         let schema_with_extra_op_column = {
-            let arrow_schema = schema_to_arrow_schema(&self.config.schema)?;
+            let arrow_schema = schema_to_arrow_schema(&self.schema)?;
             let mut new_fields = arrow_schema.fields().iter().cloned().collect::<Vec<_>>();
             new_fields.push(Arc::new(ArrowField::new(
                 "op".to_owned(),

@@ -31,8 +31,6 @@ pub mod generator;
 
 const TABLE_NAME: &str = "t1";
 const NAMESPACE_NAME: &str = "namespace";
-const DATA_FILE_PREFIX: &str = "test_berg_loom";
-const DATA_SUBDIR: &str = "/data";
 
 pub fn get_test_schema() -> Result<Schema> {
     let schema = Schema::builder()
@@ -54,9 +52,12 @@ pub fn get_test_schema() -> Result<Schema> {
     Ok(schema)
 }
 
-pub async fn build_test_iceberg_table() -> Result<()> {
+pub async fn build_test_iceberg_table(
+    schema: Option<Schema>,
+    file_generator_config: Option<FileGeneratorConfig>,
+) -> Result<()> {
     let catalog = get_rest_catalog().await;
-    let schema = get_test_schema()?;
+    let schema = schema.unwrap_or_else(|| get_test_schema().unwrap());
     let table_creation = TableCreation::builder()
         .name(TABLE_NAME.to_string())
         .schema(schema.clone())
@@ -68,14 +69,10 @@ pub async fn build_test_iceberg_table() -> Result<()> {
     let table = catalog
         .create_table(&namespace_ident, table_creation)
         .await?;
-    let writer_config = WriterConfig {
-        data_file_prefix: DATA_FILE_PREFIX.to_owned(),
-        file_io: table.file_io().clone(),
-        dir_path: format!("{}{}", table.metadata().location(), DATA_SUBDIR),
-        equality_ids: vec![1],
-    };
-    let config = FileGeneratorConfig::new(Arc::new(schema), writer_config);
-    let mut file_generator = FileGenerator::new(config)?;
+    let writer_config = WriterConfig::new(&table);
+    let file_generator_config = file_generator_config.unwrap_or_default();
+    let mut file_generator =
+        FileGenerator::new(file_generator_config, Arc::new(schema), writer_config)?;
     let commit_data_files = file_generator.generate().await?;
     let mut data_files = Vec::new();
     let mut position_delete_files = Vec::new();
@@ -104,14 +101,4 @@ pub async fn build_test_iceberg_table() -> Result<()> {
     fast_append_action.add_data_files(equality_delete_files)?;
     fast_append_action.apply().await?.commit(&catalog).await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_build_test_iceberg_table() {
-        build_test_iceberg_table().await.unwrap();
-    }
 }
