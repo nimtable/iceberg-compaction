@@ -25,7 +25,7 @@
 
 ### Memory Catalog Example
 
-We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compact for Iceberg table compaction:
+We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compaction for Iceberg table compaction:
 
 ```bash
 # Navigate to the example directory
@@ -38,7 +38,7 @@ cargo run
 The example includes:
 - Setting up an in-memory Iceberg catalog
 - Creating a sample table.
-- Performing table compaction using iceberg-compact
+- Performing table compaction using iceberg-compaction
 
 For more details, see the [memory-catalog example](./examples/memory-catalog/).
 

@@ -2154,7 +2154,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-core"
+name = "iceberg-compaction-core"
 version = "0.1.0"
 dependencies = [
  "async-stream",
@@ -2183,12 +2183,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-example"
+name = "iceberg-compaction-example"
 version = "0.1.0"
 dependencies = [
  "iceberg",
  "iceberg-catalog-memory",
- "iceberg-compact-core",
+ "iceberg-compaction-core",
  "parquet",
  "tempfile",
  "tokio",
