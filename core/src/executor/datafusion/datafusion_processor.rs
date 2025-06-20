@@ -166,7 +166,7 @@ pub struct DatafusionTableRegister {
     file_io: FileIO,
     ctx: Arc<SessionContext>,
 
-    batch_parallelism: usize,
+    executor_parallelism: usize,
     max_record_batch_rows: usize,
 }
 
@@ -174,13 +174,13 @@ impl DatafusionTableRegister {
     pub fn new(
         file_io: FileIO,
         ctx: Arc<SessionContext>,
-        batch_parallelism: usize,
+        executor_parallelism: usize,
         max_record_batch_rows: usize,
     ) -> Self {
         DatafusionTableRegister {
             file_io,
             ctx,
-            batch_parallelism,
+            executor_parallelism,
             max_record_batch_rows,
         }
     }
@@ -226,7 +226,7 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
-            self.batch_parallelism,
+            self.executor_parallelism,
             self.max_record_batch_rows,
         );
 
