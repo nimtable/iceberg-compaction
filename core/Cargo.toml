@@ -15,7 +15,7 @@ iceberg = { workspace = true }
 iceberg-catalog-memory = { workspace = true }
 iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
-mixtrics = "0.1.0"
+mixtrics = "0.2.0"
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
