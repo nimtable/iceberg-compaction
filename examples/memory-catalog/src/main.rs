@@ -7,8 +7,8 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 
-use iceberg_compact_core::compaction::CompactionBuilder;
-use iceberg_compact_core::config::CompactionConfigBuilder;
+use iceberg_compaction_core::compaction::CompactionBuilder;
+use iceberg_compaction_core::config::CompactionConfigBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
