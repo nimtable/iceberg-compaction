@@ -24,7 +24,8 @@ use crate::{
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        repartition::RepartitionExec, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -153,11 +154,8 @@ impl DatafusionProcessor {
                 physical_plan
             };
 
-        // we must execute the plan with output parallelism, target_partitions is not used for repartitioning
-        let mut batches = Vec::with_capacity(self.config.output_parallelism);
-        for i in 0..self.config.output_parallelism {
-            batches.push(plan_to_execute.execute(i, self.ctx.task_ctx())?);
-        }
+        // Use execute_stream_partitioned to execute all partitions at once
+        let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
         Ok((batches, input_schema))
     }
 }
