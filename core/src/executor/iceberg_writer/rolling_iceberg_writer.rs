@@ -72,15 +72,15 @@ where
             }
             
             // Create a new writer
-            self.inner_writer = Some(self.inner_writer_builder.clone().build().await?);
             self.current_written_size = 0;
         }
         
         // Write the batch to the current writer.
-        if let Some(writer) = &mut self.inner_writer {
-            writer.write(input).await?;
-            self.current_written_size += input_size as u64;
+        if self.inner_writer.is_none() {
+            self.inner_writer = Some(self.inner_writer_builder.clone().build().await?);
         }
+        self.inner_writer.as_mut().unwrap().write(input).await?;
+        self.current_written_size += input_size as u64;
         Ok(())
     }
 
