@@ -120,7 +120,7 @@ impl IcebergFileTaskScan {
         file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
+        executor_parallelism: usize,
         max_record_batch_rows: usize,
     ) -> Result<Self, DataFusionError> {
         let output_schema = match projection {
@@ -152,7 +152,7 @@ impl IcebergFileTaskScan {
         } else {
             file_scan_tasks
         };
-        let file_scan_tasks_group = split_n_vecs(file_scan_tasks_projection, batch_parallelism);
+        let file_scan_tasks_group = split_n_vecs(file_scan_tasks_projection, executor_parallelism);
         let plan_properties =
             Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
         let predicates = convert_filters_to_predicate(filters);
