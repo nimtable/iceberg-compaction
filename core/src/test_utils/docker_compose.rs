@@ -78,16 +78,20 @@ pub async fn get_rest_catalog() -> RestCatalog {
     let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
         let docker_compose = guard.as_ref().unwrap();
-        let aws_access_key_id =
-            docker_compose.get_container_env_value(REST_SERVICE, AWS_ACCESS_KEY_ID);
-        let aws_secret_access_key =
-            docker_compose.get_container_env_value(REST_SERVICE, AWS_SECRET_ACCESS_KEY);
-        let aws_region = docker_compose.get_container_env_value(REST_SERVICE, AWS_REGION);
+        // let aws_access_key_id =
+        //     docker_compose.get_container_env_value(REST_SERVICE, AWS_ACCESS_KEY_ID);
+        // let aws_secret_access_key =
+        //     docker_compose.get_container_env_value(REST_SERVICE, AWS_SECRET_ACCESS_KEY);
+        // let aws_region = docker_compose.get_container_env_value(REST_SERVICE, AWS_REGION);
+        let aws_access_key_id = Some("xxx".to_string());
+        let aws_secret_access_key = Some("xxx".to_string());
+        let aws_region = Some("ap-northeast-2".to_string());
+
         let minio_ip = docker_compose.get_container_ip(MINIO_SERVICE);
         let minio_port = docker_compose
             .get_container_env_value(MINIO_SERVICE, MINIO_API_PORT)
             .unwrap_or(DEFAULT_MINIO_PORT.to_string());
-        let aws_endpoint = format!("http://{}:{}", minio_ip, minio_port);
+        // let aws_endpoint = format!("http://{}:{}", minio_ip, minio_port);
         let props = HashMap::from([
             (
                 S3_ACCESS_KEY_ID.to_string(),
@@ -101,7 +105,8 @@ pub async fn get_rest_catalog() -> RestCatalog {
                 S3_REGION.to_string(),
                 aws_region.unwrap_or(DEFAULT_REGION.to_string()),
             ),
-            (S3_ENDPOINT.to_string(), aws_endpoint),
+            // ("warehouse.path".to_string(), "s3://test-snowflake-iceberg-source/demo".to_string()),
+            // (S3_ENDPOINT.to_string(), aws_endpoint),
         ]);
         let rest_catalog_ip = docker_compose.get_container_ip(REST_SERVICE);
         (rest_catalog_ip, props)
@@ -115,6 +120,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
 
     let config = RestCatalogConfig::builder()
         .uri(format!("http://{}", rest_socket_addr))
+        .warehouse("s3://test-snowflake-iceberg-source/demo".to_string())
         .props(props)
         .build();
     RestCatalog::new(config)

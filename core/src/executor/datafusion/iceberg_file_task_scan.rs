@@ -19,6 +19,7 @@ use std::collections::BinaryHeap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
+use std::time::Instant;
 
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -308,17 +309,35 @@ async fn get_batch_stream(
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let stream = try_stream! {
         let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+        let total_files = file_scan_tasks.len();
+        let mut processed_files = 0;
+        
+        println!("[PERF] 开始扫描 {} 个文件...", total_files);
+        let scan_start = Instant::now();
+        
         for task in file_scan_tasks {
+            let file_start = Instant::now();
             let file_path = task.data_file_path.clone();
             let data_file_content = task.data_file_content;
             let sequence_number = task.sequence_number;
+            
+            println!("[PERF] 处理文件 {}/{}: {}", processed_files + 1, total_files, file_path);
+            
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
             let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone()).with_batch_size(max_record_batch_rows);
+            
+            let read_start = Instant::now();
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
                 .await
                 .map_err(to_datafusion_error)?;
+            let read_duration = read_start.elapsed();
+            println!("[PERF]   文件读取完成，耗时: {:?}", read_duration);
+            
+            let process_start = Instant::now();
             let mut index_start = 0;
+            let mut batch_count = 0;
+            
             while let Some(batch) = batch_stream.next().await {
                 let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match data_file_content {
@@ -342,10 +361,23 @@ async fn get_batch_stream(
                     },
                 };
                 if let Some(batch) = record_batch_buffer.add(batch)? {
+                    batch_count += 1;
                     yield batch;
                 }
             }
+            
+            let process_duration = process_start.elapsed();
+            let file_duration = file_start.elapsed();
+            println!("[PERF]   文件处理完成，生成 {} 个批次，处理耗时: {:?}, 总耗时: {:?}", 
+                     batch_count, process_duration, file_duration);
+            
+            processed_files += 1;
         }
+        
+        let scan_duration = scan_start.elapsed();
+        println!("[PERF] 所有文件扫描完成，总耗时: {:?}, 平均每文件: {:?}", 
+                 scan_duration, scan_duration / total_files.max(1) as u32);
+        
         if let Some(batch) = record_batch_buffer.finish()? {
             yield batch;
         }

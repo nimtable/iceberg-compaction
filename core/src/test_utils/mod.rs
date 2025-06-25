@@ -14,16 +14,23 @@
  * limitations under the License.
  */
 
+use crate::compaction::{self, get_tasks_from_table, Compaction};
+use crate::config::CompactionConfigBuilder;
 use crate::error::Result;
+use crate::executor::datafusion::datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use crate::test_utils::{
     docker_compose::get_rest_catalog,
     generator::{FileGenerator, FileGeneratorConfig, WriterConfig},
 };
+use crate::{CompactionConfig, CompactionError};
+use futures::future::try_join_all;
+use futures::StreamExt;
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation,
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
 };
+use tokio::task::JoinHandle;
 use std::{collections::HashMap, sync::Arc};
 
 pub mod docker_compose;
@@ -72,7 +79,7 @@ pub async fn build_test_iceberg_table(
     let writer_config = WriterConfig::new(&table);
     let file_generator_config = file_generator_config.unwrap_or_default();
     let mut file_generator =
-        FileGenerator::new(file_generator_config, Arc::new(schema), writer_config)?;
+        FileGenerator::new(file_generator_config, Arc::new(schema.clone()), writer_config)?;
     let commit_data_files = file_generator.generate().await?;
     let mut data_files = Vec::new();
     let mut position_delete_files = Vec::new();
@@ -88,6 +95,9 @@ pub async fn build_test_iceberg_table(
             }
         }
     }
+    println!("data_files: {:?}", data_files.len());
+    println!("position_delete_files: {:?}", position_delete_files.len());
+    println!("equality_delete_files: {:?}", equality_delete_files.len());
     let txn = Transaction::new(&table);
     let mut fast_append_action = txn.fast_append(Some(rand::random::<i64>()), None, vec![])?;
     fast_append_action
@@ -99,6 +109,49 @@ pub async fn build_test_iceberg_table(
     let txn = Transaction::new(&table);
     let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
     fast_append_action.add_data_files(equality_delete_files)?;
-    fast_append_action.apply().await?.commit(&catalog).await?;
+    let table = fast_append_action.apply().await?.commit(&catalog).await?;
+
+    let config = Arc::new(CompactionConfigBuilder::default()
+        .batch_parallelism(16)
+        .target_partitions(1)
+        .build()
+        .unwrap());
+    let timer = std::time::Instant::now();
+    let file_io = table.file_io().clone();
+    let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?).unwrap();
+    let mut datafusion_task_ctx = DataFusionTaskContext::builder()?
+            .with_schema(Arc::new(schema))
+            .with_input_data_files(input_file_scan_tasks)
+            .build()?;
+    datafusion_task_ctx.exec_sql = format!("select * from {}", datafusion_task_ctx.data_file_table_name());
+    let mut futures = Vec::new();
+    let (batches, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
+            .execute(datafusion_task_ctx)
+            .await?;
+        for mut batch in batches {
+            let future: JoinHandle<
+                std::result::Result<(), CompactionError>,
+            > = tokio::spawn(async move {
+                // 拉取batch阶段
+                while let Some(b) = batch.as_mut().next().await {
+                    let batch_data = b?;
+                }
+                
+                Ok(())
+            });
+            futures.push(future);
+        }
+        try_join_all(futures).await.unwrap();
+    let duration = timer.elapsed();
+    println!("duration: {:?}", duration);
     Ok(())
+}
+
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_build_test_iceberg_table() {
+        build_test_iceberg_table(None, Some(FileGeneratorConfig::default())).await.unwrap();
+    }
 }

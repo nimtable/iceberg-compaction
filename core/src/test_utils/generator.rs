@@ -54,12 +54,12 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 
-const DEFAULT_DATA_FILE_ROW_COUNT: usize = 10000;
-const DEFAULT_EQUALITY_DELETE_ROW_COUNT: usize = 200;
-const DEFAULT_POSITION_DELETE_ROW_COUNT: usize = 300;
-const DEFAULT_DATA_FILE_NUM: usize = 10;
-const DEFAULT_BATCH_SIZE: usize = 512;
-const DEFAULT_STRING_LENGTH: usize = 16;
+const DEFAULT_DATA_FILE_ROW_COUNT: usize = 1024 * 512;
+const DEFAULT_EQUALITY_DELETE_ROW_COUNT: usize = 0;
+const DEFAULT_POSITION_DELETE_ROW_COUNT: usize = 0;
+const DEFAULT_DATA_FILE_NUM: usize = 128;
+const DEFAULT_BATCH_SIZE: usize = 1024;
+const DEFAULT_STRING_LENGTH: usize = 1024;
 const DEFAULT_DATA_FILE_PREFIX: &str = "test_berg_loom";
 const DEFAULT_DATA_SUBDIR: &str = "/data";
 
@@ -215,7 +215,7 @@ pub fn generate_string(len: usize) -> String {
 }
 
 /// Configuration for file generation with default values
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct FileGeneratorConfig {
     /// Number of rows per data file
     pub data_file_row_count: usize,
@@ -277,6 +277,7 @@ impl FileGeneratorConfig {
         self
     }
 }
+
 
 pub struct FileGenerator {
     pub record_batch_generator: RecordBatchGenerator,
@@ -418,6 +419,7 @@ impl FileGenerator {
     /// # Returns
     /// A vector of DataFile objects representing the generated files
     pub async fn generate(&mut self) -> Result<Vec<DataFile>> {
+        println!("start generate{:?}",self.config);
         let mut data_files = Vec::new();
 
         let equality_delete_delta_writer_builder =
@@ -425,10 +427,17 @@ impl FileGenerator {
         let mut equality_delete_delta_writer =
             equality_delete_delta_writer_builder.clone().build().await?;
 
-        let equality_delete_rate =
-            self.config.data_file_row_count / self.config.equality_delete_row_count + 1;
-        let position_delete_rate =
-            self.config.data_file_row_count / self.config.position_delete_row_count + 1;
+        // Calculate delete rates only if delete counts are non-zero
+        let equality_delete_rate = if self.config.equality_delete_row_count > 0 {
+            Some(self.config.data_file_row_count / self.config.equality_delete_row_count + 1)
+        } else {
+            None
+        };
+        let position_delete_rate = if self.config.position_delete_row_count > 0 {
+            Some(self.config.data_file_row_count / self.config.position_delete_row_count + 1)
+        } else {
+            None
+        };
 
         let mut data_file_num = 0;
 
@@ -470,13 +479,15 @@ impl FileGenerator {
                     equality_delete_delta_writer_builder.clone().build().await?;
                 data_file_num = 0;
             }
+            data_file_num += num_rows;
 
-            // 1. add equality delete
-
-            let equality_delete_batch = build_delete_batch(&batch, equality_delete_rate, num_rows)?;
-            equality_delete_delta_writer
-                .write(equality_delete_batch)
-                .await?;
+            // 1. add equality delete if rate is set
+            if let Some(rate) = equality_delete_rate {
+                let equality_delete_batch = build_delete_batch(&batch, rate, num_rows)?;
+                equality_delete_delta_writer
+                    .write(equality_delete_batch)
+                    .await?;
+            }
 
             // 2. add data file
             let mut columns = batch.columns().to_vec();
@@ -485,11 +496,13 @@ impl FileGenerator {
                 .map_err(|e| CompactionError::Test(e.to_string()))?;
             equality_delete_delta_writer.write(batch_with_op).await?;
 
-            // 3. add position delete
-            let position_delete_batch = build_delete_batch(&batch, position_delete_rate, num_rows)?;
-            equality_delete_delta_writer
-                .write(position_delete_batch)
-                .await?;
+            // 3. add position delete if rate is set
+            if let Some(rate) = position_delete_rate {
+                let position_delete_batch = build_delete_batch(&batch, rate, num_rows)?;
+                equality_delete_delta_writer
+                    .write(position_delete_batch)
+                    .await?;
+            }
         }
         data_files.extend(equality_delete_delta_writer.close().await?);
         Ok(data_files)

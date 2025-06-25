@@ -391,7 +391,7 @@ async fn get_old_files_from_table(table: Table) -> Result<(Vec<DataFile>, Vec<Da
     Ok((data_file, delete_file))
 }
 
-async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
+pub async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
     let snapshot_id = table.metadata().current_snapshot_id().unwrap();
 
     let scan = table
