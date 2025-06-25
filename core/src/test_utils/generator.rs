@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -425,10 +425,16 @@ impl FileGenerator {
         let mut equality_delete_delta_writer =
             equality_delete_delta_writer_builder.clone().build().await?;
 
-        let equality_delete_rate =
-            self.config.data_file_row_count / self.config.equality_delete_row_count + 1;
-        let position_delete_rate =
-            self.config.data_file_row_count / self.config.position_delete_row_count + 1;
+        let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
+            None
+        } else {
+            Some(self.config.data_file_row_count / self.config.equality_delete_row_count + 1)
+        };
+        let position_delete_rate = if self.config.position_delete_row_count == 0 {
+            None
+        } else {
+            Some(self.config.data_file_row_count / self.config.position_delete_row_count + 1)
+        };
 
         let mut data_file_num = 0;
 
@@ -470,13 +476,15 @@ impl FileGenerator {
                     equality_delete_delta_writer_builder.clone().build().await?;
                 data_file_num = 0;
             }
+            data_file_num += num_rows;
 
             // 1. add equality delete
-
-            let equality_delete_batch = build_delete_batch(&batch, equality_delete_rate, num_rows)?;
-            equality_delete_delta_writer
-                .write(equality_delete_batch)
-                .await?;
+            if let Some(delete_rate) = equality_delete_rate {
+                let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
+                equality_delete_delta_writer
+                    .write(delete_batch)
+                    .await?;
+            }
 
             // 2. add data file
             let mut columns = batch.columns().to_vec();
@@ -486,10 +494,12 @@ impl FileGenerator {
             equality_delete_delta_writer.write(batch_with_op).await?;
 
             // 3. add position delete
-            let position_delete_batch = build_delete_batch(&batch, position_delete_rate, num_rows)?;
-            equality_delete_delta_writer
-                .write(position_delete_batch)
-                .await?;
+            if let Some(delete_rate) = position_delete_rate {
+                let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
+                equality_delete_delta_writer
+                    .write(delete_batch)
+                    .await?;
+            }
         }
         data_files.extend(equality_delete_delta_writer.close().await?);
         Ok(data_files)

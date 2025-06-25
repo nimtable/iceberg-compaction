@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compact
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -730,7 +730,7 @@ mod tests {
         let mut buffer = RecordBatchBuffer::new(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
-        // This batch makes current_rows exactly max_rows
+                                                          // This batch makes current_rows exactly max_rows
         let exact_fill_batch = create_test_batch(50, None);
         assert!(buffer.add(exact_fill_batch).unwrap().is_none()); // 50 + 50 = 100. No yield yet.
         assert_eq!(buffer.current_rows, 100);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,13 @@
  * limitations under the License.
  */
 
+// Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 use core::net::{IpAddr, SocketAddr};
 use std::{collections::HashMap, process::Command, sync::RwLock};
 
 use ctor::{ctor, dtor};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use port_scanner::scan_port_addr;
-
-// Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 
 const REST_CATALOG_PORT: u16 = 8181;
 const REST_SERVICE: &str = "rest";
