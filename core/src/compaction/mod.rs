@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 iceberg-compact
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
+    RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;
@@ -628,17 +628,17 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
     };
     use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;

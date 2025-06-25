@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 iceberg-compact
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use derive_builder::Builder;
 use parquet::{basic::Compression, file::properties::WriterProperties};
 use serde::Deserialize;
 
-const DEFAULT_PREFIX: &str = "iceberg-compact";
+const DEFAULT_PREFIX: &str = "iceberg-compaction";
 const DEFAULT_EXECUTOR_PARALLELISM: usize = 4;
 const DEFAULT_OUTPUT_PARALLELISM: usize = 4;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
@@ -29,7 +29,9 @@ const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_created_by(concat!("iceberg-compact version ", env!("CARGO_PKG_VERSION")).to_owned())
+        .set_created_by(
+            concat!("iceberg-compaction version ", env!("CARGO_PKG_VERSION")).to_owned(),
+        )
         .build()
 }
 
