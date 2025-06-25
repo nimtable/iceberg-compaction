@@ -2154,6 +2154,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-rest"
+version = "0.4.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "http",
+ "iceberg",
+ "itertools 0.13.0",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "typed-builder 0.20.1",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
 dependencies = [
@@ -3615,6 +3635,16 @@ dependencies = [
  "web-sys",
  "webpki-roots 0.26.11",
  "windows-registry",
+]
+
+[[package]]
+name = "rest-catalog-example"
+version = "0.1.0"
+dependencies = [
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-compaction-core",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,10 @@
+[package]
+name = "rest-catalog-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-compaction-core = { workspace = true }
+tokio = { workspace = true }
