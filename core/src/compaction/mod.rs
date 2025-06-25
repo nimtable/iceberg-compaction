@@ -19,14 +19,14 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
+use crate::CompactionError;
+use crate::Result;
 use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
-    RewriteFilesResponse, RewriteFilesStat,
+    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
+    create_compaction_executor,
 };
-use crate::CompactionError;
-use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;

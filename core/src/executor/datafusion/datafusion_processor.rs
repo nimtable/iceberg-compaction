@@ -18,15 +18,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{
+    CompactionConfig,
     error::{CompactionError, Result},
     executor::InputFileScanTasks,
-    CompactionConfig,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
-        ExecutionPlanProperties, Partitioning,
+        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
+        repartition::RepartitionExec,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -212,7 +212,9 @@ impl DatafusionProcessor {
 
         tracing::info!(
             "📋 DataFusion Plan Analysis - Original partitions: {}, Target partitions: {}, Batch parallelism: {}",
-            original_partitions, configured_target_partitions, configured_batch_parallelism
+            original_partitions,
+            configured_target_partitions,
+            configured_batch_parallelism
         );
 
         // 🔍 执行计划详细分析（默认开启统计收集用于诊断）
@@ -266,8 +268,13 @@ impl DatafusionProcessor {
 
         tracing::info!(
             "🔍 DATAFUSION DIAGNOSIS - Timing: Register {:.1}%, Plan {:.1}%, Execute {:.1}% | Partitions: {} -> {} | BatchStreams: {} | Analysis: {}",
-            register_percent, plan_percent, execute_percent,
-            original_partitions, configured_target_partitions, batches.len(), datafusion_analysis
+            register_percent,
+            plan_percent,
+            execute_percent,
+            original_partitions,
+            configured_target_partitions,
+            batches.len(),
+            datafusion_analysis
         );
 
         Ok((batches, input_schema))
@@ -979,7 +986,16 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS final_result",
-            POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE
         );
         assert_eq!(sql, expected_sql);
     }
@@ -1013,7 +1029,13 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
-            equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
         );
         assert_eq!(sql, expected_sql);
     }
@@ -1048,7 +1070,13 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
-            equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
         );
         assert_eq!(sql, expected_sql);
     }
@@ -1082,7 +1110,19 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num, sys_hidden_file_path, sys_hidden_pos FROM {}) AS {} ON {}.sys_hidden_file_path = {}.sys_hidden_file_path AND {}.sys_hidden_pos = {}.sys_hidden_pos) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
-            equality_delete_table_name, POSITION_DELETE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, POSITION_DELETE_TABLE, DATA_FILE_TABLE, equality_delete_table_name, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name
+            equality_delete_table_name,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            POSITION_DELETE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name
         );
         assert_eq!(sql, expected_sql);
     }
@@ -1132,7 +1172,19 @@ mod tests {
 
         let expected_sql = format!(
             "SELECT id, name FROM (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {} RIGHT ANTI JOIN (SELECT id, name, sys_hidden_seq_num FROM {}) AS {} ON {}.id = {}.id AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS {} ON {}.name = {}.name AND {}.sys_hidden_seq_num < {}.sys_hidden_seq_num) AS final_result",
-            equality_delete_table_name_2, equality_delete_table_name_1, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_1, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_1, DATA_FILE_TABLE, equality_delete_table_name_2, DATA_FILE_TABLE, DATA_FILE_TABLE, equality_delete_table_name_2
+            equality_delete_table_name_2,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_1,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_2,
+            DATA_FILE_TABLE,
+            DATA_FILE_TABLE,
+            equality_delete_table_name_2
         );
         assert_eq!(sql, expected_sql);
     }

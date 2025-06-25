@@ -17,8 +17,8 @@
 use std::any::Any;
 use std::collections::BinaryHeap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::vec;
 
@@ -33,7 +33,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
@@ -88,14 +88,20 @@ fn calculate_partition_file_concurrency(
     // 详细诊断日志
     tracing::info!(
         "🔧 Partition concurrency calculation - Total scan concurrency: {}, Partitions: {}, Files in partition: {}, Base per partition: {}, Final concurrency: {}",
-        total_file_scan_concurrency, batch_parallelism, file_count_in_partition, base_concurrency, safe_concurrency
+        total_file_scan_concurrency,
+        batch_parallelism,
+        file_count_in_partition,
+        base_concurrency,
+        safe_concurrency
     );
 
     // 警告：如果并发度太低，可能影响性能
     if safe_concurrency < 8 {
         tracing::warn!(
             "⚠️  Low file concurrency detected ({}) - consider increasing file_scan_concurrency from {} to {}",
-            safe_concurrency, total_file_scan_concurrency, batch_parallelism * 16
+            safe_concurrency,
+            total_file_scan_concurrency,
+            batch_parallelism * 16
         );
     }
 
@@ -494,7 +500,7 @@ async fn get_batch_stream(
 
                 // 📊 更新诊断数据
                 diagnostics.file_open_time.fetch_add(open_time.as_nanos() as u64, Ordering::Relaxed);
-                diagnostics.total_io_wait_time.fetch_add((open_time + read_time).as_nanos() as u64, Ordering::Relaxed);
+                diagnostics.total_io_wait_time.fetch_add(read_time.as_nanos() as u64, Ordering::Relaxed);
                 diagnostics.time_in_file_read.fetch_add(total_file_time.as_nanos() as u64, Ordering::Relaxed);
 
                 // 🔍 单文件分析
@@ -504,7 +510,7 @@ async fn get_batch_stream(
                 let open_percent = (open_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
                 let read_percent = (read_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
 
-                tracing::debug!(
+                tracing::info!(
                     "📁 File {}: {:.1}MB, {:.1}MB/s, {} rows, {} batches | Open: {:.1}%, Read: {:.1}%",
                     file_idx, file_size_mb, throughput, total_rows, processed_batches.len(),
                     open_percent, read_percent
@@ -705,9 +711,17 @@ impl BottleneckDiagnostics {
 
         // 🔍 单条日志包含所有诊断信息
         tracing::info!(
-            "🔍 BOTTLENECK DIAGNOSIS - Time: I/O {:.1}%, CPU {:.1}%, FileRead {:.1}%, DataFusion {:.1}% | Parallelism: MaxFiles {}, MaxPartitions {} | Result: {}",
-            io_percent, cpu_percent, file_read_percent, datafusion_percent,
-            max_files, max_partitions, bottleneck_analysis
+            "🔍 BOTTLENECK DIAGNOSIS - Time: I/O {:.1}%, CPU {:.1}%, FileRead {:.1}%, DataFusion {:.1}% | Parallelism: MaxFiles {}, MaxPartitions {} | Result: {}, I/O {:.1}ms, CPU {:.1}ms, FileRead {:.1}ms",
+            io_percent,
+            cpu_percent,
+            file_read_percent,
+            datafusion_percent,
+            max_files,
+            max_partitions,
+            bottleneck_analysis,
+            io_time as f64 / 1_000_000.0,
+            cpu_time as f64 / 1_000_000.0,
+            file_read_time as f64 / 1_000_000.0
         );
     }
 }
@@ -1004,7 +1018,7 @@ mod tests {
         let mut buffer = RecordBatchBuffer::new(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
-                                                          // This batch makes current_rows exactly max_rows
+        // This batch makes current_rows exactly max_rows
         let exact_fill_batch = create_test_batch(50, None);
         assert!(buffer.add(exact_fill_batch).unwrap().is_none()); // 50 + 50 = 100. No yield yet.
         assert_eq!(buffer.current_rows, 100);

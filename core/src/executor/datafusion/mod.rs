@@ -18,23 +18,23 @@ use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
 use ::datafusion::parquet::file::properties::WriterProperties;
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{future::try_join_all, StreamExt};
+use futures::{StreamExt, future::try_join_all};
 use iceberg::{
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
+        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
             ParquetWriterBuilder,
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
         },
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
-        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use sqlx::types::Uuid;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -57,6 +57,7 @@ pub struct WriterDiagnostics {
 
     // 时间分布
     writer_creation_time: AtomicU64,
+    wait_exec_time: AtomicU64,
     batch_write_time: AtomicU64,
     writer_close_time: AtomicU64,
 
@@ -71,6 +72,7 @@ impl WriterDiagnostics {
             total_batches_written: AtomicU64::new(0),
             total_bytes_written: AtomicU64::new(0),
             writer_creation_time: AtomicU64::new(0),
+            wait_exec_time: AtomicU64::new(0),
             batch_write_time: AtomicU64::new(0),
             writer_close_time: AtomicU64::new(0),
             start_time: Instant::now(),
@@ -82,6 +84,7 @@ impl WriterDiagnostics {
         let creation_time = self.writer_creation_time.load(Ordering::Relaxed);
         let write_time = self.batch_write_time.load(Ordering::Relaxed);
         let close_time = self.writer_close_time.load(Ordering::Relaxed);
+        let wait_exec_time = self.wait_exec_time.load(Ordering::Relaxed);
 
         let total_partitions = self.total_partitions.load(Ordering::Relaxed);
         let total_batches = self.total_batches_written.load(Ordering::Relaxed);
@@ -108,9 +111,18 @@ impl WriterDiagnostics {
         };
 
         tracing::info!(
-            "🔍 WRITER DIAGNOSIS - Timing: Creation {:.1}%, Write {:.1}%, Close {:.1}% | Partitions: {}, Batches: {}, Files: {}, Throughput: {:.1}MB/s | Analysis: {}",
-            creation_percent, write_percent, close_percent,
-            total_partitions, total_batches, output_files_count, throughput_mbps, writer_analysis
+            "🔍 WRITER DIAGNOSIS - Timing: Creation {:.1}%, Write {:.1}%, Close {:.1}% | Partitions: {}, Batches: {}, Files: {}, Throughput: {:.1}MB/s | Analysis: {}, WaitExec {:.1}ms, BatchWrite {:.1}ms, WriterClose {:.1}ms",
+            creation_percent,
+            write_percent,
+            close_percent,
+            total_partitions,
+            total_batches,
+            output_files_count,
+            throughput_mbps,
+            writer_analysis,
+            wait_exec_time as f64 / 1_000_000.0,
+            write_time as f64 / 1_000_000.0,
+            close_time as f64 / 1_000_000.0
         );
     }
 }
@@ -137,7 +149,9 @@ impl CompactionExecutor for DataFusionExecutor {
 
         tracing::info!(
             "🚀 Starting rewrite_files - Input files: {}, Target partitions: {}, Batch parallelism: {}",
-            rewritten_files_count, config.target_partitions, config.batch_parallelism
+            rewritten_files_count,
+            config.target_partitions,
+            config.batch_parallelism
         );
 
         // 1. DataFusion 执行阶段
@@ -228,10 +242,15 @@ impl CompactionExecutor for DataFusionExecutor {
                 let mut total_rows = 0;
                 let write_start = Instant::now();
 
+                let mut wait_exec_time = Instant::now();
                 while let Some(b) = batch.as_mut().next().await {
                     let batch_write_start = Instant::now();
                     let record_batch = b?;
                     let batch_rows = record_batch.num_rows();
+                    diagnostics.wait_exec_time.fetch_add(
+                        wait_exec_time.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
 
                     data_file_writer.write(record_batch).await?;
 
@@ -253,6 +272,7 @@ impl CompactionExecutor for DataFusionExecutor {
                         batch_rows,
                         batch_write_time
                     );
+                    wait_exec_time = Instant::now();
                 }
                 let total_write_time = write_start.elapsed();
 
@@ -282,9 +302,15 @@ impl CompactionExecutor for DataFusionExecutor {
 
                 tracing::info!(
                     "📝 Partition {} complete: {} batches, {} rows, {} files, {:.1}MB, {:.1}MB/s | Create: {:.1}%, Write: {:.1}%, Close: {:.1}%",
-                    partition_id, batch_count, total_rows, data_files.len(),
-                    total_bytes as f64 / 1024.0 / 1024.0, throughput_mbps,
-                    create_percent, write_percent, close_percent
+                    partition_id,
+                    batch_count,
+                    total_rows,
+                    data_files.len(),
+                    total_bytes as f64 / 1024.0 / 1024.0,
+                    throughput_mbps,
+                    create_percent,
+                    write_percent,
+                    close_percent
                 );
 
                 diagnostics.active_writers.fetch_sub(1, Ordering::Relaxed);
@@ -324,8 +350,12 @@ impl CompactionExecutor for DataFusionExecutor {
 
         tracing::info!(
             "🔍 REWRITE_FILES DIAGNOSIS - Total: {:?} | Phases: DataFusion {:.1}%, Writers {:.1}%, Collect {:.1}% | Files: {} -> {} | Bytes: {:.1}MB | Throughput: {:.1}MB/s",
-            overall_time, datafusion_percent, writer_percent, collect_percent,
-            rewritten_files_count, output_data_files.len(),
+            overall_time,
+            datafusion_percent,
+            writer_percent,
+            collect_percent,
+            rewritten_files_count,
+            output_data_files.len(),
             stat.rewritten_bytes as f64 / 1024.0 / 1024.0,
             (stat.rewritten_bytes as f64 / 1024.0 / 1024.0) / overall_time.as_secs_f64()
         );
