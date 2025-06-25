@@ -481,9 +481,7 @@ impl FileGenerator {
             // 1. add equality delete
             if let Some(delete_rate) = equality_delete_rate {
                 let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
-                equality_delete_delta_writer
-                    .write(delete_batch)
-                    .await?;
+                equality_delete_delta_writer.write(delete_batch).await?;
             }
 
             // 2. add data file
@@ -496,9 +494,7 @@ impl FileGenerator {
             // 3. add position delete
             if let Some(delete_rate) = position_delete_rate {
                 let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
-                equality_delete_delta_writer
-                    .write(delete_batch)
-                    .await?;
+                equality_delete_delta_writer.write(delete_batch).await?;
             }
         }
         data_files.extend(equality_delete_delta_writer.close().await?);
