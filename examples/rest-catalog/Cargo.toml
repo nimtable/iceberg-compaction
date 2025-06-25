@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-iceberg-compact-core = { workspace = true }
+iceberg-compaction-core = { workspace = true }
 tokio = { workspace = true }

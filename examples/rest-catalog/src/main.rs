@@ -6,8 +6,8 @@ use iceberg::io::{
 };
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use iceberg_compact_core::compaction::CompactionBuilder;
-use iceberg_compact_core::config::CompactionConfigBuilder;
+use iceberg_compaction_core::compaction::CompactionBuilder;
+use iceberg_compaction_core::config::CompactionConfigBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
