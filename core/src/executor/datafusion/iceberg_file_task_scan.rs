@@ -577,6 +577,7 @@ async fn get_batch_stream(
         // 🚀 流式处理：每个文件现在返回流而不是 Vec<RecordBatch>
         // Process batches as they come from concurrent file streams
         pin_mut!(file_streams);
+        let mut file_scan_time = Instant::now();
         while let Some(file_stream_result) = file_streams.try_next().await? {
             // file_stream_result 现在是 Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>
             let file_stream = file_stream_result;
@@ -584,6 +585,9 @@ async fn get_batch_stream(
 
             // 流式处理每个文件的批次
             while let Some(batch_result) = file_stream.try_next().await? {
+                let file_scan_timer = file_scan_time.elapsed();
+                diagnostics.time_in_file_read.fetch_add(file_scan_timer.as_nanos() as u64, Ordering::Relaxed);
+                
                 let buffer_start = Instant::now();
                 if let Some(buffered_batch) = record_batch_buffer.add(batch_result)? {
                     batch_count += 1;
@@ -593,6 +597,7 @@ async fn get_batch_stream(
                     tracing::debug!("📦 Produced batch {}: {} rows", batch_count, buffered_batch.num_rows());
                     yield buffered_batch;
                 }
+                file_scan_time = Instant::now();
             }
         }
 
@@ -713,6 +718,8 @@ pub struct BottleneckDiagnostics {
     time_in_datafusion: AtomicU64,
     time_in_buffer_ops: AtomicU64,
 
+    time_in_file_scan: AtomicU64,
+
     start_time: Instant,
 }
 
@@ -727,6 +734,7 @@ impl BottleneckDiagnostics {
             time_in_file_read: AtomicU64::new(0),
             time_in_datafusion: AtomicU64::new(0),
             time_in_buffer_ops: AtomicU64::new(0),
+            time_in_file_scan: AtomicU64::new(0),
             start_time: Instant::now(),
         })
     }
@@ -737,7 +745,7 @@ impl BottleneckDiagnostics {
         let cpu_time = self.total_cpu_time.load(Ordering::Relaxed);
         let file_read_time = self.time_in_file_read.load(Ordering::Relaxed);
         let datafusion_time = self.time_in_datafusion.load(Ordering::Relaxed);
-
+        let file_scan_time = self.time_in_file_scan.load(Ordering::Relaxed);
         let max_files = self.max_concurrent_files.load(Ordering::Relaxed);
         let max_partitions = self.max_concurrent_partitions.load(Ordering::Relaxed);
 
@@ -762,7 +770,7 @@ impl BottleneckDiagnostics {
 
         // 🔍 单条日志包含所有诊断信息
         tracing::info!(
-            "🔍 BOTTLENECK DIAGNOSIS - Time: I/O {:.1}%, CPU {:.1}%, FileRead {:.1}%, DataFusion {:.1}% | Parallelism: MaxFiles {}, MaxPartitions {} | Result: {}, I/O {:.1}ms, CPU {:.1}ms, FileRead {:.1}ms",
+            "🔍 BOTTLENECK DIAGNOSIS - Time: I/O {:.1}%, CPU {:.1}%, FileRead {:.1}%, DataFusion {:.1}% | Parallelism: MaxFiles {}, MaxPartitions {} | Result: {}, I/O {:.1}ms, CPU {:.1}ms, FileRead {:.1}ms, FileScan {:.1}ms",
             io_percent,
             cpu_percent,
             file_read_percent,
@@ -772,7 +780,8 @@ impl BottleneckDiagnostics {
             bottleneck_analysis,
             io_time as f64 / 1_000_000.0,
             cpu_time as f64 / 1_000_000.0,
-            file_read_time as f64 / 1_000_000.0
+            file_read_time as f64 / 1_000_000.0,
+            file_scan_time as f64 / 1_000_000.0
         );
     }
 }
