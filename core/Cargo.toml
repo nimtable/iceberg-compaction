@@ -1,5 +1,5 @@
 [package]
-name = "bergloom-core"
+name = "iceberg-compaction-core"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,16 +7,16 @@ edition = "2024"
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 backon = "1.2.0"
-bergloom-codegen = { workspace = true }
 datafusion = "45.0.0"
 derive_builder = "0.20"
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-memory = { workspace = true }
 iceberg-datafusion = { workspace = true }
-mixtrics = "0.1.0"
+itertools = "0.13.0"
+mixtrics = "0.2.0"
 parquet = { workspace = true }
-prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -32,7 +32,9 @@ sqlx = { version = "0.8.2", default-features = false, features = [
 	"time",
 	"uuid",
 ] }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
 url = { workspace = true }
+uuid = "1.0"

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,23 +18,23 @@ use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
 use ::datafusion::parquet::file::properties::WriterProperties;
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
+use futures::{future::try_join_all, StreamExt};
 use iceberg::{
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use sqlx::types::Uuid;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -147,13 +147,6 @@ impl CompactionExecutor for DataFusionExecutor {
         let mut stat = RewriteFilesStat::default();
         let rewritten_files_count = input_file_scan_tasks.input_files_count();
 
-        tracing::info!(
-            "🚀 Starting rewrite_files - Input files: {}, Target partitions: {}, Batch parallelism: {}",
-            rewritten_files_count,
-            config.target_partitions,
-            config.batch_parallelism
-        );
-
         // 1. DataFusion 执行阶段
         let datafusion_start = Instant::now();
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
@@ -166,14 +159,13 @@ impl CompactionExecutor for DataFusionExecutor {
         let datafusion_time = datafusion_start.elapsed();
 
         // 2. 写入阶段诊断初始化
-        let writer_diagnostics = WriterDiagnostics::new(config.batch_parallelism);
+        let writer_diagnostics = WriterDiagnostics::new(config.executor_parallelism);
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(config.batch_parallelism);
 
         tracing::info!(
             "📊 DataFusion execution completed in {:?}, starting {} writer tasks",
             datafusion_time,
-            config.batch_parallelism
+            config.executor_parallelism
         );
 
         // 3. 启动写入任务并行监控
@@ -205,6 +197,7 @@ impl CompactionExecutor for DataFusionExecutor {
             }
         });
 
+        let mut futures = Vec::with_capacity(config.executor_parallelism);
         // build iceberg writer for each partition
         for (partition_id, mut batch) in batches.into_iter().enumerate() {
             let dir_path = dir_path.clone();

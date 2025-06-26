@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ pub struct IcebergFileScanTaskTableProvider {
     file_io: FileIO,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
-    batch_parallelism: usize,
+    executor_parallelism: usize,
     max_record_batch_rows: usize,
     file_scan_concurrency: usize,
 }
@@ -48,7 +48,7 @@ impl IcebergFileScanTaskTableProvider {
         file_io: FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
+        executor_parallelism: usize,
         max_record_batch_rows: usize,
         file_scan_concurrency: usize,
     ) -> Self {
@@ -58,7 +58,7 @@ impl IcebergFileScanTaskTableProvider {
             file_io,
             need_seq_num,
             need_file_path_and_pos,
-            batch_parallelism,
+            executor_parallelism,
             max_record_batch_rows,
             file_scan_concurrency,
         }
@@ -97,10 +97,10 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             &self.file_io,
             self.need_seq_num,
             self.need_file_path_and_pos,
-            self.batch_parallelism,
+            self.executor_parallelism,
             self.max_record_batch_rows,
             self.file_scan_concurrency,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(

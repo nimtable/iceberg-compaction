@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
+    RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use futures_async_stream::for_await;
 use iceberg::scan::FileScanTask;
@@ -182,7 +182,7 @@ pub struct Compaction {
     pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
 }
 
-struct CompacitonResult {
+struct CompactionResult {
     stats: RewriteFilesStat,
 
     compaction_validator: Option<CompactionValidator>,
@@ -195,7 +195,7 @@ impl Compaction {
     }
 
     pub async fn compact(&self) -> Result<RewriteFilesStat> {
-        let CompacitonResult {
+        let CompactionResult {
             stats,
             compaction_validator,
         } = match self.compaction_type {
@@ -216,7 +216,7 @@ impl Compaction {
         Ok(stats)
     }
 
-    async fn full_compact(&self) -> Result<CompacitonResult> {
+    async fn full_compact(&self) -> Result<CompactionResult> {
         let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
         let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
         let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
@@ -224,6 +224,12 @@ impl Compaction {
         let now = std::time::Instant::now();
 
         let table = self.catalog.load_table(&self.table_ident).await?;
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(CompactionResult {
+                stats: RewriteFilesStat::default(),
+                compaction_validator: None,
+            });
+        }
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
         let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?);
 
@@ -334,7 +340,7 @@ impl Compaction {
             None
         };
 
-        Ok(CompacitonResult {
+        Ok(CompactionResult {
             stats: RewriteFilesStat {
                 rewritten_files_count: stat.rewritten_files_count,
                 added_files_count: stat.added_files_count,
@@ -604,5 +610,278 @@ impl RewriteDataFilesCommitManager {
             })
             .await
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::compaction::CompactionBuilder;
+    use crate::config::CompactionConfigBuilder;
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::io::FileIOBuilder;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::table::Table;
+    use iceberg::transaction::Transaction;
+    use iceberg::writer::base_writer::equality_delete_writer::{
+        EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+    };
+    use iceberg::writer::base_writer::sort_position_delete_writer::{
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
+    };
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::function_writer::equality_delta_writer::{
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
+    };
+    use iceberg::writer::{
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
+    };
+    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg_catalog_memory::MemoryCatalog;
+    use itertools::Itertools;
+    use parquet::file::properties::WriterProperties;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    async fn create_namespace<C: Catalog>(catalog: &C, namespace_ident: &NamespaceIdent) {
+        let _ = catalog
+            .create_namespace(namespace_ident, HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    fn simple_table_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn simple_table_schema_with_pos() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "pos", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    async fn create_table<C: Catalog>(catalog: &C, table_ident: &TableIdent) {
+        let _ = catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn create_test_record_batch_with_pos(iceberg_schema: &Schema, insert: bool) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        let op = if insert { INSERT_OP } else { DELETE_OP };
+        let pos_array = Int32Array::from(vec![op, op, op]);
+
+        // Convert iceberg schema to arrow schema to ensure field ID consistency
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(pos_array),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn build_equality_delta_writer(
+        table: &Table,
+        warehouse_location: String,
+        unique_column_ids: Vec<i32>,
+    ) -> impl IcebergWriter {
+        let table_schema = table.metadata().current_schema();
+
+        // Set up writer
+        let location_generator = DefaultLocationGenerator {
+            dir_path: warehouse_location,
+        };
+
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "data".to_string(),
+            Some("test".to_string()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table_schema.clone(),
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+
+        let data_file_builder = DataFileWriterBuilder::new(
+            parquet_writer_builder,
+            None,
+            table.metadata().default_partition_spec().spec_id(),
+        );
+
+        let config = EqualityDeleteWriterConfig::new(
+            unique_column_ids.clone(),
+            table_schema.clone(),
+            None,
+            0,
+        )
+        .unwrap();
+
+        let unique_uuid_suffix = Uuid::now_v7();
+
+        let equality_delete_fields = unique_column_ids
+            .iter()
+            .map(|id| table_schema.field_by_id(*id).unwrap().clone())
+            .collect_vec();
+
+        let equality_delete_builder = EqualityDeleteFileWriterBuilder::new(
+            ParquetWriterBuilder::new(
+                WriterProperties::new(),
+                Arc::new(
+                    Schema::builder()
+                        .with_fields(equality_delete_fields)
+                        .build()
+                        .unwrap(),
+                ),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
+                DefaultFileNameGenerator::new(
+                    "123".to_string(),
+                    Some(format!("eq-del-{}", unique_uuid_suffix)),
+                    iceberg::spec::DataFileFormat::Parquet,
+                ),
+            ),
+            config,
+        );
+
+        let position_delete_builder = SortPositionDeleteWriterBuilder::new(
+            ParquetWriterBuilder::new(
+                WriterProperties::new(),
+                POSITION_DELETE_SCHEMA.clone(),
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
+                DefaultFileNameGenerator::new(
+                    "123".to_string(),
+                    Some(format!("pos-del-{}", unique_uuid_suffix)),
+                    iceberg::spec::DataFileFormat::Parquet,
+                ),
+            ),
+            1024 * 1024, // 1MB
+            None,
+            None,
+        );
+
+        let delta_builder = EqualityDeltaWriterBuilder::new(
+            data_file_builder,
+            position_delete_builder,
+            equality_delete_builder,
+            unique_column_ids,
+        );
+
+        delta_builder.build().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_commit_and_compaction() {
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        let unique_column_ids = vec![1];
+        let mut writer =
+            build_equality_delta_writer(&table, warehouse_location.clone(), unique_column_ids)
+                .await;
+
+        let insert_batch = create_test_record_batch_with_pos(&simple_table_schema_with_pos(), true);
+
+        let delete_batch =
+            create_test_record_batch_with_pos(&simple_table_schema_with_pos(), false);
+
+        // Write data (insert): generate data files
+        writer.write(insert_batch.clone()).await.unwrap();
+
+        // Write data (delete) generate position delete files
+        writer.write(delete_batch).await.unwrap();
+
+        // Write data (insert) generate data files
+        writer.write(insert_batch).await.unwrap();
+
+        let data_files = writer.close().await.unwrap();
+
+        // Start transaction and commit
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(data_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
+
+        // Commit the transaction
+        let updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Verify the snapshot was created
+        let snapshots = updated_table.metadata().snapshots();
+        assert!(snapshots.len() > 0, "Should have at least one snapshot");
+
+        let latest_snapshot = updated_table.metadata().current_snapshot().unwrap();
+
+        // Verify we can load the table again and see the data
+        let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
+        let current_snapshot = reloaded_table.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            current_snapshot.snapshot_id(),
+            latest_snapshot.snapshot_id()
+        );
+
+        let rewrite_files_stat = CompactionBuilder::new()
+            .with_catalog(Arc::new(catalog))
+            .with_table_ident(table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .enable_validate_compaction(true)
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap()
+            .compact()
+            .await
+            .unwrap();
+
+        assert_eq!(rewrite_files_stat.rewritten_files_count, 2);
     }
 }

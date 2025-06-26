@@ -18,15 +18,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{
-    CompactionConfig,
     error::{CompactionError, Result},
     executor::InputFileScanTasks,
+    CompactionConfig,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -90,30 +90,29 @@ impl DatafusionProcessor {
         }
 
         // 🚀 优化 DataFusion 配置以提高性能
-        let session_config = SessionConfig::new()
-            .with_target_partitions(config.target_partitions)
-            .with_batch_size(config.max_record_batch_rows) // 使用用户配置的批次大小
+        let session_config = SessionConfig::new() // 使用用户配置的批次大小
             // 🔥 关键优化：启用批次合并和重分区
             .with_coalesce_batches(true)
             .with_repartition_joins(true)
             .with_repartition_aggregations(true)
             .with_repartition_windows(true)
             // 🚀 启用统计收集用于诊断
-            .with_collect_statistics(true);
-
+            .with_collect_statistics(true)
+            .with_target_partitions(config.executor_parallelism)
+            .with_batch_size(config.max_record_batch_rows);
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
         tracing::info!(
             "🔧 DataFusion Config - Target partitions: {}, Batch size: {}, Coalesce: enabled, Statistics: enabled, Optimizations: enabled",
-            config.target_partitions,
+            config.executor_parallelism,
             config.max_record_batch_rows
         );
 
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
-            config.batch_parallelism,
-            config.max_record_batch_rows, // 使用用户配置的批次大小
+            config.executor_parallelism,
+            config.max_record_batch_rows,
             config.file_scan_concurrency,
         );
         Self {
@@ -207,15 +206,6 @@ impl DatafusionProcessor {
 
         // 3. 分析执行计划的并行度 - 关键检查点
         let original_partitions = physical_plan.output_partitioning().partition_count();
-        let configured_target_partitions = self.config.target_partitions;
-        let configured_batch_parallelism = self.config.batch_parallelism;
-
-        tracing::info!(
-            "📋 DataFusion Plan Analysis - Original partitions: {}, Target partitions: {}, Batch parallelism: {}",
-            original_partitions,
-            configured_target_partitions,
-            configured_batch_parallelism
-        );
 
         // 🔍 执行计划详细分析（默认开启统计收集用于诊断）
         self.analyze_physical_plan_statistics(&physical_plan);
@@ -223,15 +213,12 @@ impl DatafusionProcessor {
         // 4. 执行计划优化和重分区
         let execute_start = Instant::now();
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
-            if original_partitions != configured_target_partitions {
-                tracing::info!(
-                    "🔄 Repartitioning from {} to {} partitions",
-                    original_partitions,
-                    configured_target_partitions
-                );
+            if physical_plan.output_partitioning().partition_count()
+                != self.config.output_parallelism
+            {
                 Arc::new(RepartitionExec::try_new(
                     physical_plan,
-                    Partitioning::RoundRobinBatch(configured_target_partitions),
+                    Partitioning::RoundRobinBatch(self.config.output_parallelism),
                 )?)
             } else {
                 tracing::info!(
@@ -258,9 +245,9 @@ impl DatafusionProcessor {
             "BOTTLENECK: Table registration too slow"
         } else if plan_time.as_millis() > 2000 {
             "BOTTLENECK: Query planning too slow"
-        } else if original_partitions == 1 && configured_target_partitions > 1 {
+        } else if original_partitions == 1 && self.config.executor_parallelism > 1 {
             "BOTTLENECK: Single partition execution plan"
-        } else if original_partitions < configured_target_partitions / 2 {
+        } else if original_partitions < self.config.executor_parallelism / 2 {
             "WARNING: Low partition utilization"
         } else {
             "DataFusion execution optimal"
@@ -272,7 +259,7 @@ impl DatafusionProcessor {
             plan_percent,
             execute_percent,
             original_partitions,
-            configured_target_partitions,
+            self.config.executor_parallelism,
             batches.len(),
             datafusion_analysis
         );
@@ -385,7 +372,7 @@ pub struct DatafusionTableRegister {
     file_io: FileIO,
     ctx: Arc<SessionContext>,
 
-    batch_parallelism: usize,
+    executor_parallelism: usize,
     max_record_batch_rows: usize,
     file_scan_concurrency: usize,
 }
@@ -394,14 +381,14 @@ impl DatafusionTableRegister {
     pub fn new(
         file_io: FileIO,
         ctx: Arc<SessionContext>,
-        batch_parallelism: usize,
+        executor_parallelism: usize,
         max_record_batch_rows: usize,
         file_scan_concurrency: usize,
     ) -> Self {
         DatafusionTableRegister {
             file_io,
             ctx,
-            batch_parallelism,
+            executor_parallelism,
             max_record_batch_rows,
             file_scan_concurrency,
         }
@@ -448,7 +435,7 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
-            self.batch_parallelism,
+            self.executor_parallelism,
             self.max_record_batch_rows,
             self.file_scan_concurrency,
         );
@@ -991,9 +978,6 @@ mod tests {
             DATA_FILE_TABLE,
             DATA_FILE_TABLE,
             POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
-            POSITION_DELETE_TABLE,
-            DATA_FILE_TABLE,
             DATA_FILE_TABLE,
             POSITION_DELETE_TABLE
         );

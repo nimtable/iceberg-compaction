@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 BergLoom
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 use std::any::Any;
 use std::collections::BinaryHeap;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::vec;
 
@@ -33,7 +33,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
@@ -53,7 +53,7 @@ use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
 ///
 /// # Arguments
 /// * `total_file_scan_concurrency` - Total concurrent file reads across all partitions
-/// * `batch_parallelism` - Number of partitions (parallel batches)
+/// * `executor_parallelism` - Number of partitions (parallel batches)
 /// * `file_count_in_partition` - Number of files in this specific partition
 ///
 /// # Returns
@@ -63,7 +63,7 @@ use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
 /// 3. Conservative limits to prevent S3 connection timeouts
 fn calculate_partition_file_concurrency(
     total_file_scan_concurrency: usize,
-    batch_parallelism: usize,
+    executor_parallelism: usize,
     file_count_in_partition: usize,
 ) -> usize {
     if file_count_in_partition == 0 {
@@ -71,7 +71,7 @@ fn calculate_partition_file_concurrency(
     }
 
     // Calculate base concurrency per partition
-    let base_concurrency = total_file_scan_concurrency / batch_parallelism.max(1);
+    let base_concurrency = total_file_scan_concurrency / executor_parallelism.max(1);
 
     // 🔥 关键修改：大幅提高并发限制
     const MAX_CONCURRENT_FILES_PER_PARTITION: usize = 32; // 从8提高到32
@@ -89,7 +89,7 @@ fn calculate_partition_file_concurrency(
     tracing::info!(
         "🔧 Partition concurrency calculation - Total scan concurrency: {}, Partitions: {}, Files in partition: {}, Base per partition: {}, Final concurrency: {}",
         total_file_scan_concurrency,
-        batch_parallelism,
+        executor_parallelism,
         file_count_in_partition,
         base_concurrency,
         safe_concurrency
@@ -101,7 +101,7 @@ fn calculate_partition_file_concurrency(
             "⚠️  Low file concurrency detected ({}) - consider increasing file_scan_concurrency from {} to {}",
             safe_concurrency,
             total_file_scan_concurrency,
-            batch_parallelism * 16
+            executor_parallelism * 16
         );
     }
 
@@ -188,21 +188,45 @@ impl IcebergFileTaskScan {
         file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
-        batch_parallelism: usize,
+        executor_parallelism: usize,
         max_record_batch_rows: usize,
         file_scan_concurrency: usize,
-    ) -> Self {
+    ) -> Result<Self, DataFusionError> {
         let output_schema = match projection {
             None => schema.clone(),
             Some(projection) => Arc::new(schema.project(projection).unwrap()),
         };
-        let file_scan_tasks_group = split_n_vecs(file_scan_tasks, batch_parallelism);
+        let projection = get_column_names(schema.clone(), projection);
+        let file_scan_tasks_projection = if let Some(projection) = &projection {
+            file_scan_tasks
+                .into_iter()
+                .map(|mut task| {
+                    let project_field_ids = projection
+                        .iter()
+                        .filter_map(|name| task.schema().field_id_by_name(name))
+                        .collect::<Vec<_>>();
+                    let new_schema = iceberg::spec::Schema::builder()
+                        .with_fields(
+                            projection
+                                .iter()
+                                .filter_map(|name| task.schema().field_by_name(name).cloned()),
+                        )
+                        .build()
+                        .map_err(to_datafusion_error)?;
+                    task.schema = Arc::new(new_schema);
+                    task.project_field_ids = project_field_ids;
+                    Ok(task)
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?
+        } else {
+            file_scan_tasks
+        };
+        let file_scan_tasks_group = split_n_vecs(file_scan_tasks_projection, executor_parallelism);
         let plan_properties =
             Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
-        let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
 
-        Self {
+        Ok(Self {
             file_scan_tasks_group,
             plan_properties,
             projection,
@@ -212,7 +236,7 @@ impl IcebergFileTaskScan {
             need_file_path_and_pos,
             max_record_batch_rows,
             file_scan_concurrency,
-        }
+        })
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
@@ -331,7 +355,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         let file_scan_tasks = &self.file_scan_tasks_group[partition];
         let partition_concurrency = calculate_partition_file_concurrency(
             self.file_scan_concurrency,
-            self.file_scan_tasks_group.len(), // batch_parallelism
+            self.file_scan_tasks_group.len(), // executor_parallelism
             file_scan_tasks.len(),
         );
 
@@ -1018,7 +1042,7 @@ mod tests {
         let mut buffer = RecordBatchBuffer::new(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
-        // This batch makes current_rows exactly max_rows
+                                                          // This batch makes current_rows exactly max_rows
         let exact_fill_batch = create_test_batch(50, None);
         assert!(buffer.add(exact_fill_batch).unwrap().is_none()); // 50 + 50 = 100. No yield yet.
         assert_eq!(buffer.current_rows, 100);
