@@ -476,14 +476,22 @@ async fn get_batch_stream(
                     .map_err(to_datafusion_error)?;
                 let open_time = open_start.elapsed();
 
-                // 2. 数据读取和处理阶段
+                // 2. 数据读取和处理阶段 - 流式处理，避免内存拷贝
                 let read_start = Instant::now();
-                let mut processed_batches = Vec::new();
-                let mut total_rows = 0;
                 let mut index_start = 0i64;
 
-                // Transform the stream to add metadata
-                let transformed_stream = batch_stream.map(move |batch_result| {
+                // 用于统计的原子计数器
+                let total_rows_counter = Arc::new(AtomicUsize::new(0));
+                let batch_counter = Arc::new(AtomicUsize::new(0));
+
+                // 在闭包使用之前克隆计数器
+                let rows_counter_for_map = total_rows_counter.clone();
+                let batch_counter_for_map = batch_counter.clone();
+                let rows_counter_for_log = total_rows_counter.clone();
+                let batch_counter_for_log = batch_counter.clone();
+
+                // 🚀 关键优化：直接返回流，避免收集到 Vec
+                let processed_stream = batch_stream.map(move |batch_result| {
                     let batch = batch_result.map_err(to_datafusion_error)?;
                     let current_index = index_start;
                     index_start += batch.num_rows() as i64;
@@ -508,57 +516,76 @@ async fn get_batch_stream(
                             add_seq_num_into_batch(batch, sequence_number)?
                         },
                     };
+
+                    // 更新统计
+                    rows_counter_for_map.fetch_add(processed_batch.num_rows(), Ordering::Relaxed);
+                    batch_counter_for_map.fetch_add(1, Ordering::Relaxed);
+
                     Ok::<RecordBatch, DataFusionError>(processed_batch)
                 });
 
-                // 收集所有批次
-                pin_mut!(transformed_stream);
-                while let Some(batch) = transformed_stream.try_next().await? {
-                    total_rows += batch.num_rows();
-                    processed_batches.push(batch);
-                }
+                // 在流处理完成后添加诊断信息
+                let finalized_stream = processed_stream.chain(futures::stream::once(async move {
+                    let read_time = read_start.elapsed();
+                    let total_file_time = file_start.elapsed();
+                    active_counter.fetch_sub(1, Ordering::Relaxed);
 
-                let read_time = read_start.elapsed();
-                let total_file_time = file_start.elapsed();
-                active_counter.fetch_sub(1, Ordering::Relaxed);
+                    // 📊 更新诊断数据
+                    diagnostics.file_open_time.fetch_add(open_time.as_nanos() as u64, Ordering::Relaxed);
+                    diagnostics.total_io_wait_time.fetch_add(read_time.as_nanos() as u64, Ordering::Relaxed);
+                    diagnostics.time_in_file_read.fetch_add(total_file_time.as_nanos() as u64, Ordering::Relaxed);
 
-                // 📊 更新诊断数据
-                diagnostics.file_open_time.fetch_add(open_time.as_nanos() as u64, Ordering::Relaxed);
-                diagnostics.total_io_wait_time.fetch_add(read_time.as_nanos() as u64, Ordering::Relaxed);
-                diagnostics.time_in_file_read.fetch_add(total_file_time.as_nanos() as u64, Ordering::Relaxed);
+                    // 🔍 单文件分析
+                    let total_rows = rows_counter_for_log.load(Ordering::Relaxed);
+                    let batch_count = batch_counter_for_log.load(Ordering::Relaxed);
+                    let file_size_mb = file_size as f64 / 1024.0 / 1024.0;
+                    let throughput = file_size_mb / total_file_time.as_secs_f64();
 
-                // 🔍 单文件分析
-                let file_size_mb = file_size as f64 / 1024.0 / 1024.0;
-                let throughput = file_size_mb / total_file_time.as_secs_f64();
+                    let open_percent = (open_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
+                    let read_percent = (read_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
 
-                let open_percent = (open_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
-                let read_percent = (read_time.as_secs_f64() / total_file_time.as_secs_f64()) * 100.0;
+                    tracing::info!(
+                        "📁 File {}: {:.1}MB, {:.1}MB/s, {} rows, {} batches | Open: {:.1}%, Read: {:.1}%",
+                        file_idx, file_size_mb, throughput, total_rows, batch_count,
+                        open_percent, read_percent
+                    );
 
-                tracing::info!(
-                    "📁 File {}: {:.1}MB, {:.1}MB/s, {} rows, {} batches | Open: {:.1}%, Read: {:.1}%",
-                    file_idx, file_size_mb, throughput, total_rows, processed_batches.len(),
-                    open_percent, read_percent
-                );
+                    // 🚨 单文件瓶颈检测
+                    if throughput < 10.0 {
+                        tracing::warn!("🐌 Very slow file {}: {:.1}MB/s", file_idx, throughput);
+                    }
+                    if open_percent > 50.0 {
+                        tracing::warn!("🐌 Slow file open {}: {:.1}% of time", file_idx, open_percent);
+                    }
 
-                // 🚨 单文件瓶颈检测
-                if throughput < 10.0 {
-                    tracing::warn!("🐌 Very slow file {}: {:.1}MB/s", file_idx, throughput);
-                }
-                if open_percent > 50.0 {
-                    tracing::warn!("🐌 Slow file open {}: {:.1}% of time", file_idx, open_percent);
-                }
+                    // 返回一个标记，但会被过滤掉
+                    Err::<RecordBatch, DataFusionError>(DataFusionError::Internal("Stream end marker".to_string()))
+                }))
+                .filter_map(|result| async move {
+                    match result {
+                        Ok(batch) => Some(Ok(batch)),
+                        Err(e) if e.to_string().contains("Stream end marker") => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                });
 
-                Ok::<Vec<RecordBatch>, DataFusionError>(processed_batches)
+                Ok::<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>, DataFusionError>(Box::pin(finalized_stream))
             }
         }))
         .buffer_unordered(partition_file_concurrency); // Use calculated concurrency for this partition
 
+        // 🚀 流式处理：每个文件现在返回流而不是 Vec<RecordBatch>
         // Process batches as they come from concurrent file streams
         pin_mut!(file_streams);
-        while let Some(batches_result) = file_streams.try_next().await? {
-            for batch in batches_result {
+        while let Some(file_stream_result) = file_streams.try_next().await? {
+            // file_stream_result 现在是 Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>
+            let file_stream = file_stream_result;
+            pin_mut!(file_stream);
+
+            // 流式处理每个文件的批次
+            while let Some(batch_result) = file_stream.try_next().await? {
                 let buffer_start = Instant::now();
-                if let Some(buffered_batch) = record_batch_buffer.add(batch)? {
+                if let Some(buffered_batch) = record_batch_buffer.add(batch_result)? {
                     batch_count += 1;
                     let buffer_time = buffer_start.elapsed();
                     diagnostics.time_in_buffer_ops.fetch_add(buffer_time.as_nanos() as u64, Ordering::Relaxed);
