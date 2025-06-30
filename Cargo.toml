@@ -21,11 +21,6 @@ iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "15a4686b911d8a0847347342eda4e77f9057d29b" }
 parquet = { version = "54", features = ["async"] }
 
-# Serialization
-serde = { version = "1", features = ["rc"] }
-serde_json = { version = "1" }
-serde_with = { version = "3", features = ["json"] }
-
 # Error handling
 thiserror = "2.0.11"
 tokio = { version = "1", default-features = false }

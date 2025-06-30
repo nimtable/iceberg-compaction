@@ -16,14 +16,14 @@
 
 use derive_builder::Builder;
 use parquet::{basic::Compression, file::properties::WriterProperties};
-use serde::Deserialize;
 
-const DEFAULT_PREFIX: &str = "iceberg-compact";
-const DEFAULT_BATCH_PARALLELISM: usize = 4;
-const DEFAULT_TARGET_PARTITIONS: usize = 4;
-const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
-const DEFAULT_VALIDATE_COMPACTION: bool = false;
-const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
+pub const DEFAULT_PREFIX: &str = "iceberg-compact";
+pub const DEFAULT_BATCH_PARALLELISM: usize = 4;
+pub const DEFAULT_TARGET_PARTITIONS: usize = 4;
+pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
+pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
+pub const DEFAULT_MAX_CONCURRENT_CLOSES: usize = 4;
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -33,23 +33,30 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-#[derive(Builder, Debug, Deserialize, Default, Clone)]
+#[derive(Builder, Debug, Default, Clone)]
 pub struct CompactionConfig {
+    /// Number of batches to process in parallel during compaction
     #[builder(default = "DEFAULT_BATCH_PARALLELISM")]
     pub batch_parallelism: usize,
+    /// Target number of partitions for the compacted data
     #[builder(default = "DEFAULT_TARGET_PARTITIONS")]
     pub target_partitions: usize,
+    /// Prefix for generated data file names
     #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
+    /// Target size in bytes for each compacted file (default: 1GB)
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size: u64,
+    /// Whether to enable validation after compaction completes
     #[builder(default = "DEFAULT_VALIDATE_COMPACTION")]
     pub enable_validate_compaction: bool,
+    /// Maximum number of rows in each record batch
     #[builder(default = "DEFAULT_MAX_RECORD_BATCH_ROWS")]
     pub max_record_batch_rows: usize,
-
-    #[serde(skip)]
-    // FIXME: this is a workaround for serde not supporting default values for WriterProperties
+    /// Maximum number of concurrent file close operations
+    #[builder(default = "DEFAULT_MAX_CONCURRENT_CLOSES")]
+    pub max_concurrent_closes: usize,
+    /// Parquet writer properties for output files
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
 }

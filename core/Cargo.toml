@@ -17,9 +17,6 @@ iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
 mixtrics = "0.1.0"
 parquet = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
 	"chrono",

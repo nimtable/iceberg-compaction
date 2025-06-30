@@ -15,13 +15,15 @@
  */
 
 use datafusion::arrow::array::RecordBatch;
-use iceberg::{ErrorKind, Result};
+use futures::future;
 use iceberg::{
     spec::DataFile,
     writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
 };
+use iceberg::{ErrorKind, Result};
 use tokio::task::JoinHandle;
-use futures::future;
+
+use crate::config::{DEFAULT_MAX_CONCURRENT_CLOSES, DEFAULT_TARGET_FILE_SIZE};
 
 /// RollingIcebergWriter wraps an IcebergWriter and splits output files by target size.
 pub struct RollingIcebergWriter<B, D> {
@@ -64,17 +66,15 @@ where
                 if self.close_futures.len() >= self.max_concurrent_closes {
                     self.wait_for_one_close().await?;
                 }
-                
-                let close_handle = tokio::spawn(async move {
-                    inner_writer.close().await
-                });
+
+                let close_handle = tokio::spawn(async move { inner_writer.close().await });
                 self.close_futures.push(close_handle);
             }
-            
+
             // Create a new writer
             self.current_written_size = 0;
         }
-        
+
         // Write the batch to the current writer.
         if self.inner_writer.is_none() {
             self.inner_writer = Some(self.inner_writer_builder.clone().build().await?);
@@ -87,20 +87,22 @@ where
     /// Close the writer, ensuring all data files are finalized and returned.
     async fn close(&mut self) -> Result<Vec<DataFile>> {
         let mut data_files = std::mem::take(&mut self.data_files);
-        
+
         // Wait for all pending close operations to complete
         let close_futures = std::mem::take(&mut self.close_futures);
         for close_handle in close_futures {
             match close_handle.await {
                 Ok(Ok(files)) => data_files.extend(files),
                 Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(iceberg::Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to join close task: {}", e)
-                )),
+                Err(e) => {
+                    return Err(iceberg::Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to join close task: {}", e),
+                    ))
+                }
             }
         }
-        
+
         // Close the current writer
         if let Some(mut writer) = self.inner_writer.take() {
             data_files.extend(writer.close().await?);
@@ -117,11 +119,12 @@ impl<B, D> RollingIcebergWriter<B, D> {
         }
 
         // Use select_all to wait for the first future to complete
-        let (result, _index, remaining) = future::select_all(std::mem::take(&mut self.close_futures)).await;
-        
+        let (result, _index, remaining) =
+            future::select_all(std::mem::take(&mut self.close_futures)).await;
+
         // Put back the remaining futures
         self.close_futures = remaining;
-        
+
         // Handle the completed result
         match result {
             Ok(Ok(files)) => {
@@ -131,8 +134,8 @@ impl<B, D> RollingIcebergWriter<B, D> {
             Ok(Err(e)) => Err(e),
             Err(e) => Err(iceberg::Error::new(
                 ErrorKind::Unexpected,
-                format!("Failed to join close task: {}", e)
-            ))
+                format!("Failed to join close task: {}", e),
+            )),
         }
     }
 }
@@ -163,23 +166,29 @@ pub fn need_build_new_file(
 /// Builder for RollingIcebergWriter.
 pub struct RollingIcebergWriterBuilder<B> {
     inner_builder: B,
-    target_file_size: u64,
-    max_concurrent_closes: usize,
+    target_file_size: Option<u64>,
+    max_concurrent_closes: Option<usize>,
 }
 
 impl<B> RollingIcebergWriterBuilder<B> {
     /// Create a new RollingIcebergWriterBuilder.
-    pub fn new(inner_builder: B, target_file_size: u64) -> Self {
+    pub fn new(inner_builder: B) -> Self {
         Self {
             inner_builder,
-            target_file_size,
-            max_concurrent_closes: 10, // Default value
+            target_file_size: None,
+            max_concurrent_closes: None,
         }
     }
-    
+
+    /// Set the target file size in bytes.
+    pub fn with_target_file_size(mut self, target_file_size: u64) -> Self {
+        self.target_file_size = Some(target_file_size);
+        self
+    }
+
     /// Set the maximum number of concurrent close operations.
     pub fn with_max_concurrent_closes(mut self, max_concurrent_closes: usize) -> Self {
-        self.max_concurrent_closes = max_concurrent_closes;
+        self.max_concurrent_closes = Some(max_concurrent_closes);
         self
     }
 }
@@ -197,11 +206,13 @@ where
         Ok(RollingIcebergWriter {
             inner_writer_builder: self.inner_builder.clone(),
             inner_writer: Some(self.inner_builder.build().await?),
-            target_file_size: self.target_file_size,
+            target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE), // Default to 1 GB
             data_files: Vec::new(),
             current_written_size: 0,
             close_futures: Vec::new(),
-            max_concurrent_closes: self.max_concurrent_closes,
+            max_concurrent_closes: self
+                .max_concurrent_closes
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_CLOSES), // Default to 4 concurrent closes
         })
     }
 }

@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer};
-use ::datafusion::parquet::file::properties::WriterProperties;
+use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer, CompactionConfig};
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::{future::try_join_all, StreamExt};
@@ -87,8 +86,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     schema,
                     file_io,
                     partition_spec,
-                    config.target_file_size,
-                    config.write_parquet_properties.clone(),
+                    config.clone(),
                 )
                 .await?;
                 while let Some(b) = batch.as_mut().next().await {
@@ -129,8 +127,7 @@ impl DataFusionExecutor {
         schema: Arc<Schema>,
         file_io: FileIO,
         partition_spec: Arc<PartitionSpec>,
-        target_file_size: u64,
-        write_parquet_properties: WriterProperties,
+        config: Arc<CompactionConfig>,
     ) -> Result<Box<dyn IcebergWriter>> {
         let location_generator = DefaultLocationGenerator { dir_path };
         let unique_uuid_suffix = Uuid::now_v7();
@@ -141,7 +138,7 @@ impl DataFusionExecutor {
         );
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
-            write_parquet_properties,
+            config.write_parquet_properties.clone(),
             schema.clone(),
             file_io,
             location_generator,
@@ -150,10 +147,10 @@ impl DataFusionExecutor {
 
         let data_file_builder =
             DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-        let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
-            data_file_builder,
-            target_file_size,
-        );
+        let data_file_size_writer =
+            rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
+                .with_target_file_size(config.target_file_size)
+                .with_max_concurrent_closes(config.max_concurrent_closes);
         let iceberg_output_writer = if partition_spec.fields().is_empty() {
             Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
         } else {
