@@ -2154,7 +2154,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-core"
+name = "iceberg-catalog-rest"
+version = "0.4.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "http",
+ "iceberg",
+ "itertools 0.13.0",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "typed-builder 0.20.1",
+ "uuid",
+]
+
+[[package]]
+name = "iceberg-compaction-core"
 version = "0.1.0"
 dependencies = [
  "async-stream",
@@ -2180,12 +2200,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-example"
+name = "iceberg-compaction-example"
 version = "0.1.0"
 dependencies = [
  "iceberg",
  "iceberg-catalog-memory",
- "iceberg-compact-core",
+ "iceberg-compaction-core",
  "parquet",
  "tempfile",
  "tokio",
@@ -2660,9 +2680,9 @@ dependencies = [
 
 [[package]]
 name = "mixtrics"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "749ed12bab176c8a42c13a679dd2de12876d5ad4abe7525548e31ae001a9ebbf"
+checksum = "adbcddf5a90b959eea97ae505e0391f5c6dd411fbf546d43b9c59ad1c3bd4391"
 dependencies = [
  "itertools 0.14.0",
  "parking_lot",
@@ -3612,6 +3632,16 @@ dependencies = [
  "web-sys",
  "webpki-roots 0.26.11",
  "windows-registry",
+]
+
+[[package]]
+name = "rest-catalog-example"
+version = "0.1.0"
+dependencies = [
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-compaction-core",
+ "tokio",
 ]
 
 [[package]]

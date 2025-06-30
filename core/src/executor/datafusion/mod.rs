@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 iceberg-compact
+ * Copyright 2025 iceberg-compaction
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .execute(datafusion_task_ctx)
             .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(config.batch_parallelism);
+        let mut futures = Vec::with_capacity(config.executor_parallelism);
         // build iceberg writer for each partition
         for mut batch in batches {
             let dir_path = dir_path.clone();

@@ -94,8 +94,8 @@ impl CompactionValidator {
 
         let validator_config = Arc::new(
             CompactionConfigBuilder::default()
-                .batch_parallelism(config.batch_parallelism)
-                .target_partitions(config.target_partitions)
+                .executor_parallelism(config.executor_parallelism)
+                .output_parallelism(config.output_parallelism)
                 .build()
                 .map_err(|e| CompactionError::Config(e.to_string()))?,
         );

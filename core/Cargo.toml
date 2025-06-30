@@ -1,5 +1,5 @@
 [package]
-name = "iceberg-compact-core"
+name = "iceberg-compaction-core"
 version = "0.1.0"
 edition = "2024"
 
@@ -15,7 +15,7 @@ iceberg = { workspace = true }
 iceberg-catalog-memory = { workspace = true }
 iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
-mixtrics = "0.1.0"
+mixtrics = "0.2.0"
 parquet = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
