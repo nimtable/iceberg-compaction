@@ -17,15 +17,15 @@
 use std::sync::Arc;
 
 use crate::{
+    CompactionConfig,
     error::{CompactionError, Result},
     executor::InputFileScanTasks,
-    CompactionConfig,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
-        ExecutionPlanProperties, Partitioning,
+        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
+        repartition::RepartitionExec,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -55,7 +55,11 @@ impl DatafusionProcessor {
     pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.executor_parallelism)
-            .with_batch_size(config.max_record_batch_rows);
+            .with_batch_size(config.max_record_batch_rows)
+            .set_bool(
+                "datafusion.sql_parser.enable_ident_normalization",
+                config.enable_normalized_column_identifiers,
+            );
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
         let table_register = DatafusionTableRegister::new(
             file_io,

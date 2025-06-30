@@ -24,6 +24,7 @@ pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
 pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 pub const DEFAULT_MAX_CONCURRENT_CLOSES: usize = 4;
+pub const DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS: bool = true;
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -60,4 +61,10 @@ pub struct CompactionConfig {
     /// Parquet writer properties for output files
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
+    /// The executor engine will normalize un-quoted column identifiers to lowercase (default: true).
+    ///
+    /// Some Iceberg engines allow creating tables with case sensitive column names;
+    /// to compact those tables, set this value to false.
+    #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
+    pub enable_normalized_column_identifiers: bool,
 }
