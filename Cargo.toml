@@ -13,13 +13,13 @@ futures-async-stream = "0.2.9"
 iceberg-compaction-core = { path = "./core" }
 
 # Data processing and storage
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7f941d0db6378decd671c72efd9137597d3a548c", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484", features = [
     "storage-s3",
     "storage-gcs",
 ] }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7f941d0db6378decd671c72efd9137597d3a548c" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7f941d0db6378decd671c72efd9137597d3a548c" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "7f941d0db6378decd671c72efd9137597d3a548c" }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 parquet = { version = "54", features = ["async"] }
 
 # Error handling
