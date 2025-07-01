@@ -18,10 +18,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use iceberg::io::FileIOBuilder;
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_memory::MemoryCatalog;
+use iceberg_compaction_core::iceberg::io::FileIOBuilder;
+use iceberg_compaction_core::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg_compaction_core::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use iceberg_compaction_core::iceberg_catalog_memory::MemoryCatalog;
 
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::CompactionConfigBuilder;

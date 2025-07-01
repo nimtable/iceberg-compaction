@@ -2186,6 +2186,7 @@ dependencies = [
  "futures-async-stream",
  "iceberg",
  "iceberg-catalog-memory",
+ "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -2203,8 +2204,6 @@ dependencies = [
 name = "iceberg-compaction-example"
 version = "0.1.0"
 dependencies = [
- "iceberg",
- "iceberg-catalog-memory",
  "iceberg-compaction-core",
  "parquet",
  "tempfile",
@@ -3638,8 +3637,6 @@ dependencies = [
 name = "rest-catalog-example"
 version = "0.1.0"
 dependencies = [
- "iceberg",
- "iceberg-catalog-rest",
  "iceberg-compaction-core",
  "tokio",
 ]
