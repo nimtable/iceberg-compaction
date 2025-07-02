@@ -256,9 +256,9 @@ impl Compaction {
             None
         };
 
-        // Step 2: Create rewrite request (extensible)
+        // Step 2: Create rewrite request
         let rewrite_files_request = self
-            .create_rewrite_request(&table, input_file_scan_tasks)
+            .create_rewrite_request(&table, input_file_scan_tasks.clone())
             .await?;
 
         // Step 3: Execute rewrite
@@ -288,6 +288,7 @@ impl Compaction {
             .commit_compaction_results(
                 &table,
                 output_data_files_for_commit,
+                &input_file_scan_tasks,
                 current_snapshot,
                 table.file_io(),
             )
@@ -409,6 +410,7 @@ impl Compaction {
         &self,
         table: &Table,
         output_data_files: Vec<DataFile>,
+        input_file_scan_tasks: &InputFileScanTasks,
         snapshot: &Arc<Snapshot>,
         file_io: &FileIO,
     ) -> Result<Table> {
@@ -427,14 +429,27 @@ impl Compaction {
             consistency_params,
         );
 
-        let (data_files, delete_files) =
+        let (all_data_files, all_delete_files) =
             get_all_files_from_snapshot(snapshot, file_io, table.metadata()).await?;
 
+        // Collect file paths from all input scan tasks
+        let input_file_paths: std::collections::HashSet<&str> = input_file_scan_tasks
+            .data_files
+            .iter()
+            .chain(&input_file_scan_tasks.position_delete_files)
+            .chain(&input_file_scan_tasks.equality_delete_files)
+            .map(|task| task.data_file_path())
+            .collect();
+
+        // Filter all files to only include those from input scan tasks
+        let input_files: Vec<DataFile> = all_data_files
+            .into_iter()
+            .chain(all_delete_files.into_iter())
+            .filter(|file| input_file_paths.contains(file.file_path()))
+            .collect();
+
         commit_manager
-            .rewrite_files(
-                output_data_files,
-                data_files.into_iter().chain(delete_files.into_iter()),
-            )
+            .rewrite_files(output_data_files, input_files)
             .await
     }
 }
@@ -804,6 +819,20 @@ mod tests {
         .unwrap()
     }
 
+    fn create_test_record_batch(iceberg_schema: &Schema) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+
+        // Convert iceberg schema to arrow schema to ensure field ID consistency
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap()
+    }
+
     async fn build_equality_delta_writer(
         table: &Table,
         warehouse_location: String,
@@ -898,6 +927,41 @@ mod tests {
         delta_builder.build().await.unwrap()
     }
 
+    async fn build_simple_data_writer(
+        table: &Table,
+        warehouse_location: String,
+        file_name_suffix: &str,
+    ) -> impl IcebergWriter {
+        let table_schema = table.metadata().current_schema();
+
+        // Set up writer
+        let location_generator = DefaultLocationGenerator {
+            dir_path: warehouse_location,
+        };
+
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "data".to_string(),
+            Some(file_name_suffix.to_string()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table_schema.clone(),
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+
+        let data_file_builder = DataFileWriterBuilder::new(
+            parquet_writer_builder,
+            None,
+            table.metadata().default_partition_spec().spec_id(),
+        );
+
+        data_file_builder.build().await.unwrap()
+    }
+
     #[tokio::test]
     async fn test_write_commit_and_compaction() {
         // Create a temporary directory for the warehouse location
@@ -980,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_small_files_compaction() {
+    async fn test_full_compaction() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
         let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
@@ -1004,11 +1068,13 @@ mod tests {
 
         let insert_batch = create_test_record_batch_with_pos(&simple_table_schema_with_pos(), true);
 
-        // Write data (insert): generate data files
+        // Write multiple batches to create multiple files
+        writer.write(insert_batch.clone()).await.unwrap();
         writer.write(insert_batch.clone()).await.unwrap();
         writer.write(insert_batch).await.unwrap();
 
         let data_files = writer.close().await.unwrap();
+        let initial_file_count = data_files.len();
 
         // Start transaction and commit
         let transaction = Transaction::new(&table);
@@ -1019,16 +1085,13 @@ mod tests {
         // Commit the transaction
         let _updated_table = tx.commit(&catalog).await.unwrap();
 
-        // Test small files compaction
+        // Test full compaction - should compact all files
         let rewrite_files_stat = CompactionBuilder::new()
             .with_catalog(Arc::new(catalog))
             .with_table_ident(table_ident.clone())
-            .with_compaction_type(super::CompactionType::SmallFiles)
+            .with_compaction_type(super::CompactionType::Full)
             .with_config(Arc::new(
-                CompactionConfigBuilder::default()
-                    .small_file_threshold(1024 * 1024 * 100) // 100MB threshold
-                    .build()
-                    .unwrap(),
+                CompactionConfigBuilder::default().build().unwrap(),
             ))
             .build()
             .await
@@ -1037,7 +1100,192 @@ mod tests {
             .await
             .unwrap();
 
-        // Should rewrite small files
-        assert!(rewrite_files_stat.rewritten_files_count > 0);
+        // Full compaction should rewrite all existing files
+        assert_eq!(
+            rewrite_files_stat.rewritten_files_count,
+            initial_file_count as u32
+        );
+        // Should create at least 1 new file from all the data (might be more depending on size)
+        assert!(rewrite_files_stat.added_files_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_small_files_compaction_with_validation() {
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        // Create multiple small data files
+        let mut small_writer1 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "small1").await;
+        let batch = create_test_record_batch(&simple_table_schema());
+        small_writer1.write(batch.clone()).await.unwrap();
+        let small_files1 = small_writer1.close().await.unwrap();
+
+        let mut small_writer2 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "small2").await;
+        small_writer2.write(batch.clone()).await.unwrap();
+        let small_files2 = small_writer2.close().await.unwrap();
+
+        // Create a larger file by writing multiple batches
+        let mut large_writer =
+            build_simple_data_writer(&table, warehouse_location.clone(), "large").await;
+        // Write multiple batches to make it larger
+        for _ in 0..10 {
+            large_writer.write(batch.clone()).await.unwrap();
+        }
+        let large_files = large_writer.close().await.unwrap();
+
+        // Commit all files
+        let mut all_data_files = Vec::new();
+        all_data_files.extend(small_files1);
+        all_data_files.extend(small_files2);
+        all_data_files.extend(large_files);
+
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(all_data_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
+
+        // Commit the transaction
+        let updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Get files before compaction for validation
+        let snapshot_before = updated_table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot_before
+            .load_manifest_list(updated_table.file_io(), updated_table.metadata())
+            .await
+            .unwrap();
+
+        let mut data_files_before = Vec::new();
+        for manifest in manifest_list.entries() {
+            let manifest_file = manifest
+                .load_manifest(updated_table.file_io())
+                .await
+                .unwrap();
+
+            for entry in manifest_file.entries() {
+                if entry.is_alive() {
+                    data_files_before.push(entry.data_file().clone());
+                }
+            }
+        }
+
+        // Test small files compaction with a threshold that should only select small files
+        let small_file_threshold = 10_000; // 10KB threshold - should only compact really small files
+        let catalog_arc = Arc::new(catalog);
+        let compaction = CompactionBuilder::new()
+            .with_catalog(catalog_arc.clone())
+            .with_table_ident(table_ident.clone())
+            .with_compaction_type(super::CompactionType::SmallFiles)
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .small_file_threshold(small_file_threshold)
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        // Get the files that would be selected for compaction
+        let files_to_compact = compaction
+            .select_files_for_compaction(&updated_table, snapshot_before.snapshot_id())
+            .await
+            .unwrap();
+
+        // Validate file selection logic
+        let selected_file_paths: std::collections::HashSet<&str> = files_to_compact
+            .data_files
+            .iter()
+            .map(|task| task.data_file_path())
+            .collect();
+
+        // Verify that only small files are selected for compaction
+        let small_files_count = data_files_before
+            .iter()
+            .filter(|file| file.file_size_in_bytes() < small_file_threshold as u64)
+            .count();
+
+        for data_file in &data_files_before {
+            if data_file.file_size_in_bytes() < small_file_threshold as u64 {
+                assert!(
+                    selected_file_paths.contains(data_file.file_path()),
+                    "Small file {} (size: {}) should be selected for compaction",
+                    data_file.file_path(),
+                    data_file.file_size_in_bytes()
+                );
+            } else {
+                assert!(
+                    !selected_file_paths.contains(data_file.file_path()),
+                    "Large file {} (size: {}) should NOT be selected for compaction",
+                    data_file.file_path(),
+                    data_file.file_size_in_bytes()
+                );
+            }
+        }
+
+        // Ensure we have small files to test compaction with
+        assert!(
+            small_files_count > 0,
+            "Test setup should create small files to compact"
+        );
+
+        // Execute the actual compaction
+        let rewrite_files_stat = compaction.compact().await.unwrap();
+
+        // Validate compaction results
+        assert_eq!(
+            rewrite_files_stat.rewritten_files_count,
+            small_files_count as u32
+        );
+        assert!(rewrite_files_stat.added_files_count > 0);
+
+        // Verify final state - load the table after compaction
+        let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
+        let final_snapshot = final_table.metadata().current_snapshot().unwrap();
+        let final_manifest_list = final_snapshot
+            .load_manifest_list(final_table.file_io(), final_table.metadata())
+            .await
+            .unwrap();
+
+        let mut final_data_files = Vec::new();
+        for manifest in final_manifest_list.entries() {
+            let manifest_file = manifest.load_manifest(final_table.file_io()).await.unwrap();
+
+            for entry in manifest_file.entries() {
+                if entry.is_alive() {
+                    final_data_files.push(entry.data_file().clone());
+                }
+            }
+        }
+
+        // Verify that large files are still present (unchanged)
+        let final_file_paths: std::collections::HashSet<&str> = final_data_files
+            .iter()
+            .map(|file| file.file_path())
+            .collect();
+
+        for data_file in &data_files_before {
+            if data_file.file_size_in_bytes() >= small_file_threshold as u64 {
+                assert!(
+                    final_file_paths.contains(data_file.file_path()),
+                    "Large file {} should still be present after compaction",
+                    data_file.file_path()
+                );
+            }
+        }
     }
 }
