@@ -22,7 +22,9 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod executor;
+pub mod file_selection;
 
 pub use config::CompactionConfig;
 pub use error::{CompactionError, Result};
 pub use executor::CompactionExecutor;
+pub use file_selection::strategy::FileStrategyFactory;
