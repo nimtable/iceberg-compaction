@@ -26,25 +26,20 @@ use crate::executor::{
     create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
     RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::file_selection::FileSelector;
 use crate::CompactionError;
 use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
-use futures_async_stream::for_await;
-use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
 
-mod strategy;
 mod validator;
-
-pub use strategy::FileStrategyFactory;
 
 pub enum CompactionType {
     Full,
@@ -374,13 +369,10 @@ impl Compaction {
         table: &Table,
         snapshot_id: i64,
     ) -> Result<InputFileScanTasks> {
-        get_scan_tasks_from_table_with_snapshot_id(
-            table,
-            snapshot_id,
-            &self.compaction_type,
-            &self.config,
-        )
-        .await
+        use crate::file_selection::strategy::FileStrategyFactory;
+
+        let strategy = FileStrategyFactory::create_strategy(&self.compaction_type, &self.config);
+        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
     }
 
     /// Hook for customizing the rewrite request configuration
@@ -484,72 +476,6 @@ async fn get_all_files_from_snapshot(
         }
     }
     Ok((data_file, delete_file))
-}
-
-async fn get_scan_tasks_from_table_with_snapshot_id(
-    table: &Table,
-    snapshot_id: i64,
-    compaction_type: &CompactionType,
-    config: &CompactionConfig,
-) -> Result<InputFileScanTasks> {
-    let scan = table
-        .scan()
-        .snapshot_id(snapshot_id)
-        .with_delete_file_processing_enabled(true)
-        .build()?;
-
-    let file_scan_stream = scan.plan_files().await?;
-
-    let mut data_files = vec![];
-
-    #[for_await]
-    for task in file_scan_stream {
-        let task: FileScanTask = task?;
-        match task.data_file_content {
-            iceberg::spec::DataContentType::Data => {
-                data_files.push(task);
-            }
-            _ => {
-                unreachable!()
-            }
-        }
-    }
-
-    // Apply file filtering strategies based on compaction type
-    let strategy = FileStrategyFactory::create_strategy(compaction_type, config);
-    let filtered_data_files = strategy.filter(data_files)?;
-
-    // Extract delete files from the filtered data files
-    let mut position_delete_files = HashMap::new();
-    let mut equality_delete_files = HashMap::new();
-
-    for task in &filtered_data_files {
-        for delete_task in task.deletes.iter() {
-            match &delete_task.data_file_content {
-                iceberg::spec::DataContentType::PositionDeletes => {
-                    let mut delete_task = delete_task.clone();
-                    delete_task.project_field_ids = vec![];
-                    position_delete_files.insert(delete_task.data_file_path.clone(), delete_task);
-                }
-                iceberg::spec::DataContentType::EqualityDeletes => {
-                    let mut delete_task = delete_task.clone();
-                    delete_task.project_field_ids = delete_task.equality_ids.clone();
-                    equality_delete_files.insert(delete_task.data_file_path.clone(), delete_task);
-                }
-                _ => {
-                    unreachable!()
-                }
-            }
-        }
-    }
-
-    let filtered_tasks = InputFileScanTasks {
-        data_files: filtered_data_files,
-        position_delete_files: position_delete_files.into_values().collect(),
-        equality_delete_files: equality_delete_files.into_values().collect(),
-    };
-
-    Ok(filtered_tasks)
 }
 
 /// Configuration for the commit manager, including retry strategies.
@@ -1213,14 +1139,19 @@ mod tests {
             .map(|task| task.data_file_path())
             .collect();
 
-        // Verify that only small files are selected for compaction
         let small_files_count = data_files_before
             .iter()
-            .filter(|file| file.file_size_in_bytes() < small_file_threshold as u64)
+            .filter(|file| file.file_size_in_bytes() < small_file_threshold)
             .count();
 
+        let large_files_count = data_files_before
+            .iter()
+            .filter(|file| file.file_size_in_bytes() >= small_file_threshold)
+            .count();
+
+        // Verify that only small files are selected
         for data_file in &data_files_before {
-            if data_file.file_size_in_bytes() < small_file_threshold as u64 {
+            if data_file.file_size_in_bytes() < small_file_threshold {
                 assert!(
                     selected_file_paths.contains(data_file.file_path()),
                     "Small file {} (size: {}) should be selected for compaction",
@@ -1237,13 +1168,13 @@ mod tests {
             }
         }
 
-        // Ensure we have small files to test compaction with
+        // Ensure we have small files to test with
         assert!(
             small_files_count > 0,
             "Test setup should create small files to compact"
         );
 
-        // Execute the actual compaction
+        // Run the actual compaction
         let rewrite_files_stat = compaction.compact().await.unwrap();
 
         // Validate compaction results
@@ -1251,9 +1182,12 @@ mod tests {
             rewrite_files_stat.rewritten_files_count,
             small_files_count as u32
         );
+
+        // Should create fewer files than were compacted (compaction benefit)
+        assert!(rewrite_files_stat.added_files_count <= small_files_count as u32);
         assert!(rewrite_files_stat.added_files_count > 0);
 
-        // Verify final state - load the table after compaction
+        // Verify final state: total files should be reduced
         let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
         let final_snapshot = final_table.metadata().current_snapshot().unwrap();
         let final_manifest_list = final_snapshot
@@ -1272,14 +1206,19 @@ mod tests {
             }
         }
 
-        // Verify that large files are still present (unchanged)
+        // Final file count should be: large_files + newly_created_files
+        let expected_final_count =
+            large_files_count + rewrite_files_stat.added_files_count as usize;
+        assert_eq!(final_data_files.len(), expected_final_count);
+
+        // Verify that large files are still present and untouched
         let final_file_paths: std::collections::HashSet<&str> = final_data_files
             .iter()
             .map(|file| file.file_path())
             .collect();
 
         for data_file in &data_files_before {
-            if data_file.file_size_in_bytes() >= small_file_threshold as u64 {
+            if data_file.file_size_in_bytes() >= small_file_threshold {
                 assert!(
                     final_file_paths.contains(data_file.file_path()),
                     "Large file {} should still be present after compaction",
