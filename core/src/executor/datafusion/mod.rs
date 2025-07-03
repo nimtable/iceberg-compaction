@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-use parquet::file::properties::WriterProperties;
-use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer, CompactionConfig};
+use crate::{CompactionConfig, error::Result, executor::iceberg_writer::rolling_iceberg_writer};
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::{StreamExt, future::try_join_all};
@@ -32,6 +31,7 @@ use iceberg::{
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
     },
 };
+use parquet::file::properties::WriterProperties;
 use sqlx::types::Uuid;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -139,9 +139,9 @@ pub async fn build_iceberg_data_file_writer(
     .await?;
     let data_file_builder =
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-    let data_file_size_writer = rolling_iceberg_writer::RollingIcebergWriterBuilder::new(
-        data_file_builder,
-    ).with_target_file_size(config.target_file_size);
+    let data_file_size_writer =
+        rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
+            .with_target_file_size(config.target_file_size);
     let iceberg_output_writer = if partition_spec.fields().is_empty() {
         Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
     } else {
