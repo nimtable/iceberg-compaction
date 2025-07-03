@@ -98,8 +98,6 @@ impl CompactionExecutor for DataFusionExecutor {
                 // Process each record batch with metrics
                 let mut fetch_batch_start = Instant::now();
                 while let Some(batch_result) = batch_stream.as_mut().next().await {
-                    // let fetch_start = Instant::now();
-
                     if let Some(metrics_recorder) = &metrics_recorder {
                         metrics_recorder.record_datafusion_batch_fetch_duration(
                             fetch_batch_start.elapsed().as_millis() as f64,
