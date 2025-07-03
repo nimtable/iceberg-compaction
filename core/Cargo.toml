@@ -1,5 +1,5 @@
 [package]
-name = "iceberg-compact-core"
+name = "iceberg-compaction-core"
 version = "0.1.0"
 edition = "2024"
 
@@ -19,11 +19,8 @@ rand = { workspace = true }
 port_scanner = { workspace = true }
 ctor = { workspace = true }
 itertools = "0.13.0"
-mixtrics = "0.1.0"
+mixtrics = "0.2.0"
 parquet = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
 	"chrono",

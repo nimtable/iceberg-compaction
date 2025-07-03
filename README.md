@@ -1,6 +1,9 @@
-# iceberg-compact
+# Compaction Runtime for Apache Iceberg™
 
-iceberg-compact is a high-performance Iceberg table compaction runtime built on Rust, optimized specifically for large-scale data lakes. This tool specializes in compacting Apache Iceberg tables efficiently and safely.
+**Disclaimer:** This project is not affiliated with or endorsed by the Apache Software Foundation. “Apache”, “Apache Iceberg”, and related marks are trademarks of the ASF.
+
+`iceberg-compaction` is a high-performance Rust-based engine that compacts Apache Iceberg™ tables efficiently and safely at scale.
+
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -22,7 +25,7 @@ iceberg-compact is a high-performance Iceberg table compaction runtime built on 
 
 ### Memory Catalog Example
 
-We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compact for Iceberg table compaction:
+We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compaction for Iceberg table compaction:
 
 ```bash
 # Navigate to the example directory
@@ -35,7 +38,7 @@ cargo run
 The example includes:
 - Setting up an in-memory Iceberg catalog
 - Creating a sample table.
-- Performing table compaction using iceberg-compact
+- Performing table compaction using iceberg-compaction
 
 For more details, see the [memory-catalog example](./examples/memory-catalog/).
 

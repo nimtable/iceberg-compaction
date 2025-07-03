@@ -2101,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=a43641762eafe135498b886db2257102f3069484#a43641762eafe135498b886db2257102f3069484"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2153,7 +2153,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-memory"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=a43641762eafe135498b886db2257102f3069484#a43641762eafe135498b886db2257102f3069484"
 dependencies = [
  "async-trait",
  "futures",
@@ -2166,7 +2166,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=a43641762eafe135498b886db2257102f3069484#a43641762eafe135498b886db2257102f3069484"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2184,7 +2184,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-core"
+name = "iceberg-compaction-core"
 version = "0.1.0"
 dependencies = [
  "async-stream",
@@ -2204,9 +2204,6 @@ dependencies = [
  "parquet",
  "port_scanner",
  "rand 0.9.1",
- "serde",
- "serde_json",
- "serde_with",
  "sqlx",
  "tempfile",
  "thiserror 2.0.12",
@@ -2217,12 +2214,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-compact-example"
+name = "iceberg-compaction-example"
 version = "0.1.0"
 dependencies = [
  "iceberg",
  "iceberg-catalog-memory",
- "iceberg-compact-core",
+ "iceberg-compaction-core",
  "parquet",
  "tempfile",
  "tokio",
@@ -2231,7 +2228,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=15a4686b911d8a0847347342eda4e77f9057d29b#15a4686b911d8a0847347342eda4e77f9057d29b"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=a43641762eafe135498b886db2257102f3069484#a43641762eafe135498b886db2257102f3069484"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2697,9 +2694,9 @@ dependencies = [
 
 [[package]]
 name = "mixtrics"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "749ed12bab176c8a42c13a679dd2de12876d5ad4abe7525548e31ae001a9ebbf"
+checksum = "adbcddf5a90b959eea97ae505e0391f5c6dd411fbf546d43b9c59ad1c3bd4391"
 dependencies = [
  "itertools 0.14.0",
  "parking_lot",
@@ -3655,6 +3652,16 @@ dependencies = [
  "web-sys",
  "webpki-roots 0.26.11",
  "windows-registry",
+]
+
+[[package]]
+name = "rest-catalog-example"
+version = "0.1.0"
+dependencies = [
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-compaction-core",
+ "tokio",
 ]
 
 [[package]]
@@ -5204,7 +5211,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
