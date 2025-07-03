@@ -17,6 +17,7 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a
     "storage-s3",
     "storage-gcs",
 ] }
+iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
