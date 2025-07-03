@@ -20,6 +20,9 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a
 iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
+rand = "0.9.1"
+port_scanner = "0.1.5"
+ctor = "0.2.8"
 parquet = { version = "54", features = ["async"] }
 
 # Error handling
