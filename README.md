@@ -42,39 +42,39 @@ The example includes:
 
 For more details, see the [rest-catalog example](./examples/rest-catalog/).
 
-# Development Roadmap
+## Development Roadmap
 
-## Performance 🚀
+### Performance 🚀
 
 - [ ] Partial compaction: Support incremental compaction strategies
 - [ ] Compaction Policy: Multiple built-in policies (size-based, time-based, cost-optimized)
 - [ ] Built-in cache: Metadata and query result caching for improved performance
 
-## Stability 🔒
+### Stability 🔒
 
 - [ ] Spill to disk: Handle large datasets that exceed memory limits
 - [ ] Network rebuild: Robust handling of network failures and retries
 - [ ] Task breakpoint resume: Resume operations from failure points
 - [ ] E2E test framework: Comprehensive testing infrastructure
 
-## Observability 📊
+### Observability 📊
 
 - [ ] Job progress display: Progress tracking
 - [ ] Comprehensive compaction metrics: Detailed performance and operation metrics
 
-## Customizability 🎛️
+### Customizability 🎛️
 
 - [ ] Tune parquet: Configurable Parquet writer parameters
 - [ ] Fine-grained configurable compaction parameters: Extensive customization options
 
-## Functionality ⚙️
+### Functionality ⚙️
 
-### iceberg-rust
+#### iceberg-rust
 
 - [ ] Expire snapshot
 - [ ] Rewrite manifest
 
-### iceberg-compaction
+#### iceberg-compaction
 
 - [ ] Binpack/Sort/ZOrder Compaction
 - [ ] Clustering / Order by: Support for data reorganization and sorting
