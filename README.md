@@ -67,7 +67,7 @@ For more details, see the [rest-catalog example](./examples/rest-catalog/).
 - [ ] Tune parquet: Configurable Parquet writer parameters
 - [ ] Fine-grained configurable compaction parameters: Extensive customization options
 
-## Functionality
+## Functionality ⚙️
 
 ### iceberg-rust
 
