@@ -45,31 +45,37 @@ For more details, see the [rest-catalog example](./examples/rest-catalog/).
 # Development Roadmap
 
 ## Performance 🚀
-- [] Partial compaction: Support incremental compaction strategies
-- [] Compaction Policy: Multiple built-in policies (size-based, time-based, cost-optimized)
-- [] Built-in cache: Metadata and query result caching for improved performance
+
+- [ ] Partial compaction: Support incremental compaction strategies
+- [ ] Compaction Policy: Multiple built-in policies (size-based, time-based, cost-optimized)
+- [ ] Built-in cache: Metadata and query result caching for improved performance
 
 ## Stability 🔒
-- [] Spill to disk: Handle large datasets that exceed memory limits
-- [] Network rebuild: Robust handling of network failures and retries
-- [] Task breakpoint resume: Resume operations from failure points
-- [] E2E test framework: Comprehensive testing infrastructure
+
+- [ ] Spill to disk: Handle large datasets that exceed memory limits
+- [ ] Network rebuild: Robust handling of network failures and retries
+- [ ] Task breakpoint resume: Resume operations from failure points
+- [ ] E2E test framework: Comprehensive testing infrastructure
 
 ## Observability 📊
-- [] Job progress display: Progress tracking
-- [] Comprehensive compaction metrics: Detailed performance and operation metrics
+
+- [ ] Job progress display: Progress tracking
+- [ ] Comprehensive compaction metrics: Detailed performance and operation metrics
 
 ## Customizability 🎛️
-- [] Tune parquet: Configurable Parquet writer parameters
-- [] Fine-grained configurable compaction parameters: Extensive customization options
+
+- [ ] Tune parquet: Configurable Parquet writer parameters
+- [ ] Fine-grained configurable compaction parameters: Extensive customization options
 
 ## Functionality
 
 ### iceberg-rust
-- [] Expire snapshot
-- [] Rewrite manifest
+
+- [ ] Expire snapshot
+- [ ] Rewrite manifest
 
 ### iceberg-compaction
-- [] binpack, sort, zorder compaction
-- [] Clustering / Order by: Support for data reorganization and sorting
-- [] File clean: Delete orphan files
+
+- [ ] Binpack/Sort/ZOrder Compaction
+- [ ] Clustering / Order by: Support for data reorganization and sorting
+- [ ] File clean: Delete orphan files
