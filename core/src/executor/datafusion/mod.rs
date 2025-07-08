@@ -14,21 +14,21 @@
  * limitations under the License.
  */
 
-use crate::{CompactionConfig, error::Result, executor::iceberg_writer::rolling_iceberg_writer};
+use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer, CompactionConfig};
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
+use futures::{future::try_join_all, StreamExt};
 use iceberg::{
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use parquet::file::properties::WriterProperties;
@@ -141,7 +141,11 @@ pub async fn build_iceberg_data_file_writer(
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(config.target_file_size);
+            .with_target_file_size(config.target_file_size)
+            .with_max_concurrent_closes(config.max_concurrent_closes)
+            .with_dynamic_size_estimation(config.enable_dynamic_size_estimation)
+            .with_size_estimation_smoothing_factor(config.size_estimation_smoothing_factor);
+
     let iceberg_output_writer = if partition_spec.fields().is_empty() {
         Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
     } else {
