@@ -44,7 +44,7 @@ pub const SYS_HIDDEN_FILE_PATH: &str = "sys_hidden_file_path";
 pub const SYS_HIDDEN_POS: &str = "sys_hidden_pos";
 const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS];
 
-/// DataFusion processor for Iceberg compaction with merge-on-read optimization
+/// `DataFusion` processor for Iceberg compaction with merge-on-read optimization
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
     ctx: Arc<SessionContext>,
@@ -74,7 +74,7 @@ impl DatafusionProcessor {
         }
     }
 
-    /// Registers all necessary tables (data files, position deletes, equality deletes) with DataFusion
+    /// Registers all necessary tables (data files, position deletes, equality deletes) with `DataFusion`
     pub fn register_tables(&self, mut datafusion_task_ctx: DataFusionTaskContext) -> Result<()> {
         // Register data file table if present
         if let Some(datafile_schema) = datafusion_task_ctx.data_file_schema.take() {
@@ -123,10 +123,10 @@ impl DatafusionProcessor {
         Ok(())
     }
 
-    /// Executes the compaction query using DataFusion
+    /// Executes the compaction query using `DataFusion`
     ///
     /// This method:
-    /// 1. Registers all necessary tables with DataFusion
+    /// 1. Registers all necessary tables with `DataFusion`
     /// 2. Creates and executes the merge-on-read SQL query
     /// 3. Applies repartitioning if needed for optimal parallelism
     /// 4. Returns streaming result batches and the input schema
@@ -283,7 +283,7 @@ impl<'a> SqlBuilder<'a> {
     /// 3. Optionally joins with equality delete files to exclude rows based on equality conditions
     pub fn build_merge_on_read_sql(self) -> Result<String> {
         let data_file_table_name = self.data_file_table_name.as_ref().ok_or_else(|| {
-            CompactionError::Execution("Data file table name is not provided".to_string())
+            CompactionError::Execution("Data file table name is not provided".to_owned())
         })?;
 
         // Determine which hidden columns are needed for join conditions
@@ -302,11 +302,11 @@ impl<'a> SqlBuilder<'a> {
         // Build the complete column list including hidden columns for internal queries
         let mut internal_columns = self.project_names.clone();
         if need_seq_num {
-            internal_columns.push(SYS_HIDDEN_SEQ_NUM.to_string());
+            internal_columns.push(SYS_HIDDEN_SEQ_NUM.to_owned());
         }
         if need_file_path_and_pos {
-            internal_columns.push(SYS_HIDDEN_FILE_PATH.to_string());
-            internal_columns.push(SYS_HIDDEN_POS.to_string());
+            internal_columns.push(SYS_HIDDEN_FILE_PATH.to_owned());
+            internal_columns.push(SYS_HIDDEN_POS.to_owned());
         }
 
         // Start with a SELECT query that includes all necessary columns
@@ -322,7 +322,7 @@ impl<'a> SqlBuilder<'a> {
             let position_delete_table_name =
                 self.position_delete_table_name.as_ref().ok_or_else(|| {
                     CompactionError::Execution(
-                        "Position delete table name is not provided".to_string(),
+                        "Position delete table name is not provided".to_owned(),
                     )
                 })?;
 
@@ -596,7 +596,7 @@ impl DataFusionTaskContextBuilder {
         })
     }
 
-    /// Builds an equality delete schema based on the given equality_ids
+    /// Builds an equality delete schema based on the given `equality_ids`
     fn build_equality_delete_schema(
         &self,
         equality_ids: &[i32],
@@ -1046,7 +1046,7 @@ mod tests {
 
         let meta = EqualityDeleteMetadata {
             equality_delete_schema: schema,
-            equality_delete_table_name: "test_table".to_string(),
+            equality_delete_table_name: "test_table".to_owned(),
             file_scan_tasks: vec![],
         };
 
@@ -1058,7 +1058,7 @@ mod tests {
     ///
     /// This test ensures that when we have both position deletes and equality deletes,
     /// the generated SQL correctly includes hidden columns in all nested subqueries,
-    /// preventing the "No field named _data_file_table.sys_hidden_seq_num" error.
+    /// preventing the "No field named `_data_file_table.sys_hidden_seq_num`" error.
     #[test]
     fn test_nested_table_alias_hidden_columns_fix() {
         let project_names = vec![
@@ -1086,7 +1086,7 @@ mod tests {
                 ])
                 .build()
                 .unwrap(),
-            "_equality_delete_table_0".to_string(),
+            "_equality_delete_table_0".to_owned(),
         );
 
         let equality_delete_metadatas = vec![equality_delete_metadata];
@@ -1095,8 +1095,8 @@ mod tests {
         // This creates the most complex nested SQL structure
         let builder = SqlBuilder::new(
             &project_names,
-            Some("_position_delete_table".to_string()),
-            Some("_data_file_table".to_string()),
+            Some("_position_delete_table".to_owned()),
+            Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             true, // need_file_path_and_pos = true (triggers position delete logic)
         );
@@ -1133,7 +1133,7 @@ mod tests {
                 ])
                 .build()
                 .unwrap(),
-            "_equality_delete_table_0".to_string(),
+            "_equality_delete_table_0".to_owned(),
         );
 
         let equality_delete_metadatas = vec![equality_delete_metadata];
@@ -1142,7 +1142,7 @@ mod tests {
         let builder = SqlBuilder::new(
             &project_names,
             None, // No position delete table
-            Some("_data_file_table".to_string()),
+            Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             false, // need_file_path_and_pos = false
         );
@@ -1164,8 +1164,8 @@ mod tests {
         // Test scenario: ONLY position deletes (no equality deletes)
         let builder = SqlBuilder::new(
             &project_names,
-            Some("_position_delete_table".to_string()),
-            Some("_data_file_table".to_string()),
+            Some("_position_delete_table".to_owned()),
+            Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             true, // need_file_path_and_pos = true
         );
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// Test that verifies SQL generation works correctly with no deletes
     ///
-    /// This is the simplest case - should not add any hidden columns or wrap in final_result.
+    /// This is the simplest case - should not add any hidden columns or wrap in `final_result`.
     #[test]
     fn test_no_deletes_no_hidden_columns() {
         let project_names = vec!["id".to_owned(), "name".to_owned()];
@@ -1188,7 +1188,7 @@ mod tests {
         let builder = SqlBuilder::new(
             &project_names,
             None, // No position delete table
-            Some("_data_file_table".to_string()),
+            Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             false, // need_file_path_and_pos = false
         );

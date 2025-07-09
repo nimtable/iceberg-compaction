@@ -49,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_builder =
         iceberg_compaction_core::iceberg_catalog_rest::RestCatalogConfig::builder()
-            .uri("http://localhost:8080/your/catalog/uri".to_string())
-            .warehouse("your-warehouse-location".to_string())
+            .uri("http://localhost:8080/your/catalog/uri".to_owned())
+            .warehouse("your-warehouse-location".to_owned())
             .props(iceberg_configs);
 
     // 2. Create the catalog
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_catalog(catalog.clone())
         .with_table_ident(table_ident.clone())
         .with_config(Arc::new(compaction_config))
-        .with_catalog_name("my_rest_catalog".to_string())
+        .with_catalog_name("my_rest_catalog".to_owned())
         .build()
         .await?;
 

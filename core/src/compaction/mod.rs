@@ -19,16 +19,16 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::Metrics;
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
+    RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
-use futures_async_stream::for_await;
+use futures::StreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
@@ -59,7 +59,7 @@ pub struct CompactionBuilder {
 }
 
 impl CompactionBuilder {
-    /// Create a new CompactionBuilder with default settings
+    /// Create a new `CompactionBuilder` with default settings
     pub fn new() -> Self {
         Self {
             config: None,
@@ -79,7 +79,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the executor type (defaults to DataFusion)
+    /// Set the executor type (defaults to `DataFusion`)
     pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
         self.executor_type = executor_type;
         self
@@ -91,7 +91,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the metrics registry (optional, defaults to NoopMetricsRegistry)
+    /// Set the metrics registry (optional, defaults to `NoopMetricsRegistry`)
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
         self.registry = registry;
         self
@@ -123,22 +123,22 @@ impl CompactionBuilder {
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
         let config = self.config.ok_or_else(|| {
-            crate::error::CompactionError::Execution("CompactionConfig is required".to_string())
+            crate::error::CompactionError::Execution("CompactionConfig is required".to_owned())
         })?;
 
         let catalog = self.catalog.ok_or_else(|| {
-            crate::error::CompactionError::Execution("Catalog is required".to_string())
+            crate::error::CompactionError::Execution("Catalog is required".to_owned())
         })?;
 
         let table_ident = self.table_ident.ok_or_else(|| {
-            crate::error::CompactionError::Execution("TableIdent is required".to_string())
+            crate::error::CompactionError::Execution("TableIdent is required".to_owned())
         })?;
 
         let compaction_type = self.compaction_type.unwrap_or(CompactionType::Full);
 
         if !catalog.table_exists(&table_ident).await? {
             return Err(crate::error::CompactionError::Execution(
-                "Table does not exist".to_string(),
+                "Table does not exist".to_owned(),
             ));
         }
 
@@ -189,7 +189,7 @@ struct CompactionResult {
 }
 
 impl Compaction {
-    /// Create a new CompactionBuilder for flexible configuration
+    /// Create a new `CompactionBuilder` for flexible configuration
     pub fn builder() -> CompactionBuilder {
         CompactionBuilder::new()
     }
@@ -405,12 +405,12 @@ async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
     let mut data_files = vec![];
     let mut equality_delete_files = HashMap::new();
 
-    #[for_await]
-    for task in file_scan_stream {
-        let task: FileScanTask = task?;
+    let mut file_scan_stream = file_scan_stream;
+    while let Some(task_result) = file_scan_stream.next().await {
+        let task: FileScanTask = task_result?;
         match task.data_file_content {
             iceberg::spec::DataContentType::Data => {
-                for delete_task in task.deletes.iter() {
+                for delete_task in &task.deletes {
                     match &delete_task.data_file_content {
                         iceberg::spec::DataContentType::PositionDeletes => {
                             let mut delete_task = delete_task.clone();
@@ -554,8 +554,7 @@ impl RewriteDataFilesCommitManager {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
                             format!(
-                                "No snapshot found with the given snapshot_id {}",
-                                starting_snapshot_id
+                                "No snapshot found with the given snapshot_id {starting_snapshot_id}"
                             ),
                         ));
                     }
@@ -628,17 +627,17 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
     };
     use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;
@@ -723,8 +722,8 @@ mod tests {
         };
 
         let file_name_generator = DefaultFileNameGenerator::new(
-            "data".to_string(),
-            Some("test".to_string()),
+            "data".to_owned(),
+            Some("test".to_owned()),
             iceberg::spec::DataFileFormat::Parquet,
         );
 
@@ -769,8 +768,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("eq-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("eq-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -784,8 +783,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("pos-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("pos-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -808,7 +807,7 @@ mod tests {
     async fn test_write_commit_and_compaction() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         // Create a memory catalog with the file IO and warehouse location
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));

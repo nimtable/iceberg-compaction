@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-#![feature(proc_macro_hygiene, stmt_expr_attributes)]
-#![feature(coroutines)]
-
 pub mod common;
 pub mod compaction;
 pub mod config;

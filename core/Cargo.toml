@@ -7,21 +7,20 @@ edition = "2024"
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 backon = "1.2.0"
+ctor = { workspace = true }
 datafusion = "45.0.0"
 derive_builder = "0.20"
 futures = { workspace = true }
-futures-async-stream = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-memory = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
-rand = { workspace = true }
-port_scanner = { workspace = true }
-ctor = { workspace = true }
 itertools = "0.13.0"
 mixtrics = "0.2.0"
 parquet = { workspace = true }
+port_scanner = { workspace = true }
+rand = { workspace = true }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
 	"chrono",
@@ -40,3 +39,6 @@ tokio = { workspace = true }
 tracing = "0.1"
 url = { workspace = true }
 uuid = "1.0"
+
+[lints]
+workspace = true

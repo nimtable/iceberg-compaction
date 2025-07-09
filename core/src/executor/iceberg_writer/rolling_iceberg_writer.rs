@@ -16,16 +16,16 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
-use iceberg::{ErrorKind, Result};
 use iceberg::{
     spec::DataFile,
     writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
 };
+use iceberg::{ErrorKind, Result};
 use tokio::task::JoinHandle;
 
 use crate::config::{DEFAULT_MAX_CONCURRENT_CLOSES, DEFAULT_TARGET_FILE_SIZE};
 
-/// RollingIcebergWriter wraps an IcebergWriter and splits output files by target size.
+/// `RollingIcebergWriter` wraps an `IcebergWriter` and splits output files by target size.
 pub struct RollingIcebergWriter<B, D> {
     /// Builder for creating new inner writers.
     inner_writer_builder: B,
@@ -163,7 +163,7 @@ pub fn need_build_new_file(
 }
 
 #[derive(Clone)]
-/// Builder for RollingIcebergWriter.
+/// Builder for `RollingIcebergWriter`.
 pub struct RollingIcebergWriterBuilder<B> {
     inner_builder: B,
     target_file_size: Option<u64>,
@@ -171,7 +171,7 @@ pub struct RollingIcebergWriterBuilder<B> {
 }
 
 impl<B> RollingIcebergWriterBuilder<B> {
-    /// Create a new RollingIcebergWriterBuilder.
+    /// Create a new `RollingIcebergWriterBuilder`.
     pub fn new(inner_builder: B) -> Self {
         Self {
             inner_builder,
