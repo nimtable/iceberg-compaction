@@ -246,6 +246,14 @@ impl Compaction {
             .select_files_for_compaction(&table, current_snapshot.snapshot_id())
             .await?;
 
+        // Check if any input files were selected
+        if input_file_scan_tasks.input_files_count() == 0 {
+            return Ok(CompactionResult {
+                stats: RewriteFilesStat::default(),
+                compaction_validator: None,
+            });
+        }
+
         let mut input_tasks_for_validation = if self.config.enable_validate_compaction {
             Some(input_file_scan_tasks.clone())
         } else {
