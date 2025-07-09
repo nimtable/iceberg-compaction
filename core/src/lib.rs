@@ -14,15 +14,18 @@
  * limitations under the License.
  */
 
-#![feature(proc_macro_hygiene, stmt_expr_attributes)]
-#![feature(coroutines)]
-
 pub mod common;
 pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod executor;
+pub mod test_utils;
 
 pub use config::CompactionConfig;
 pub use error::{CompactionError, Result};
 pub use executor::CompactionExecutor;
+
+// Re-export iceberg related crates
+pub use iceberg;
+pub use iceberg_catalog_memory;
+pub use iceberg_catalog_rest;

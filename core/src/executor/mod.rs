@@ -48,7 +48,7 @@ pub struct RewriteFilesRequest {
 }
 
 #[derive(Debug, Clone)]
-/// InputFileScanTasks contains the file scan tasks for data files, position delete files, and equality delete files.
+/// `InputFileScanTasks` contains the file scan tasks for data files, position delete files, and equality delete files.
 pub struct InputFileScanTasks {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,

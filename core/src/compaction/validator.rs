@@ -132,7 +132,7 @@ impl CompactionValidator {
             .await?;
 
         let mut total_input_rows = 0;
-        for stream_result in input_batches_streams.iter_mut() {
+        for stream_result in &mut input_batches_streams {
             // Iterate over each stream
             while let Some(batch_result) = stream_result.as_mut().next().await {
                 total_input_rows += batch_result?.num_rows();
@@ -140,7 +140,7 @@ impl CompactionValidator {
         }
 
         let mut total_output_rows = 0;
-        for stream_result in output_batches_streams.iter_mut() {
+        for stream_result in &mut output_batches_streams {
             // Iterate over each stream
             while let Some(batch_result) = stream_result.as_mut().next().await {
                 total_output_rows += batch_result?.num_rows();

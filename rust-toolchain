@@ -1,2 +1,2 @@
 [toolchain]
-channel = "nightly-2025-03-05"
+channel = "1.88.0"
