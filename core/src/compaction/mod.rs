@@ -41,9 +41,10 @@ use backon::Retryable;
 
 mod validator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionType {
     Full,
-    SmallFiles,
+    MergeSmallDataFiles,
 }
 
 /// Builder for creating Compaction instances with flexible configuration
@@ -198,7 +199,7 @@ impl Compaction {
             stats,
             compaction_validator,
         } = match self.compaction_type {
-            CompactionType::Full | CompactionType::SmallFiles => {
+            CompactionType::Full | CompactionType::MergeSmallDataFiles => {
                 // Use the generic implementation for simple compaction types
                 self.execute_standard_compaction().await?
             }
@@ -369,9 +370,10 @@ impl Compaction {
         table: &Table,
         snapshot_id: i64,
     ) -> Result<InputFileScanTasks> {
-        use crate::file_selection::strategy::FileStrategyFactory;
+        use crate::file_selection::FileStrategyFactory;
 
-        let strategy = FileStrategyFactory::create_strategy(&self.compaction_type, &self.config);
+        let strategy =
+            FileStrategyFactory::create_files_strategy(self.compaction_type, &self.config);
         FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
     }
 
@@ -1115,7 +1117,7 @@ mod tests {
         let compaction = CompactionBuilder::new()
             .with_catalog(catalog_arc.clone())
             .with_table_ident(table_ident.clone())
-            .with_compaction_type(super::CompactionType::SmallFiles)
+            .with_compaction_type(super::CompactionType::MergeSmallDataFiles)
             .with_config(Arc::new(
                 CompactionConfigBuilder::default()
                     .small_file_threshold(small_file_threshold)

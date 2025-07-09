@@ -23,6 +23,9 @@ use std::collections::HashMap;
 
 pub mod strategy;
 
+// Re-export commonly used types for convenience
+pub use strategy::{FileStrategyFactory, StaticFileStrategy, UnifiedStrategy};
+
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
@@ -31,7 +34,7 @@ impl FileSelector {
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
-        strategy: Box<dyn strategy::FileStrategy>,
+        strategy: UnifiedStrategy,
     ) -> Result<InputFileScanTasks> {
         let scan = table
             .scan()
@@ -56,8 +59,8 @@ impl FileSelector {
             }
         }
 
-        // Apply file filtering strategy
-        let filtered_data_files = strategy.filter(data_files)?;
+        // Apply file filtering strategy using static dispatch
+        let filtered_data_files: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter());
 
         // Extract delete files from the filtered data files
         Self::build_input_file_scan_tasks(filtered_data_files)
