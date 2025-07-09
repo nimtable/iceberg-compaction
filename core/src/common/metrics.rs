@@ -50,13 +50,13 @@ pub struct Metrics {
 impl Metrics {
     pub fn new(registry: BoxedRegistry) -> Self {
         let compaction_commit_counter = registry.register_counter_vec(
-            "compaction_commit_counter".into(),
+            "iceberg_compaction_commit_counter".into(),
             "iceberg-compaction compaction total commit counts".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_duration = registry.register_histogram_vec_with_buckets(
-            "compaction_duration".into(),
+            "iceberg_compaction_duration".into(),
             "iceberg-compaction compaction duration in seconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
@@ -65,14 +65,14 @@ impl Metrics {
         );
 
         let compaction_failed_data_files_count = registry.register_counter_vec(
-            "compaction_failed_data_files_count".into(),
+            "iceberg_compaction_failed_data_files_count".into(),
             "iceberg-compaction compaction failed data files count".into(),
             &["catalog_name", "table_ident"],
         );
 
         // 10ms 100ms 1s 10s 100s
         let compaction_commit_duration = registry.register_histogram_vec_with_buckets(
-            "compaction_commit_duration".into(),
+            "iceberg_compaction_commit_duration".into(),
             "iceberg-compaction compaction commit duration in milliseconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
@@ -81,86 +81,86 @@ impl Metrics {
         );
 
         let compaction_commit_failed_counter = registry.register_counter_vec(
-            "compaction_commit_failed_counter".into(),
+            "iceberg_compaction_commit_failed_counter".into(),
             "iceberg-compaction compaction commit failed counts".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_executor_error_counter = registry.register_counter_vec(
-            "compaction_executor_error_counter".into(),
+            "iceberg_compaction_executor_error_counter".into(),
             "iceberg-compaction compaction executor error counts".into(),
             &["catalog_name", "table_ident"],
         );
 
         // === Input/Output metrics registration ===
         let compaction_input_files_count = registry.register_gauge_vec(
-            "compaction_input_files_count".into(),
+            "iceberg_compaction_input_files_count".into(),
             "Number of input files being compacted".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_output_files_count = registry.register_gauge_vec(
-            "compaction_output_files_count".into(),
+            "iceberg_compaction_output_files_count".into(),
             "Number of output files from compaction".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_input_bytes_total = registry.register_counter_vec(
-            "compaction_input_bytes_total".into(),
+            "iceberg_compaction_input_bytes_total".into(),
             "Total number of bytes in input files for compaction".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_output_bytes_total = registry.register_counter_vec(
-            "compaction_output_bytes_total".into(),
+            "iceberg_compaction_output_bytes_total".into(),
             "Total number of bytes in output files from compaction".into(),
             &["catalog_name", "table_ident"],
         );
 
         // === DataFusion processing metrics ===
         let compaction_datafusion_records_processed_total = registry.register_counter_vec(
-            "compaction_datafusion_records_processed_total".into(),
+            "iceberg_compaction_datafusion_records_processed_total".into(),
             "Total number of records processed by DataFusion during compaction".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_datafusion_batch_fetch_duration = registry
             .register_histogram_vec_with_buckets(
-                "compaction_datafusion_batch_fetch_duration".into(),
+                "iceberg_compaction_datafusion_batch_fetch_duration".into(),
                 "Duration of fetching individual record batches in DataFusion (milliseconds)"
                     .into(),
                 &["catalog_name", "table_ident"],
                 Buckets::exponential(
-                    1.0, 2.0, 16, // 1ms, 2ms, 4ms, 8ms, ..., 32768ms (~33s), 65536ms (~1min)
+                    1.0, 10.0, 6, // 1ms, 10ms, 100ms, 1s, 10s, 100s
                 ),
             );
 
         let compaction_datafusion_batch_write_duration = registry
             .register_histogram_vec_with_buckets(
-                "compaction_datafusion_batch_write_duration".into(),
+                "iceberg_compaction_datafusion_batch_write_duration".into(),
                 "Duration of writing individual record batches in DataFusion (milliseconds)".into(),
                 &["catalog_name", "table_ident"],
                 Buckets::exponential(
-                    1.0, 2.0, 16, // 1ms, 2ms, 4ms, 8ms, ..., 32768ms (~33s), 65536ms (~1min)
+                    1.0, 10.0, 6, // 1ms, 10ms, 100ms, 1s, 10s, 100s
                 ),
             );
 
         let compaction_datafusion_bytes_processed_total = registry.register_counter_vec(
-            "compaction_datafusion_bytes_processed_total".into(),
+            "iceberg_compaction_datafusion_bytes_processed_total".into(),
             "Total number of bytes processed by DataFusion during compaction".into(),
             &["catalog_name", "table_ident"],
         );
 
         let compaction_datafusion_batch_row_count_dist = registry
             .register_histogram_vec_with_buckets(
-                "compaction_datafusion_batch_row_count_dist".into(),
+                "iceberg_compaction_datafusion_batch_row_count_dist".into(),
                 "Distribution of row counts in record batches processed by DataFusion".into(),
                 &["catalog_name", "table_ident"],
                 Buckets::exponential(100.0, 2.0, 10), // 100, 200, 400, ..., 51200 rows
             );
 
         let compaction_datafusion_batch_bytes_dist = registry.register_histogram_vec_with_buckets(
-            "compaction_datafusion_batch_bytes_dist".into(),
+            "iceberg_compaction_datafusion_batch_bytes_dist".into(),
             "Distribution of byte sizes of record batches processed by DataFusion".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(1024.0 * 64.0, 2.0, 12), // 64KB, 128KB, 256KB, ..., 128MB
