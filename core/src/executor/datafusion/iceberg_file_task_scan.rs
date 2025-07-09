@@ -299,6 +299,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
 }
 
 /// Gets a stream of record batches from a list of file scan tasks
+#[allow(clippy::unused_async)]
 async fn get_batch_stream(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
@@ -730,7 +731,7 @@ mod tests {
         let mut buffer = RecordBatchBuffer::new(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
-        // This batch makes current_rows exactly max_rows
+                                                          // This batch makes current_rows exactly max_rows
         let exact_fill_batch = create_test_batch(50, None);
         assert!(buffer.add(exact_fill_batch).unwrap().is_none()); // 50 + 50 = 100. No yield yet.
         assert_eq!(buffer.current_rows, 100);

@@ -9,10 +9,10 @@ async-trait = "0.1.86"
 
 # Local workspace members
 futures = "0.3.17"
-futures-async-stream = "0.2.9"
 iceberg-compaction-core = { path = "./core" }
 
 # Data processing and storage
+ctor = "0.2.8"
 iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484", features = [
     "storage-s3",
     "storage-gcs",
@@ -21,10 +21,9 @@ iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.g
 iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
 iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "a43641762eafe135498b886db2257102f3069484" }
-rand = "0.9.1"
-port_scanner = "0.1.5"
-ctor = "0.2.8"
 parquet = { version = "54", features = ["async"] }
+port_scanner = "0.1.5"
+rand = "0.9.1"
 
 # Error handling
 thiserror = "2.0.11"
@@ -33,3 +32,34 @@ tokio = { version = "1", default-features = false }
 # Utilities
 tempfile = "3.8"
 url = "2"
+
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+dbg_macro = "warn"
+disallowed_methods = "warn"
+disallowed_types = "warn"
+doc_markdown = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+inconsistent_struct_constructor = "warn"
+unused_async = "warn"
+map_flatten = "warn"
+await_holding_lock = "warn"
+# For private code, this is a little pedantic and not worth fixing.
+# &Vec or &String is acceptable
+ptr_arg = "allow"
+# a little pedantic
+get_first = "allow"
+new_without_default = "allow"
+# TODO: remove later https://github.com/rust-lang/rust-clippy/issues/12537
+# duplicated_attributes = "allow"
+# TODO: remove later https://github.com/rust-lang/rust-clippy/issues/12436
+mixed_attributes_style = "allow"
+too_long_first_doc_paragraph = "allow"
+str_to_string = "warn"
+string_to_string = "warn"
+
+# TODO: this makes sense, but it's too noisy for now (2025-03-10)
+large_enum_variant = "allow"
+# TODO: this makes sense, but it's too noisy for now (2025-03-10)
+result_large_err = "allow"

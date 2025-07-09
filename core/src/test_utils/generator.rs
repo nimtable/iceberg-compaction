@@ -14,40 +14,40 @@
  * limitations under the License.
  */
 
-use crate::{CompactionError, error::Result, executor::datafusion::build_parquet_writer_builder};
-use futures_async_stream::try_stream;
+use crate::{error::Result, executor::datafusion::build_parquet_writer_builder, CompactionError};
+use async_stream::try_stream;
 use iceberg::{
     arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
     io::FileIO,
     spec::{DataFile, Schema},
     table::Table,
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::{
             data_file_writer::DataFileWriterBuilder,
             equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
             sort_position_delete_writer::{
-                POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+                SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
             },
         },
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::equality_delta_writer::{
-            DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+            EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
         },
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use parquet::file::properties::WriterProperties;
-use rand::{Rng, distr::Alphanumeric};
+use rand::{distr::Alphanumeric, Rng};
 use std::sync::Arc;
 
 use datafusion::arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
     },
     compute::filter,
     datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
@@ -80,7 +80,7 @@ pub struct RecordBatchGenerator {
 }
 
 impl RecordBatchGenerator {
-    /// Creates a new RecordBatchGenerator with specified parameters
+    /// Creates a new `RecordBatchGenerator` with specified parameters
     ///
     /// # Arguments
     /// * `num_rows` - Total number of rows to generate across all batches
@@ -99,20 +99,21 @@ impl RecordBatchGenerator {
     /// This method yields record batches of the specified batch size until
     /// all rows have been generated. The last batch may contain fewer rows
     /// if the total number of rows is not evenly divisible by batch size.
-    #[try_stream(boxed, ok = RecordBatch, error = CompactionError)]
-    pub async fn generate(&self) {
-        let mut num_rows = self.num_rows;
-        loop {
-            if num_rows > self.batch_size {
-                let batch = self.generate_batch(self.batch_size).unwrap();
-                num_rows -= self.batch_size;
-                yield batch;
-            } else if num_rows > 0 {
-                let batch = self.generate_batch(num_rows).unwrap();
-                num_rows = 0;
-                yield batch;
-            } else {
-                break;
+    pub fn generate(&self) -> impl futures::Stream<Item = crate::Result<RecordBatch>> + '_ {
+        try_stream! {
+            let mut num_rows = self.num_rows;
+            loop {
+                if num_rows > self.batch_size {
+                    let batch = self.generate_batch(self.batch_size)?;
+                    num_rows -= self.batch_size;
+                    yield batch;
+                } else if num_rows > 0 {
+                    let batch = self.generate_batch(num_rows)?;
+                    num_rows = 0;
+                    yield batch;
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -123,7 +124,7 @@ impl RecordBatchGenerator {
     /// * `batch_size` - Number of rows to generate in this batch
     ///
     /// # Returns
-    /// A RecordBatch containing randomly generated data according to the schema
+    /// A `RecordBatch` containing randomly generated data according to the schema
     pub fn generate_batch(&self, batch_size: usize) -> Result<RecordBatch> {
         let arrays = self
             .schema
@@ -236,7 +237,7 @@ impl Default for FileGeneratorConfig {
 }
 
 impl FileGeneratorConfig {
-    /// Creates a new FileGeneratorConfig with default settings
+    /// Creates a new `FileGeneratorConfig` with default settings
     pub fn new() -> Self {
         Self {
             data_file_row_count: DEFAULT_DATA_FILE_ROW_COUNT,
@@ -294,7 +295,7 @@ pub struct WriterConfig {
 }
 
 impl WriterConfig {
-    /// Creates a new WriterConfig from a table with default settings
+    /// Creates a new `WriterConfig` from a table with default settings
     ///
     /// # Arguments
     /// * `table` - The Iceberg table to use for configuration
@@ -309,7 +310,7 @@ impl WriterConfig {
 }
 
 impl FileGenerator {
-    /// Creates a new FileGenerator with the specified configuration
+    /// Creates a new `FileGenerator` with the specified configuration
     ///
     /// # Arguments
     /// * `config` - Configuration for file generation
@@ -317,7 +318,7 @@ impl FileGenerator {
     /// * `writer_config` - Configuration for file writers
     ///
     /// # Returns
-    /// A configured FileGenerator instance
+    /// A configured `FileGenerator` instance
     pub fn new(
         config: FileGeneratorConfig,
         schema: Arc<Schema>,
@@ -341,11 +342,11 @@ impl FileGenerator {
     ///
     /// This method creates a writer builder that can handle:
     /// - Data file writes
-    /// - Position delete writes  
+    /// - Position delete writes
     /// - Equality delete writes
     ///
     /// # Returns
-    /// A configured EqualityDeleteDeltaWriterBuilder
+    /// A configured `EqualityDeleteDeltaWriterBuilder`
     async fn build_equality_delete_delta_writer_builder(
         &self,
     ) -> Result<EqualityDeleteDeltaWriterBuilder> {
@@ -416,7 +417,7 @@ impl FileGenerator {
     /// at specified rates to simulate real-world data patterns.
     ///
     /// # Returns
-    /// A vector of DataFile objects representing the generated files
+    /// A vector of `DataFile` objects representing the generated files
     pub async fn generate(&mut self) -> Result<Vec<DataFile>> {
         let mut data_files = Vec::new();
 
@@ -438,7 +439,8 @@ impl FileGenerator {
 
         let mut data_file_num = 0;
 
-        let mut stream = self.record_batch_generator.generate().boxed();
+        let stream = self.record_batch_generator.generate();
+        futures::pin_mut!(stream);
         let schema_with_extra_op_column = {
             let arrow_schema = schema_to_arrow_schema(&self.schema)?;
             let mut new_fields = arrow_schema.fields().iter().cloned().collect::<Vec<_>>();

@@ -14,21 +14,21 @@
  * limitations under the License.
  */
 
-use crate::{CompactionConfig, error::Result, executor::iceberg_writer::rolling_iceberg_writer};
+use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer, CompactionConfig};
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
+use futures::{future::try_join_all, StreamExt};
 use iceberg::{
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use parquet::file::properties::WriterProperties;
