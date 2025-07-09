@@ -19,7 +19,7 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::common::Metrics;
+use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
     create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
@@ -217,11 +217,13 @@ impl Compaction {
     }
 
     async fn full_compact(&self) -> Result<CompactionResult> {
-        let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-        let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
-        let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
-
         let now = std::time::Instant::now();
+
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.metrics.clone(),
+            self.catalog_name.clone(),
+            self.table_ident.to_string(),
+        );
 
         let table = self.catalog.load_table(&self.table_ident).await?;
         if table.metadata().current_snapshot().is_none() {
@@ -231,6 +233,14 @@ impl Compaction {
             });
         }
         let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
+
+        let input_total_bytes: u64 = data_files
+            .iter()
+            .chain(delete_files.iter())
+            .map(|f| f.file_size_in_bytes())
+            .sum();
+        let input_files_count = data_files.len() + delete_files.len();
+
         let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?);
 
         let file_io = table.file_io().clone();
@@ -250,6 +260,7 @@ impl Compaction {
             config: self.config.clone(),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
+            metrics_recorder: Some(metrics_recorder.clone()),
         };
         let RewriteFilesResponse {
             data_files: mut output_data_files,
@@ -257,10 +268,7 @@ impl Compaction {
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
             Err(e) => {
-                self.metrics
-                    .compaction_executor_error_counter
-                    .counter(&label_vec)
-                    .increase(1);
+                metrics_recorder.record_executor_error();
                 return Err(e);
             }
         };
@@ -293,35 +301,16 @@ impl Compaction {
             )
             .await?;
 
-        self.metrics
-            .compaction_commit_duration
-            .histogram(&label_vec)
-            .record(commit_now.elapsed().as_secs_f64());
+        metrics_recorder.record_commit_duration(commit_now.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_duration(now.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_stats(&stat);
 
-        self.metrics
-            .compaction_duration
-            .histogram(&label_vec)
-            .record(now.elapsed().as_secs_f64());
-
-        self.metrics
-            .compaction_rewritten_bytes
-            .counter(&label_vec)
-            .increase(stat.rewritten_bytes);
-
-        self.metrics
-            .compaction_rewritten_files_count
-            .counter(&label_vec)
-            .increase(stat.rewritten_files_count as u64);
-
-        self.metrics
-            .compaction_added_files_count
-            .counter(&label_vec)
-            .increase(stat.added_files_count as u64);
-
-        self.metrics
-            .compaction_failed_data_files_count
-            .counter(&label_vec)
-            .increase(stat.failed_data_files_count as u64);
+        metrics_recorder.record_compaction_complete(
+            input_files_count as u32,
+            input_total_bytes,
+            stat.added_files_count,
+            stat.rewritten_bytes,
+        );
 
         let compaction_validator = if self.config.enable_validate_compaction {
             Some(
@@ -469,8 +458,7 @@ pub struct RewriteDataFilesCommitManager {
     starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
     use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
 
-    catalog_name: String,  // Catalog name for metrics
-    metrics: Arc<Metrics>, // Metrics for tracking commit operations
+    metrics_recorder: CompactionMetricsRecorder, // Metrics recorder for tracking commit operations
 
     basic_schema_id: i32, // Schema ID for the table, used for validation
 }
@@ -491,14 +479,16 @@ impl RewriteDataFilesCommitManager {
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
     ) -> Self {
+        let metrics_recorder =
+            CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
+
         Self {
             config,
             catalog,
             table_ident,
             starting_snapshot_id: consistency_params.starting_snapshot_id,
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
-            catalog_name,
-            metrics,
+            metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
         }
     }
@@ -511,6 +501,7 @@ impl RewriteDataFilesCommitManager {
     ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+
         let operation = || {
             let catalog = self.catalog.clone();
             let table_ident = self.table_ident.clone();
@@ -518,12 +509,7 @@ impl RewriteDataFilesCommitManager {
             let delete_files = delete_files.clone();
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
-            let metrics = self.metrics.clone();
-
-            let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-            let catalog_name_label: std::borrow::Cow<'static, str> =
-                self.catalog_name.clone().into();
-            let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
+            let metrics_recorder = self.metrics_recorder.clone();
 
             async move {
                 // reload the table to get the latest state
@@ -568,17 +554,11 @@ impl RewriteDataFilesCommitManager {
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
-                        metrics
-                            .compaction_commit_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_success();
                         Ok(table)
                     }
                     Err(commit_err) => {
-                        metrics
-                            .compaction_commit_failed_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_failure();
 
                         tracing::error!(
                             "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
