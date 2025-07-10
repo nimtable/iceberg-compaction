@@ -82,6 +82,47 @@ pub struct RewriteFilesStat {
     pub output_files_count: usize,
     pub input_total_bytes: u64,
     pub output_total_bytes: u64,
+
+    pub input_data_file_count: usize,
+    pub input_position_delete_file_count: usize,
+    pub input_equality_delete_file_count: usize,
+    pub input_data_file_total_bytes: u64,
+    pub input_position_delete_file_total_bytes: u64,
+    pub input_equality_delete_file_total_bytes: u64,
+}
+
+impl RewriteFilesStat {
+    pub fn record_input(&mut self, input_file_scan_tasks: &InputFileScanTasks) {
+        self.input_files_count = input_file_scan_tasks.input_files_count();
+        self.input_total_bytes = input_file_scan_tasks.input_total_bytes();
+
+        self.input_data_file_count = input_file_scan_tasks.data_files.len();
+        self.input_position_delete_file_count = input_file_scan_tasks.position_delete_files.len();
+        self.input_equality_delete_file_count = input_file_scan_tasks.equality_delete_files.len();
+        self.input_data_file_total_bytes = input_file_scan_tasks
+            .data_files
+            .iter()
+            .map(|task| task.file_size_in_bytes)
+            .sum::<u64>();
+        self.input_position_delete_file_total_bytes = input_file_scan_tasks
+            .position_delete_files
+            .iter()
+            .map(|task| task.file_size_in_bytes)
+            .sum::<u64>();
+        self.input_equality_delete_file_total_bytes = input_file_scan_tasks
+            .equality_delete_files
+            .iter()
+            .map(|task| task.file_size_in_bytes)
+            .sum::<u64>();
+    }
+
+    pub fn record_output(&mut self, data_files: &[DataFile]) {
+        self.output_files_count = data_files.len();
+        self.output_total_bytes = data_files
+            .iter()
+            .map(|file| file.file_size_in_bytes())
+            .sum::<u64>();
+    }
 }
 
 pub enum ExecutorType {
