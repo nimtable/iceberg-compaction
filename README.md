@@ -42,17 +42,40 @@ The example includes:
 
 For more details, see the [rest-catalog example](./examples/rest-catalog/).
 
-## 🗺️ Roadmap
+## Development Roadmap
 
-### Runtime Enhancements
-- [ ] Incremental compaction support
-- [ ] Merge-on-read performance optimization
-- [ ] Standalone scheduler component
+### Performance 🚀
 
-### Iceberg Features
-- [ ] Partition evolution support
-- [ ] Schema evolution support
+- [ ] Partial compaction: Support incremental compaction strategies
+- [ ] Compaction Policy: Multiple built-in policies (size-based, time-based, cost-optimized)
+- [ ] Built-in cache: Metadata and query result caching for improved performance
 
-### Cloud Support
-- [ ] Azure Blob Storage integration
-- [ ] GCP Cloud Storage integration
+### Stability 🔒
+
+- [ ] Spill to disk: Handle large datasets that exceed memory limits
+- [ ] Network rebuild: Robust handling of network failures and retries
+- [ ] Task breakpoint resume: Resume operations from failure points
+- [ ] E2E test framework: Comprehensive testing infrastructure
+
+### Observability 📊
+
+- [ ] Job progress display: Progress tracking
+- [ ] Comprehensive compaction metrics: Detailed performance and operation metrics
+
+### Customizability 🎛️
+
+- [ ] Tune parquet: Configurable Parquet writer parameters
+- [ ] Fine-grained configurable compaction parameters: Extensive customization options
+
+### Functionality ⚙️
+
+#### iceberg-rust
+
+- [ ] Expire snapshot
+- [ ] Rewrite manifest
+
+#### iceberg-compaction
+
+- [ ] Binpack/Sort/ZOrder Compaction
+- [ ] Clustering / Order by: Support for data reorganization and sorting
+- [ ] File clean: Delete orphan files
