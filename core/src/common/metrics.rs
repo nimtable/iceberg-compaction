@@ -23,7 +23,6 @@ pub struct Metrics {
     // commit metrics
     pub compaction_commit_counter: BoxedCounterVec,
     pub compaction_duration: BoxedHistogramVec,
-    pub compaction_failed_data_files_count: BoxedCounterVec,
     pub compaction_commit_duration: BoxedHistogramVec,
     pub compaction_commit_failed_counter: BoxedCounterVec,
     pub compaction_executor_error_counter: BoxedCounterVec,
@@ -60,12 +59,6 @@ impl Metrics {
             Buckets::exponential(
                 1.0, 2.0, 20, // Start at 1 second, double each bucket, up to 20 buckets
             ),
-        );
-
-        let compaction_failed_data_files_count = registry.register_counter_vec(
-            "iceberg_compaction_failed_data_files_count".into(),
-            "iceberg-compaction compaction failed data files count".into(),
-            &["catalog_name", "table_ident"],
         );
 
         // 10ms 100ms 1s 10s 100s
@@ -167,7 +160,6 @@ impl Metrics {
         Self {
             compaction_commit_counter,
             compaction_duration,
-            compaction_failed_data_files_count,
             compaction_commit_duration,
             compaction_commit_failed_counter,
             compaction_executor_error_counter,
