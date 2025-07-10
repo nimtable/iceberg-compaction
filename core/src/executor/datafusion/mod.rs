@@ -61,8 +61,8 @@ impl CompactionExecutor for DataFusionExecutor {
             metrics_recorder,
         } = request;
 
-        let mut stat = RewriteFilesStat::default();
-        let rewritten_files_count = input_file_scan_tasks.input_files_count();
+        let mut stats = RewriteFilesStat::default();
+        stats.record_input(&input_file_scan_tasks);
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
@@ -141,17 +141,11 @@ impl CompactionExecutor for DataFusionExecutor {
             .collect::<Result<Vec<_>>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
 
-        stat.added_files_count = output_data_files.len() as u32;
-        let rewritten_bytes = output_data_files
-            .iter()
-            .map(|f| f.file_size_in_bytes())
-            .sum();
-        stat.rewritten_bytes = rewritten_bytes;
-        stat.rewritten_files_count = rewritten_files_count;
+        stats.record_output(&output_data_files);
 
         Ok(RewriteFilesResponse {
             data_files: output_data_files,
-            stat,
+            stats,
         })
     }
 }

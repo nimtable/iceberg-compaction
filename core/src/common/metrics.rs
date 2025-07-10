@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-use mixtrics::metrics::{
-    BoxedCounterVec, BoxedGaugeVec, BoxedHistogramVec, BoxedRegistry, Buckets,
-};
+use mixtrics::metrics::{BoxedCounterVec, BoxedHistogramVec, BoxedRegistry, Buckets};
 use std::sync::Arc;
 
 use crate::executor::RewriteFilesStat;
@@ -25,14 +23,13 @@ pub struct Metrics {
     // commit metrics
     pub compaction_commit_counter: BoxedCounterVec,
     pub compaction_duration: BoxedHistogramVec,
-    pub compaction_failed_data_files_count: BoxedCounterVec,
     pub compaction_commit_duration: BoxedHistogramVec,
     pub compaction_commit_failed_counter: BoxedCounterVec,
     pub compaction_executor_error_counter: BoxedCounterVec,
 
     // input/output metrics
-    pub compaction_input_files_count: BoxedGaugeVec,
-    pub compaction_output_files_count: BoxedGaugeVec,
+    pub compaction_input_files_count: BoxedCounterVec,
+    pub compaction_output_files_count: BoxedCounterVec,
     pub compaction_input_bytes_total: BoxedCounterVec,
     pub compaction_output_bytes_total: BoxedCounterVec,
 
@@ -64,12 +61,6 @@ impl Metrics {
             ),
         );
 
-        let compaction_failed_data_files_count = registry.register_counter_vec(
-            "iceberg_compaction_failed_data_files_count".into(),
-            "iceberg-compaction compaction failed data files count".into(),
-            &["catalog_name", "table_ident"],
-        );
-
         // 10ms 100ms 1s 10s 100s
         let compaction_commit_duration = registry.register_histogram_vec_with_buckets(
             "iceberg_compaction_commit_duration".into(),
@@ -93,13 +84,13 @@ impl Metrics {
         );
 
         // === Input/Output metrics registration ===
-        let compaction_input_files_count = registry.register_gauge_vec(
+        let compaction_input_files_count = registry.register_counter_vec(
             "iceberg_compaction_input_files_count".into(),
             "Number of input files being compacted".into(),
             &["catalog_name", "table_ident"],
         );
 
-        let compaction_output_files_count = registry.register_gauge_vec(
+        let compaction_output_files_count = registry.register_counter_vec(
             "iceberg_compaction_output_files_count".into(),
             "Number of output files from compaction".into(),
             &["catalog_name", "table_ident"],
@@ -169,7 +160,6 @@ impl Metrics {
         Self {
             compaction_commit_counter,
             compaction_duration,
-            compaction_failed_data_files_count,
             compaction_commit_duration,
             compaction_commit_failed_counter,
             compaction_executor_error_counter,
@@ -215,36 +205,6 @@ impl CompactionMetricsRecorder {
         ]
     }
 
-    /// Record compaction input files and bytes
-    pub fn record_compaction_input(&self, file_count: u32, total_bytes: u64) {
-        let label_vec = self.label_vec();
-
-        self.metrics
-            .compaction_input_files_count
-            .gauge(&label_vec)
-            .absolute(file_count as u64);
-
-        self.metrics
-            .compaction_input_bytes_total
-            .counter(&label_vec)
-            .increase(total_bytes);
-    }
-
-    /// Record compaction output files and bytes
-    pub fn record_compaction_output(&self, file_count: u32, total_bytes: u64) {
-        let label_vec = self.label_vec();
-
-        self.metrics
-            .compaction_output_files_count
-            .gauge(&label_vec)
-            .absolute(file_count as u64);
-
-        self.metrics
-            .compaction_output_bytes_total
-            .counter(&label_vec)
-            .increase(total_bytes);
-    }
-
     /// Record compaction duration
     pub fn record_compaction_duration(&self, duration_secs: f64) {
         let label_vec = self.label_vec();
@@ -263,16 +223,6 @@ impl CompactionMetricsRecorder {
             .compaction_commit_duration
             .histogram(&label_vec)
             .record(duration_secs);
-    }
-
-    /// Record compaction statistics
-    pub fn record_compaction_stats(&self, stat: &RewriteFilesStat) {
-        let label_vec = self.label_vec();
-
-        self.metrics
-            .compaction_failed_data_files_count
-            .counter(&label_vec)
-            .increase(stat.failed_data_files_count as u64);
     }
 
     /// Record successful compaction commit
@@ -307,15 +257,37 @@ impl CompactionMetricsRecorder {
 
     /// Record complete compaction metrics
     /// This is a convenience method that records all basic compaction metrics
-    pub fn record_compaction_complete(
-        &self,
-        input_file_count: u32,
-        input_bytes: u64,
-        output_file_count: u32,
-        output_bytes: u64,
-    ) {
-        self.record_compaction_input(input_file_count, input_bytes);
-        self.record_compaction_output(output_file_count, output_bytes);
+    pub fn record_compaction_complete(&self, stats: &RewriteFilesStat) {
+        let label_vec = self.label_vec();
+
+        if stats.input_files_count > 0 {
+            self.metrics
+                .compaction_input_files_count
+                .counter(&label_vec)
+                .increase(stats.input_files_count as u64);
+        }
+
+        if stats.input_total_bytes > 0 {
+            self.metrics
+                .compaction_input_bytes_total
+                .counter(&label_vec)
+                .increase(stats.input_total_bytes);
+        }
+
+        // output
+        if stats.output_files_count > 0 {
+            self.metrics
+                .compaction_output_files_count
+                .counter(&label_vec)
+                .increase(stats.output_files_count as u64);
+        }
+
+        if stats.output_total_bytes > 0 {
+            self.metrics
+                .compaction_output_bytes_total
+                .counter(&label_vec)
+                .increase(stats.output_total_bytes);
+        }
     }
 
     pub fn record_datafusion_batch_fetch_duration(&self, fetch_duration_ms: f64) {
