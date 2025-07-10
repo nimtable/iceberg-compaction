@@ -31,8 +31,10 @@ use iceberg::{
         IcebergWriter, IcebergWriterBuilder,
     },
 };
+use parquet::file::properties::WriterProperties;
 use sqlx::types::Uuid;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::task::JoinHandle;
 
 use crate::CompactionError;
@@ -43,7 +45,7 @@ use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DataFusionExecutor {}
 
 #[async_trait]
@@ -56,13 +58,15 @@ impl CompactionExecutor for DataFusionExecutor {
             config,
             dir_path,
             partition_spec,
+            metrics_recorder,
         } = request;
 
-        let mut stat = RewriteFilesStat::default();
-        let rewritten_files_count = input_file_scan_tasks.input_files_count();
+        let mut stats = RewriteFilesStat::default();
+        let input_files_count = input_file_scan_tasks.input_files_count();
+        let input_total_bytes = input_file_scan_tasks.input_total_bytes();
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
-            .with_schema(schema)
+            .with_schema(schema.clone())
             .with_input_data_files(input_file_scan_tasks)
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
@@ -70,17 +74,20 @@ impl CompactionExecutor for DataFusionExecutor {
             .await?;
         let arc_input_schema = Arc::new(input_schema);
         let mut futures = Vec::with_capacity(config.executor_parallelism);
+
         // build iceberg writer for each partition
-        for mut batch in batches {
+        for mut batch_stream in batches {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
             let config = config.clone();
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
+            let metrics_recorder = metrics_recorder.clone();
+
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
-                let mut data_file_writer = Self::build_iceberg_writer(
+                let mut data_file_writer = build_iceberg_data_file_writer(
                     config.data_file_prefix.clone(),
                     dir_path,
                     schema,
@@ -89,9 +96,38 @@ impl CompactionExecutor for DataFusionExecutor {
                     config.clone(),
                 )
                 .await?;
-                while let Some(b) = batch.as_mut().next().await {
-                    data_file_writer.write(b?).await?;
+
+                // Process each record batch with metrics
+                let mut fetch_batch_start = Instant::now();
+                while let Some(batch_result) = batch_stream.as_mut().next().await {
+                    if let Some(metrics_recorder) = &metrics_recorder {
+                        metrics_recorder.record_datafusion_batch_fetch_duration(
+                            fetch_batch_start.elapsed().as_millis() as f64,
+                        );
+                    }
+
+                    let batch = batch_result?;
+
+                    let record_count = batch.num_rows() as u64;
+                    let batch_bytes = batch.get_array_memory_size() as u64;
+
+                    // Write the batch
+                    let write_start = Instant::now();
+                    data_file_writer.write(batch).await?;
+                    if let Some(metrics_recorder) = &metrics_recorder {
+                        metrics_recorder.record_datafusion_batch_write_duration(
+                            write_start.elapsed().as_millis() as f64,
+                        );
+                    }
+
+                    // Record detailed batch stats
+                    if let Some(metrics_recorder) = &metrics_recorder {
+                        metrics_recorder.record_batch_stats(record_count, batch_bytes);
+                    }
+
+                    fetch_batch_start = Instant::now(); // Reset for next batch
                 }
+
                 let data_files = data_file_writer.close().await?;
                 Ok(data_files)
             });
@@ -106,64 +142,81 @@ impl CompactionExecutor for DataFusionExecutor {
             .collect::<Result<Vec<_>>>()
             .map(|iters| iters.into_iter().flatten().collect())?;
 
-        stat.added_files_count = output_data_files.len() as u32;
-        stat.rewritten_bytes = output_data_files
+        stats.output_files_count = output_data_files.len();
+        let output_total_bytes = output_data_files
             .iter()
             .map(|f| f.file_size_in_bytes())
             .sum();
-        stat.rewritten_files_count = rewritten_files_count;
+        stats.output_total_bytes = output_total_bytes;
+
+        stats.input_files_count = input_files_count;
+        stats.input_total_bytes = input_total_bytes;
 
         Ok(RewriteFilesResponse {
             data_files: output_data_files,
-            stat,
+            stats,
         })
     }
 }
 
-impl DataFusionExecutor {
-    async fn build_iceberg_writer(
-        data_file_prefix: String,
-        dir_path: String,
-        schema: Arc<Schema>,
-        file_io: FileIO,
-        partition_spec: Arc<PartitionSpec>,
-        config: Arc<CompactionConfig>,
-    ) -> Result<Box<dyn IcebergWriter>> {
-        let location_generator = DefaultLocationGenerator { dir_path };
-        let unique_uuid_suffix = Uuid::now_v7();
-        let file_name_generator = DefaultFileNameGenerator::new(
-            data_file_prefix,
-            Some(unique_uuid_suffix.to_string()),
-            iceberg::spec::DataFileFormat::Parquet,
-        );
+pub async fn build_iceberg_data_file_writer(
+    data_file_prefix: String,
+    dir_path: String,
+    schema: Arc<Schema>,
+    file_io: FileIO,
+    partition_spec: Arc<PartitionSpec>,
+    config: Arc<CompactionConfig>,
+) -> Result<Box<dyn IcebergWriter>> {
+    let parquet_writer_builder = build_parquet_writer_builder(
+        data_file_prefix,
+        dir_path,
+        schema.clone(),
+        file_io,
+        config.write_parquet_properties.clone(),
+    )
+    .await?;
+    let data_file_builder =
+        DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
+    let data_file_size_writer =
+        rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
+            .with_target_file_size(config.target_file_size);
+    let iceberg_output_writer = if partition_spec.fields().is_empty() {
+        Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
+    } else {
+        Box::new(
+            FanoutPartitionWriterBuilder::new(
+                data_file_size_writer,
+                partition_spec.clone(),
+                schema,
+            )?
+            .build()
+            .await?,
+        ) as Box<dyn IcebergWriter>
+    };
+    Ok(iceberg_output_writer)
+}
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            config.write_parquet_properties.clone(),
-            schema.clone(),
-            file_io,
-            location_generator,
-            file_name_generator,
-        );
+pub async fn build_parquet_writer_builder(
+    data_file_prefix: String,
+    dir_path: String,
+    schema: Arc<Schema>,
+    file_io: FileIO,
+    write_parquet_properties: WriterProperties,
+) -> Result<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>> {
+    let location_generator = DefaultLocationGenerator { dir_path };
+    let unique_uuid_suffix = Uuid::now_v7();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        data_file_prefix,
+        Some(unique_uuid_suffix.to_string()),
+        iceberg::spec::DataFileFormat::Parquet,
+    );
 
-        let data_file_builder =
-            DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-        let data_file_size_writer =
-            rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-                .with_target_file_size(config.target_file_size)
-                .with_max_concurrent_closes(config.max_concurrent_closes);
-        let iceberg_output_writer = if partition_spec.fields().is_empty() {
-            Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
-        } else {
-            Box::new(
-                FanoutPartitionWriterBuilder::new(
-                    data_file_size_writer,
-                    partition_spec.clone(),
-                    schema,
-                )?
-                .build()
-                .await?,
-            ) as Box<dyn IcebergWriter>
-        };
-        Ok(iceberg_output_writer)
-    }
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        write_parquet_properties,
+        schema.clone(),
+        file_io,
+        location_generator,
+        file_name_generator,
+    );
+    Ok(parquet_writer_builder)
 }

@@ -23,24 +23,24 @@
 
 ## 📝 Examples
 
-### Memory Catalog Example
+### REST Catalog Example
 
-We provide a complete working example using an in-memory catalog. This example demonstrates how to use iceberg-compaction for Iceberg table compaction:
+We provide a complete working example using a REST catalog. This example demonstrates how to use iceberg-compaction for Iceberg table compaction with a REST catalog backend:
 
 ```bash
 # Navigate to the example directory
-cd examples/memory-catalog
+cd examples/rest-catalog
 
 # Run the example
 cargo run
 ```
 
 The example includes:
-- Setting up an in-memory Iceberg catalog
-- Creating a sample table.
+- Setting up a REST Iceberg catalog with S3 storage
+- Configuring authentication and connection settings
 - Performing table compaction using iceberg-compaction
 
-For more details, see the [memory-catalog example](./examples/memory-catalog/).
+For more details, see the [rest-catalog example](./examples/rest-catalog/).
 
 ## 🗺️ Roadmap
 

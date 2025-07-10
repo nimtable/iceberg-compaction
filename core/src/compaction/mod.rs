@@ -20,7 +20,7 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::common::Metrics;
+use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
     create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
@@ -60,7 +60,7 @@ pub struct CompactionBuilder {
 }
 
 impl CompactionBuilder {
-    /// Create a new CompactionBuilder with default settings
+    /// Create a new `CompactionBuilder` with default settings
     pub fn new() -> Self {
         Self {
             config: None,
@@ -80,7 +80,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the executor type (defaults to DataFusion)
+    /// Set the executor type (defaults to `DataFusion`)
     pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
         self.executor_type = executor_type;
         self
@@ -92,7 +92,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the metrics registry (optional, defaults to NoopMetricsRegistry)
+    /// Set the metrics registry (optional, defaults to `NoopMetricsRegistry`)
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
         self.registry = registry;
         self
@@ -124,22 +124,22 @@ impl CompactionBuilder {
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
         let config = self.config.ok_or_else(|| {
-            crate::error::CompactionError::Execution("CompactionConfig is required".to_string())
+            crate::error::CompactionError::Execution("CompactionConfig is required".to_owned())
         })?;
 
         let catalog = self.catalog.ok_or_else(|| {
-            crate::error::CompactionError::Execution("Catalog is required".to_string())
+            crate::error::CompactionError::Execution("Catalog is required".to_owned())
         })?;
 
         let table_ident = self.table_ident.ok_or_else(|| {
-            crate::error::CompactionError::Execution("TableIdent is required".to_string())
+            crate::error::CompactionError::Execution("TableIdent is required".to_owned())
         })?;
 
         let compaction_type = self.compaction_type.unwrap_or(CompactionType::Full);
 
         if !catalog.table_exists(&table_ident).await? {
             return Err(crate::error::CompactionError::Execution(
-                "Table does not exist".to_string(),
+                "Table does not exist".to_owned(),
             ));
         }
 
@@ -189,7 +189,7 @@ struct CompactionResult {
 }
 
 impl Compaction {
-    /// Create a new CompactionBuilder for flexible configuration
+    /// Create a new `CompactionBuilder` for flexible configuration
     pub fn builder() -> CompactionBuilder {
         CompactionBuilder::new()
     }
@@ -220,14 +220,15 @@ impl Compaction {
     }
 
     /// Standard compaction implementation for simple file-based compaction types
-    /// This works well for Full and SmallFiles compaction where the main difference
-    /// is the FileStrategy used for file selection
+    /// This works well for Full and `SmallFiles` compaction where the main difference
+    /// is the `FileStrategy` used for file selection
     async fn execute_standard_compaction(&self) -> Result<CompactionResult> {
-        let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-        let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
-        let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
-
         let now = std::time::Instant::now();
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.metrics.clone(),
+            self.catalog_name.clone(),
+            self.table_ident.to_string(),
+        );
 
         let table = self.catalog.load_table(&self.table_ident).await?;
 
@@ -261,21 +262,17 @@ impl Compaction {
         };
 
         // Step 2: Create rewrite request
-        let rewrite_files_request = self
-            .create_rewrite_request(&table, input_file_scan_tasks.clone())
-            .await?;
+        let rewrite_files_request =
+            self.create_rewrite_request(&table, input_file_scan_tasks.clone())?;
 
         // Step 3: Execute rewrite
         let RewriteFilesResponse {
             data_files: mut output_data_files,
-            stat,
+            stats,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
             Err(e) => {
-                self.metrics
-                    .compaction_executor_error_counter
-                    .counter(&label_vec)
-                    .increase(1);
+                metrics_recorder.record_executor_error();
                 return Err(e);
             }
         };
@@ -288,7 +285,17 @@ impl Compaction {
         };
 
         // Step 4: Commit results (extensible)
-        let committed_table = self
+        // let committed_table = self
+        //     .commit_compaction_results(
+        //         &table,
+        //         output_data_files_for_commit,
+        //         &input_file_scan_tasks,
+        //         current_snapshot,
+        //         table.file_io(),
+        //     )
+        //     .await?;
+
+        let committed_table = match self
             .commit_compaction_results(
                 &table,
                 output_data_files_for_commit,
@@ -296,10 +303,17 @@ impl Compaction {
                 current_snapshot,
                 table.file_io(),
             )
-            .await?;
+            .await
+        {
+            Ok(table) => table,
+            Err(e) => {
+                metrics_recorder.record_executor_error();
+                return Err(e);
+            }
+        };
 
         // Step 5: Update metrics
-        self.update_metrics(&label_vec, &stat, now, commit_now);
+        self.update_metrics(&metrics_recorder, &stats, now, commit_now);
 
         // Step 6: Setup validation if enabled
         let compaction_validator = if self.config.enable_validate_compaction {
@@ -320,12 +334,7 @@ impl Compaction {
         };
 
         Ok(CompactionResult {
-            stats: RewriteFilesStat {
-                rewritten_files_count: stat.rewritten_files_count,
-                added_files_count: stat.added_files_count,
-                rewritten_bytes: stat.rewritten_bytes,
-                failed_data_files_count: stat.failed_data_files_count,
-            },
+            stats,
             compaction_validator,
         })
     }
@@ -333,46 +342,20 @@ impl Compaction {
     /// Helper method to update metrics
     fn update_metrics(
         &self,
-        label_vec: &[std::borrow::Cow<'static, str>; 2],
-        stat: &RewriteFilesStat,
+        metrics_recorder: &CompactionMetricsRecorder,
+        stats: &RewriteFilesStat,
         start_time: std::time::Instant,
         commit_start_time: std::time::Instant,
     ) {
-        self.metrics
-            .compaction_commit_duration
-            .histogram(label_vec)
-            .record(commit_start_time.elapsed().as_secs_f64());
-
-        self.metrics
-            .compaction_duration
-            .histogram(label_vec)
-            .record(start_time.elapsed().as_secs_f64());
-
-        self.metrics
-            .compaction_rewritten_bytes
-            .counter(label_vec)
-            .increase(stat.rewritten_bytes);
-
-        self.metrics
-            .compaction_rewritten_files_count
-            .counter(label_vec)
-            .increase(stat.rewritten_files_count as u64);
-
-        self.metrics
-            .compaction_added_files_count
-            .counter(label_vec)
-            .increase(stat.added_files_count as u64);
-
-        self.metrics
-            .compaction_failed_data_files_count
-            .counter(label_vec)
-            .increase(stat.failed_data_files_count as u64);
+        metrics_recorder.record_commit_duration(commit_start_time.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_duration(start_time.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_complete(stats);
     }
 
     // Template method pattern: These methods can be overridden for specific compaction types
 
-    /// Hook for customizing file selection logic beyond simple FileStrategy
-    /// Default implementation uses FileStrategy, but complex compaction types can override
+    /// Hook for customizing file selection logic beyond simple `FileStrategy`
+    /// Default implementation uses `FileStrategy`, but complex compaction types can override
     async fn select_files_for_compaction(
         &self,
         table: &Table,
@@ -387,7 +370,7 @@ impl Compaction {
 
     /// Hook for customizing the rewrite request configuration
     /// Default implementation creates a standard request, but can be customized
-    async fn create_rewrite_request(
+    fn create_rewrite_request(
         &self,
         table: &Table,
         input_tasks: InputFileScanTasks,
@@ -395,6 +378,11 @@ impl Compaction {
         let schema = table.metadata().current_schema();
         let default_location_generator =
             DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.metrics.clone(),
+            self.catalog_name.clone(),
+            self.table_ident.to_string(),
+        );
 
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
@@ -403,6 +391,7 @@ impl Compaction {
             config: self.config.clone(),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
+            metrics_recorder: Some(metrics_recorder),
         })
     }
 
@@ -514,8 +503,7 @@ pub struct RewriteDataFilesCommitManager {
     starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
     use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
 
-    catalog_name: String,  // Catalog name for metrics
-    metrics: Arc<Metrics>, // Metrics for tracking commit operations
+    metrics_recorder: CompactionMetricsRecorder, // Metrics recorder for tracking commit operations
 
     basic_schema_id: i32, // Schema ID for the table, used for validation
 }
@@ -536,14 +524,16 @@ impl RewriteDataFilesCommitManager {
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
     ) -> Self {
+        let metrics_recorder =
+            CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
+
         Self {
             config,
             catalog,
             table_ident,
             starting_snapshot_id: consistency_params.starting_snapshot_id,
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
-            catalog_name,
-            metrics,
+            metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
         }
     }
@@ -556,6 +546,7 @@ impl RewriteDataFilesCommitManager {
     ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+
         let operation = || {
             let catalog = self.catalog.clone();
             let table_ident = self.table_ident.clone();
@@ -563,12 +554,7 @@ impl RewriteDataFilesCommitManager {
             let delete_files = delete_files.clone();
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
-            let metrics = self.metrics.clone();
-
-            let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-            let catalog_name_label: std::borrow::Cow<'static, str> =
-                self.catalog_name.clone().into();
-            let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
+            let metrics_recorder = self.metrics_recorder.clone();
 
             async move {
                 // reload the table to get the latest state
@@ -599,8 +585,7 @@ impl RewriteDataFilesCommitManager {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
                             format!(
-                                "No snapshot found with the given snapshot_id {}",
-                                starting_snapshot_id
+                                "No snapshot found with the given snapshot_id {starting_snapshot_id}"
                             ),
                         ));
                     }
@@ -614,17 +599,11 @@ impl RewriteDataFilesCommitManager {
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
-                        metrics
-                            .compaction_commit_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_success();
                         Ok(table)
                     }
                     Err(commit_err) => {
-                        metrics
-                            .compaction_commit_failed_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_failure();
 
                         tracing::error!(
                             "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
@@ -782,8 +761,8 @@ mod tests {
         };
 
         let file_name_generator = DefaultFileNameGenerator::new(
-            "data".to_string(),
-            Some("test".to_string()),
+            "data".to_owned(),
+            Some("test".to_owned()),
             iceberg::spec::DataFileFormat::Parquet,
         );
 
@@ -828,8 +807,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("eq-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("eq-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -843,8 +822,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("pos-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("pos-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -876,8 +855,8 @@ mod tests {
         };
 
         let file_name_generator = DefaultFileNameGenerator::new(
-            "data".to_string(),
-            Some(file_name_suffix.to_string()),
+            "data".to_owned(),
+            Some(file_name_suffix.to_owned()),
             iceberg::spec::DataFileFormat::Parquet,
         );
 
@@ -902,7 +881,7 @@ mod tests {
     async fn test_write_commit_and_compaction() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         // Create a memory catalog with the file IO and warehouse location
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -976,14 +955,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rewrite_files_stat.rewritten_files_count, 2);
+        assert_eq!(rewrite_files_stat.input_files_count, 2);
     }
 
     #[tokio::test]
     async fn test_full_compaction() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         // Create a memory catalog with the file IO and warehouse location
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -1037,19 +1016,16 @@ mod tests {
             .unwrap();
 
         // Full compaction should rewrite all existing files
-        assert_eq!(
-            rewrite_files_stat.rewritten_files_count,
-            initial_file_count as u32
-        );
+        assert_eq!(rewrite_files_stat.input_files_count, initial_file_count);
         // Should create at least 1 new file from all the data (might be more depending on size)
-        assert!(rewrite_files_stat.added_files_count >= 1);
+        assert!(rewrite_files_stat.output_files_count >= 1);
     }
 
     #[tokio::test]
     async fn test_small_files_compaction_with_validation() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         // Create a memory catalog with the file IO and warehouse location
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -1188,14 +1164,11 @@ mod tests {
         let rewrite_files_stat = compaction.compact().await.unwrap();
 
         // Validate compaction results
-        assert_eq!(
-            rewrite_files_stat.rewritten_files_count,
-            small_files_count as u32
-        );
+        assert_eq!(rewrite_files_stat.input_files_count, small_files_count,);
 
         // Should create fewer files than were compacted (compaction benefit)
-        assert!(rewrite_files_stat.added_files_count <= small_files_count as u32);
-        assert!(rewrite_files_stat.added_files_count > 0);
+        assert!(rewrite_files_stat.output_files_count <= small_files_count);
+        assert!(rewrite_files_stat.output_files_count > 0);
 
         // Verify final state: total files should be reduced
         let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
@@ -1218,7 +1191,7 @@ mod tests {
 
         // Final file count should be: large_files + newly_created_files
         let expected_final_count =
-            large_files_count + rewrite_files_stat.added_files_count as usize;
+            large_files_count + rewrite_files_stat.output_files_count as usize;
         assert_eq!(final_data_files.len(), expected_final_count);
 
         // Verify that large files are still present and untouched

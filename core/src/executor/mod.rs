@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
+use crate::common::CompactionMetricsRecorder;
 use crate::config::CompactionConfig;
 use iceberg::spec::{DataFile, Schema};
 
@@ -42,10 +43,12 @@ pub struct RewriteFilesRequest {
     pub config: Arc<CompactionConfig>,
     pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
+
+    pub metrics_recorder: Option<CompactionMetricsRecorder>,
 }
 
 #[derive(Debug, Clone)]
-/// InputFileScanTasks contains the file scan tasks for data files, position delete files, and equality delete files.
+/// `InputFileScanTasks` contains the file scan tasks for data files, position delete files, and equality delete files.
 pub struct InputFileScanTasks {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,
@@ -53,25 +56,32 @@ pub struct InputFileScanTasks {
 }
 
 impl InputFileScanTasks {
-    pub fn input_files_count(&self) -> u32 {
-        self.data_files.len() as u32
-            + self.position_delete_files.len() as u32
-            + self.equality_delete_files.len() as u32
+    pub fn input_files_count(&self) -> usize {
+        self.data_files.len() + self.position_delete_files.len() + self.equality_delete_files.len()
+    }
+
+    pub fn input_total_bytes(&self) -> u64 {
+        self.data_files
+            .iter()
+            .chain(&self.position_delete_files)
+            .chain(&self.equality_delete_files)
+            .map(|task| task.file_size_in_bytes)
+            .sum()
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RewriteFilesResponse {
     pub data_files: Vec<DataFile>,
-    pub stat: RewriteFilesStat,
+    pub stats: RewriteFilesStat,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RewriteFilesStat {
-    pub rewritten_files_count: u32,
-    pub added_files_count: u32,
-    pub rewritten_bytes: u64,
-    pub failed_data_files_count: u32,
+    pub input_files_count: usize,
+    pub output_files_count: usize,
+    pub input_total_bytes: u64,
+    pub output_total_bytes: u64,
 }
 
 pub enum ExecutorType {

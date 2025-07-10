@@ -299,6 +299,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
 }
 
 /// Gets a stream of record batches from a list of file scan tasks
+#[allow(clippy::unused_async)]
 async fn get_batch_stream(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,

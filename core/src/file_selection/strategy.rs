@@ -79,7 +79,7 @@ impl StaticFileStrategy for NoopStrategy {
     }
 
     fn description(&self) -> String {
-        "Noop".to_string()
+        "Noop".to_owned()
     }
 }
 
@@ -97,7 +97,7 @@ impl StaticFileStrategy for NoDeleteFilesStrategy {
     }
 
     fn description(&self) -> String {
-        "NoDeleteFiles".to_string()
+        "NoDeleteFiles".to_owned()
     }
 }
 
@@ -135,7 +135,7 @@ impl StaticFileStrategy for SizeFilterStrategy {
             }
             (Some(min), None) => format!("SizeFilter[>{}MB]", min / 1024 / 1024),
             (None, Some(max)) => format!("SizeFilter[<{}MB]", max / 1024 / 1024),
-            (None, None) => "SizeFilter[Any]".to_string(),
+            (None, None) => "SizeFilter[Any]".to_owned(),
         }
     }
 }
@@ -240,10 +240,10 @@ impl UnifiedStrategy {
         }
     }
 
-    /// Create a UnifiedStrategy from any StaticFileStrategy
+    /// Create a `UnifiedStrategy` from any `StaticFileStrategy`
     ///
     /// This is a convenience method that allows you to wrap any static strategy
-    /// in the UnifiedStrategy enum for use with the unified interface.
+    /// in the `UnifiedStrategy` enum for use with the unified interface.
     pub fn from_static<T: Into<UnifiedStrategy>>(strategy: T) -> Self {
         strategy.into()
     }
@@ -425,7 +425,7 @@ mod tests {
             start: 0,
             length: file_size,
             record_count: Some(100),
-            data_file_path: file_path.to_string(),
+            data_file_path: file_path.to_owned(),
             data_file_content: DataContentType::Data,
             data_file_format: DataFileFormat::Parquet,
             schema: Arc::new(iceberg::spec::Schema::builder().build().unwrap()),
@@ -472,7 +472,7 @@ mod tests {
             start: 0,
             length: file_size,
             record_count: Some(100),
-            data_file_path: file_path.to_string(),
+            data_file_path: file_path.to_owned(),
             data_file_content: DataContentType::Data,
             data_file_format: DataFileFormat::Parquet,
             schema: Arc::new(iceberg::spec::Schema::builder().build().unwrap()),

@@ -16,7 +16,7 @@
 
 use crate::executor::InputFileScanTasks;
 use crate::Result;
-use futures_async_stream::for_await;
+use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use std::collections::HashMap;
@@ -44,20 +44,18 @@ impl FileSelector {
 
         let file_scan_stream = scan.plan_files().await?;
 
-        let mut data_files = vec![];
-
-        #[for_await]
-        for task in file_scan_stream {
-            let task: FileScanTask = task?;
-            match task.data_file_content {
-                iceberg::spec::DataContentType::Data => {
-                    data_files.push(task);
-                }
-                _ => {
-                    unreachable!()
-                }
-            }
-        }
+        let data_files: Vec<FileScanTask> = file_scan_stream
+            .try_filter_map(|task| {
+                futures::future::ready(Ok(
+                    if matches!(task.data_file_content, iceberg::spec::DataContentType::Data) {
+                        Some(task)
+                    } else {
+                        None
+                    },
+                ))
+            })
+            .try_collect()
+            .await?;
 
         // Apply file filtering strategy using static dispatch
         let filtered_data_files: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter());
@@ -66,7 +64,7 @@ impl FileSelector {
         Self::build_input_file_scan_tasks(filtered_data_files)
     }
 
-    /// Build InputFileScanTasks from filtered data files
+    /// Build `InputFileScanTasks` from filtered data files
     fn build_input_file_scan_tasks(
         filtered_data_files: Vec<FileScanTask>,
     ) -> Result<InputFileScanTasks> {
@@ -74,7 +72,7 @@ impl FileSelector {
         let mut equality_delete_files = HashMap::new();
 
         for task in &filtered_data_files {
-            for delete_task in task.deletes.iter() {
+            for delete_task in &task.deletes {
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
                         let mut delete_task = delete_task.clone();
