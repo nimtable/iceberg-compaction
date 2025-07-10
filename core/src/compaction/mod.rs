@@ -285,15 +285,6 @@ impl Compaction {
         };
 
         // Step 4: Commit results (extensible)
-        // let committed_table = self
-        //     .commit_compaction_results(
-        //         &table,
-        //         output_data_files_for_commit,
-        //         &input_file_scan_tasks,
-        //         current_snapshot,
-        //         table.file_io(),
-        //     )
-        //     .await?;
 
         let committed_table = match self
             .commit_compaction_results(
