@@ -72,7 +72,7 @@ fn after_all() {
 /// This function:
 /// 1. Retrieves necessary configuration from Docker containers
 /// 2. Waits for the REST Catalog service to be ready
-/// 3. Creates and returns a configured RestCatalog instance
+/// 3. Creates and returns a configured `RestCatalog` instance
 pub async fn get_rest_catalog() -> RestCatalog {
     let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
@@ -85,22 +85,22 @@ pub async fn get_rest_catalog() -> RestCatalog {
         let minio_ip = docker_compose.get_container_ip(MINIO_SERVICE);
         let minio_port = docker_compose
             .get_container_env_value(MINIO_SERVICE, MINIO_API_PORT)
-            .unwrap_or(DEFAULT_MINIO_PORT.to_string());
+            .unwrap_or(DEFAULT_MINIO_PORT.to_owned());
         let aws_endpoint = format!("http://{}:{}", minio_ip, minio_port);
         let props = HashMap::from([
             (
-                S3_ACCESS_KEY_ID.to_string(),
-                aws_access_key_id.unwrap_or(DEFAULT_ADMIN.to_string()),
+                S3_ACCESS_KEY_ID.to_owned(),
+                aws_access_key_id.unwrap_or(DEFAULT_ADMIN.to_owned()),
             ),
             (
-                S3_SECRET_ACCESS_KEY.to_string(),
-                aws_secret_access_key.unwrap_or(DEFAULT_PASSWORD.to_string()),
+                S3_SECRET_ACCESS_KEY.to_owned(),
+                aws_secret_access_key.unwrap_or(DEFAULT_PASSWORD.to_owned()),
             ),
             (
-                S3_REGION.to_string(),
-                aws_region.unwrap_or(DEFAULT_REGION.to_string()),
+                S3_REGION.to_owned(),
+                aws_region.unwrap_or(DEFAULT_REGION.to_owned()),
             ),
-            (S3_ENDPOINT.to_string(), aws_endpoint),
+            (S3_ENDPOINT.to_owned(), aws_endpoint),
         ]);
         let rest_catalog_ip = docker_compose.get_container_ip(REST_SERVICE);
         (rest_catalog_ip, props)
@@ -125,7 +125,7 @@ struct DockerCompose {
 }
 
 impl DockerCompose {
-    /// Creates a new DockerCompose instance.
+    /// Creates a new `DockerCompose` instance.
     ///
     /// # Arguments
     /// * `project_name` - The Docker Compose project name
@@ -147,9 +147,9 @@ impl DockerCompose {
             .arg("--format")
             .arg("{{.OSType}}/{{.Architecture}}");
 
-        let result = get_cmd_output_result(cmd, "Get os arch".to_string());
+        let result = get_cmd_output_result(cmd, "Get os arch".to_owned());
         match result {
-            Ok(value) => value.trim().to_string(),
+            Ok(value) => value.trim().to_owned(),
             Err(_err) => {
                 // docker/podman do not consistently place OSArch info in the same json path across OS and versions
                 // Below tries an alternative path if the above path fails
@@ -158,9 +158,9 @@ impl DockerCompose {
                     .arg("info")
                     .arg("--format")
                     .arg("{{.Version.OsArch}}");
-                get_cmd_output(alt_cmd, "Get os arch".to_string())
+                get_cmd_output(alt_cmd, "Get os arch".to_owned())
                     .trim()
-                    .to_string()
+                    .to_owned()
             }
         }
     }
@@ -270,7 +270,7 @@ impl DockerCompose {
             .filter_map(|line| {
                 let parts: Vec<&str> = line.splitn(2, '=').collect();
                 if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
+                    Some((parts[0].to_owned(), parts[1].to_owned()))
                 } else {
                     None
                 }
@@ -327,7 +327,7 @@ pub fn run_command(mut cmd: Command, desc: impl ToString) {
 /// * `desc` - A description of the command for logging purposes
 ///
 /// # Returns
-/// Ok(stdout) on success, Err(error_message) on failure
+/// Ok(stdout) on success, `Err(error_message)` on failure
 pub fn get_cmd_output_result(mut cmd: Command, desc: impl ToString) -> Result<String, String> {
     let desc = desc.to_string();
     tracing::info!("Starting to {}, command: {:?}", &desc, cmd);

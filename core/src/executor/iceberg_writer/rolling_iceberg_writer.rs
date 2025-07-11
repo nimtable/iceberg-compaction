@@ -33,7 +33,7 @@ use crate::config::{
 pub struct SizeEstimationTracker {
     /// Whether dynamic size estimation is enabled
     enabled: bool,
-    /// Current size estimation ratio (physical_size / memory_size), None if not learned yet
+    /// Current size estimation ratio (`physical_size / memory_size`), None if not learned yet
     ratio: Option<f64>,
     /// Smoothing factor for ratio updates
     smoothing_factor: f64,
@@ -158,7 +158,7 @@ impl SizeEstimationTracker {
 
 type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 
-/// RollingIcebergWriter wraps an IcebergWriter and splits output files by target size.
+/// `RollingIcebergWriter` wraps an `IcebergWriter` and splits output files by target size.
 ///
 /// # Features
 ///
@@ -218,8 +218,8 @@ pub struct RollingIcebergWriter<B, D> {
     data_files: Vec<DataFile>,
     /// Size estimation tracker for dynamic file size prediction.
     size_tracker: SizeEstimationTracker,
-    /// Futures for all closing writers with their file size information (files, small_file_info).
-    /// small_file_info is Some((final_physical_size, unflushed_memory_size)) only for small files that need ratio calculation.
+    /// Futures for all closing writers with their file size information (files, `small_file_info`).
+    /// `small_file_info` is Some((`final_physical_size`, `unflushed_memory_size`)) only for small files that need ratio calculation.
     close_futures: CloseFuture,
     /// Maximum number of concurrent close operations allowed.
     max_concurrent_closes: usize,
@@ -797,7 +797,7 @@ mod tests {
         }
 
         fn current_file_path(&self) -> String {
-            "mock_file.parquet".to_string()
+            "mock_file.parquet".to_owned()
         }
 
         fn current_row_num(&self) -> usize {
@@ -833,7 +833,7 @@ mod tests {
 
         DataFileBuilder::default()
             .content(iceberg::spec::DataContentType::Data)
-            .file_path("mock_file.parquet".to_string())
+            .file_path("mock_file.parquet".to_owned())
             .file_format(DataFileFormat::Parquet)
             .partition(Struct::empty())
             .record_count(100)

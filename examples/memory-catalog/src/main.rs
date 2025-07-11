@@ -30,7 +30,7 @@ use iceberg_compaction_core::config::CompactionConfigBuilder;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Set up a temporary warehouse location
     let temp_dir = TempDir::new()?;
-    let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+    let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
 
     // 2. Create file I/O and memory catalog
     let file_io = FileIOBuilder::new_fs_io().build()?;
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_catalog(catalog.clone())
         .with_table_ident(table_ident.clone())
         .with_config(Arc::new(compaction_config))
-        .with_catalog_name("memory_catalog".to_string())
+        .with_catalog_name("memory_catalog".to_owned())
         .build()
         .await?;
 
@@ -80,10 +80,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. Display compaction results
     println!("Compaction completed successfully!");
-    println!("  - Rewritten files: {}", stats.rewritten_files_count);
-    println!("  - Added files: {}", stats.added_files_count);
-    println!("  - Rewritten bytes: {}", stats.rewritten_bytes);
-    println!("  - Failed files: {}", stats.failed_data_files_count);
+    println!("  - Input files: {}", stats.input_files_count);
+    println!("  - Output files: {}", stats.output_files_count);
+    println!("  - Input bytes: {}", stats.input_total_bytes);
+    println!("  - Output bytes: {}", stats.output_total_bytes);
 
     Ok(())
 }

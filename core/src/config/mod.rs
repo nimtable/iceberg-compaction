@@ -27,6 +27,8 @@ pub const DEFAULT_MAX_CONCURRENT_CLOSES: usize = 4;
 pub const DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS: bool = true;
 pub const DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION: bool = false;
 pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
+pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
+pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -60,6 +62,12 @@ pub struct CompactionConfig {
     /// Maximum number of concurrent file close operations
     #[builder(default = "DEFAULT_MAX_CONCURRENT_CLOSES")]
     pub max_concurrent_closes: usize,
+    /// Threshold for small file compaction (default: 32MB)
+    #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
+    pub small_file_threshold: u64,
+    /// Maximum total size for a single compaction task (default: 10GB)
+    #[builder(default = "DEFAULT_MAX_TASK_TOTAL_SIZE")]
+    pub max_task_total_size: u64,
     /// Parquet writer properties for output files
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,

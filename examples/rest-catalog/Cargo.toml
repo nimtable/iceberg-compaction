@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 iceberg-compaction-core = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

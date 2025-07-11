@@ -20,9 +20,9 @@ use crate::test_utils::{
     generator::{FileGenerator, FileGeneratorConfig, WriterConfig},
 };
 use iceberg::{
-    Catalog, NamespaceIdent, TableCreation,
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
+    Catalog, NamespaceIdent, TableCreation,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -59,7 +59,7 @@ pub async fn build_test_iceberg_table(
     let catalog = get_rest_catalog().await;
     let schema = schema.unwrap_or_else(|| get_test_schema().unwrap());
     let table_creation = TableCreation::builder()
-        .name(TABLE_NAME.to_string())
+        .name(TABLE_NAME.to_owned())
         .schema(schema.clone())
         .build();
     let namespace_ident = NamespaceIdent::new(NAMESPACE_NAME.to_owned());

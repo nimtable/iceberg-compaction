@@ -14,26 +14,25 @@
  * limitations under the License.
  */
 
-use iceberg::spec::DataFile;
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, Snapshot};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
-use crate::common::Metrics;
+use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::executor::{
-    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
+    RewriteFilesResponse, RewriteFilesStat,
 };
+use crate::file_selection::FileSelector;
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
-use futures_async_stream::for_await;
-use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +41,10 @@ use backon::Retryable;
 
 mod validator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionType {
     Full,
+    MergeSmallDataFiles,
 }
 
 /// Builder for creating Compaction instances with flexible configuration
@@ -59,7 +60,7 @@ pub struct CompactionBuilder {
 }
 
 impl CompactionBuilder {
-    /// Create a new CompactionBuilder with default settings
+    /// Create a new `CompactionBuilder` with default settings
     pub fn new() -> Self {
         Self {
             config: None,
@@ -79,7 +80,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the executor type (defaults to DataFusion)
+    /// Set the executor type (defaults to `DataFusion`)
     pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
         self.executor_type = executor_type;
         self
@@ -91,7 +92,7 @@ impl CompactionBuilder {
         self
     }
 
-    /// Set the metrics registry (optional, defaults to NoopMetricsRegistry)
+    /// Set the metrics registry (optional, defaults to `NoopMetricsRegistry`)
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
         self.registry = registry;
         self
@@ -123,22 +124,22 @@ impl CompactionBuilder {
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
         let config = self.config.ok_or_else(|| {
-            crate::error::CompactionError::Execution("CompactionConfig is required".to_string())
+            crate::error::CompactionError::Execution("CompactionConfig is required".to_owned())
         })?;
 
         let catalog = self.catalog.ok_or_else(|| {
-            crate::error::CompactionError::Execution("Catalog is required".to_string())
+            crate::error::CompactionError::Execution("Catalog is required".to_owned())
         })?;
 
         let table_ident = self.table_ident.ok_or_else(|| {
-            crate::error::CompactionError::Execution("TableIdent is required".to_string())
+            crate::error::CompactionError::Execution("TableIdent is required".to_owned())
         })?;
 
         let compaction_type = self.compaction_type.unwrap_or(CompactionType::Full);
 
         if !catalog.table_exists(&table_ident).await? {
             return Err(crate::error::CompactionError::Execution(
-                "Table does not exist".to_string(),
+                "Table does not exist".to_owned(),
             ));
         }
 
@@ -184,12 +185,11 @@ pub struct Compaction {
 
 struct CompactionResult {
     stats: RewriteFilesStat,
-
     compaction_validator: Option<CompactionValidator>,
 }
 
 impl Compaction {
-    /// Create a new CompactionBuilder for flexible configuration
+    /// Create a new `CompactionBuilder` for flexible configuration
     pub fn builder() -> CompactionBuilder {
         CompactionBuilder::new()
     }
@@ -199,7 +199,10 @@ impl Compaction {
             stats,
             compaction_validator,
         } = match self.compaction_type {
-            CompactionType::Full => self.full_compact().await?,
+            CompactionType::Full | CompactionType::MergeSmallDataFiles => {
+                // Use the generic implementation for simple compaction types
+                self.execute_standard_compaction().await?
+            }
         };
 
         // validate
@@ -216,120 +219,101 @@ impl Compaction {
         Ok(stats)
     }
 
-    async fn full_compact(&self) -> Result<CompactionResult> {
-        let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-        let catalog_name_label: std::borrow::Cow<'static, str> = self.catalog_name.clone().into();
-        let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
-
+    /// Standard compaction implementation for simple file-based compaction types
+    /// This works well for Full and `SmallFiles` compaction where the main difference
+    /// is the `FileStrategy` used for file selection
+    async fn execute_standard_compaction(&self) -> Result<CompactionResult> {
         let now = std::time::Instant::now();
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.metrics.clone(),
+            self.catalog_name.clone(),
+            self.table_ident.to_string(),
+        );
 
         let table = self.catalog.load_table(&self.table_ident).await?;
+
+        // check if the current snapshot exists
         if table.metadata().current_snapshot().is_none() {
             return Ok(CompactionResult {
                 stats: RewriteFilesStat::default(),
                 compaction_validator: None,
             });
         }
-        let (data_files, delete_files) = get_old_files_from_table(table.clone()).await?;
-        let mut input_file_scan_tasks = Some(get_tasks_from_table(table.clone()).await?);
 
-        let file_io = table.file_io().clone();
-        let schema = table.metadata().current_schema();
-        let basic_schema_id = schema.schema_id();
-        // TODO: support check partition spec
-        let default_location_generator =
-            DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let rewrite_files_request = RewriteFilesRequest {
-            file_io: file_io.clone(),
-            schema: schema.clone(),
-            input_file_scan_tasks: if self.config.enable_validate_compaction {
-                input_file_scan_tasks.clone().unwrap()
-            } else {
-                input_file_scan_tasks.take().unwrap()
-            },
-            config: self.config.clone(),
-            dir_path: default_location_generator.dir_path,
-            partition_spec: table.metadata().default_partition_spec().clone(),
+        let current_snapshot = table.metadata().current_snapshot().unwrap();
+
+        // Step 1: Select files for compaction (extensible)
+        let input_file_scan_tasks = self
+            .select_files_for_compaction(&table, current_snapshot.snapshot_id())
+            .await?;
+
+        // Check if any input files were selected
+        if input_file_scan_tasks.input_files_count() == 0 {
+            return Ok(CompactionResult {
+                stats: RewriteFilesStat::default(),
+                compaction_validator: None,
+            });
+        }
+
+        let mut input_tasks_for_validation = if self.config.enable_validate_compaction {
+            Some(input_file_scan_tasks.clone())
+        } else {
+            None
         };
+
+        // Step 2: Create rewrite request
+        let rewrite_files_request =
+            self.create_rewrite_request(&table, input_file_scan_tasks.clone())?;
+
+        // Step 3: Execute rewrite
         let RewriteFilesResponse {
             data_files: mut output_data_files,
-            stat,
+            stats,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
             Err(e) => {
-                self.metrics
-                    .compaction_executor_error_counter
-                    .counter(&label_vec)
-                    .increase(1);
+                metrics_recorder.record_executor_error();
                 return Err(e);
             }
         };
 
-        let consistency_params = CommitConsistencyParams {
-            starting_snapshot_id: table.metadata().current_snapshot_id().unwrap(),
-            use_starting_sequence_number: true,
-            basic_schema_id,
-        };
-
-        let commit_manager = RewriteDataFilesCommitManager::new(
-            self.commit_retry_config.clone(),
-            self.catalog.clone(),
-            self.table_ident.clone(),
-            self.catalog_name.clone(),
-            self.metrics.clone(),
-            consistency_params,
-        );
-
         let commit_now = std::time::Instant::now();
-        let output_data_files = if self.config.enable_validate_compaction {
+        let output_data_files_for_commit = if self.config.enable_validate_compaction {
             output_data_files.clone()
         } else {
             std::mem::take(&mut output_data_files)
         };
-        let committed_table = commit_manager
-            .rewrite_files(
-                output_data_files.clone(),
-                data_files.into_iter().chain(delete_files.into_iter()),
+
+        // Step 4: Commit results (extensible)
+
+        let committed_table = match self
+            .commit_compaction_results(
+                &table,
+                output_data_files_for_commit,
+                &input_file_scan_tasks,
+                current_snapshot,
+                table.file_io(),
             )
-            .await?;
+            .await
+        {
+            Ok(table) => table,
+            Err(e) => {
+                metrics_recorder.record_executor_error();
+                return Err(e);
+            }
+        };
 
-        self.metrics
-            .compaction_commit_duration
-            .histogram(&label_vec)
-            .record(commit_now.elapsed().as_secs_f64());
+        // Step 5: Update metrics
+        self.update_metrics(&metrics_recorder, &stats, now, commit_now);
 
-        self.metrics
-            .compaction_duration
-            .histogram(&label_vec)
-            .record(now.elapsed().as_secs_f64());
-
-        self.metrics
-            .compaction_rewritten_bytes
-            .counter(&label_vec)
-            .increase(stat.rewritten_bytes);
-
-        self.metrics
-            .compaction_rewritten_files_count
-            .counter(&label_vec)
-            .increase(stat.rewritten_files_count as u64);
-
-        self.metrics
-            .compaction_added_files_count
-            .counter(&label_vec)
-            .increase(stat.added_files_count as u64);
-
-        self.metrics
-            .compaction_failed_data_files_count
-            .counter(&label_vec)
-            .increase(stat.failed_data_files_count as u64);
-
+        // Step 6: Setup validation if enabled
         let compaction_validator = if self.config.enable_validate_compaction {
             Some(
                 CompactionValidator::new(
-                    input_file_scan_tasks.unwrap(),
+                    input_tasks_for_validation.take().unwrap(),
                     output_data_files,
                     self.config.clone(),
-                    schema.clone(),
+                    table.metadata().current_schema().clone(),
                     table.metadata().current_schema().clone(),
                     committed_table,
                     self.catalog_name.clone(),
@@ -341,38 +325,131 @@ impl Compaction {
         };
 
         Ok(CompactionResult {
-            stats: RewriteFilesStat {
-                rewritten_files_count: stat.rewritten_files_count,
-                added_files_count: stat.added_files_count,
-                rewritten_bytes: stat.rewritten_bytes,
-                failed_data_files_count: stat.failed_data_files_count,
-            },
+            stats,
             compaction_validator,
         })
     }
 
-    pub async fn expire_snapshot(&self, table_ident: TableIdent) -> Result<()> {
-        let table = self.catalog.load_table(&table_ident).await?;
-        let txn = Transaction::new(&table);
-        let txn = txn.expire_snapshot().apply().await?;
-        txn.commit(self.catalog.as_ref()).await?;
-        Ok(())
+    /// Helper method to update metrics
+    fn update_metrics(
+        &self,
+        metrics_recorder: &CompactionMetricsRecorder,
+        stats: &RewriteFilesStat,
+        start_time: std::time::Instant,
+        commit_start_time: std::time::Instant,
+    ) {
+        metrics_recorder.record_commit_duration(commit_start_time.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_duration(start_time.elapsed().as_secs_f64());
+        metrics_recorder.record_compaction_complete(stats);
+    }
+
+    // Template method pattern: These methods can be overridden for specific compaction types
+
+    /// Hook for customizing file selection logic beyond simple `FileStrategy`
+    /// Default implementation uses `FileStrategy`, but complex compaction types can override
+    async fn select_files_for_compaction(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+    ) -> Result<InputFileScanTasks> {
+        use crate::file_selection::FileStrategyFactory;
+
+        let strategy =
+            FileStrategyFactory::create_files_strategy(self.compaction_type, &self.config);
+        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
+    }
+
+    /// Hook for customizing the rewrite request configuration
+    /// Default implementation creates a standard request, but can be customized
+    fn create_rewrite_request(
+        &self,
+        table: &Table,
+        input_tasks: InputFileScanTasks,
+    ) -> Result<RewriteFilesRequest> {
+        let schema = table.metadata().current_schema();
+        let default_location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.metrics.clone(),
+            self.catalog_name.clone(),
+            self.table_ident.to_string(),
+        );
+
+        Ok(RewriteFilesRequest {
+            file_io: table.file_io().clone(),
+            schema: schema.clone(),
+            input_file_scan_tasks: input_tasks,
+            config: self.config.clone(),
+            dir_path: default_location_generator.dir_path,
+            partition_spec: table.metadata().default_partition_spec().clone(),
+            metrics_recorder: Some(metrics_recorder),
+        })
+    }
+
+    /// Hook for customizing the commit strategy
+    /// Default implementation commits all files at once, but can be customized for batch commits
+    async fn commit_compaction_results(
+        &self,
+        table: &Table,
+        output_data_files: Vec<DataFile>,
+        input_file_scan_tasks: &InputFileScanTasks,
+        snapshot: &Arc<Snapshot>,
+        file_io: &FileIO,
+    ) -> Result<Table> {
+        let consistency_params = CommitConsistencyParams {
+            starting_snapshot_id: table.metadata().current_snapshot_id().unwrap(),
+            use_starting_sequence_number: true,
+            basic_schema_id: table.metadata().current_schema().schema_id(),
+        };
+
+        let commit_manager = RewriteDataFilesCommitManager::new(
+            self.commit_retry_config.clone(),
+            self.catalog.clone(),
+            self.table_ident.clone(),
+            self.catalog_name.clone(),
+            self.metrics.clone(),
+            consistency_params,
+        );
+
+        let (all_data_files, all_delete_files) =
+            get_all_files_from_snapshot(snapshot, file_io, table.metadata()).await?;
+
+        // Collect file paths from all input scan tasks
+        let input_file_paths: std::collections::HashSet<&str> = input_file_scan_tasks
+            .data_files
+            .iter()
+            .chain(&input_file_scan_tasks.position_delete_files)
+            .chain(&input_file_scan_tasks.equality_delete_files)
+            .map(|task| task.data_file_path())
+            .collect();
+
+        // Filter all files to only include those from input scan tasks
+        let input_files: Vec<DataFile> = all_data_files
+            .into_iter()
+            .chain(all_delete_files.into_iter())
+            .filter(|file| input_file_paths.contains(file.file_path()))
+            .collect();
+
+        commit_manager
+            .rewrite_files(output_data_files, input_files)
+            .await
     }
 }
 
-async fn get_old_files_from_table(table: Table) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
-    let manifest_list = table
-        .metadata()
-        .current_snapshot()
-        .unwrap()
-        .load_manifest_list(table.file_io(), table.metadata())
+async fn get_all_files_from_snapshot(
+    snapshot: &Arc<Snapshot>,
+    file_io: &FileIO,
+    table_metadata: &iceberg::spec::TableMetadata,
+) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
+    let manifest_list = snapshot
+        .load_manifest_list(file_io, table_metadata)
         .await
         .unwrap();
 
     let mut data_file = vec![];
     let mut delete_file = vec![];
     for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(table.file_io()).await.unwrap();
+        let a = manifest_file.load_manifest(file_io).await.unwrap();
         let (entry, _) = a.into_parts();
         for i in entry {
             match i.content_type() {
@@ -389,58 +466,6 @@ async fn get_old_files_from_table(table: Table) -> Result<(Vec<DataFile>, Vec<Da
         }
     }
     Ok((data_file, delete_file))
-}
-
-async fn get_tasks_from_table(table: Table) -> Result<InputFileScanTasks> {
-    let snapshot_id = table.metadata().current_snapshot_id().unwrap();
-
-    let scan = table
-        .scan()
-        .snapshot_id(snapshot_id)
-        .with_delete_file_processing_enabled(true)
-        .build()?;
-    let file_scan_stream = scan.plan_files().await?;
-
-    let mut position_delete_files = HashMap::new();
-    let mut data_files = vec![];
-    let mut equality_delete_files = HashMap::new();
-
-    #[for_await]
-    for task in file_scan_stream {
-        let task: FileScanTask = task?;
-        match task.data_file_content {
-            iceberg::spec::DataContentType::Data => {
-                for delete_task in task.deletes.iter() {
-                    match &delete_task.data_file_content {
-                        iceberg::spec::DataContentType::PositionDeletes => {
-                            let mut delete_task = delete_task.clone();
-                            delete_task.project_field_ids = vec![];
-                            position_delete_files
-                                .insert(delete_task.data_file_path.clone(), delete_task);
-                        }
-                        iceberg::spec::DataContentType::EqualityDeletes => {
-                            let mut delete_task = delete_task.clone();
-                            delete_task.project_field_ids = delete_task.equality_ids.clone();
-                            equality_delete_files
-                                .insert(delete_task.data_file_path.clone(), delete_task);
-                        }
-                        _ => {
-                            unreachable!()
-                        }
-                    }
-                }
-                data_files.push(task);
-            }
-            _ => {
-                unreachable!()
-            }
-        }
-    }
-    Ok(InputFileScanTasks {
-        data_files,
-        position_delete_files: position_delete_files.into_values().collect(),
-        equality_delete_files: equality_delete_files.into_values().collect(),
-    })
 }
 
 /// Configuration for the commit manager, including retry strategies.
@@ -469,8 +494,7 @@ pub struct RewriteDataFilesCommitManager {
     starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
     use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
 
-    catalog_name: String,  // Catalog name for metrics
-    metrics: Arc<Metrics>, // Metrics for tracking commit operations
+    metrics_recorder: CompactionMetricsRecorder, // Metrics recorder for tracking commit operations
 
     basic_schema_id: i32, // Schema ID for the table, used for validation
 }
@@ -491,14 +515,16 @@ impl RewriteDataFilesCommitManager {
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
     ) -> Self {
+        let metrics_recorder =
+            CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
+
         Self {
             config,
             catalog,
             table_ident,
             starting_snapshot_id: consistency_params.starting_snapshot_id,
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
-            catalog_name,
-            metrics,
+            metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
         }
     }
@@ -511,6 +537,7 @@ impl RewriteDataFilesCommitManager {
     ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+
         let operation = || {
             let catalog = self.catalog.clone();
             let table_ident = self.table_ident.clone();
@@ -518,12 +545,7 @@ impl RewriteDataFilesCommitManager {
             let delete_files = delete_files.clone();
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
-            let metrics = self.metrics.clone();
-
-            let table_label: std::borrow::Cow<'static, str> = self.table_ident.to_string().into();
-            let catalog_name_label: std::borrow::Cow<'static, str> =
-                self.catalog_name.clone().into();
-            let label_vec: [std::borrow::Cow<'static, str>; 2] = [catalog_name_label, table_label];
+            let metrics_recorder = self.metrics_recorder.clone();
 
             async move {
                 // reload the table to get the latest state
@@ -554,8 +576,7 @@ impl RewriteDataFilesCommitManager {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
                             format!(
-                                "No snapshot found with the given snapshot_id {}",
-                                starting_snapshot_id
+                                "No snapshot found with the given snapshot_id {starting_snapshot_id}"
                             ),
                         ));
                     }
@@ -569,17 +590,11 @@ impl RewriteDataFilesCommitManager {
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
-                        metrics
-                            .compaction_commit_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_success();
                         Ok(table)
                     }
                     Err(commit_err) => {
-                        metrics
-                            .compaction_commit_failed_counter
-                            .counter(&label_vec)
-                            .increase(1);
+                        metrics_recorder.record_commit_failure();
 
                         tracing::error!(
                             "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
@@ -628,17 +643,17 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
     };
     use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;
@@ -710,6 +725,20 @@ mod tests {
         .unwrap()
     }
 
+    fn create_test_record_batch(iceberg_schema: &Schema) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+
+        // Convert iceberg schema to arrow schema to ensure field ID consistency
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap()
+    }
+
     async fn build_equality_delta_writer(
         table: &Table,
         warehouse_location: String,
@@ -723,8 +752,8 @@ mod tests {
         };
 
         let file_name_generator = DefaultFileNameGenerator::new(
-            "data".to_string(),
-            Some("test".to_string()),
+            "data".to_owned(),
+            Some("test".to_owned()),
             iceberg::spec::DataFileFormat::Parquet,
         );
 
@@ -769,8 +798,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("eq-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("eq-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -784,8 +813,8 @@ mod tests {
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
                 DefaultFileNameGenerator::new(
-                    "123".to_string(),
-                    Some(format!("pos-del-{}", unique_uuid_suffix)),
+                    "123".to_owned(),
+                    Some(format!("pos-del-{unique_uuid_suffix}")),
                     iceberg::spec::DataFileFormat::Parquet,
                 ),
             ),
@@ -804,11 +833,46 @@ mod tests {
         delta_builder.build().await.unwrap()
     }
 
+    async fn build_simple_data_writer(
+        table: &Table,
+        warehouse_location: String,
+        file_name_suffix: &str,
+    ) -> impl IcebergWriter {
+        let table_schema = table.metadata().current_schema();
+
+        // Set up writer
+        let location_generator = DefaultLocationGenerator {
+            dir_path: warehouse_location,
+        };
+
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "data".to_owned(),
+            Some(file_name_suffix.to_owned()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            table_schema.clone(),
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+
+        let data_file_builder = DataFileWriterBuilder::new(
+            parquet_writer_builder,
+            None,
+            table.metadata().default_partition_spec().spec_id(),
+        );
+
+        data_file_builder.build().await.unwrap()
+    }
+
     #[tokio::test]
     async fn test_write_commit_and_compaction() {
         // Create a temporary directory for the warehouse location
         let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_string();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         // Create a memory catalog with the file IO and warehouse location
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -882,6 +946,259 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rewrite_files_stat.rewritten_files_count, 2);
+        assert_eq!(rewrite_files_stat.input_files_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_full_compaction() {
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        let unique_column_ids = vec![1];
+        let mut writer =
+            build_equality_delta_writer(&table, warehouse_location.clone(), unique_column_ids)
+                .await;
+
+        let insert_batch = create_test_record_batch_with_pos(&simple_table_schema_with_pos(), true);
+
+        // Write multiple batches to create multiple files
+        writer.write(insert_batch.clone()).await.unwrap();
+        writer.write(insert_batch.clone()).await.unwrap();
+        writer.write(insert_batch).await.unwrap();
+
+        let data_files = writer.close().await.unwrap();
+        let initial_file_count = data_files.len();
+
+        // Start transaction and commit
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(data_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
+
+        // Commit the transaction
+        let _updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Test full compaction - should compact all files
+        let rewrite_files_stat = CompactionBuilder::new()
+            .with_catalog(Arc::new(catalog))
+            .with_table_ident(table_ident.clone())
+            .with_compaction_type(super::CompactionType::Full)
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap()
+            .compact()
+            .await
+            .unwrap();
+
+        // Full compaction should rewrite all existing files
+        assert_eq!(rewrite_files_stat.input_files_count, initial_file_count);
+        // Should create at least 1 new file from all the data (might be more depending on size)
+        assert!(rewrite_files_stat.output_files_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_small_files_compaction_with_validation() {
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        // Create a memory catalog with the file IO and warehouse location
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        // Load the table
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        // Create multiple small data files
+        let mut small_writer1 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "small1").await;
+        let batch = create_test_record_batch(&simple_table_schema());
+        small_writer1.write(batch.clone()).await.unwrap();
+        let small_files1 = small_writer1.close().await.unwrap();
+
+        let mut small_writer2 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "small2").await;
+        small_writer2.write(batch.clone()).await.unwrap();
+        let small_files2 = small_writer2.close().await.unwrap();
+
+        // Create a larger file by writing multiple batches
+        let mut large_writer =
+            build_simple_data_writer(&table, warehouse_location.clone(), "large").await;
+        // Write multiple batches to make it larger
+        for _ in 0..10 {
+            large_writer.write(batch.clone()).await.unwrap();
+        }
+        let large_files = large_writer.close().await.unwrap();
+
+        // Commit all files
+        let mut all_data_files = Vec::new();
+        all_data_files.extend(small_files1);
+        all_data_files.extend(small_files2);
+        all_data_files.extend(large_files);
+
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(all_data_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
+
+        // Commit the transaction
+        let updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Get files before compaction for validation
+        let snapshot_before = updated_table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot_before
+            .load_manifest_list(updated_table.file_io(), updated_table.metadata())
+            .await
+            .unwrap();
+
+        let mut data_files_before = Vec::new();
+        for manifest in manifest_list.entries() {
+            let manifest_file = manifest
+                .load_manifest(updated_table.file_io())
+                .await
+                .unwrap();
+
+            for entry in manifest_file.entries() {
+                if entry.is_alive() {
+                    data_files_before.push(entry.data_file().clone());
+                }
+            }
+        }
+
+        // Test small files compaction with a threshold that should only select small files
+        let small_file_threshold = 10_000; // 10KB threshold - should only compact really small files
+        let catalog_arc = Arc::new(catalog);
+        let compaction = CompactionBuilder::new()
+            .with_catalog(catalog_arc.clone())
+            .with_table_ident(table_ident.clone())
+            .with_compaction_type(super::CompactionType::MergeSmallDataFiles)
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .small_file_threshold(small_file_threshold)
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        // Get the files that would be selected for compaction
+        let files_to_compact = compaction
+            .select_files_for_compaction(&updated_table, snapshot_before.snapshot_id())
+            .await
+            .unwrap();
+
+        // Validate file selection logic
+        let selected_file_paths: std::collections::HashSet<&str> = files_to_compact
+            .data_files
+            .iter()
+            .map(|task| task.data_file_path())
+            .collect();
+
+        let small_files_count = data_files_before
+            .iter()
+            .filter(|file| file.file_size_in_bytes() < small_file_threshold)
+            .count();
+
+        let large_files_count = data_files_before
+            .iter()
+            .filter(|file| file.file_size_in_bytes() >= small_file_threshold)
+            .count();
+
+        // Verify that only small files are selected
+        for data_file in &data_files_before {
+            if data_file.file_size_in_bytes() < small_file_threshold {
+                assert!(
+                    selected_file_paths.contains(data_file.file_path()),
+                    "Small file {} (size: {}) should be selected for compaction",
+                    data_file.file_path(),
+                    data_file.file_size_in_bytes()
+                );
+            } else {
+                assert!(
+                    !selected_file_paths.contains(data_file.file_path()),
+                    "Large file {} (size: {}) should NOT be selected for compaction",
+                    data_file.file_path(),
+                    data_file.file_size_in_bytes()
+                );
+            }
+        }
+
+        // Ensure we have small files to test with
+        assert!(
+            small_files_count > 0,
+            "Test setup should create small files to compact"
+        );
+
+        // Run the actual compaction
+        let rewrite_files_stat = compaction.compact().await.unwrap();
+
+        // Validate compaction results
+        assert_eq!(rewrite_files_stat.input_files_count, small_files_count,);
+
+        // Should create fewer files than were compacted (compaction benefit)
+        assert!(rewrite_files_stat.output_files_count <= small_files_count);
+        assert!(rewrite_files_stat.output_files_count > 0);
+
+        // Verify final state: total files should be reduced
+        let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
+        let final_snapshot = final_table.metadata().current_snapshot().unwrap();
+        let final_manifest_list = final_snapshot
+            .load_manifest_list(final_table.file_io(), final_table.metadata())
+            .await
+            .unwrap();
+
+        let mut final_data_files = Vec::new();
+        for manifest in final_manifest_list.entries() {
+            let manifest_file = manifest.load_manifest(final_table.file_io()).await.unwrap();
+
+            for entry in manifest_file.entries() {
+                if entry.is_alive() {
+                    final_data_files.push(entry.data_file().clone());
+                }
+            }
+        }
+
+        // Final file count should be: large_files + newly_created_files
+        let expected_final_count =
+            large_files_count + rewrite_files_stat.output_files_count as usize;
+        assert_eq!(final_data_files.len(), expected_final_count);
+
+        // Verify that large files are still present and untouched
+        let final_file_paths: std::collections::HashSet<&str> = final_data_files
+            .iter()
+            .map(|file| file.file_path())
+            .collect();
+
+        for data_file in &data_files_before {
+            if data_file.file_size_in_bytes() >= small_file_threshold {
+                assert!(
+                    final_file_paths.contains(data_file.file_path()),
+                    "Large file {} should still be present after compaction",
+                    data_file.file_path()
+                );
+            }
+        }
     }
 }
