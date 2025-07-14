@@ -14,19 +14,14 @@
  * limitations under the License.
  */
 
-pub mod common;
-pub mod compaction;
-pub mod config;
-pub mod error;
-pub mod executor;
-pub mod file_selection;
+//! Integration tests for iceberg-compaction using Docker Compose.
+//!
+//! This crate provides Docker Compose-based integration testing utilities
+//! that are separate from the main library's unit tests.
 
-pub use config::CompactionConfig;
-pub use error::{CompactionError, Result};
-pub use executor::CompactionExecutor;
-pub use file_selection::strategy::FileStrategyFactory;
+pub mod docker_compose;
+pub mod test_utils;
 
-// Re-export iceberg related crates
-pub use iceberg;
-pub use iceberg_catalog_memory;
-pub use iceberg_catalog_rest;
+// Re-export commonly used items
+pub use docker_compose::get_rest_catalog;
+pub use test_utils::*;
