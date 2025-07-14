@@ -76,23 +76,22 @@ impl SizeEstimationTracker {
         self.current_memory_size += size;
     }
 
-    pub fn estimate_sizes(&self, memory_size: u64, input_size: u64) -> (u64, u64) {
+    /// Estimate physical size from memory size using learned compression ratio
+    pub fn estimate_physical_size(&self, memory_size: u64) -> u64 {
         if self.enabled {
             if let Some(ratio) = self.ratio {
-                let estimated_memory_size = (memory_size as f64 * ratio) as u64;
-                let estimated_input_size = (input_size as f64 * ratio) as u64;
-                (estimated_memory_size, estimated_input_size)
+                (memory_size as f64 * ratio) as u64
             } else {
-                (memory_size, input_size)
+                memory_size
             }
         } else {
-            (memory_size, input_size)
+            memory_size
         }
     }
 
     /// Calculate total estimated size including physical size
-    pub fn calculate_total_estimated_size(&self, memory_size: u64, input_size: u64) -> u64 {
-        let (estimated_memory_size, _) = self.estimate_sizes(memory_size, input_size);
+    pub fn calculate_total_estimated_size(&self) -> u64 {
+        let estimated_memory_size = self.estimate_physical_size(self.current_memory_size);
         self.last_physical_size + estimated_memory_size
     }
 
@@ -252,17 +251,14 @@ where
             }
         }
 
-        // Calculate total estimated size using size tracker
-        let total_estimated_size = self.size_tracker.calculate_total_estimated_size(
-            self.size_tracker.get_current_memory_size(),
-            input_size,
-        );
-
-        let (estimated_memory_size, estimated_input_size) = self
-            .size_tracker
-            .estimate_sizes(self.size_tracker.get_current_memory_size(), input_size);
+        // Calculate estimated sizes
+        let estimated_input_size = self.size_tracker.estimate_physical_size(input_size);
+        let total_estimated_size = self.size_tracker.calculate_total_estimated_size();
 
         if self.size_tracker.is_enabled() {
+            let estimated_memory_size = self
+                .size_tracker
+                .estimate_physical_size(self.size_tracker.get_current_memory_size());
             tracing::debug!(
                 "Size estimation: physical={}, memory={}, estimated_memory={}, input={}, estimated_input={}, total_estimated={}, estimation_ratio={:.3}",
                 self.size_tracker.get_last_physical_size(),
@@ -564,12 +560,13 @@ mod tests {
         tracker.add_memory_size(1000);
         assert_eq!(tracker.get_current_memory_size(), 1000);
 
-        let (estimated_memory, estimated_input) = tracker.estimate_sizes(500, 200);
+        let estimated_memory = tracker.estimate_physical_size(500);
+        let estimated_input = tracker.estimate_physical_size(200);
         assert_eq!(estimated_memory, 500);
         assert_eq!(estimated_input, 200);
 
-        let total = tracker.calculate_total_estimated_size(500, 200);
-        assert_eq!(total, 500);
+        let total = tracker.calculate_total_estimated_size();
+        assert_eq!(total, 1000); // 0 physical + 1000 memory (disabled, so 1:1 ratio)
 
         // Enabled tracker - basic functionality
         let mut tracker = SizeEstimationTracker::new(true, 0.3);
@@ -598,12 +595,13 @@ mod tests {
         tracker.update_physical_size(400);
         assert!((tracker.get_ratio() - 0.4).abs() < 0.001);
 
-        let (estimated_memory, estimated_input) = tracker.estimate_sizes(1000, 500);
+        let estimated_memory = tracker.estimate_physical_size(1000);
+        let estimated_input = tracker.estimate_physical_size(500);
         assert_eq!(estimated_memory, 400);
         assert_eq!(estimated_input, 200);
 
         tracker.add_memory_size(800);
-        let total = tracker.calculate_total_estimated_size(800, 300);
+        let total = tracker.calculate_total_estimated_size();
         assert_eq!(total, 720); // 400 + 320
 
         // Test reset preserves ratio
@@ -960,9 +958,7 @@ mod tests {
         rolling_writer.write(small_batch).await.unwrap();
 
         // Should use existing ratio for estimation
-        let estimated_size = rolling_writer
-            .size_tracker
-            .calculate_total_estimated_size(actual_memory_size, 100);
+        let estimated_size = rolling_writer.size_tracker.calculate_total_estimated_size();
         let expected_estimated = (actual_memory_size as f64 * compression_ratio) as u64; // 0 physical + estimated memory
         assert_eq!(estimated_size, expected_estimated);
 
