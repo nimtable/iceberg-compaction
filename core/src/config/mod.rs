@@ -25,6 +25,8 @@ pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
 pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 pub const DEFAULT_MAX_CONCURRENT_CLOSES: usize = 4;
 pub const DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS: bool = true;
+pub const DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION: bool = false;
+pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
 pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
 pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 
@@ -75,4 +77,13 @@ pub struct CompactionConfig {
     /// to compact those tables, set this value to false.
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
+    /// Whether to enable dynamic file size estimation for better rolling prediction (default: false)
+    /// This feature learns the compression ratio from actual write operations to improve size estimation.
+    #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
+    pub enable_dynamic_size_estimation: bool,
+    /// Smoothing factor for dynamic size estimation updates (default: 0.3)
+    /// Lower values make the estimation more stable but slower to adapt to new data patterns.
+    /// Higher values make the estimation more responsive but potentially more volatile.
+    #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
+    pub size_estimation_smoothing_factor: f64,
 }

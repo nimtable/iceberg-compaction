@@ -170,7 +170,11 @@ pub async fn build_iceberg_data_file_writer(
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(config.target_file_size);
+            .with_target_file_size(config.target_file_size)
+            .with_max_concurrent_closes(config.max_concurrent_closes)
+            .with_dynamic_size_estimation(config.enable_dynamic_size_estimation)
+            .with_size_estimation_smoothing_factor(config.size_estimation_smoothing_factor);
+
     let iceberg_output_writer = if partition_spec.fields().is_empty() {
         Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
     } else {
