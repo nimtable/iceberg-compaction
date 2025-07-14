@@ -20,6 +20,7 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod file_selection;
+#[cfg(not(test))]
 pub mod test_utils;
 
 pub use config::CompactionConfig;
