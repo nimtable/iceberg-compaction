@@ -14,19 +14,18 @@
  * limitations under the License.
  */
 
-use crate::error::Result;
-use crate::test_utils::{
-    docker_compose::get_rest_catalog,
-    generator::{FileGenerator, FileGeneratorConfig, WriterConfig},
-};
+use std::{collections::HashMap, sync::Arc};
+
 use iceberg::{
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
     Catalog, NamespaceIdent, TableCreation,
 };
-use std::{collections::HashMap, sync::Arc};
+use iceberg_compaction_core::error::Result;
 
-pub mod docker_compose;
+use crate::docker_compose::get_rest_catalog;
+use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
+
 pub mod generator;
 
 const TABLE_NAME: &str = "t1";

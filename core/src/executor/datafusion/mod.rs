@@ -164,8 +164,7 @@ pub async fn build_iceberg_data_file_writer(
         schema.clone(),
         file_io,
         config.write_parquet_properties.clone(),
-    )
-    .await?;
+    )?;
     let data_file_builder =
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
@@ -191,7 +190,7 @@ pub async fn build_iceberg_data_file_writer(
     Ok(iceberg_output_writer)
 }
 
-pub async fn build_parquet_writer_builder(
+pub fn build_parquet_writer_builder(
     data_file_prefix: String,
     dir_path: String,
     schema: Arc<Schema>,

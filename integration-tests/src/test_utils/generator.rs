@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use crate::{error::Result, executor::datafusion::build_parquet_writer_builder, CompactionError};
 use async_stream::try_stream;
 use iceberg::{
     arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
@@ -38,6 +37,9 @@ use iceberg::{
         },
         IcebergWriter, IcebergWriterBuilder,
     },
+};
+use iceberg_compaction_core::{
+    error::Result, executor::datafusion::build_parquet_writer_builder, CompactionError,
 };
 use parquet::file::properties::WriterProperties;
 use rand::{distr::Alphanumeric, Rng};
@@ -99,7 +101,9 @@ impl RecordBatchGenerator {
     /// This method yields record batches of the specified batch size until
     /// all rows have been generated. The last batch may contain fewer rows
     /// if the total number of rows is not evenly divisible by batch size.
-    pub fn generate(&self) -> impl futures::Stream<Item = crate::Result<RecordBatch>> + '_ {
+    pub fn generate(
+        &self,
+    ) -> impl futures::Stream<Item = iceberg_compaction_core::Result<RecordBatch>> + '_ {
         try_stream! {
             let mut num_rows = self.num_rows;
             loop {
@@ -347,7 +351,7 @@ impl FileGenerator {
     ///
     /// # Returns
     /// A configured `EqualityDeleteDeltaWriterBuilder`
-    async fn build_equality_delete_delta_writer_builder(
+    fn build_equality_delete_delta_writer_builder(
         &self,
     ) -> Result<EqualityDeleteDeltaWriterBuilder> {
         let WriterConfig {
@@ -362,8 +366,7 @@ impl FileGenerator {
             self.schema.clone(),
             file_io.clone(),
             WriterProperties::default(),
-        )
-        .await?;
+        )?;
         let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
 
         let parquet_writer_builder = build_parquet_writer_builder(
@@ -372,8 +375,7 @@ impl FileGenerator {
             POSITION_DELETE_SCHEMA.clone(),
             file_io.clone(),
             WriterProperties::default(),
-        )
-        .await?;
+        )?;
         let position_delete_file_writer_builder = SortPositionDeleteWriterBuilder::new(
             parquet_writer_builder.clone(),
             self.config.position_delete_row_count,
@@ -390,8 +392,7 @@ impl FileGenerator {
             )?),
             file_io.clone(),
             WriterProperties::default(),
-        )
-        .await?;
+        )?;
         let equality_delete_file_writer_builder = EqualityDeleteFileWriterBuilder::new(
             parquet_writer_builder.clone(),
             EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone(), None, 0)?,
@@ -422,7 +423,7 @@ impl FileGenerator {
         let mut data_files = Vec::new();
 
         let equality_delete_delta_writer_builder =
-            self.build_equality_delete_delta_writer_builder().await?;
+            self.build_equality_delete_delta_writer_builder()?;
         let mut equality_delete_delta_writer =
             equality_delete_delta_writer_builder.clone().build().await?;
 
