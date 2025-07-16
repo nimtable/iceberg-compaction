@@ -7,7 +7,11 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
+ * Unless required by ap/// Configuration for parallel file reading optimization
+const DEFAULT_PARALLEL_READ_THRESHOLD: usize = 5; // Minimum files to consider parallel reading
+const DEFAULT_SMALL_FILE_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB threshold for small files
+const DEFAULT_SMALL_FILE_RATIO_THRESHOLD: f64 = 0.7; // At least 70% of files should be small
+const DEFAULT_MAX_CONCURRENT_FILES: usize = 10; // Maximum concurrent file reads to prevent OOMcable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -31,6 +35,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
+use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
@@ -298,9 +303,166 @@ impl ExecutionPlan for IcebergFileTaskScan {
     }
 }
 
+/// Configuration for parallel file reading optimization
+const DEFAULT_PARALLEL_READ_THRESHOLD: usize = 5; // Minimum files to consider parallel reading
+const DEFAULT_SMALL_FILE_SIZE_THRESHOLD: u64 = 6 * 1024 * 1024; // 6MB threshold for small files
+const DEFAULT_SMALL_FILE_RATIO_THRESHOLD: f64 = 0.4; // At least 40% of files should be small
+const DEFAULT_MAX_CONCURRENT_FILES: usize = 10; // Maximum concurrent file reads to prevent OOM
+
+/// Determine whether to use parallel reading based on file characteristics
+fn should_use_parallel_reading(file_scan_tasks: &[FileScanTask]) -> bool {
+    // Need at least minimum number of files to consider parallel reading
+    if file_scan_tasks.len() < DEFAULT_PARALLEL_READ_THRESHOLD {
+        return false;
+    }
+
+    // Calculate small file statistics
+    let small_files_count = file_scan_tasks
+        .iter()
+        .filter(|task| task.length <= DEFAULT_SMALL_FILE_SIZE_THRESHOLD)
+        .count();
+
+    let small_file_ratio = small_files_count as f64 / file_scan_tasks.len() as f64;
+
+    // Only enable parallel reading if:
+    // 1. We have enough files AND
+    // 2. A significant portion of files are small (likely to benefit from parallel IO)
+    small_file_ratio >= DEFAULT_SMALL_FILE_RATIO_THRESHOLD
+}
+
 /// Gets a stream of record batches from a list of file scan tasks
 #[allow(clippy::unused_async)]
 async fn get_batch_stream(
+    file_io: FileIO,
+    file_scan_tasks: Vec<FileScanTask>,
+    need_seq_num: bool,
+    need_file_path_and_pos: bool,
+    max_record_batch_rows: usize,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    // Decide whether to use parallel reading based on file characteristics
+    let use_parallel = should_use_parallel_reading(&file_scan_tasks);
+
+    tracing::info!(
+        "Using {} reading for {} file scan tasks",
+        if use_parallel {
+            "parallel"
+        } else {
+            "sequential"
+        },
+        file_scan_tasks.len()
+    );
+
+    if use_parallel {
+        get_batch_stream_parallel(
+            file_io,
+            file_scan_tasks,
+            need_seq_num,
+            need_file_path_and_pos,
+            max_record_batch_rows,
+        )
+    } else {
+        get_batch_stream_sequential(
+            file_io,
+            file_scan_tasks,
+            need_seq_num,
+            need_file_path_and_pos,
+            max_record_batch_rows,
+        )
+    }
+}
+
+/// Parallel version of batch stream reading with concurrency control
+fn get_batch_stream_parallel(
+    file_io: FileIO,
+    file_scan_tasks: Vec<FileScanTask>,
+    need_seq_num: bool,
+    need_file_path_and_pos: bool,
+    max_record_batch_rows: usize,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let stream = try_stream! {
+        let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+
+        // Process files in chunks to control concurrency
+        let chunk_size = DEFAULT_MAX_CONCURRENT_FILES;
+        let task_chunks = file_scan_tasks.chunks(chunk_size);
+
+        for chunk in task_chunks {
+            // Create futures for reading files in this chunk
+            let mut file_futures = FuturesUnordered::new();
+
+            for task in chunk {
+                let file_io_clone = file_io.clone();
+                let file_path = task.data_file_path.clone();
+                let data_file_content = task.data_file_content;
+                let sequence_number = task.sequence_number;
+                let task_clone = task.clone();
+
+                // Create a future for reading this file
+                let file_future = async move {
+                    let task_stream = futures::stream::iter(vec![Ok(task_clone)]).boxed();
+                    let arrow_reader_builder = ArrowReaderBuilder::new(file_io_clone).with_batch_size(max_record_batch_rows);
+                    let mut batch_stream = arrow_reader_builder.build()
+                        .read(task_stream)
+                        .await
+                        .map_err(to_datafusion_error)?;
+
+                    let mut batches = Vec::new();
+                    let mut index_start = 0i64;
+
+                    while let Some(batch) = batch_stream.next().await {
+                        let mut batch = batch.map_err(to_datafusion_error)?;
+                        let batch = match data_file_content {
+                            iceberg::spec::DataContentType::Data => {
+                                // add sequence number if needed
+                                if need_seq_num {
+                                    batch = add_seq_num_into_batch(batch, sequence_number)?;
+                                }
+                                // add file path and position if needed
+                                if need_file_path_and_pos {
+                                    batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
+                                    index_start += batch.num_rows() as i64;
+                                }
+                                batch
+                            }
+                            iceberg::spec::DataContentType::PositionDeletes => {
+                                batch
+                            },
+                            iceberg::spec::DataContentType::EqualityDeletes => {
+                                add_seq_num_into_batch(batch, sequence_number)?
+                            },
+                        };
+                        batches.push(batch);
+                    }
+
+                    Ok::<Vec<RecordBatch>, DataFusionError>(batches)
+                };
+
+                file_futures.push(file_future);
+            }
+
+            // Process completed file reads in this chunk as they finish
+            while let Some(file_result) = file_futures.next().await {
+                let file_batches = file_result?;
+
+                // Add all batches from this file to the buffer
+                for batch in file_batches {
+                    if let Some(batch) = record_batch_buffer.add(batch)? {
+                        yield batch;
+                    }
+                }
+            }
+        }
+
+        // Yield any remaining batches in the buffer
+        if let Some(batch) = record_batch_buffer.finish()? {
+            yield batch;
+        }
+    };
+    Ok(Box::pin(stream))
+}
+
+/// Sequential version of batch stream reading (original implementation)
+fn get_batch_stream_sequential(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
     need_seq_num: bool,
@@ -765,5 +927,82 @@ mod tests {
         assert!(result.is_none(), "Should not yield the small batch");
         assert_eq!(buffer.current_rows, small_batch_rows);
         assert_eq!(buffer.buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_should_use_parallel_reading_logic() {
+        // Test case 1: Not enough files (less than threshold)
+        let small_tasks = vec![
+            create_file_scan_task(1024 * 1024, 1),     // 1MB - small file
+            create_file_scan_task(2 * 1024 * 1024, 2), // 2MB - small file
+        ];
+        assert!(
+            !should_use_parallel_reading(&small_tasks),
+            "Should not use parallel reading for too few files"
+        );
+
+        // Test case 2: Enough files, but not enough small files (less than 70%)
+        let mixed_tasks = vec![
+            create_file_scan_task(5 * 1024 * 1024, 1), // 5MB - small file
+            create_file_scan_task(15 * 1024 * 1024, 2), // 15MB - large file
+            create_file_scan_task(20 * 1024 * 1024, 3), // 20MB - large file
+            create_file_scan_task(25 * 1024 * 1024, 4), // 25MB - large file
+            create_file_scan_task(30 * 1024 * 1024, 5), // 30MB - large file
+        ];
+        assert!(
+            !should_use_parallel_reading(&mixed_tasks),
+            "Should not use parallel reading when small file ratio is too low"
+        );
+
+        // Test case 3: Enough files and enough small files (>= 70%)
+        let mostly_small_tasks = vec![
+            create_file_scan_task(5 * 1024 * 1024, 1), // 5MB - small file
+            create_file_scan_task(8 * 1024 * 1024, 2), // 8MB - small file
+            create_file_scan_task(7 * 1024 * 1024, 3), // 7MB - small file
+            create_file_scan_task(6 * 1024 * 1024, 4), // 6MB - small file
+            create_file_scan_task(15 * 1024 * 1024, 5), // 15MB - large file
+        ];
+        assert!(
+            should_use_parallel_reading(&mostly_small_tasks),
+            "Should use parallel reading when small file ratio is high"
+        );
+
+        // Test case 4: Exactly at threshold (70%)
+        let threshold_tasks = vec![
+            create_file_scan_task(5 * 1024 * 1024, 1), // 5MB - small file
+            create_file_scan_task(8 * 1024 * 1024, 2), // 8MB - small file
+            create_file_scan_task(7 * 1024 * 1024, 3), // 7MB - small file
+            create_file_scan_task(6 * 1024 * 1024, 4), // 6MB - small file
+            create_file_scan_task(9 * 1024 * 1024, 5), // 9MB - small file
+            create_file_scan_task(3 * 1024 * 1024, 6), // 3MB - small file
+            create_file_scan_task(2 * 1024 * 1024, 7), // 2MB - small file
+            create_file_scan_task(15 * 1024 * 1024, 8), // 15MB - large file
+            create_file_scan_task(20 * 1024 * 1024, 9), // 20MB - large file
+            create_file_scan_task(25 * 1024 * 1024, 10), // 25MB - large file
+        ];
+        // 7 out of 10 files are small = 70%
+        assert!(
+            should_use_parallel_reading(&threshold_tasks),
+            "Should use parallel reading when exactly at threshold"
+        );
+
+        // Test case 5: Just below threshold (69%)
+        let below_threshold_tasks = vec![
+            create_file_scan_task(5 * 1024 * 1024, 1), // 5MB - small file
+            create_file_scan_task(8 * 1024 * 1024, 2), // 8MB - small file
+            create_file_scan_task(7 * 1024 * 1024, 3), // 7MB - small file
+            create_file_scan_task(6 * 1024 * 1024, 4), // 6MB - small file
+            create_file_scan_task(9 * 1024 * 1024, 5), // 9MB - small file
+            create_file_scan_task(3 * 1024 * 1024, 6), // 3MB - small file
+            create_file_scan_task(15 * 1024 * 1024, 7), // 15MB - large file
+            create_file_scan_task(20 * 1024 * 1024, 8), // 20MB - large file
+            create_file_scan_task(25 * 1024 * 1024, 9), // 25MB - large file
+            create_file_scan_task(30 * 1024 * 1024, 10), // 30MB - large file
+        ];
+        // 6 out of 10 files are small = 60%
+        assert!(
+            !should_use_parallel_reading(&below_threshold_tasks),
+            "Should not use parallel reading when below threshold"
+        );
     }
 }
