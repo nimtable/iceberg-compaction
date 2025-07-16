@@ -18,6 +18,7 @@ use mixtrics::metrics::{BoxedCounterVec, BoxedHistogramVec, BoxedRegistry, Bucke
 use std::sync::Arc;
 
 use crate::executor::RewriteFilesStat;
+use tracing::info;
 
 pub struct Metrics {
     // commit metrics
@@ -208,7 +209,10 @@ impl CompactionMetricsRecorder {
     /// Record compaction duration
     pub fn record_compaction_duration(&self, duration_secs: f64) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_duration, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, duration_secs
+        );
         self.metrics
             .compaction_duration
             .histogram(&label_vec)
@@ -218,7 +222,10 @@ impl CompactionMetricsRecorder {
     /// Record commit duration
     pub fn record_commit_duration(&self, duration_secs: f64) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_commit_duration, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, duration_secs
+        );
         self.metrics
             .compaction_commit_duration
             .histogram(&label_vec)
@@ -228,7 +235,10 @@ impl CompactionMetricsRecorder {
     /// Record successful compaction commit
     pub fn record_commit_success(&self) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_commit_counter, catalog: {}, table: {}, value: 1",
+            self.catalog_name, self.table_ident
+        );
         self.metrics
             .compaction_commit_counter
             .counter(&label_vec)
@@ -238,7 +248,10 @@ impl CompactionMetricsRecorder {
     /// Record compaction commit failure
     pub fn record_commit_failure(&self) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_commit_failed_counter, catalog: {}, table: {}, value: 1",
+            self.catalog_name, self.table_ident
+        );
         self.metrics
             .compaction_commit_failed_counter
             .counter(&label_vec)
@@ -248,7 +261,10 @@ impl CompactionMetricsRecorder {
     /// Record executor error
     pub fn record_executor_error(&self) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_executor_error_counter, catalog: {}, table: {}, value: 1",
+            self.catalog_name, self.table_ident
+        );
         self.metrics
             .compaction_executor_error_counter
             .counter(&label_vec)
@@ -261,6 +277,10 @@ impl CompactionMetricsRecorder {
         let label_vec = self.label_vec();
 
         if stats.input_files_count > 0 {
+            info!(
+                "Recording metric: compaction_input_files_count, catalog: {}, table: {}, value: {}",
+                self.catalog_name, self.table_ident, stats.input_files_count
+            );
             self.metrics
                 .compaction_input_files_count
                 .counter(&label_vec)
@@ -268,6 +288,10 @@ impl CompactionMetricsRecorder {
         }
 
         if stats.input_total_bytes > 0 {
+            info!(
+                "Recording metric: compaction_input_bytes_total, catalog: {}, table: {}, value: {}",
+                self.catalog_name, self.table_ident, stats.input_total_bytes
+            );
             self.metrics
                 .compaction_input_bytes_total
                 .counter(&label_vec)
@@ -276,6 +300,10 @@ impl CompactionMetricsRecorder {
 
         // output
         if stats.output_files_count > 0 {
+            info!(
+                "Recording metric: compaction_output_files_count, catalog: {}, table: {}, value: {}",
+                self.catalog_name, self.table_ident, stats.output_files_count
+            );
             self.metrics
                 .compaction_output_files_count
                 .counter(&label_vec)
@@ -283,6 +311,10 @@ impl CompactionMetricsRecorder {
         }
 
         if stats.output_total_bytes > 0 {
+            info!(
+                "Recording metric: compaction_output_bytes_total, catalog: {}, table: {}, value: {}",
+                self.catalog_name, self.table_ident, stats.output_total_bytes
+            );
             self.metrics
                 .compaction_output_bytes_total
                 .counter(&label_vec)
@@ -292,7 +324,10 @@ impl CompactionMetricsRecorder {
 
     pub fn record_datafusion_batch_fetch_duration(&self, fetch_duration_ms: f64) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_datafusion_batch_fetch_duration, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, fetch_duration_ms
+        );
         self.metrics
             .compaction_datafusion_batch_fetch_duration
             .histogram(&label_vec)
@@ -301,7 +336,10 @@ impl CompactionMetricsRecorder {
 
     pub fn record_datafusion_batch_write_duration(&self, write_duration_ms: f64) {
         let label_vec = self.label_vec();
-
+        info!(
+            "Recording metric: compaction_datafusion_batch_write_duration, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, write_duration_ms
+        );
         self.metrics
             .compaction_datafusion_batch_write_duration
             .histogram(&label_vec)
@@ -310,21 +348,37 @@ impl CompactionMetricsRecorder {
 
     pub fn record_batch_stats(&self, record_count: u64, batch_bytes: u64) {
         let label_vec = self.label_vec();
+        info!(
+            "Recording metric: compaction_datafusion_records_processed_total, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, record_count
+        );
         self.metrics
             .compaction_datafusion_records_processed_total
             .counter(&label_vec)
             .increase(record_count);
 
+        info!(
+            "Recording metric: compaction_datafusion_bytes_processed_total, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, batch_bytes
+        );
         self.metrics
             .compaction_datafusion_bytes_processed_total
             .counter(&label_vec)
             .increase(batch_bytes);
 
+        info!(
+            "Recording metric: compaction_datafusion_batch_row_count_dist, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, record_count
+        );
         self.metrics
             .compaction_datafusion_batch_row_count_dist
             .histogram(&label_vec)
             .record(record_count as f64);
 
+        info!(
+            "Recording metric: compaction_datafusion_batch_bytes_dist, catalog: {}, table: {}, value: {}",
+            self.catalog_name, self.table_ident, batch_bytes
+        );
         self.metrics
             .compaction_datafusion_batch_bytes_dist
             .histogram(&label_vec)
