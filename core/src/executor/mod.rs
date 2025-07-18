@@ -21,7 +21,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
 use crate::common::CompactionMetricsRecorder;
-use crate::config::CompactionConfig;
+use crate::config::{CompactionConfig, RuntimeConfig};
 use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
@@ -43,11 +43,11 @@ pub struct RewriteFilesRequest {
     pub config: Arc<CompactionConfig>,
     pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
-
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
+    pub runtime_config: RuntimeConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 /// `InputFileScanTasks` contains the file scan tasks for data files, position delete files, and equality delete files.
 pub struct InputFileScanTasks {
     pub data_files: Vec<FileScanTask>,

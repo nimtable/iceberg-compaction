@@ -16,6 +16,22 @@
 
 pub mod metrics;
 
+use std::num::NonZeroUsize;
+
 // Re-export metrics components
 pub use metrics::CompactionMetricsRecorder;
 pub use metrics::Metrics;
+
+// Use a default value of 1 as the safest option.
+// See https://doc.rust-lang.org/std/thread/fn.available_parallelism.html#limitations
+// for more details.
+const DEFAULT_PARALLELISM: usize = 1;
+
+pub(crate) fn available_parallelism() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or_else(|_err| {
+        // Failed to get the level of parallelism.
+
+        // Using a default value.
+        NonZeroUsize::new(DEFAULT_PARALLELISM).unwrap()
+    })
+}
