@@ -214,10 +214,10 @@ impl Default for CompactionBuilder {
 /// For scenarios requiring preview or fine-grained control, use the two-step approach:
 ///
 /// ```rust,no_run
-/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType};
-/// use iceberg_compaction_core::config::CompactionConfig;
+/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType, CompactionPlanner};
+/// use iceberg_compaction_core::config::{CompactionConfig, CompactionPlanningConfigBuilder};
 /// use std::sync::Arc;
-/// use iceberg::TableIdent;
+/// use iceberg::{TableIdent, Catalog};
 /// use iceberg_catalog_memory::MemoryCatalog;
 /// use iceberg::io::FileIOBuilder;
 ///
@@ -234,12 +234,24 @@ impl Default for CompactionBuilder {
 ///     .build()
 ///     .await?;
 ///
-/// // For plan-driven workflow, you would typically use the regular compact() method
-/// // which handles planning internally, or access the planning functionality
-/// // through the compaction's internal interfaces
-/// let stats = compaction.compact().await?;
-/// println!("Compaction completed: {} -> {} files",
-///          stats.input_files_count, stats.output_files_count);
+/// // Step 1: Create a planner and generate a plan (preview what will be processed)
+/// let planner = CompactionPlanner::new(config.planning.clone());
+/// let table = catalog.load_table(&table_ident).await?;
+/// let plan = planner.plan_compaction(&table, CompactionType::Full).await?;
+///
+/// // Preview the plan details
+/// println!("Plan will process {} files ({} bytes)",
+///          plan.file_count(), plan.total_bytes());
+/// println!("Recommended parallelism: executor={}, output={}",
+///          plan.recommended_executor_parallelism(),
+///          plan.recommended_output_parallelism());
+///
+/// // Step 2: Execute with the plan (commit is still automatic)
+/// if !plan.is_empty() {
+///     let stats = compaction.compact_with_plan(plan).await?;
+///     println!("Compaction completed: {} -> {} files",
+///              stats.input_files_count, stats.output_files_count);
+/// }
 /// # Ok(())
 /// # }
 /// ```
@@ -533,7 +545,7 @@ impl Compaction {
     //     Ok(CompactionPlan::new(input_file_scan_tasks, runtime_config))
     // }
 
-    async fn compact_with_plan(&self, plan: CompactionPlan) -> Result<RewriteFilesStat> {
+    pub async fn compact_with_plan(&self, plan: CompactionPlan) -> Result<RewriteFilesStat> {
         let CompactionResult {
             stats,
             compaction_validator,
