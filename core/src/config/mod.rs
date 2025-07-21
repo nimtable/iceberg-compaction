@@ -53,10 +53,23 @@ pub struct RuntimeConfig {
     pub output_parallelism: usize,
 }
 
+/// Common configuration for compaction
+/// Contains parameters that are shared across different compaction phases
+#[derive(Builder, Debug, Clone, Default)]
+pub struct CompactionBaseConfig {
+    /// Target size in bytes for each compacted file (default: 1GB)
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size: u64,
+}
+
 /// Configuration for compaction planning phase
 /// Contains parameters that affect file selection and parallelism calculation
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionPlanningConfig {
+    /// Base configuration shared across all compaction phases
+    #[builder(default)]
+    pub base: CompactionBaseConfig,
+
     /// Threshold for small file compaction (default: 32MB)
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
     pub small_file_threshold: u64,
@@ -80,10 +93,6 @@ pub struct CompactionPlanningConfig {
     /// Whether to enable heuristic output parallelism (default: true)
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
-
-    /// Target size in bytes for each compacted file (used in parallelism calculation)
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
 }
 
 impl Default for CompactionPlanningConfig {
@@ -96,6 +105,10 @@ impl Default for CompactionPlanningConfig {
 /// Contains parameters that affect the actual compaction execution
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
+    /// Base configuration shared across all compaction phases
+    #[builder(default)]
+    pub base: CompactionBaseConfig,
+
     #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
 

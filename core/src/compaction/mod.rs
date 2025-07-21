@@ -22,7 +22,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
-use crate::config::{RuntimeConfig, RuntimeConfigBuilder};
+use crate::config::{CompactionPlanningConfig, RuntimeConfig, RuntimeConfigBuilder};
 use crate::executor::{
     create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
     RewriteFilesResponse, RewriteFilesStat,
@@ -182,9 +182,17 @@ impl Default for CompactionBuilder {
 ///
 /// ```rust,no_run
 /// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType};
+/// use iceberg_compaction_core::config::CompactionConfig;
 /// use std::sync::Arc;
+/// use iceberg::TableIdent;
+/// use iceberg_catalog_memory::MemoryCatalog;
+/// use iceberg::io::FileIOBuilder;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let file_io = FileIOBuilder::new_fs_io().build()?;
+/// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
+/// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
+/// # let config = CompactionConfig::default();
 /// let compaction = CompactionBuilder::new()
 ///     .with_catalog(catalog)
 ///     .with_table_ident(table_ident)
@@ -206,35 +214,32 @@ impl Default for CompactionBuilder {
 /// For scenarios requiring preview or fine-grained control, use the two-step approach:
 ///
 /// ```rust,no_run
-/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType, Compaction};
+/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType};
+/// use iceberg_compaction_core::config::CompactionConfig;
 /// use std::sync::Arc;
+/// use iceberg::TableIdent;
+/// use iceberg_catalog_memory::MemoryCatalog;
+/// use iceberg::io::FileIOBuilder;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let file_io = FileIOBuilder::new_fs_io().build()?;
+/// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
+/// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
+/// # let config = CompactionConfig::default();
 /// let compaction = CompactionBuilder::new()
-///     .with_catalog(catalog)
-///     .with_table_ident(table_ident)
+///     .with_catalog(catalog.clone())
+///     .with_table_ident(table_ident.clone())
 ///     .with_compaction_type(CompactionType::Full)
-///     .with_config(Arc::new(config))
+///     .with_config(Arc::new(config.clone()))
 ///     .build()
 ///     .await?;
 ///
-/// // Step 1: Create a plan (preview what will be processed)
-/// let table = catalog.load_table(&table_ident).await?;
-/// let plan = Compaction::plan_compaction(&table, CompactionType::Full, &config).await?;
-///
-/// // Preview the plan details
-/// println!("Plan will process {} files ({} bytes)",
-///          plan.file_count(), plan.total_bytes());
-/// println!("Recommended parallelism: executor={}, output={}",
-///          plan.recommended_executor_parallelism(),
-///          plan.recommended_output_parallelism());
-///
-/// // Step 2: Execute with the plan (commit is still automatic)
-/// if !plan.is_empty() {
-///     let stats = compaction.compact_with_plan(plan).await?;
-///     println!("Compaction completed: {} -> {} files",
-///              stats.input_files_count, stats.output_files_count);
-/// }
+/// // For plan-driven workflow, you would typically use the regular compact() method
+/// // which handles planning internally, or access the planning functionality
+/// // through the compaction's internal interfaces
+/// let stats = compaction.compact().await?;
+/// println!("Compaction completed: {} -> {} files",
+///          stats.input_files_count, stats.output_files_count);
 /// # Ok(())
 /// # }
 /// ```
@@ -277,7 +282,14 @@ impl Compaction {
 
     pub async fn compact(&self) -> Result<RewriteFilesStat> {
         let table = self.catalog.load_table(&self.table_ident).await?;
-        let plan = Self::plan_compaction(&table, self.compaction_type, &self.config).await?;
+        // 1. plan the compaction
+        let compaction_planner = CompactionPlanner::new(self.config.planning.clone());
+
+        let plan = compaction_planner
+            .plan_compaction(&table, self.compaction_type)
+            .await?;
+
+        // 2. execute the compaction with the plan
         self.compact_with_plan(plan).await
     }
 
@@ -398,21 +410,17 @@ impl Compaction {
         metrics_recorder.record_compaction_complete(stats);
     }
 
-    // Template method pattern: These methods can be overridden for specific compaction types
+    // async fn select_files_for_compaction(
+    //     table: &Table,
+    //     snapshot_id: i64,
+    //     compaction_type: CompactionType,
+    //     config: &CompactionPlanningConfig,
+    // ) -> Result<InputFileScanTasks> {
+    //     use crate::file_selection::FileStrategyFactory;
 
-    /// Hook for customizing file selection logic beyond simple `FileStrategy`
-    /// Default implementation uses `FileStrategy`, but complex compaction types can override
-    async fn select_files_for_compaction(
-        table: &Table,
-        snapshot_id: i64,
-        compaction_type: CompactionType,
-        config: &CompactionConfig,
-    ) -> Result<InputFileScanTasks> {
-        use crate::file_selection::FileStrategyFactory;
-
-        let strategy = FileStrategyFactory::create_files_strategy(compaction_type, config);
-        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
-    }
+    //     let strategy = FileStrategyFactory::create_files_strategy(compaction_type, config);
+    //     FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
+    // }
 
     /// Hook for customizing the rewrite request configuration
     /// Default implementation creates a standard request, but can be customized
@@ -491,39 +499,39 @@ impl Compaction {
             .await
     }
 
-    async fn plan_compaction(
-        table: &Table,
-        compaction_type: CompactionType,
-        config: &CompactionConfig,
-    ) -> Result<CompactionPlan> {
-        // check if the current snapshot exists
-        if table.metadata().current_snapshot().is_none() {
-            return Ok(CompactionPlan::dummy());
-        }
+    // async fn plan_compaction(
+    //     table: &Table,
+    //     compaction_type: CompactionType,
+    //     config: &CompactionConfig,
+    // ) -> Result<CompactionPlan> {
+    //     // check if the current snapshot exists
+    //     if table.metadata().current_snapshot().is_none() {
+    //         return Ok(CompactionPlan::dummy());
+    //     }
 
-        let current_snapshot = table.metadata().current_snapshot().unwrap();
+    //     let current_snapshot = table.metadata().current_snapshot().unwrap();
 
-        // Step 1: Select files for compaction (extensible)
-        let input_file_scan_tasks = Compaction::select_files_for_compaction(
-            table,
-            current_snapshot.snapshot_id(),
-            compaction_type,
-            config,
-        )
-        .await?;
+    //     // Step 1: Select files for compaction (extensible)
+    //     let input_file_scan_tasks = Compaction::select_files_for_compaction(
+    //         table,
+    //         current_snapshot.snapshot_id(),
+    //         compaction_type,
+    //         config,
+    //     )
+    //     .await?;
 
-        let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
-            .calculate_parallelism(&input_file_scan_tasks, config)
-            .map_err(|e| CompactionError::Execution(e.to_string()))?;
+    //     let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
+    //         .calculate_parallelism(&input_file_scan_tasks, config)
+    //         .map_err(|e| CompactionError::Execution(e.to_string()))?;
 
-        let runtime_config = RuntimeConfigBuilder::default()
-            .executor_parallelism(executor_parallelism)
-            .output_parallelism(output_parallelism)
-            .build()
-            .map_err(|e| CompactionError::Config(e.to_string()))?;
+    //     let runtime_config = RuntimeConfigBuilder::default()
+    //         .executor_parallelism(executor_parallelism)
+    //         .output_parallelism(output_parallelism)
+    //         .build()
+    //         .map_err(|e| CompactionError::Config(e.to_string()))?;
 
-        Ok(CompactionPlan::new(input_file_scan_tasks, runtime_config))
-    }
+    //     Ok(CompactionPlan::new(input_file_scan_tasks, runtime_config))
+    // }
 
     async fn compact_with_plan(&self, plan: CompactionPlan) -> Result<RewriteFilesStat> {
         let CompactionResult {
@@ -795,7 +803,7 @@ impl DefaultParallelismCalculator {
     fn calculate_parallelism(
         &self,
         files_to_compact: &InputFileScanTasks,
-        config: &CompactionConfig,
+        config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
         let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
         if total_file_size_for_partitioning == 0 {
@@ -807,29 +815,29 @@ impl DefaultParallelismCalculator {
         }
 
         let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.planning.min_size_per_partition)
+            .div_ceil(config.min_size_per_partition)
             .max(1) as usize; // Ensure at least one partition.
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
 
         let partition_by_count = total_files_count_for_partitioning
-            .div_ceil(config.planning.max_file_count_per_partition)
+            .div_ceil(config.max_file_count_per_partition)
             .max(1); // Ensure at least one partition.
 
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.planning.max_parallelism);
+            .min(config.max_parallelism);
 
         // `output_parallelism` should not exceed `input_parallelism`
         // and should also not exceed max_parallelism.
         // It's primarily driven by size to avoid small output files.
         let mut output_parallelism = partition_by_size
             .min(input_parallelism)
-            .min(config.planning.max_parallelism);
+            .min(config.max_parallelism);
 
         // Heuristic: If the total task data size is very small (less than target_file_size_bytes),
         // force output_parallelism to 1 to encourage merging into a single, larger output file.
-        if config.planning.enable_heuristic_output_parallelism {
+        if config.enable_heuristic_output_parallelism {
             let total_data_file_size = files_to_compact
                 .data_files
                 .iter()
@@ -837,7 +845,7 @@ impl DefaultParallelismCalculator {
                 .sum::<u64>();
 
             if total_data_file_size > 0 // Only apply if there's data
-            && total_data_file_size < config.planning.target_file_size
+            && total_data_file_size < config.base.target_file_size
             && output_parallelism > 1
             {
                 output_parallelism = 1;
@@ -848,9 +856,66 @@ impl DefaultParallelismCalculator {
     }
 }
 
+pub struct CompactionPlanner {
+    config: CompactionPlanningConfig,
+}
+
+impl CompactionPlanner {
+    pub fn new(config: CompactionPlanningConfig) -> Self {
+        Self { config }
+    }
+
+    /// Plan a compaction based on the provided table and compaction type
+    pub async fn plan_compaction(
+        &self,
+        table: &Table,
+        compaction_type: CompactionType,
+    ) -> Result<CompactionPlan> {
+        // check if the current snapshot exists
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(CompactionPlan::dummy());
+        }
+
+        let current_snapshot = table.metadata().current_snapshot().unwrap();
+
+        // Step 1: Select files for compaction (extensible)
+        let input_file_scan_tasks = self
+            .select_files_for_compaction(table, current_snapshot.snapshot_id(), compaction_type)
+            .await?;
+
+        let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
+            .calculate_parallelism(&input_file_scan_tasks, &self.config)
+            .map_err(|e| CompactionError::Execution(e.to_string()))?;
+
+        let runtime_config = RuntimeConfigBuilder::default()
+            .executor_parallelism(executor_parallelism)
+            .output_parallelism(output_parallelism)
+            .build()
+            .map_err(|e| CompactionError::Config(e.to_string()))?;
+
+        Ok(CompactionPlan::new(input_file_scan_tasks, runtime_config))
+    }
+
+    // Template method pattern: These methods can be overridden for specific compaction types
+
+    /// Hook for customizing file selection logic beyond simple `FileStrategy`
+    /// Default implementation uses `FileStrategy`, but complex compaction types can override
+    async fn select_files_for_compaction(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        compaction_type: CompactionType,
+    ) -> Result<InputFileScanTasks> {
+        use crate::file_selection::FileStrategyFactory;
+
+        let strategy = FileStrategyFactory::create_files_strategy(compaction_type, &self.config);
+        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::compaction::{Compaction, CompactionBuilder};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfigBuilder,
     };
@@ -1336,15 +1401,17 @@ mod tests {
             .await
             .unwrap();
 
+        let planner = CompactionPlanner::new(compaction.config.planning.clone());
+
         // Get the files that would be selected for compaction
-        let files_to_compact = Compaction::select_files_for_compaction(
-            &updated_table,
-            snapshot_before.snapshot_id(),
-            super::CompactionType::MergeSmallDataFiles,
-            &compaction.config,
-        )
-        .await
-        .unwrap();
+        let files_to_compact = planner
+            .select_files_for_compaction(
+                &updated_table,
+                snapshot_before.snapshot_id(),
+                super::CompactionType::MergeSmallDataFiles,
+            )
+            .await
+            .unwrap();
 
         // Validate file selection logic
         let selected_file_paths: std::collections::HashSet<&str> = files_to_compact
@@ -1456,14 +1523,14 @@ mod tests {
 
         let table = catalog.load_table(&table_ident).await.unwrap();
 
+        let planner =
+            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+
         // Test empty table
-        let plan = Compaction::plan_compaction(
-            &table,
-            super::CompactionType::Full,
-            &CompactionConfigBuilder::default().build().unwrap(),
-        )
-        .await
-        .unwrap();
+        let plan = planner
+            .plan_compaction(&table, super::CompactionType::Full)
+            .await
+            .unwrap();
 
         assert!(plan.is_empty());
         assert_eq!(plan.file_count(), 0);
@@ -1482,14 +1549,14 @@ mod tests {
         let tx = append_action.apply().await.unwrap();
         let updated_table = tx.commit(&catalog).await.unwrap();
 
+        let planner =
+            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+
         // Test plan with data
-        let plan = Compaction::plan_compaction(
-            &updated_table,
-            super::CompactionType::Full,
-            &CompactionConfigBuilder::default().build().unwrap(),
-        )
-        .await
-        .unwrap();
+        let plan = planner
+            .plan_compaction(&updated_table, super::CompactionType::Full)
+            .await
+            .unwrap();
 
         assert!(!plan.is_empty());
         assert!(plan.file_count() > 0);
@@ -1539,14 +1606,13 @@ mod tests {
             .await
             .unwrap();
 
+        let planner = CompactionPlanner::new(compaction.config.planning.clone());
+
         // Test planning separately
-        let plan = Compaction::plan_compaction(
-            &updated_table,
-            super::CompactionType::Full,
-            &compaction.config,
-        )
-        .await
-        .unwrap();
+        let plan = planner
+            .plan_compaction(&updated_table, super::CompactionType::Full)
+            .await
+            .unwrap();
 
         assert!(!plan.is_empty());
 

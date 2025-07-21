@@ -15,7 +15,7 @@
  */
 
 use crate::compaction::CompactionType;
-use crate::CompactionConfig;
+use crate::config::CompactionPlanningConfig;
 use iceberg::scan::FileScanTask;
 
 /// Strategy trait for filtering files during compaction
@@ -271,22 +271,22 @@ impl FileStrategyFactory {
     /// # Examples
     /// ```rust,no_run
     /// # use iceberg_compaction_core::file_selection::strategy::FileStrategyFactory;
-    /// # use iceberg_compaction_core::config::CompactionConfig;
-    /// # let config = CompactionConfig::default();
+    /// # use iceberg_compaction_core::config::CompactionPlanningConfig;
+    /// # let config = CompactionPlanningConfig::default();
     /// let strategy = FileStrategyFactory::create_small_files_strategy(&config);
     /// ```
-    pub fn create_small_files_strategy(config: &CompactionConfig) -> SmallFilesStrategy {
+    pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> SmallFilesStrategy {
         // Build the strategy: NoDeleteFiles -> SizeFilter -> TaskSizeLimit
         Compose::new(
             Compose::new(
                 NoDeleteFilesStrategy,
                 SizeFilterStrategy {
                     min_size: None,
-                    max_size: Some(config.planning.small_file_threshold),
+                    max_size: Some(config.small_file_threshold),
                 },
             ),
             TaskSizeLimitStrategy {
-                max_total_size: config.planning.max_task_total_size,
+                max_total_size: config.max_task_total_size,
             },
         )
     }
@@ -332,8 +332,8 @@ impl FileStrategyFactory {
     /// ```rust,no_run
     /// # use iceberg_compaction_core::file_selection::strategy::FileStrategyFactory;
     /// # use iceberg_compaction_core::compaction::CompactionType;
-    /// # use iceberg_compaction_core::config::CompactionConfig;
-    /// # let config = CompactionConfig::default();
+    /// # use iceberg_compaction_core::config::CompactionPlanningConfig;
+    /// # let config = CompactionPlanningConfig::default();
     /// let strategy = FileStrategyFactory::create_files_strategy(
     ///     CompactionType::MergeSmallDataFiles,
     ///     &config
@@ -341,7 +341,7 @@ impl FileStrategyFactory {
     /// ```
     pub fn create_files_strategy(
         compaction_type: CompactionType,
-        config: &CompactionConfig,
+        config: &CompactionPlanningConfig,
     ) -> UnifiedStrategy {
         match compaction_type {
             CompactionType::MergeSmallDataFiles => Self::create_small_files_strategy(config).into(),
@@ -414,7 +414,7 @@ impl<T> StrategyBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CompactionConfigBuilder, CompactionPlanningConfigBuilder};
+    use crate::config::CompactionPlanningConfigBuilder;
 
     // Helper function to create test FileScanTask
     fn create_test_file_scan_task(file_path: &str, file_size: u64) -> FileScanTask {
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_file_strategy_factory() {
-        let config = CompactionConfigBuilder::default().build().unwrap();
+        let config = CompactionPlanningConfigBuilder::default().build().unwrap();
 
         // Test individual strategy creation
         let noop_strategy = FileStrategyFactory::create_noop_strategy();
@@ -627,14 +627,9 @@ mod tests {
 
     #[test]
     fn test_unified_strategy() {
-        let planning_config = CompactionPlanningConfigBuilder::default()
+        let config = CompactionPlanningConfigBuilder::default()
             .small_file_threshold(10 * 1024 * 1024) // 10MB threshold
             .max_task_total_size(100 * 1024 * 1024) // 100MB task limit
-            .build()
-            .unwrap();
-
-        let config = CompactionConfigBuilder::default()
-            .planning(planning_config)
             .build()
             .unwrap();
 
@@ -659,7 +654,7 @@ mod tests {
 
         // Verify all selected files are under the threshold and have no deletes
         for file in &result {
-            assert!(file.length <= config.planning.small_file_threshold);
+            assert!(file.length <= config.small_file_threshold);
             assert!(file.deletes.is_empty());
         }
 
@@ -716,14 +711,9 @@ mod tests {
 
     #[test]
     fn test_small_files_strategy_end_to_end() {
-        let planning_config = CompactionPlanningConfigBuilder::default()
+        let config = CompactionPlanningConfigBuilder::default()
             .small_file_threshold(20 * 1024 * 1024) // 20MB threshold
             .max_task_total_size(50 * 1024 * 1024) // 50MB task limit
-            .build()
-            .unwrap();
-
-        let config = CompactionConfigBuilder::default()
-            .planning(planning_config)
             .build()
             .unwrap();
 
@@ -745,7 +735,7 @@ mod tests {
 
         // Verify all selected files are under the threshold and have no deletes
         for file in &result {
-            assert!(file.length <= config.planning.small_file_threshold);
+            assert!(file.length <= config.small_file_threshold);
             assert!(file.deletes.is_empty());
         }
     }
