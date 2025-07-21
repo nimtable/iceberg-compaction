@@ -146,6 +146,7 @@ impl CompactionExecutor for DataFusionExecutor {
         Ok(RewriteFilesResponse {
             data_files: output_data_files,
             stats,
+            snapshot_id: 0, // Placeholder for snapshot_id, should be set by the caller
         })
     }
 }
