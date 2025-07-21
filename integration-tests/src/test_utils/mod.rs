@@ -88,7 +88,8 @@ pub async fn build_test_iceberg_table(
         }
     }
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn.fast_append(Some(rand::random::<i64>()), None, vec![])?;
+    let mut fast_append_action =
+        txn.fast_append(Some(rand::random::<i64>()), None, vec![], None)?;
     fast_append_action
         .add_data_files(data_files)?
         .add_data_files(position_delete_files)?;
@@ -96,7 +97,8 @@ pub async fn build_test_iceberg_table(
 
     let snapshot = table.metadata().current_snapshot().unwrap();
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
+    let mut fast_append_action =
+        txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![], None)?;
     fast_append_action.add_data_files(equality_delete_files)?;
     fast_append_action.apply().await?.commit(&catalog).await?;
     Ok(())

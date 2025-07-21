@@ -207,6 +207,10 @@ impl CompactionMetricsRecorder {
 
     /// Record compaction duration
     pub fn record_compaction_duration(&self, duration_secs: f64) {
+        if duration_secs == 0.0 {
+            return; // Avoid recording zero duration
+        }
+
         let label_vec = self.label_vec();
 
         self.metrics
@@ -217,6 +221,10 @@ impl CompactionMetricsRecorder {
 
     /// Record commit duration
     pub fn record_commit_duration(&self, duration_secs: f64) {
+        if duration_secs == 0.0 {
+            return; // Avoid recording zero duration
+        }
+
         let label_vec = self.label_vec();
 
         self.metrics
@@ -258,6 +266,10 @@ impl CompactionMetricsRecorder {
     /// Record complete compaction metrics
     /// This is a convenience method that records all basic compaction metrics
     pub fn record_compaction_complete(&self, stats: &RewriteFilesStat) {
+        if stats.input_files_count == 0 && stats.output_files_count == 0 {
+            return; // No files processed, skip metrics
+        }
+
         let label_vec = self.label_vec();
 
         if stats.input_files_count > 0 {
@@ -291,6 +303,10 @@ impl CompactionMetricsRecorder {
     }
 
     pub fn record_datafusion_batch_fetch_duration(&self, fetch_duration_ms: f64) {
+        if fetch_duration_ms <= 1.0 {
+            return; // Avoid recording zero or negative durations
+        }
+
         let label_vec = self.label_vec();
 
         self.metrics
@@ -300,6 +316,10 @@ impl CompactionMetricsRecorder {
     }
 
     pub fn record_datafusion_batch_write_duration(&self, write_duration_ms: f64) {
+        if write_duration_ms <= 1.0 {
+            return; // Avoid recording zero or negative durations
+        }
+
         let label_vec = self.label_vec();
 
         self.metrics
@@ -309,25 +329,34 @@ impl CompactionMetricsRecorder {
     }
 
     pub fn record_batch_stats(&self, record_count: u64, batch_bytes: u64) {
+        if record_count == 0 && batch_bytes == 0 {
+            return; // No records or bytes, skip metrics
+        }
+
         let label_vec = self.label_vec();
-        self.metrics
-            .compaction_datafusion_records_processed_total
-            .counter(&label_vec)
-            .increase(record_count);
 
-        self.metrics
-            .compaction_datafusion_bytes_processed_total
-            .counter(&label_vec)
-            .increase(batch_bytes);
+        if record_count > 0 {
+            self.metrics
+                .compaction_datafusion_records_processed_total
+                .counter(&label_vec)
+                .increase(record_count);
 
-        self.metrics
-            .compaction_datafusion_batch_row_count_dist
-            .histogram(&label_vec)
-            .record(record_count as f64);
+            self.metrics
+                .compaction_datafusion_batch_row_count_dist
+                .histogram(&label_vec)
+                .record(record_count as f64);
+        }
 
-        self.metrics
-            .compaction_datafusion_batch_bytes_dist
-            .histogram(&label_vec)
-            .record(batch_bytes as f64);
+        if batch_bytes > 0 {
+            self.metrics
+                .compaction_datafusion_bytes_processed_total
+                .counter(&label_vec)
+                .increase(batch_bytes);
+
+            self.metrics
+                .compaction_datafusion_batch_bytes_dist
+                .histogram(&label_vec)
+                .record(batch_bytes as f64);
+        }
     }
 }
