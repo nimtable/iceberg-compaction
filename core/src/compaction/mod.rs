@@ -207,11 +207,6 @@ impl Compaction {
         CompactionBuilder::new()
     }
 
-    // pub fn compact_and_get_output(&self) -> Result<(Vec<DataFile>, RewriteFilesStat)> {
-    //     let stats = self.compact().await?;
-    //     Ok((stats.output_data_files, stats))
-    // }
-
     pub async fn compact(&self) -> Result<RewriteFilesResponse> {
         let CompactionResult {
             resp,
@@ -309,6 +304,7 @@ impl Compaction {
         let RewriteFilesResponse {
             data_files: output_data_files,
             stats,
+            snapshot_id: _,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
             Err(e) => {
@@ -344,6 +340,17 @@ impl Compaction {
             }
         };
 
+        let snapshot_id = {
+            let current_snapshot = match &self.to_branch {
+                Some(branch) => table.metadata().snapshot_for_ref(branch),
+                None => table.metadata().current_snapshot(),
+            };
+
+            current_snapshot
+                .map(|s| s.snapshot_id())
+                .ok_or_else(|| CompactionError::Execution("Snapshot id is not set".to_owned()))?
+        };
+
         // Step 5: Update metrics
         self.update_metrics(&metrics_recorder, &stats, now, commit_now);
 
@@ -369,6 +376,7 @@ impl Compaction {
             resp: RewriteFilesResponse {
                 data_files: output_data_files,
                 stats,
+                snapshot_id,
             },
             compaction_validator,
         })

@@ -74,6 +74,7 @@ impl InputFileScanTasks {
 pub struct RewriteFilesResponse {
     pub data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
+    pub snapshot_id: i64,
 }
 
 #[derive(Debug, Clone, Default)]
