@@ -21,7 +21,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
 use crate::common::CompactionMetricsRecorder;
-use crate::config::{CompactionConfig, RuntimeConfig};
+use crate::config::{CompactionExecutionConfig, RuntimeConfig};
 use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
@@ -40,7 +40,7 @@ pub struct RewriteFilesRequest {
     pub file_io: FileIO,
     pub schema: Arc<Schema>,
     pub input_file_scan_tasks: InputFileScanTasks,
-    pub config: Arc<CompactionConfig>,
+    pub execution_config: Arc<CompactionExecutionConfig>,
     pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,

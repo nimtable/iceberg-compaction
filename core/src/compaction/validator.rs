@@ -25,7 +25,7 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, Schema};
 use iceberg::table::Table;
 
-use crate::config::{CompactionConfigBuilder, RuntimeConfig};
+use crate::config::{CompactionExecutionConfigBuilder, RuntimeConfig};
 use crate::error::Result;
 use crate::executor::datafusion::datafusion_processor::{
     DataFusionTaskContext, DatafusionProcessor,
@@ -93,7 +93,7 @@ impl CompactionValidator {
             .build()?;
 
         let validator_config = Arc::new(
-            CompactionConfigBuilder::default()
+            CompactionExecutionConfigBuilder::default()
                 .build()
                 .map_err(|e| CompactionError::Config(e.to_string()))?,
         );
