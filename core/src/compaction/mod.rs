@@ -15,7 +15,7 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot};
+use iceberg::spec::{DataFile, Operation, Snapshot};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
@@ -462,6 +462,7 @@ impl Compaction {
             self.metrics.clone(),
             consistency_params,
             self.to_branch.clone(),
+            Some(Operation::Replace),
         );
 
         let (all_data_files, all_delete_files) =
@@ -496,6 +497,7 @@ impl Compaction {
         &self,
         consistency_params: CommitConsistencyParams,
         to_branch: Option<String>,
+        operation: Option<Operation>,
     ) -> RewriteDataFilesCommitManager {
         RewriteDataFilesCommitManager::new(
             self.commit_retry_config.clone(),
@@ -505,6 +507,7 @@ impl Compaction {
             self.metrics.clone(),
             consistency_params,
             to_branch,
+            operation,
         )
     }
 }
@@ -572,6 +575,8 @@ pub struct RewriteDataFilesCommitManager {
     basic_schema_id: i32, // Schema ID for the table, used for validation
 
     to_branch: Option<String>, // Optional branch to commit to, if applicable
+
+    operation: Option<Operation>,
 }
 
 pub struct CommitConsistencyParams {
@@ -582,6 +587,7 @@ pub struct CommitConsistencyParams {
 
 /// Manages the commit process with retries
 impl RewriteDataFilesCommitManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: RewriteDataFilesCommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
@@ -590,6 +596,7 @@ impl RewriteDataFilesCommitManager {
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
         to_branch: Option<String>,
+        operation: Option<Operation>,
     ) -> Self {
         let metrics_recorder =
             CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
@@ -603,6 +610,7 @@ impl RewriteDataFilesCommitManager {
             metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
             to_branch,
+            operation,
         }
     }
 
@@ -645,10 +653,12 @@ impl RewriteDataFilesCommitManager {
                 let rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        txn.rewrite_files(None, vec![], self.to_branch.clone())?
+                        txn.rewrite_files(None, vec![])?
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
                             .new_data_file_sequence_number(snapshot.sequence_number())?
+                            .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))?
+                            .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -658,9 +668,11 @@ impl RewriteDataFilesCommitManager {
                         ));
                     }
                 } else {
-                    txn.rewrite_files(None, vec![], self.to_branch.clone())?
+                    txn.rewrite_files(None, vec![])?
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
+                        .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))?
+                        .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
                 };
 
                 let txn = rewrite_action.apply().await?;
@@ -986,7 +998,7 @@ mod tests {
 
         // Start transaction and commit
         let transaction = Transaction::new(&table);
-        let mut append_action = transaction.fast_append(None, None, vec![], None).unwrap();
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(data_files).unwrap();
         let tx = append_action.apply().await.unwrap();
 
@@ -1061,7 +1073,7 @@ mod tests {
 
         // Start transaction and commit
         let transaction = Transaction::new(&table);
-        let mut append_action = transaction.fast_append(None, None, vec![], None).unwrap();
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(data_files).unwrap();
         let tx = append_action.apply().await.unwrap();
 
@@ -1138,7 +1150,7 @@ mod tests {
         all_data_files.extend(large_files);
 
         let transaction = Transaction::new(&table);
-        let mut append_action = transaction.fast_append(None, None, vec![], None).unwrap();
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(all_data_files).unwrap();
         let tx = append_action.apply().await.unwrap();
 
