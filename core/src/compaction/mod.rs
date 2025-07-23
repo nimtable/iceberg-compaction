@@ -246,15 +246,6 @@ impl Compaction {
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        // if table.metadata().current_snapshot().is_none() {
-        //     return Ok(CompactionResult {
-        //         resp: RewriteFilesResponse::default(),
-        //         compaction_validator: None,
-        //     });
-        // }
-
-        // let current_snapshot = table.metadata().current_snapshot().unwrap();
-
         let current_snapshot = match &self.to_branch {
             Some(branch) => table.metadata().snapshot_for_ref(branch),
             None => table.metadata().current_snapshot(),
@@ -656,9 +647,9 @@ impl RewriteDataFilesCommitManager {
                         txn.rewrite_files(None, vec![])?
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
-                            .new_data_file_sequence_number(snapshot.sequence_number())?
-                            .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))?
+                            .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))
                             .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
+                            .with_starting_sequence_number(snapshot.sequence_number())?
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -671,7 +662,7 @@ impl RewriteDataFilesCommitManager {
                     txn.rewrite_files(None, vec![])?
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
-                        .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))?
+                        .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))
                         .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
                 };
 
