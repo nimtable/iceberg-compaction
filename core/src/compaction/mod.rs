@@ -15,7 +15,7 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot};
+use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
@@ -192,10 +192,11 @@ pub struct Compaction {
     pub to_branch: Option<String>,
 }
 
-struct CompactionResult {
-    // stats: RewriteFilesStat,
-    resp: RewriteFilesResponse,
-    compaction_validator: Option<CompactionValidator>,
+#[derive(Default)]
+pub struct CompactionResult {
+    pub data_files: Vec<DataFile>,
+    pub stats: RewriteFilesStat,
+    pub table: Option<Table>,
 }
 
 impl Compaction {
@@ -204,11 +205,8 @@ impl Compaction {
         CompactionBuilder::new()
     }
 
-    pub async fn compact(&self) -> Result<RewriteFilesResponse> {
-        let CompactionResult {
-            resp,
-            compaction_validator,
-        } = match self.compaction_type {
+    pub async fn compact(&self) -> Result<CompactionResult> {
+        let (compaction_result, compaction_validator) = match self.compaction_type {
             CompactionType::Full | CompactionType::MergeSmallDataFiles => {
                 // Use the generic implementation for simple compaction types
                 self.execute_standard_compaction().await?
@@ -226,13 +224,15 @@ impl Compaction {
             );
         }
 
-        Ok(resp)
+        Ok(compaction_result)
     }
 
     /// Standard compaction implementation for simple file-based compaction types
     /// This works well for Full and `SmallFiles` compaction where the main difference
     /// is the `FileStrategy` used for file selection
-    async fn execute_standard_compaction(&self) -> Result<CompactionResult> {
+    async fn execute_standard_compaction(
+        &self,
+    ) -> Result<(CompactionResult, Option<CompactionValidator>)> {
         let now = std::time::Instant::now();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
@@ -249,10 +249,7 @@ impl Compaction {
         };
 
         if current_snapshot.is_none() {
-            return Ok(CompactionResult {
-                resp: RewriteFilesResponse::default(),
-                compaction_validator: None,
-            });
+            return Ok((CompactionResult::default(), None));
         }
 
         let current_snapshot = current_snapshot.unwrap();
@@ -264,10 +261,7 @@ impl Compaction {
 
         // Check if any input files were selected
         if input_file_scan_tasks.input_files_count() == 0 {
-            return Ok(CompactionResult {
-                resp: RewriteFilesResponse::default(),
-                compaction_validator: None,
-            });
+            return Ok((CompactionResult::default(), None));
         }
 
         let mut input_tasks_for_validation = if self.config.enable_validate_compaction {
@@ -284,7 +278,6 @@ impl Compaction {
         let RewriteFilesResponse {
             data_files: output_data_files,
             stats,
-            snapshot_id: _,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
             Err(e) => {
@@ -294,15 +287,9 @@ impl Compaction {
         };
 
         let commit_now = std::time::Instant::now();
-        // let output_data_files_for_commit = if self.config.enable_validate_compaction {
-        //     output_data_files.clone()
-        // } else {
-        //     std::mem::take(&mut output_data_files)
-        // };
         let output_data_files_for_commit = output_data_files.clone();
 
         // Step 4: Commit results (extensible)
-
         let committed_table = match self
             .commit_compaction_results(
                 &table,
@@ -320,17 +307,6 @@ impl Compaction {
             }
         };
 
-        let snapshot_id = {
-            let current_snapshot = match &self.to_branch {
-                Some(branch) => table.metadata().snapshot_for_ref(branch),
-                None => table.metadata().current_snapshot(),
-            };
-
-            current_snapshot
-                .map(|s| s.snapshot_id())
-                .ok_or_else(|| CompactionError::Execution("Snapshot id is not set".to_owned()))?
-        };
-
         // Step 5: Update metrics
         self.update_metrics(&metrics_recorder, &stats, now, commit_now);
 
@@ -343,7 +319,7 @@ impl Compaction {
                     self.config.clone(),
                     table.metadata().current_schema().clone(),
                     table.metadata().current_schema().clone(),
-                    committed_table,
+                    committed_table.clone(),
                     self.catalog_name.clone(),
                 )
                 .await?,
@@ -352,14 +328,14 @@ impl Compaction {
             None
         };
 
-        Ok(CompactionResult {
-            resp: RewriteFilesResponse {
+        Ok((
+            CompactionResult {
                 data_files: output_data_files,
                 stats,
-                snapshot_id,
+                table: Some(committed_table),
             },
             compaction_validator,
-        })
+        ))
     }
 
     /// Helper method to update metrics
@@ -466,7 +442,7 @@ impl Compaction {
             .rewrite_files(
                 output_data_files,
                 input_files,
-                self.to_branch.as_deref().unwrap_or("main"),
+                self.to_branch.as_deref().unwrap_or(MAIN_BRANCH),
             )
             .await
     }

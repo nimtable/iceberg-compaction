@@ -303,8 +303,8 @@ impl CompactionMetricsRecorder {
     }
 
     pub fn record_datafusion_batch_fetch_duration(&self, fetch_duration_ms: f64) {
-        if fetch_duration_ms <= 1.0 {
-            return; // Avoid recording zero or negative durations
+        if fetch_duration_ms <= 0.0 || !fetch_duration_ms.is_finite() {
+            return; // Avoid recording zero, negative, or invalid durations
         }
 
         let label_vec = self.label_vec();
@@ -316,8 +316,8 @@ impl CompactionMetricsRecorder {
     }
 
     pub fn record_datafusion_batch_write_duration(&self, write_duration_ms: f64) {
-        if write_duration_ms <= 1.0 {
-            return; // Avoid recording zero or negative durations
+        if write_duration_ms <= 0.0 || !write_duration_ms.is_finite() {
+            return; // Avoid recording zero, negative, or invalid durations
         }
 
         let label_vec = self.label_vec();
