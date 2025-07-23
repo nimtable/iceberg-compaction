@@ -15,7 +15,7 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Operation, Snapshot};
+use iceberg::spec::{DataFile, Snapshot};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
@@ -56,7 +56,7 @@ pub struct CompactionBuilder {
     table_ident: Option<TableIdent>,
     compaction_type: Option<CompactionType>,
     catalog_name: Option<String>,
-    commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    commit_retry_config: CommitManagerRetryConfig,
 
     to_branch: Option<String>,
 }
@@ -72,7 +72,7 @@ impl CompactionBuilder {
             table_ident: None,
             compaction_type: None,
             catalog_name: None,
-            commit_retry_config: RewriteDataFilesCommitManagerRetryConfig::default(),
+            commit_retry_config: CommitManagerRetryConfig::default(),
             to_branch: None,
         }
     }
@@ -116,10 +116,7 @@ impl CompactionBuilder {
         self
     }
 
-    pub fn with_retry_config(
-        mut self,
-        retry_config: RewriteDataFilesCommitManagerRetryConfig,
-    ) -> Self {
+    pub fn with_retry_config(mut self, retry_config: CommitManagerRetryConfig) -> Self {
         self.commit_retry_config = retry_config;
         self
     }
@@ -191,7 +188,7 @@ pub struct Compaction {
     pub compaction_type: CompactionType,
     pub catalog_name: String,
 
-    pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    pub commit_retry_config: CommitManagerRetryConfig,
     pub to_branch: Option<String>,
 }
 
@@ -259,14 +256,6 @@ impl Compaction {
         }
 
         let current_snapshot = current_snapshot.unwrap();
-
-        // debug
-        // tracing::info!(
-        //     "Compaction started for catalog '{}' table '{}' with snapshot ID {} branch '{}'",
-        //     self.catalog_name,
-        //     self.table_ident,
-        //     current_snapshot.snapshot_id(),
-        // );
 
         // Step 1: Select files for compaction (extensible)
         let input_file_scan_tasks = self
@@ -445,15 +434,13 @@ impl Compaction {
             basic_schema_id: table.metadata().current_schema().schema_id(),
         };
 
-        let commit_manager = RewriteDataFilesCommitManager::new(
+        let commit_manager = CommitManager::new(
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
-            self.to_branch.clone(),
-            Some(Operation::Replace),
         );
 
         let (all_data_files, all_delete_files) =
@@ -476,7 +463,11 @@ impl Compaction {
             .collect();
 
         commit_manager
-            .rewrite_files(output_data_files, input_files)
+            .rewrite_files(
+                output_data_files,
+                input_files,
+                self.to_branch.as_deref().unwrap_or("main"),
+            )
             .await
     }
 
@@ -484,21 +475,17 @@ impl Compaction {
         self.metrics.clone()
     }
 
-    pub fn build_rewrite_file_commit_manager(
+    pub fn build_commit_manager(
         &self,
         consistency_params: CommitConsistencyParams,
-        to_branch: Option<String>,
-        operation: Option<Operation>,
-    ) -> RewriteDataFilesCommitManager {
-        RewriteDataFilesCommitManager::new(
+    ) -> CommitManager {
+        CommitManager::new(
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
-            to_branch,
-            operation,
         )
     }
 }
@@ -537,13 +524,13 @@ async fn get_all_files_from_snapshot(
 
 /// Configuration for the commit manager, including retry strategies.
 #[derive(Debug, Clone)]
-pub struct RewriteDataFilesCommitManagerRetryConfig {
+pub struct CommitManagerRetryConfig {
     pub max_retries: u32, // This can be used to configure the backon strategy
     pub retry_initial_delay: Duration, // For exponential backoff
     pub retry_max_delay: Duration, // For exponential backoff
 }
 
-impl Default for RewriteDataFilesCommitManagerRetryConfig {
+impl Default for CommitManagerRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -554,8 +541,8 @@ impl Default for RewriteDataFilesCommitManagerRetryConfig {
 }
 
 // Manages the commit process with retries
-pub struct RewriteDataFilesCommitManager {
-    config: RewriteDataFilesCommitManagerRetryConfig,
+pub struct CommitManager {
+    config: CommitManagerRetryConfig,
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
@@ -564,10 +551,6 @@ pub struct RewriteDataFilesCommitManager {
     metrics_recorder: CompactionMetricsRecorder, // Metrics recorder for tracking commit operations
 
     basic_schema_id: i32, // Schema ID for the table, used for validation
-
-    to_branch: Option<String>, // Optional branch to commit to, if applicable
-
-    operation: Option<Operation>,
 }
 
 pub struct CommitConsistencyParams {
@@ -577,17 +560,15 @@ pub struct CommitConsistencyParams {
 }
 
 /// Manages the commit process with retries
-impl RewriteDataFilesCommitManager {
+impl CommitManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: RewriteDataFilesCommitManagerRetryConfig,
+        config: CommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         catalog_name: String,
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
-        to_branch: Option<String>,
-        operation: Option<Operation>,
     ) -> Self {
         let metrics_recorder =
             CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
@@ -600,8 +581,6 @@ impl RewriteDataFilesCommitManager {
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
             metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
-            to_branch,
-            operation,
         }
     }
 
@@ -610,6 +589,7 @@ impl RewriteDataFilesCommitManager {
         &self,
         data_files: impl IntoIterator<Item = DataFile>,
         delete_files: impl IntoIterator<Item = DataFile>,
+        to_branch: &str,
     ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
@@ -647,8 +627,7 @@ impl RewriteDataFilesCommitManager {
                         txn.rewrite_files(None, vec![])?
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
-                            .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))
-                            .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
+                            .with_to_branch(to_branch.to_owned())
                             .with_starting_sequence_number(snapshot.sequence_number())?
                     } else {
                         return Err(iceberg::Error::new(
@@ -662,8 +641,7 @@ impl RewriteDataFilesCommitManager {
                     txn.rewrite_files(None, vec![])?
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
-                        .with_to_branch(self.to_branch.clone().unwrap_or("main".to_owned()))
-                        .with_operation(self.operation.clone().unwrap_or(Operation::Replace))
+                        .with_to_branch(to_branch.to_owned())
                 };
 
                 let txn = rewrite_action.apply().await?;
@@ -705,6 +683,106 @@ impl RewriteDataFilesCommitManager {
             })
             .await
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
+    }
+
+    pub async fn overwrite_files(
+        &self,
+        data_files: impl IntoIterator<Item = DataFile>,
+        delete_files: impl IntoIterator<Item = DataFile>,
+        to_branch: &str,
+    ) -> Result<Table> {
+        let data_files: Vec<DataFile> = data_files.into_iter().collect();
+        let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+
+        let operation = || {
+            let catalog = self.catalog.clone();
+            let table_ident = self.table_ident.clone();
+            let data_files = data_files.clone();
+            let delete_files = delete_files.clone();
+            let use_starting_sequence_number = self.use_starting_sequence_number;
+            let starting_snapshot_id = self.starting_snapshot_id;
+            let metrics_recorder = self.metrics_recorder.clone();
+
+            async move {
+                // reload the table to get the latest state
+                let table = catalog.load_table(&table_ident).await?;
+
+                let schema_id = table.metadata().current_schema().schema_id();
+                if schema_id != self.basic_schema_id {
+                    return Err(iceberg::Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Schema ID mismatch: expected {}, found {}",
+                            self.basic_schema_id, schema_id
+                        ),
+                    ));
+                }
+
+                let txn = Transaction::new(&table);
+
+                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
+                let overwrite_action = if use_starting_sequence_number {
+                    // TODO: avoid retry if the snapshot_id is not found
+                    if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
+                        txn.overwrite_files(None, vec![])?
+                            .add_data_files(data_files)?
+                            .delete_files(delete_files)?
+                            .with_to_branch(to_branch.to_owned())
+                            .with_starting_sequence_number(snapshot.sequence_number())?
+                    } else {
+                        return Err(iceberg::Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "No snapshot found with the given snapshot_id {starting_snapshot_id}"
+                            ),
+                        ));
+                    }
+                } else {
+                    txn.overwrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                        .with_to_branch(to_branch.to_owned())
+                };
+
+                let txn = overwrite_action.apply().await?;
+                match txn.commit(catalog.as_ref()).await {
+                    Ok(table) => {
+                        // Update metrics after a successful commit
+                        metrics_recorder.record_commit_success();
+                        Ok(table)
+                    }
+                    Err(commit_err) => {
+                        metrics_recorder.record_commit_failure();
+
+                        tracing::error!(
+                            "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
+                            table_ident,
+                            commit_err
+                        );
+                        Err(commit_err)
+                    }
+                }
+            }
+        };
+
+        let retry_strategy = ExponentialBuilder::default()
+            .with_min_delay(self.config.retry_initial_delay)
+            .with_max_delay(self.config.retry_max_delay)
+            .with_max_times(self.config.max_retries as usize);
+
+        operation
+            .retry(retry_strategy)
+            .when(|e| {
+                matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
+                    || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+            })
+            .notify(|e, d| {
+                // Notify the user about the error
+                // TODO: add metrics
+                tracing::info!("Retrying Compaction failed {:?} after {:?}", e, d);
+            })
+            .await
+            .map_err(|e: iceberg::Error| CompactionError::from(e))
     }
 }
 
