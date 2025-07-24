@@ -57,7 +57,7 @@ impl Metrics {
             "iceberg-compaction compaction duration in seconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
-                1.0, 2.0, 20, // Start at 1 second, double each bucket, up to 20 buckets
+                100.0, 4.0, 10, // Start at 100ms, multiply each bucket by 4, up to 10 buckets
             ),
         );
 

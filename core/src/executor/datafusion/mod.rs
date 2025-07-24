@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-use crate::{error::Result, executor::iceberg_writer::rolling_iceberg_writer, CompactionConfig};
+use crate::{
+    config::CompactionExecutionConfig, error::Result,
+    executor::iceberg_writer::rolling_iceberg_writer,
+};
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::{future::try_join_all, StreamExt};
@@ -55,10 +58,11 @@ impl CompactionExecutor for DataFusionExecutor {
             file_io,
             schema,
             input_file_scan_tasks,
-            config,
+            execution_config,
             dir_path,
             partition_spec,
             metrics_recorder,
+            runtime_config,
         } = request;
 
         let mut stats = RewriteFilesStat::default();
@@ -68,17 +72,21 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_schema(schema.clone())
             .with_input_data_files(input_file_scan_tasks)
             .build()?;
-        let (batches, input_schema) = DatafusionProcessor::new(config.clone(), file_io.clone())
-            .execute(datafusion_task_ctx)
-            .await?;
+        let (batches, input_schema) = DatafusionProcessor::new(
+            execution_config.clone(),
+            runtime_config.clone(),
+            file_io.clone(),
+        )
+        .execute(datafusion_task_ctx)
+        .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(config.executor_parallelism);
+        let mut futures = Vec::with_capacity(runtime_config.executor_parallelism);
 
         // build iceberg writer for each partition
         for mut batch_stream in batches {
             let dir_path = dir_path.clone();
             let schema = arc_input_schema.clone();
-            let config = config.clone();
+            let execution_config = execution_config.clone();
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
             let metrics_recorder = metrics_recorder.clone();
@@ -87,12 +95,12 @@ impl CompactionExecutor for DataFusionExecutor {
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = tokio::spawn(async move {
                 let mut data_file_writer = build_iceberg_data_file_writer(
-                    config.data_file_prefix.clone(),
+                    execution_config.data_file_prefix.clone(),
                     dir_path,
                     schema,
                     file_io,
                     partition_spec,
-                    config.clone(),
+                    execution_config,
                 )
                 .await?;
 
@@ -156,23 +164,25 @@ pub async fn build_iceberg_data_file_writer(
     schema: Arc<Schema>,
     file_io: FileIO,
     partition_spec: Arc<PartitionSpec>,
-    config: Arc<CompactionConfig>,
+    execution_config: Arc<CompactionExecutionConfig>,
 ) -> Result<Box<dyn IcebergWriter>> {
     let parquet_writer_builder = build_parquet_writer_builder(
         data_file_prefix,
         dir_path,
         schema.clone(),
         file_io,
-        config.write_parquet_properties.clone(),
+        execution_config.write_parquet_properties.clone(),
     )?;
     let data_file_builder =
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(config.target_file_size)
-            .with_max_concurrent_closes(config.max_concurrent_closes)
-            .with_dynamic_size_estimation(config.enable_dynamic_size_estimation)
-            .with_size_estimation_smoothing_factor(config.size_estimation_smoothing_factor);
+            .with_target_file_size(execution_config.target_file_size)
+            .with_max_concurrent_closes(execution_config.max_concurrent_closes)
+            .with_dynamic_size_estimation(execution_config.enable_dynamic_size_estimation)
+            .with_size_estimation_smoothing_factor(
+                execution_config.size_estimation_smoothing_factor,
+            );
 
     let iceberg_output_writer = if partition_spec.fields().is_empty() {
         Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>

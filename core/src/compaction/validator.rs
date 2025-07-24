@@ -25,13 +25,13 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, Schema};
 use iceberg::table::Table;
 
-use crate::config::CompactionConfigBuilder;
+use crate::config::{CompactionExecutionConfigBuilder, RuntimeConfig};
 use crate::error::Result;
 use crate::executor::datafusion::datafusion_processor::{
     DataFusionTaskContext, DatafusionProcessor,
 };
 use crate::executor::InputFileScanTasks;
-use crate::{CompactionConfig, CompactionError};
+use crate::CompactionError;
 
 pub struct CompactionValidator {
     datafusion_processor: DatafusionProcessor,
@@ -45,7 +45,7 @@ impl CompactionValidator {
     pub async fn new(
         input_file_scan_tasks: InputFileScanTasks,
         output_files: Vec<DataFile>,
-        config: Arc<CompactionConfig>,
+        runtime_config: RuntimeConfig,
         input_schema: Arc<Schema>,
         output_schema: Arc<Schema>,
         table: Table,
@@ -93,15 +93,13 @@ impl CompactionValidator {
             .build()?;
 
         let validator_config = Arc::new(
-            CompactionConfigBuilder::default()
-                .executor_parallelism(config.executor_parallelism)
-                .output_parallelism(config.output_parallelism)
+            CompactionExecutionConfigBuilder::default()
                 .build()
                 .map_err(|e| CompactionError::Config(e.to_string()))?,
         );
 
         let datafusion_processor =
-            DatafusionProcessor::new(validator_config, table.file_io().clone());
+            DatafusionProcessor::new(validator_config, runtime_config, table.file_io().clone());
 
         Ok(Self {
             datafusion_processor,

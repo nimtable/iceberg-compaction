@@ -17,9 +17,9 @@
 use std::sync::Arc;
 
 use crate::{
+    config::{CompactionExecutionConfig, RuntimeConfig},
     error::{CompactionError, Result},
     executor::InputFileScanTasks,
-    CompactionConfig,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
@@ -48,29 +48,34 @@ const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SY
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
     ctx: Arc<SessionContext>,
-    config: Arc<CompactionConfig>,
+    runtime_config: RuntimeConfig,
 }
 
 impl DatafusionProcessor {
-    pub fn new(config: Arc<CompactionConfig>, file_io: FileIO) -> Self {
+    pub fn new(
+        execution_config: Arc<CompactionExecutionConfig>,
+        runtime_config: RuntimeConfig,
+        file_io: FileIO,
+    ) -> Self {
         let session_config = SessionConfig::new()
-            .with_target_partitions(config.executor_parallelism)
-            .with_batch_size(config.max_record_batch_rows)
+            .with_target_partitions(runtime_config.executor_parallelism)
+            .with_batch_size(execution_config.max_record_batch_rows)
             .set_bool(
                 "datafusion.sql_parser.enable_ident_normalization",
-                config.enable_normalized_column_identifiers,
+                execution_config.enable_normalized_column_identifiers,
             );
         let ctx = Arc::new(SessionContext::new_with_config(session_config));
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
-            config.executor_parallelism,
-            config.max_record_batch_rows,
+            runtime_config.executor_parallelism,
+            execution_config.max_record_batch_rows,
         );
+
         Self {
             table_register,
             ctx,
-            config,
+            runtime_config,
         }
     }
 
@@ -148,11 +153,11 @@ impl DatafusionProcessor {
         // Conditionally create a new physical_plan if repartitioning is needed
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
             if physical_plan.output_partitioning().partition_count()
-                != self.config.output_parallelism
+                != self.runtime_config.output_parallelism
             {
                 Arc::new(RepartitionExec::try_new(
                     physical_plan,
-                    Partitioning::RoundRobinBatch(self.config.output_parallelism),
+                    Partitioning::RoundRobinBatch(self.runtime_config.output_parallelism),
                 )?)
             } else {
                 physical_plan
