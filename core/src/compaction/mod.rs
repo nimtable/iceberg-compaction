@@ -423,8 +423,8 @@ impl Compaction {
         start_time: std::time::Instant,
         commit_start_time: std::time::Instant,
     ) {
-        metrics_recorder.record_commit_duration(commit_start_time.elapsed().as_secs_f64());
-        metrics_recorder.record_compaction_duration(start_time.elapsed().as_secs_f64());
+        metrics_recorder.record_commit_duration(commit_start_time.elapsed().as_millis() as _);
+        metrics_recorder.record_compaction_duration(start_time.elapsed().as_millis() as _);
         metrics_recorder.record_compaction_complete(stats);
     }
 
