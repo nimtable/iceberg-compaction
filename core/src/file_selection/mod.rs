@@ -73,6 +73,7 @@ impl FileSelector {
 
         for task in &filtered_data_files {
             for delete_task in &task.deletes {
+                let delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
                         let mut delete_task = delete_task.clone();
