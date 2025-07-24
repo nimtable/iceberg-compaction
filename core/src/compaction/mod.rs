@@ -503,6 +503,7 @@ impl Compaction {
             .await
     }
 
+    /// Compact the table with the given plan and execution config(ignore the global compaction config)
     pub async fn compact_with_plan(
         &self,
         plan: CompactionPlan,
