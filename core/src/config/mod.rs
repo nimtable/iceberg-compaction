@@ -112,10 +112,6 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
 
-    /// Target size in bytes for each compacted file (default: 1GB)
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
-
     /// Whether to enable validation after compaction completes
     #[builder(default = "DEFAULT_VALIDATE_COMPACTION")]
     pub enable_validate_compaction: bool,
