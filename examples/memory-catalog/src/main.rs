@@ -76,7 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Perform the compaction
     println!("Starting compaction for table: {}", table_ident);
-    let stats = compaction.compact().await?;
+    let resp = compaction.compact().await?;
+    let stats = &resp.stats;
 
     // 6. Display compaction results
     println!("Compaction completed successfully!");

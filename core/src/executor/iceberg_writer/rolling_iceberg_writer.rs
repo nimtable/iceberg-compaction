@@ -176,8 +176,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 /// // Create a basic rolling writer (dynamic size estimation disabled by default)
 /// let writer = RollingIcebergWriterBuilder::new(inner_builder)
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
-///     .build()
-///     .await?;
+///     .build()?;
 /// ```
 ///
 /// ## With Dynamic Size Estimation
@@ -189,8 +188,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
 ///     .with_dynamic_size_estimation(true)       // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.3) // Adjust smoothing (optional)
-///     .build()
-///     .await?;
+///     .build()?;
 /// ```
 ///
 /// ## Custom Configuration
@@ -203,8 +201,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_max_concurrent_closes(8)              // Allow 8 concurrent closes
 ///     .with_dynamic_size_estimation(true)         // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.2) // More stable estimation
-///     .build()
-///     .await?;
+///     .build()?;
 /// ```
 pub struct RollingIcebergWriter<B, D> {
     /// Builder for creating new inner writers.

@@ -15,7 +15,7 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot};
+use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
@@ -56,7 +56,9 @@ pub struct CompactionBuilder {
     table_ident: Option<TableIdent>,
     compaction_type: Option<CompactionType>,
     catalog_name: Option<String>,
-    commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    commit_retry_config: CommitManagerRetryConfig,
+
+    to_branch: Option<String>,
 }
 
 impl CompactionBuilder {
@@ -70,7 +72,8 @@ impl CompactionBuilder {
             table_ident: None,
             compaction_type: None,
             catalog_name: None,
-            commit_retry_config: RewriteDataFilesCommitManagerRetryConfig::default(),
+            commit_retry_config: CommitManagerRetryConfig::default(),
+            to_branch: None,
         }
     }
 
@@ -113,11 +116,13 @@ impl CompactionBuilder {
         self
     }
 
-    pub fn with_retry_config(
-        mut self,
-        retry_config: RewriteDataFilesCommitManagerRetryConfig,
-    ) -> Self {
+    pub fn with_retry_config(mut self, retry_config: CommitManagerRetryConfig) -> Self {
         self.commit_retry_config = retry_config;
+        self
+    }
+
+    pub fn with_to_branch(mut self, to_branch: String) -> Self {
+        self.to_branch = Some(to_branch);
         self
     }
 
@@ -151,6 +156,8 @@ impl CompactionBuilder {
 
         let commit_retry_config = self.commit_retry_config;
 
+        let to_branch = self.to_branch.clone();
+
         Ok(Compaction {
             config,
             executor,
@@ -160,6 +167,7 @@ impl CompactionBuilder {
             compaction_type,
             catalog_name,
             commit_retry_config,
+            to_branch,
         })
     }
 }
@@ -180,12 +188,15 @@ pub struct Compaction {
     pub compaction_type: CompactionType,
     pub catalog_name: String,
 
-    pub commit_retry_config: RewriteDataFilesCommitManagerRetryConfig,
+    pub commit_retry_config: CommitManagerRetryConfig,
+    pub to_branch: Option<String>,
 }
 
-struct CompactionResult {
-    stats: RewriteFilesStat,
-    compaction_validator: Option<CompactionValidator>,
+#[derive(Default)]
+pub struct CompactionResult {
+    pub data_files: Vec<DataFile>,
+    pub stats: RewriteFilesStat,
+    pub table: Option<Table>,
 }
 
 impl Compaction {
@@ -194,11 +205,8 @@ impl Compaction {
         CompactionBuilder::new()
     }
 
-    pub async fn compact(&self) -> Result<RewriteFilesStat> {
-        let CompactionResult {
-            stats,
-            compaction_validator,
-        } = match self.compaction_type {
+    pub async fn compact(&self) -> Result<CompactionResult> {
+        let (compaction_result, compaction_validator) = match self.compaction_type {
             CompactionType::Full | CompactionType::MergeSmallDataFiles => {
                 // Use the generic implementation for simple compaction types
                 self.execute_standard_compaction().await?
@@ -216,13 +224,15 @@ impl Compaction {
             );
         }
 
-        Ok(stats)
+        Ok(compaction_result)
     }
 
     /// Standard compaction implementation for simple file-based compaction types
     /// This works well for Full and `SmallFiles` compaction where the main difference
     /// is the `FileStrategy` used for file selection
-    async fn execute_standard_compaction(&self) -> Result<CompactionResult> {
+    async fn execute_standard_compaction(
+        &self,
+    ) -> Result<(CompactionResult, Option<CompactionValidator>)> {
         let now = std::time::Instant::now();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
@@ -233,14 +243,16 @@ impl Compaction {
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        if table.metadata().current_snapshot().is_none() {
-            return Ok(CompactionResult {
-                stats: RewriteFilesStat::default(),
-                compaction_validator: None,
-            });
+        let current_snapshot = match &self.to_branch {
+            Some(branch) => table.metadata().snapshot_for_ref(branch),
+            None => table.metadata().current_snapshot(),
+        };
+
+        if current_snapshot.is_none() {
+            return Ok((CompactionResult::default(), None));
         }
 
-        let current_snapshot = table.metadata().current_snapshot().unwrap();
+        let current_snapshot = current_snapshot.unwrap();
 
         // Step 1: Select files for compaction (extensible)
         let input_file_scan_tasks = self
@@ -249,10 +261,7 @@ impl Compaction {
 
         // Check if any input files were selected
         if input_file_scan_tasks.input_files_count() == 0 {
-            return Ok(CompactionResult {
-                stats: RewriteFilesStat::default(),
-                compaction_validator: None,
-            });
+            return Ok((CompactionResult::default(), None));
         }
 
         let mut input_tasks_for_validation = if self.config.enable_validate_compaction {
@@ -267,7 +276,7 @@ impl Compaction {
 
         // Step 3: Execute rewrite
         let RewriteFilesResponse {
-            data_files: mut output_data_files,
+            data_files: output_data_files,
             stats,
         } = match self.executor.rewrite_files(rewrite_files_request).await {
             Ok(response) => response,
@@ -278,14 +287,9 @@ impl Compaction {
         };
 
         let commit_now = std::time::Instant::now();
-        let output_data_files_for_commit = if self.config.enable_validate_compaction {
-            output_data_files.clone()
-        } else {
-            std::mem::take(&mut output_data_files)
-        };
+        let output_data_files_for_commit = output_data_files.clone();
 
         // Step 4: Commit results (extensible)
-
         let committed_table = match self
             .commit_compaction_results(
                 &table,
@@ -311,11 +315,11 @@ impl Compaction {
             Some(
                 CompactionValidator::new(
                     input_tasks_for_validation.take().unwrap(),
-                    output_data_files,
+                    output_data_files.clone(),
                     self.config.clone(),
                     table.metadata().current_schema().clone(),
                     table.metadata().current_schema().clone(),
-                    committed_table,
+                    committed_table.clone(),
                     self.catalog_name.clone(),
                 )
                 .await?,
@@ -324,10 +328,14 @@ impl Compaction {
             None
         };
 
-        Ok(CompactionResult {
-            stats,
+        Ok((
+            CompactionResult {
+                data_files: output_data_files,
+                stats,
+                table: Some(committed_table),
+            },
             compaction_validator,
-        })
+        ))
     }
 
     /// Helper method to update metrics
@@ -397,12 +405,12 @@ impl Compaction {
         file_io: &FileIO,
     ) -> Result<Table> {
         let consistency_params = CommitConsistencyParams {
-            starting_snapshot_id: table.metadata().current_snapshot_id().unwrap(),
+            starting_snapshot_id: snapshot.snapshot_id(),
             use_starting_sequence_number: true,
             basic_schema_id: table.metadata().current_schema().schema_id(),
         };
 
-        let commit_manager = RewriteDataFilesCommitManager::new(
+        let commit_manager = CommitManager::new(
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
@@ -431,8 +439,30 @@ impl Compaction {
             .collect();
 
         commit_manager
-            .rewrite_files(output_data_files, input_files)
+            .rewrite_files(
+                output_data_files,
+                input_files,
+                self.to_branch.as_deref().unwrap_or(MAIN_BRANCH),
+            )
             .await
+    }
+
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    pub fn build_commit_manager(
+        &self,
+        consistency_params: CommitConsistencyParams,
+    ) -> CommitManager {
+        CommitManager::new(
+            self.commit_retry_config.clone(),
+            self.catalog.clone(),
+            self.table_ident.clone(),
+            self.catalog_name.clone(),
+            self.metrics.clone(),
+            consistency_params,
+        )
     }
 }
 
@@ -470,13 +500,13 @@ async fn get_all_files_from_snapshot(
 
 /// Configuration for the commit manager, including retry strategies.
 #[derive(Debug, Clone)]
-pub struct RewriteDataFilesCommitManagerRetryConfig {
+pub struct CommitManagerRetryConfig {
     pub max_retries: u32, // This can be used to configure the backon strategy
     pub retry_initial_delay: Duration, // For exponential backoff
     pub retry_max_delay: Duration, // For exponential backoff
 }
 
-impl Default for RewriteDataFilesCommitManagerRetryConfig {
+impl Default for CommitManagerRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -487,8 +517,8 @@ impl Default for RewriteDataFilesCommitManagerRetryConfig {
 }
 
 // Manages the commit process with retries
-pub struct RewriteDataFilesCommitManager {
-    config: RewriteDataFilesCommitManagerRetryConfig,
+pub struct CommitManager {
+    config: CommitManagerRetryConfig,
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
@@ -506,9 +536,10 @@ pub struct CommitConsistencyParams {
 }
 
 /// Manages the commit process with retries
-impl RewriteDataFilesCommitManager {
+impl CommitManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: RewriteDataFilesCommitManagerRetryConfig,
+        config: CommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         catalog_name: String,
@@ -534,6 +565,7 @@ impl RewriteDataFilesCommitManager {
         &self,
         data_files: impl IntoIterator<Item = DataFile>,
         delete_files: impl IntoIterator<Item = DataFile>,
+        to_branch: &str,
     ) -> Result<Table> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
         let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
@@ -571,7 +603,8 @@ impl RewriteDataFilesCommitManager {
                         txn.rewrite_files(None, vec![])?
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
-                            .new_data_file_sequence_number(snapshot.sequence_number())?
+                            .with_to_branch(to_branch.to_owned())
+                            .with_starting_sequence_number(snapshot.sequence_number())?
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -584,6 +617,7 @@ impl RewriteDataFilesCommitManager {
                     txn.rewrite_files(None, vec![])?
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
+                        .with_to_branch(to_branch.to_owned())
                 };
 
                 let txn = rewrite_action.apply().await?;
@@ -625,6 +659,106 @@ impl RewriteDataFilesCommitManager {
             })
             .await
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
+    }
+
+    pub async fn overwrite_files(
+        &self,
+        data_files: impl IntoIterator<Item = DataFile>,
+        delete_files: impl IntoIterator<Item = DataFile>,
+        to_branch: &str,
+    ) -> Result<Table> {
+        let data_files: Vec<DataFile> = data_files.into_iter().collect();
+        let delete_files: Vec<DataFile> = delete_files.into_iter().collect();
+
+        let operation = || {
+            let catalog = self.catalog.clone();
+            let table_ident = self.table_ident.clone();
+            let data_files = data_files.clone();
+            let delete_files = delete_files.clone();
+            let use_starting_sequence_number = self.use_starting_sequence_number;
+            let starting_snapshot_id = self.starting_snapshot_id;
+            let metrics_recorder = self.metrics_recorder.clone();
+
+            async move {
+                // reload the table to get the latest state
+                let table = catalog.load_table(&table_ident).await?;
+
+                let schema_id = table.metadata().current_schema().schema_id();
+                if schema_id != self.basic_schema_id {
+                    return Err(iceberg::Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Schema ID mismatch: expected {}, found {}",
+                            self.basic_schema_id, schema_id
+                        ),
+                    ));
+                }
+
+                let txn = Transaction::new(&table);
+
+                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
+                let overwrite_action = if use_starting_sequence_number {
+                    // TODO: avoid retry if the snapshot_id is not found
+                    if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
+                        txn.overwrite_files(None, vec![])?
+                            .add_data_files(data_files)?
+                            .delete_files(delete_files)?
+                            .with_to_branch(to_branch.to_owned())
+                            .with_starting_sequence_number(snapshot.sequence_number())?
+                    } else {
+                        return Err(iceberg::Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "No snapshot found with the given snapshot_id {starting_snapshot_id}"
+                            ),
+                        ));
+                    }
+                } else {
+                    txn.overwrite_files(None, vec![])?
+                        .add_data_files(data_files)?
+                        .delete_files(delete_files)?
+                        .with_to_branch(to_branch.to_owned())
+                };
+
+                let txn = overwrite_action.apply().await?;
+                match txn.commit(catalog.as_ref()).await {
+                    Ok(table) => {
+                        // Update metrics after a successful commit
+                        metrics_recorder.record_commit_success();
+                        Ok(table)
+                    }
+                    Err(commit_err) => {
+                        metrics_recorder.record_commit_failure();
+
+                        tracing::error!(
+                            "Commit attempt failed for table '{}': {:?}. Will retry if applicable.",
+                            table_ident,
+                            commit_err
+                        );
+                        Err(commit_err)
+                    }
+                }
+            }
+        };
+
+        let retry_strategy = ExponentialBuilder::default()
+            .with_min_delay(self.config.retry_initial_delay)
+            .with_max_delay(self.config.retry_max_delay)
+            .with_max_times(self.config.max_retries as usize);
+
+        operation
+            .retry(retry_strategy)
+            .when(|e| {
+                matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
+                    || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+            })
+            .notify(|e, d| {
+                // Notify the user about the error
+                // TODO: add metrics
+                tracing::info!("Retrying Compaction failed {:?} after {:?}", e, d);
+            })
+            .await
+            .map_err(|e: iceberg::Error| CompactionError::from(e))
     }
 }
 
@@ -930,7 +1064,7 @@ mod tests {
             latest_snapshot.snapshot_id()
         );
 
-        let rewrite_files_stat = CompactionBuilder::new()
+        let rewrite_files_resp = CompactionBuilder::new()
             .with_catalog(Arc::new(catalog))
             .with_table_ident(table_ident.clone())
             .with_config(Arc::new(
@@ -946,7 +1080,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rewrite_files_stat.input_files_count, 2);
+        assert_eq!(rewrite_files_resp.stats.input_files_count, 2);
     }
 
     #[tokio::test]
@@ -992,7 +1126,7 @@ mod tests {
         let _updated_table = tx.commit(&catalog).await.unwrap();
 
         // Test full compaction - should compact all files
-        let rewrite_files_stat = CompactionBuilder::new()
+        let rewrite_files_resp = CompactionBuilder::new()
             .with_catalog(Arc::new(catalog))
             .with_table_ident(table_ident.clone())
             .with_compaction_type(super::CompactionType::Full)
@@ -1007,9 +1141,12 @@ mod tests {
             .unwrap();
 
         // Full compaction should rewrite all existing files
-        assert_eq!(rewrite_files_stat.input_files_count, initial_file_count);
+        assert_eq!(
+            rewrite_files_resp.stats.input_files_count,
+            initial_file_count
+        );
         // Should create at least 1 new file from all the data (might be more depending on size)
-        assert!(rewrite_files_stat.output_files_count >= 1);
+        assert!(rewrite_files_resp.stats.output_files_count >= 1);
     }
 
     #[tokio::test]
@@ -1152,14 +1289,17 @@ mod tests {
         );
 
         // Run the actual compaction
-        let rewrite_files_stat = compaction.compact().await.unwrap();
+        let rewrite_files_resp = compaction.compact().await.unwrap();
 
         // Validate compaction results
-        assert_eq!(rewrite_files_stat.input_files_count, small_files_count,);
+        assert_eq!(
+            rewrite_files_resp.stats.input_files_count,
+            small_files_count,
+        );
 
         // Should create fewer files than were compacted (compaction benefit)
-        assert!(rewrite_files_stat.output_files_count <= small_files_count);
-        assert!(rewrite_files_stat.output_files_count > 0);
+        assert!(rewrite_files_resp.stats.output_files_count <= small_files_count);
+        assert!(rewrite_files_resp.stats.output_files_count > 0);
 
         // Verify final state: total files should be reduced
         let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
@@ -1182,7 +1322,7 @@ mod tests {
 
         // Final file count should be: large_files + newly_created_files
         let expected_final_count =
-            large_files_count + rewrite_files_stat.output_files_count as usize;
+            large_files_count + rewrite_files_resp.stats.output_files_count as usize;
         assert_eq!(final_data_files.len(), expected_final_count);
 
         // Verify that large files are still present and untouched
