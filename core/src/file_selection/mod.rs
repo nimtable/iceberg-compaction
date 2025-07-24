@@ -73,15 +73,14 @@ impl FileSelector {
 
         for task in &filtered_data_files {
             for delete_task in &task.deletes {
+                let mut delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
-                        let mut delete_task = delete_task.clone();
                         delete_task.project_field_ids = vec![];
                         position_delete_files
                             .insert(delete_task.data_file_path.clone(), delete_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
-                        let mut delete_task = delete_task.clone();
                         delete_task.project_field_ids = delete_task.equality_ids.clone();
                         equality_delete_files
                             .insert(delete_task.data_file_path.clone(), delete_task);
