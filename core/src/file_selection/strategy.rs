@@ -449,7 +449,7 @@ mod tests {
 
         let deletes = if has_deletes {
             // Create a dummy delete file task for testing
-            vec![FileScanTask {
+            vec![Arc::new(FileScanTask {
                 start: 0,
                 length: 1024,
                 record_count: Some(10),
@@ -463,7 +463,7 @@ mod tests {
                 sequence_number: 1,
                 equality_ids: vec![],
                 file_size_in_bytes: 1024,
-            }]
+            })]
         } else {
             vec![]
         };
