@@ -302,7 +302,7 @@ impl Compaction {
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        // WARN: We must ensure the snapshot view throughout the compaction process, so we use the snapshot_id carried by the plan as the standard.
+        // WARN: We must ensure the consistency of the snapshot view throughout the compaction process, so we use the snapshot_id carried by the plan as the reference standard.
         if let Some(branch_snapshot) = table.metadata().snapshot_by_id(plan.snapshot_id) {
             // Check if any input files were selected
             if plan.files_to_compact.input_files_count() == 0 {
