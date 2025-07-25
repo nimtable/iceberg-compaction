@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
+use std::borrow::Cow;
 
 mod validator;
 
@@ -52,30 +53,36 @@ pub enum CompactionType {
 
 /// Builder for creating Compaction instances with flexible configuration
 pub struct CompactionBuilder {
-    config: Option<Arc<CompactionConfig>>,
-    executor_type: ExecutorType,
-    catalog: Option<Arc<dyn Catalog>>,
-    registry: BoxedRegistry,
-    table_ident: Option<TableIdent>,
-    compaction_type: Option<CompactionType>,
-    catalog_name: Option<String>,
-    commit_retry_config: CommitManagerRetryConfig,
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    compaction_type: CompactionType,
 
-    to_branch: Option<String>,
+    // Optional configuration
+    catalog_name: Option<Cow<'static, str>>,
+    config: Option<Arc<CompactionConfig>>,
+    executor_type: Option<ExecutorType>,
+    registry: Option<BoxedRegistry>,
+    commit_retry_config: Option<CommitManagerRetryConfig>,
+    to_branch: Option<Cow<'static, str>>,
 }
 
 impl CompactionBuilder {
     /// Create a new `CompactionBuilder` with default settings
-    pub fn new() -> Self {
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        compaction_type: CompactionType,
+    ) -> Self {
         Self {
-            config: None,
-            executor_type: ExecutorType::DataFusion, // Default executor type
-            catalog: None,
-            registry: Box::new(NoopMetricsRegistry),
-            table_ident: None,
-            compaction_type: None,
+            catalog,
+            table_ident,
+            compaction_type,
+
             catalog_name: None,
-            commit_retry_config: CommitManagerRetryConfig::default(),
+            config: None,
+            executor_type: None,
+            registry: None,
+            commit_retry_config: None,
             to_branch: None,
         }
     }
@@ -88,92 +95,67 @@ impl CompactionBuilder {
 
     /// Set the executor type (defaults to `DataFusion`)
     pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
-        self.executor_type = executor_type;
+        self.executor_type = Some(executor_type);
         self
     }
 
-    /// Set the catalog
-    pub fn with_catalog(mut self, catalog: Arc<dyn Catalog>) -> Self {
-        self.catalog = Some(catalog);
+    /// Set the catalog name for metrics label
+    pub fn with_catalog_name(mut self, catalog_name: impl Into<Cow<'static, str>>) -> Self {
+        self.catalog_name = Some(catalog_name.into());
         self
     }
 
     /// Set the metrics registry (optional, defaults to `NoopMetricsRegistry`)
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
-        self.registry = registry;
-        self
-    }
-
-    pub fn with_table_ident(mut self, table_ident: TableIdent) -> Self {
-        self.table_ident = Some(table_ident);
-        self
-    }
-
-    pub fn with_compaction_type(mut self, compaction_type: CompactionType) -> Self {
-        self.compaction_type = Some(compaction_type);
-        self
-    }
-
-    pub fn with_catalog_name(mut self, catalog_name: String) -> Self {
-        self.catalog_name = Some(catalog_name);
+        self.registry = Some(registry);
         self
     }
 
     pub fn with_retry_config(mut self, retry_config: CommitManagerRetryConfig) -> Self {
-        self.commit_retry_config = retry_config;
+        self.commit_retry_config = Some(retry_config);
         self
     }
 
-    pub fn with_to_branch(mut self, to_branch: String) -> Self {
-        self.to_branch = Some(to_branch);
+    pub fn with_to_branch(mut self, to_branch: impl Into<Cow<'static, str>>) -> Self {
+        self.to_branch = Some(to_branch.into());
         self
     }
 
     /// Build the Compaction instance
-    pub async fn build(self) -> Result<Compaction> {
-        let catalog = self.catalog.ok_or_else(|| {
-            crate::error::CompactionError::Execution("Catalog is required".to_owned())
-        })?;
+    pub fn build(self) -> Compaction {
+        let executor_type = self.executor_type.unwrap_or(ExecutorType::DataFusion);
+        let executor = create_compaction_executor(executor_type);
 
-        let table_ident = self.table_ident.ok_or_else(|| {
-            crate::error::CompactionError::Execution("TableIdent is required".to_owned())
-        })?;
+        let metrics = if let Some(registry) = self.registry {
+            Arc::new(Metrics::new(registry))
+        } else {
+            Arc::new(Metrics::new(Box::new(NoopMetricsRegistry)))
+        };
 
-        let compaction_type = self.compaction_type.unwrap_or(CompactionType::Full);
+        let commit_retry_config = self.commit_retry_config.unwrap_or_default();
 
-        if !catalog.table_exists(&table_ident).await? {
-            return Err(crate::error::CompactionError::Execution(
-                "Table does not exist".to_owned(),
-            ));
-        }
+        let to_branch = self
+            .to_branch
+            .unwrap_or_else(|| MAIN_BRANCH.to_owned().into());
 
-        let executor = create_compaction_executor(self.executor_type);
+        let catalog_name = self
+            .catalog_name
+            .unwrap_or_else(|| "default".to_owned().into());
 
-        let metrics = Arc::new(Metrics::new(self.registry));
+        let table_ident_name = Cow::Owned(self.table_ident.name().to_owned());
 
-        let catalog_name = self.catalog_name.unwrap_or_default();
-
-        let commit_retry_config = self.commit_retry_config;
-
-        let to_branch = self.to_branch.clone();
-
-        Ok(Compaction {
+        Compaction {
             config: self.config,
             executor,
-            catalog,
+            catalog: self.catalog,
             metrics,
-            table_ident,
-            compaction_type,
+            table_ident: self.table_ident,
+            table_ident_name,
+            compaction_type: self.compaction_type,
             catalog_name,
             commit_retry_config,
             to_branch,
-        })
-    }
-}
-
-impl Default for CompactionBuilder {
-    fn default() -> Self {
-        Self::new()
+        }
     }
 }
 
@@ -199,13 +181,9 @@ impl Default for CompactionBuilder {
 /// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
 /// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
 /// # let config = CompactionConfig::default();
-/// let compaction = CompactionBuilder::new()
-///     .with_catalog(catalog)
-///     .with_table_ident(table_ident)
-///     .with_compaction_type(CompactionType::MergeSmallDataFiles)
+/// let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
 ///     .with_config(Arc::new(config))
-///     .build()
-///     .await?;
+///     .build();
 ///
 /// // Simple one-step execution - system handles everything
 /// let result = compaction.compact().await?;
@@ -232,13 +210,9 @@ impl Default for CompactionBuilder {
 /// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
 /// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
 /// # let config = CompactionConfig::default();
-/// let compaction = CompactionBuilder::new()
-///     .with_catalog(catalog.clone())
-///     .with_table_ident(table_ident.clone())
-///     .with_compaction_type(CompactionType::Full)
+/// let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
 ///     .with_config(Arc::new(config.clone()))
-///     .build()
-///     .await?;
+///     .build();
 ///
 /// // Step 1: Create a planner and generate a plan (preview what will be processed)
 /// let planner = CompactionPlanner::new(config.planning.clone());
@@ -270,11 +244,12 @@ pub struct Compaction {
     pub catalog: Arc<dyn Catalog>,
     pub metrics: Arc<Metrics>,
     pub table_ident: TableIdent,
+    pub table_ident_name: Cow<'static, str>,
     pub compaction_type: CompactionType,
-    pub catalog_name: String,
+    pub catalog_name: Cow<'static, str>,
 
     pub commit_retry_config: CommitManagerRetryConfig,
-    pub to_branch: Option<String>,
+    pub to_branch: Cow<'static, str>,
 }
 
 #[derive(Default)]
@@ -285,11 +260,6 @@ pub struct CompactionResult {
 }
 
 impl Compaction {
-    /// Create a new `CompactionBuilder` for flexible configuration
-    pub fn builder() -> CompactionBuilder {
-        CompactionBuilder::new()
-    }
-
     pub async fn compact(&self) -> Result<CompactionResult> {
         if let Some(config) = &self.config {
             let table = self.catalog.load_table(&self.table_ident).await?;
@@ -297,7 +267,7 @@ impl Compaction {
             let compaction_planner = CompactionPlanner::new(config.planning.clone());
 
             let plan = compaction_planner
-                .plan_compaction(&table, self.compaction_type)
+                .plan_compaction_with_branch(&table, self.compaction_type, &self.to_branch)
                 .await?;
 
             // 2. execute the compaction with the plan
@@ -315,102 +285,105 @@ impl Compaction {
         plan: CompactionPlan,
         execution_config: &CompactionExecutionConfig,
     ) -> Result<(CompactionResult, Option<CompactionValidator>)> {
+        if plan.to_branch != *self.to_branch {
+            return Err(CompactionError::Execution(format!(
+                "Compaction plan branch '{}' does not match configured branch '{}'",
+                plan.to_branch, self.to_branch
+            )));
+        }
+
         let now = std::time::Instant::now();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
-            self.table_ident.to_string(),
+            self.table_ident_name.clone(),
         );
 
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        let current_snapshot = match &self.to_branch {
-            Some(branch) => table.metadata().snapshot_for_ref(branch),
-            None => table.metadata().current_snapshot(),
-        };
-
-        if current_snapshot.is_none() {
-            return Ok((CompactionResult::default(), None));
-        }
-
-        let current_snapshot = table.metadata().current_snapshot().unwrap();
-        // Check if any input files were selected
-        if plan.files_to_compact.input_files_count() == 0 {
-            return Ok((CompactionResult::default(), None));
-        }
-
-        let mut input_tasks_for_validation = if execution_config.enable_validate_compaction {
-            Some(plan.files_to_compact.clone())
-        } else {
-            None
-        };
-
-        // Step 2: Create rewrite request
-        let rewrite_files_request = self.create_rewrite_request(&table, &plan, execution_config)?;
-
-        // Step 3: Execute rewrite
-        let RewriteFilesResponse {
-            data_files: output_data_files,
-            stats,
-        } = match self.executor.rewrite_files(rewrite_files_request).await {
-            Ok(response) => response,
-            Err(e) => {
-                metrics_recorder.record_executor_error();
-                return Err(e);
+        if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(&plan.to_branch) {
+            // Check if any input files were selected
+            if plan.files_to_compact.input_files_count() == 0 {
+                return Ok((CompactionResult::default(), None));
             }
-        };
 
-        let commit_now = std::time::Instant::now();
-        let output_data_files_for_commit = output_data_files.clone();
+            let mut input_tasks_for_validation = if execution_config.enable_validate_compaction {
+                Some(plan.files_to_compact.clone())
+            } else {
+                None
+            };
 
-        // Step 4: Commit results (extensible)
-        let committed_table = match self
-            .commit_compaction_results(
-                &table,
-                output_data_files_for_commit,
-                &plan.files_to_compact,
-                current_snapshot,
-                table.file_io(),
-            )
-            .await
-        {
-            Ok(table) => table,
-            Err(e) => {
-                metrics_recorder.record_executor_error();
-                return Err(e);
-            }
-        };
+            // Step 2: Create rewrite request
+            let rewrite_files_request =
+                self.create_rewrite_request(&table, &plan, execution_config)?;
 
-        // Step 5: Update metrics
-        self.update_metrics(&metrics_recorder, &stats, now, commit_now);
-
-        // Step 6: Setup validation if enabled
-        let compaction_validator = if execution_config.enable_validate_compaction {
-            Some(
-                CompactionValidator::new(
-                    input_tasks_for_validation.take().unwrap(),
-                    output_data_files.clone(),
-                    plan.runtime_config,
-                    table.metadata().current_schema().clone(),
-                    table.metadata().current_schema().clone(),
-                    committed_table.clone(),
-                    self.catalog_name.clone(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        Ok((
-            CompactionResult {
+            // Step 3: Execute rewrite
+            let RewriteFilesResponse {
                 data_files: output_data_files,
                 stats,
-                table: Some(committed_table),
-            },
-            compaction_validator,
-        ))
+            } = match self.executor.rewrite_files(rewrite_files_request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    metrics_recorder.record_executor_error();
+                    return Err(e);
+                }
+            };
+
+            let commit_now = std::time::Instant::now();
+            let output_data_files_for_commit = output_data_files.clone();
+
+            // Step 4: Commit results (extensible)
+            let committed_table = match self
+                .commit_compaction_results(
+                    &table,
+                    output_data_files_for_commit,
+                    &plan.files_to_compact,
+                    branch_snapshot,
+                    table.file_io(),
+                )
+                .await
+            {
+                Ok(table) => table,
+                Err(e) => {
+                    metrics_recorder.record_executor_error();
+                    return Err(e);
+                }
+            };
+
+            // Step 5: Update metrics
+            self.update_metrics(&metrics_recorder, &stats, now, commit_now);
+
+            // Step 6: Setup validation if enabled
+            let compaction_validator = if execution_config.enable_validate_compaction {
+                Some(
+                    CompactionValidator::new(
+                        input_tasks_for_validation.take().unwrap(),
+                        output_data_files.clone(),
+                        plan.runtime_config,
+                        table.metadata().current_schema().clone(),
+                        table.metadata().current_schema().clone(),
+                        committed_table.clone(),
+                        self.catalog_name.clone(),
+                        self.to_branch.clone(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            Ok((
+                CompactionResult {
+                    data_files: output_data_files,
+                    stats,
+                    table: Some(committed_table),
+                },
+                compaction_validator,
+            ))
+        } else {
+            Ok((CompactionResult::default(), None))
+        }
     }
 
     /// Helper method to update metrics
@@ -440,7 +413,7 @@ impl Compaction {
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
-            self.table_ident.to_string(),
+            self.table_ident_name.clone(),
         );
 
         Ok(RewriteFilesRequest {
@@ -475,6 +448,7 @@ impl Compaction {
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
+            self.table_ident_name.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
@@ -500,11 +474,7 @@ impl Compaction {
             .collect();
 
         commit_manager
-            .rewrite_files(
-                output_data_files,
-                input_files,
-                self.to_branch.as_deref().unwrap_or(MAIN_BRANCH),
-            )
+            .rewrite_files(output_data_files, input_files, &self.to_branch)
             .await
     }
 
@@ -543,6 +513,7 @@ impl Compaction {
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
+            self.table_ident_name.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
@@ -626,12 +597,16 @@ impl CommitManager {
         config: CommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
-        catalog_name: String,
+        table_ident_name: impl Into<Cow<'static, str>>,
+        catalog_name: impl Into<Cow<'static, str>>,
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
     ) -> Self {
+        let catalog_name = catalog_name.into();
+        let table_ident_name = table_ident_name.into();
+
         let metrics_recorder =
-            CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
+            CompactionMetricsRecorder::new(metrics, catalog_name.clone(), table_ident_name.clone());
 
         Self {
             config,
@@ -846,16 +821,23 @@ impl CommitManager {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CompactionPlan {
     pub files_to_compact: InputFileScanTasks,
     pub runtime_config: RuntimeConfig,
+    pub to_branch: Cow<'static, str>,
 }
 
 impl CompactionPlan {
-    pub fn new(files_to_compact: InputFileScanTasks, runtime_config: RuntimeConfig) -> Self {
+    pub fn new(
+        files_to_compact: InputFileScanTasks,
+        runtime_config: RuntimeConfig,
+        to_branch: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             files_to_compact,
             runtime_config,
+            to_branch: to_branch.into(),
         }
     }
 
@@ -863,6 +845,7 @@ impl CompactionPlan {
         Self {
             files_to_compact: InputFileScanTasks::default(),
             runtime_config: RuntimeConfig::default(),
+            to_branch: Cow::Borrowed(MAIN_BRANCH),
         }
     }
 
@@ -961,34 +944,45 @@ impl CompactionPlanner {
     }
 
     /// Plan a compaction based on the provided table and compaction type
+    pub async fn plan_compaction_with_branch(
+        &self,
+        table: &Table,
+        compaction_type: CompactionType,
+        to_branch: &str,
+    ) -> Result<CompactionPlan> {
+        if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
+            // Step 1: Select files for compaction (extensible)
+            let input_file_scan_tasks = self
+                .select_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
+                .await?;
+
+            let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
+                .calculate_parallelism(&input_file_scan_tasks, &self.config)
+                .map_err(|e| CompactionError::Execution(e.to_string()))?;
+
+            let runtime_config = RuntimeConfigBuilder::default()
+                .executor_parallelism(executor_parallelism)
+                .output_parallelism(output_parallelism)
+                .build()
+                .map_err(|e| CompactionError::Config(e.to_string()))?;
+
+            Ok(CompactionPlan::new(
+                input_file_scan_tasks,
+                runtime_config,
+                to_branch.to_owned(),
+            ))
+        } else {
+            Ok(CompactionPlan::dummy())
+        }
+    }
+
     pub async fn plan_compaction(
         &self,
         table: &Table,
         compaction_type: CompactionType,
     ) -> Result<CompactionPlan> {
-        // check if the current snapshot exists
-        if table.metadata().current_snapshot().is_none() {
-            return Ok(CompactionPlan::dummy());
-        }
-
-        let current_snapshot = table.metadata().current_snapshot().unwrap();
-
-        // Step 1: Select files for compaction (extensible)
-        let input_file_scan_tasks = self
-            .select_files_for_compaction(table, current_snapshot.snapshot_id(), compaction_type)
-            .await?;
-
-        let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
-            .calculate_parallelism(&input_file_scan_tasks, &self.config)
-            .map_err(|e| CompactionError::Execution(e.to_string()))?;
-
-        let runtime_config = RuntimeConfigBuilder::default()
-            .executor_parallelism(executor_parallelism)
-            .output_parallelism(output_parallelism)
-            .build()
-            .map_err(|e| CompactionError::Config(e.to_string()))?;
-
-        Ok(CompactionPlan::new(input_file_scan_tasks, runtime_config))
+        self.plan_compaction_with_branch(table, compaction_type, MAIN_BRANCH)
+            .await
     }
 
     // Template method pattern: These methods can be overridden for specific compaction types
@@ -1010,7 +1004,7 @@ impl CompactionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::compaction::{CompactionBuilder, CompactionPlanner};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner, CompactionType};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfigBuilder,
     };
@@ -1018,7 +1012,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIOBuilder;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, MAIN_BRANCH};
     use iceberg::table::Table;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
@@ -1302,11 +1296,17 @@ mod tests {
         let snapshots = updated_table.metadata().snapshots();
         assert!(snapshots.len() > 0, "Should have at least one snapshot");
 
-        let latest_snapshot = updated_table.metadata().current_snapshot().unwrap();
+        let latest_snapshot = updated_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
 
         // Verify we can load the table again and see the data
         let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
-        let current_snapshot = reloaded_table.metadata().current_snapshot().unwrap();
+        let current_snapshot = reloaded_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
         assert_eq!(
             current_snapshot.snapshot_id(),
             latest_snapshot.snapshot_id()
@@ -1317,21 +1317,18 @@ mod tests {
             .build()
             .unwrap();
 
-        let rewrite_files_resp = CompactionBuilder::new()
-            .with_catalog(Arc::new(catalog))
-            .with_table_ident(table_ident.clone())
-            .with_config(Arc::new(
-                CompactionConfigBuilder::default()
-                    .execution(execution_config)
-                    .build()
-                    .unwrap(),
-            ))
-            .build()
-            .await
-            .unwrap()
-            .compact()
-            .await
-            .unwrap();
+        let rewrite_files_resp =
+            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default()
+                        .execution(execution_config)
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .compact()
+                .await
+                .unwrap();
 
         assert_eq!(rewrite_files_resp.stats.input_files_count, 2);
     }
@@ -1379,19 +1376,15 @@ mod tests {
         let _updated_table = tx.commit(&catalog).await.unwrap();
 
         // Test full compaction - should compact all files
-        let rewrite_files_resp = CompactionBuilder::new()
-            .with_catalog(Arc::new(catalog))
-            .with_table_ident(table_ident.clone())
-            .with_compaction_type(super::CompactionType::Full)
-            .with_config(Arc::new(
-                CompactionConfigBuilder::default().build().unwrap(),
-            ))
-            .build()
-            .await
-            .unwrap()
-            .compact()
-            .await
-            .unwrap();
+        let rewrite_files_resp =
+            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default().build().unwrap(),
+                ))
+                .build()
+                .compact()
+                .await
+                .unwrap();
 
         // Full compaction should rewrite all existing files
         assert_eq!(
@@ -1456,7 +1449,10 @@ mod tests {
         let updated_table = tx.commit(&catalog).await.unwrap();
 
         // Get files before compaction for validation
-        let snapshot_before = updated_table.metadata().current_snapshot().unwrap();
+        let snapshot_before = updated_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
         let manifest_list = snapshot_before
             .load_manifest_list(updated_table.file_io(), updated_table.metadata())
             .await
@@ -1490,14 +1486,13 @@ mod tests {
             .build()
             .unwrap();
 
-        let compaction = CompactionBuilder::new()
-            .with_catalog(catalog_arc.clone())
-            .with_table_ident(table_ident.clone())
-            .with_compaction_type(super::CompactionType::MergeSmallDataFiles)
-            .with_config(Arc::new(compaction_config))
-            .build()
-            .await
-            .unwrap();
+        let compaction = CompactionBuilder::new(
+            catalog_arc.clone(),
+            table_ident.clone(),
+            CompactionType::MergeSmallDataFiles,
+        )
+        .with_config(Arc::new(compaction_config))
+        .build();
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
@@ -1568,7 +1563,10 @@ mod tests {
 
         // Verify final state: total files should be reduced
         let final_table = catalog_arc.load_table(&table_ident).await.unwrap();
-        let final_snapshot = final_table.metadata().current_snapshot().unwrap();
+        let final_snapshot = final_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
         let final_manifest_list = final_snapshot
             .load_manifest_list(final_table.file_io(), final_table.metadata())
             .await
@@ -1697,15 +1695,12 @@ mod tests {
         let updated_table = tx.commit(&catalog).await.unwrap();
 
         // Create compaction instance
-        let compaction = CompactionBuilder::new()
-            .with_catalog(Arc::new(catalog))
-            .with_table_ident(table_ident.clone())
-            .with_config(Arc::new(
-                CompactionConfigBuilder::default().build().unwrap(),
-            ))
-            .build()
-            .await
-            .unwrap();
+        let compaction =
+            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default().build().unwrap(),
+                ))
+                .build();
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
@@ -1724,6 +1719,163 @@ mod tests {
             .unwrap();
 
         assert!(rewrite_files_resp.stats.input_files_count > 0);
+        assert!(rewrite_files_resp.stats.output_files_count > 0);
+    }
+
+    /// Test compact_with_plan with branch functionality
+    #[tokio::test]
+    async fn test_compact_with_plan_with_branch() {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        // Create some data files on main branch
+        let mut writer1 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "main1").await;
+        let batch = create_test_record_batch(&simple_table_schema());
+        writer1.write(batch.clone()).await.unwrap();
+        let main_data_files1 = writer1.close().await.unwrap();
+
+        let mut writer2 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "main2").await;
+        writer2.write(batch.clone()).await.unwrap();
+        let main_data_files2 = writer2.close().await.unwrap();
+
+        // Commit to main branch
+        let transaction = Transaction::new(&table);
+        let branch_name = "feature/compaction-branch";
+        let mut append_action = transaction
+            .fast_append(None, None, vec![])
+            .unwrap()
+            .with_to_branch(branch_name.to_owned());
+        append_action.add_data_files(main_data_files1).unwrap();
+        append_action.add_data_files(main_data_files2).unwrap();
+        let tx = append_action.apply().await.unwrap();
+        let updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Test compaction on main branch using None branch parameter
+        let compaction =
+            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default().build().unwrap(),
+                ))
+                .with_to_branch(branch_name.to_owned())
+                .build();
+
+        let planner =
+            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+        let plan = planner
+            .plan_compaction_with_branch(&updated_table, super::CompactionType::Full, branch_name)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.file_count(), 2); // 2 files on main branch
+
+        let result = compaction
+            .compact_with_plan(plan, &compaction.config.as_ref().unwrap().execution)
+            .await
+            .unwrap();
+
+        assert_eq!(result.stats.input_files_count, 2);
+        assert_eq!(result.stats.output_files_count, 1);
+    }
+
+    /// Test branch functionality with small files compaction
+    #[tokio::test]
+    async fn test_small_files_compaction_with_branch() {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = MemoryCatalog::new(file_io.clone(), Some(warehouse_location.clone()));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(&catalog, &table_ident).await;
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        // test planning and compaction on a new branch
+        let new_branch = "feature/small-files-compaction";
+
+        let mut small_writer1 =
+            build_simple_data_writer(&table, warehouse_location.clone(), "small-branch").await;
+        let batch = create_test_record_batch(&simple_table_schema());
+        small_writer1.write(batch.clone()).await.unwrap();
+        let small_files1 = small_writer1.close().await.unwrap();
+
+        let mut large_writer =
+            build_simple_data_writer(&table, warehouse_location.clone(), "large-branch").await;
+        for _ in 0..10 {
+            large_writer.write(batch.clone()).await.unwrap();
+        }
+        let large_files = large_writer.close().await.unwrap();
+
+        // Append the small files to a new branch
+        let mut all_main_files = Vec::new();
+        all_main_files.extend(small_files1);
+        all_main_files.extend(large_files);
+
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction
+            .fast_append(None, None, vec![])
+            .unwrap()
+            .with_to_branch(new_branch.to_owned());
+        append_action.add_data_files(all_main_files).unwrap();
+        let tx = append_action.apply().await.unwrap();
+        let updated_table = tx.commit(&catalog).await.unwrap();
+
+        // Test small files compaction on main branch
+        let small_file_threshold = 900; // 900B threshold
+        let planning_config = CompactionPlanningConfigBuilder::default()
+            .small_file_threshold(small_file_threshold)
+            .build()
+            .unwrap();
+
+        let branch_planner = CompactionPlanner::new(planning_config.clone());
+
+        let branch_plan = branch_planner
+            .plan_compaction_with_branch(
+                &updated_table,
+                super::CompactionType::MergeSmallDataFiles,
+                new_branch,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(branch_plan.file_count(), 1); // Only 1 small file on branch
+        assert_eq!(branch_plan.to_branch, new_branch.to_owned());
+        let input_file_path = branch_plan.files_to_compact.data_files[0].data_file_path();
+        assert!(input_file_path.contains("small-branch"));
+
+        // Run the actual compaction on the branch
+        let branch_compaction = CompactionBuilder::new(
+            Arc::new(catalog),
+            table_ident.clone(),
+            CompactionType::MergeSmallDataFiles,
+        )
+        .with_to_branch(new_branch.to_owned())
+        .build();
+
+        let rewrite_files_resp = branch_compaction
+            .compact_with_plan(
+                branch_plan,
+                &CompactionExecutionConfigBuilder::default().build().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rewrite_files_resp.stats.input_files_count, 1);
         assert!(rewrite_files_resp.stats.output_files_count > 0);
     }
 }
