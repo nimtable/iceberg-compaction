@@ -15,7 +15,7 @@
  */
 
 use mixtrics::metrics::{BoxedCounterVec, BoxedHistogramVec, BoxedRegistry, Buckets};
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::executor::RewriteFilesStat;
 
@@ -184,25 +184,26 @@ impl Metrics {
 #[derive(Clone)]
 pub struct CompactionMetricsRecorder {
     metrics: Arc<Metrics>,
-    catalog_name: String,
-    table_ident: String,
+    catalog_name: Cow<'static, str>,
+    table_ident: Cow<'static, str>,
 }
 
 impl CompactionMetricsRecorder {
-    pub fn new(metrics: Arc<Metrics>, catalog_name: String, table_ident: String) -> Self {
+    pub fn new(
+        metrics: Arc<Metrics>,
+        catalog_name: impl Into<Cow<'static, str>>,
+        table_ident: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             metrics,
-            catalog_name,
-            table_ident,
+            catalog_name: catalog_name.into(),
+            table_ident: table_ident.into(),
         }
     }
 
     /// Helper to create label vector for metrics
     fn label_vec(&self) -> [std::borrow::Cow<'static, str>; 2] {
-        [
-            self.catalog_name.clone().into(),
-            self.table_ident.clone().into(),
-        ]
+        [self.catalog_name.clone(), self.table_ident.clone()]
     }
 
     /// Record compaction duration

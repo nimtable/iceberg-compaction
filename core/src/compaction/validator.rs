@@ -18,6 +18,7 @@
 //! Contains file writer API, and provides methods to write row groups and columns by
 //! using row group writers and column writers respectively.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -37,8 +38,8 @@ pub struct CompactionValidator {
     datafusion_processor: DatafusionProcessor,
     input_datafusion_task_ctx: Option<DataFusionTaskContext>,
     output_datafusion_task_ctx: Option<DataFusionTaskContext>,
-    table_ident: String,
-    catalog_name: String,
+    table_ident: Cow<'static, str>,
+    catalog_name: Cow<'static, str>,
 }
 
 impl CompactionValidator {
@@ -50,9 +51,12 @@ impl CompactionValidator {
         input_schema: Arc<Schema>,
         output_schema: Arc<Schema>,
         table: Table,
-        catalog_name: String,
-        to_branch: String,
+        catalog_name: impl Into<Cow<'static, str>>,
+        to_branch: impl Into<Cow<'static, str>>,
     ) -> Result<Self> {
+        let catalog_name = catalog_name.into();
+        let to_branch = to_branch.into();
+
         // TODO: Support different Schema for input and output
         if input_schema.schema_id() != output_schema.schema_id() {
             return Err(CompactionError::Config(
@@ -113,7 +117,7 @@ impl CompactionValidator {
             datafusion_processor,
             input_datafusion_task_ctx: Some(input_datafusion_task_ctx),
             output_datafusion_task_ctx: Some(output_datafusion_task_ctx),
-            table_ident: table.identifier().to_string(),
+            table_ident: table.identifier().to_string().into(),
             catalog_name,
         })
     }

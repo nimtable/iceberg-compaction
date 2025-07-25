@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
+use std::borrow::Cow;
 
 mod validator;
 
@@ -57,12 +58,12 @@ pub struct CompactionBuilder {
     compaction_type: CompactionType,
 
     // Optional configuration
-    catalog_name: Option<String>,
+    catalog_name: Option<Cow<'static, str>>,
     config: Option<Arc<CompactionConfig>>,
     executor_type: Option<ExecutorType>,
     registry: Option<BoxedRegistry>,
     commit_retry_config: Option<CommitManagerRetryConfig>,
-    to_branch: Option<String>,
+    to_branch: Option<Cow<'static, str>>,
 }
 
 impl CompactionBuilder {
@@ -99,8 +100,8 @@ impl CompactionBuilder {
     }
 
     /// Set the catalog name for metrics label
-    pub fn with_catalog_name(mut self, catalog_name: String) -> Self {
-        self.catalog_name = Some(catalog_name);
+    pub fn with_catalog_name(mut self, catalog_name: impl Into<Cow<'static, str>>) -> Self {
+        self.catalog_name = Some(catalog_name.into());
         self
     }
 
@@ -115,8 +116,8 @@ impl CompactionBuilder {
         self
     }
 
-    pub fn with_to_branch(mut self, to_branch: String) -> Self {
-        self.to_branch = Some(to_branch);
+    pub fn with_to_branch(mut self, to_branch: impl Into<Cow<'static, str>>) -> Self {
+        self.to_branch = Some(to_branch.into());
         self
     }
 
@@ -133,9 +134,15 @@ impl CompactionBuilder {
 
         let commit_retry_config = self.commit_retry_config.unwrap_or_default();
 
-        let to_branch = self.to_branch.unwrap_or(MAIN_BRANCH.to_owned());
+        let to_branch = self
+            .to_branch
+            .unwrap_or_else(|| MAIN_BRANCH.to_owned().into());
 
-        let catalog_name = self.catalog_name.unwrap_or_default();
+        let catalog_name = self
+            .catalog_name
+            .unwrap_or_else(|| "default".to_owned().into());
+
+        let table_ident_name = Cow::Owned(self.table_ident.name().to_owned());
 
         Compaction {
             config: self.config,
@@ -143,6 +150,7 @@ impl CompactionBuilder {
             catalog: self.catalog,
             metrics,
             table_ident: self.table_ident,
+            table_ident_name,
             compaction_type: self.compaction_type,
             catalog_name,
             commit_retry_config,
@@ -236,11 +244,12 @@ pub struct Compaction {
     pub catalog: Arc<dyn Catalog>,
     pub metrics: Arc<Metrics>,
     pub table_ident: TableIdent,
+    pub table_ident_name: Cow<'static, str>,
     pub compaction_type: CompactionType,
-    pub catalog_name: String,
+    pub catalog_name: Cow<'static, str>,
 
     pub commit_retry_config: CommitManagerRetryConfig,
-    pub to_branch: String,
+    pub to_branch: Cow<'static, str>,
 }
 
 #[derive(Default)]
@@ -276,7 +285,7 @@ impl Compaction {
         plan: CompactionPlan,
         execution_config: &CompactionExecutionConfig,
     ) -> Result<(CompactionResult, Option<CompactionValidator>)> {
-        if plan.to_branch != self.to_branch {
+        if plan.to_branch != *self.to_branch {
             return Err(CompactionError::Execution(format!(
                 "Compaction plan branch '{}' does not match configured branch '{}'",
                 plan.to_branch, self.to_branch
@@ -287,13 +296,13 @@ impl Compaction {
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
-            self.table_ident.to_string(),
+            self.table_ident_name.clone(),
         );
 
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        if let Some(current_snapshot) = table.metadata().snapshot_for_ref(plan.to_branch.as_str()) {
+        if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(&plan.to_branch) {
             // Check if any input files were selected
             if plan.files_to_compact.input_files_count() == 0 {
                 return Ok((CompactionResult::default(), None));
@@ -330,7 +339,7 @@ impl Compaction {
                     &table,
                     output_data_files_for_commit,
                     &plan.files_to_compact,
-                    current_snapshot,
+                    branch_snapshot,
                     table.file_io(),
                 )
                 .await
@@ -356,7 +365,7 @@ impl Compaction {
                         table.metadata().current_schema().clone(),
                         committed_table.clone(),
                         self.catalog_name.clone(),
-                        self.to_branch.to_owned(),
+                        self.to_branch.clone(),
                     )
                     .await?,
                 )
@@ -404,7 +413,7 @@ impl Compaction {
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
-            self.table_ident.to_string(),
+            self.table_ident_name.clone(),
         );
 
         Ok(RewriteFilesRequest {
@@ -439,6 +448,7 @@ impl Compaction {
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
+            self.table_ident_name.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
@@ -503,6 +513,7 @@ impl Compaction {
             self.commit_retry_config.clone(),
             self.catalog.clone(),
             self.table_ident.clone(),
+            self.table_ident_name.clone(),
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
@@ -586,12 +597,16 @@ impl CommitManager {
         config: CommitManagerRetryConfig,
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
-        catalog_name: String,
+        table_ident_name: impl Into<Cow<'static, str>>,
+        catalog_name: impl Into<Cow<'static, str>>,
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
     ) -> Self {
+        let catalog_name = catalog_name.into();
+        let table_ident_name = table_ident_name.into();
+
         let metrics_recorder =
-            CompactionMetricsRecorder::new(metrics, catalog_name, table_ident.to_string());
+            CompactionMetricsRecorder::new(metrics, catalog_name.clone(), table_ident_name.clone());
 
         Self {
             config,
@@ -810,19 +825,19 @@ impl CommitManager {
 pub struct CompactionPlan {
     pub files_to_compact: InputFileScanTasks,
     pub runtime_config: RuntimeConfig,
-    pub to_branch: String,
+    pub to_branch: Cow<'static, str>,
 }
 
 impl CompactionPlan {
     pub fn new(
         files_to_compact: InputFileScanTasks,
         runtime_config: RuntimeConfig,
-        to_branch: String,
+        to_branch: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self {
             files_to_compact,
             runtime_config,
-            to_branch,
+            to_branch: to_branch.into(),
         }
     }
 
@@ -830,7 +845,7 @@ impl CompactionPlan {
         Self {
             files_to_compact: InputFileScanTasks::default(),
             runtime_config: RuntimeConfig::default(),
-            to_branch: MAIN_BRANCH.to_owned(),
+            to_branch: Cow::Borrowed(MAIN_BRANCH),
         }
     }
 
@@ -935,10 +950,10 @@ impl CompactionPlanner {
         compaction_type: CompactionType,
         to_branch: &str,
     ) -> Result<CompactionPlan> {
-        if let Some(current_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
+        if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
             // Step 1: Select files for compaction (extensible)
             let input_file_scan_tasks = self
-                .select_files_for_compaction(table, current_snapshot.snapshot_id(), compaction_type)
+                .select_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
                 .await?;
 
             let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
