@@ -15,7 +15,7 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH};
+use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
@@ -302,7 +302,8 @@ impl Compaction {
         let table = self.catalog.load_table(&self.table_ident).await?;
 
         // check if the current snapshot exists
-        if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(&plan.to_branch) {
+        // WARN: We must ensure the snapshot view throughout the compaction process, so we use the snapshot_id carried by the plan as the standard.
+        if let Some(branch_snapshot) = table.metadata().snapshot_by_id(plan.snapshot_id) {
             // Check if any input files were selected
             if plan.files_to_compact.input_files_count() == 0 {
                 return Ok((CompactionResult::default(), None));
@@ -826,6 +827,7 @@ pub struct CompactionPlan {
     pub files_to_compact: InputFileScanTasks,
     pub runtime_config: RuntimeConfig,
     pub to_branch: Cow<'static, str>,
+    pub snapshot_id: i64,
 }
 
 impl CompactionPlan {
@@ -833,11 +835,13 @@ impl CompactionPlan {
         files_to_compact: InputFileScanTasks,
         runtime_config: RuntimeConfig,
         to_branch: impl Into<Cow<'static, str>>,
+        snapshot_id: i64,
     ) -> Self {
         Self {
             files_to_compact,
             runtime_config,
             to_branch: to_branch.into(),
+            snapshot_id,
         }
     }
 
@@ -846,6 +850,7 @@ impl CompactionPlan {
             files_to_compact: InputFileScanTasks::default(),
             runtime_config: RuntimeConfig::default(),
             to_branch: Cow::Borrowed(MAIN_BRANCH),
+            snapshot_id: UNASSIGNED_SNAPSHOT_ID,
         }
     }
 
@@ -970,6 +975,7 @@ impl CompactionPlanner {
                 input_file_scan_tasks,
                 runtime_config,
                 to_branch.to_owned(),
+                branch_snapshot.snapshot_id(),
             ))
         } else {
             Ok(CompactionPlan::dummy())
