@@ -64,16 +64,15 @@ impl CompactionValidator {
             ));
         }
 
-        let current_snapshot = table.metadata().snapshot_for_ref(&to_branch);
-
-        if current_snapshot.is_none() {
+        let snapshot_id = if let Some(snapshot) = table.metadata().snapshot_for_ref(&to_branch) {
+            snapshot.snapshot_id()
+        } else {
             return Err(CompactionError::Execution(format!(
-                "Snapshot for branch '{}' not found",
+                "No current snapshot found for the table {} branch {}",
+                table.identifier(),
                 to_branch
             )));
-        }
-
-        let snapshot_id = current_snapshot.unwrap().snapshot_id();
+        };
 
         let scan = table.scan().snapshot_id(snapshot_id).build()?;
         let output_file_paths = output_files
