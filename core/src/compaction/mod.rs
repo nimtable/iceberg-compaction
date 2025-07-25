@@ -131,10 +131,6 @@ impl CompactionBuilder {
 
     /// Build the Compaction instance
     pub async fn build(self) -> Result<Compaction> {
-        let config = self.config.ok_or_else(|| {
-            crate::error::CompactionError::Execution("CompactionConfig is required".to_owned())
-        })?;
-
         let catalog = self.catalog.ok_or_else(|| {
             crate::error::CompactionError::Execution("Catalog is required".to_owned())
         })?;
@@ -162,7 +158,7 @@ impl CompactionBuilder {
         let to_branch = self.to_branch.clone();
 
         Ok(Compaction {
-            config,
+            config: self.config,
             executor,
             catalog,
             metrics,
@@ -267,7 +263,9 @@ impl Default for CompactionBuilder {
 /// # }
 /// ```
 pub struct Compaction {
-    pub config: Arc<CompactionConfig>,
+    // TODO: Refactor me
+    // When we use plan-driven compaction, there is no need to pass in the global config.
+    pub config: Option<Arc<CompactionConfig>>,
     pub executor: Box<dyn CompactionExecutor>,
     pub catalog: Arc<dyn Catalog>,
     pub metrics: Arc<Metrics>,
@@ -293,16 +291,22 @@ impl Compaction {
     }
 
     pub async fn compact(&self) -> Result<CompactionResult> {
-        let table = self.catalog.load_table(&self.table_ident).await?;
-        // 1. plan the compaction
-        let compaction_planner = CompactionPlanner::new(self.config.planning.clone());
+        if let Some(config) = &self.config {
+            let table = self.catalog.load_table(&self.table_ident).await?;
+            // 1. plan the compaction
+            let compaction_planner = CompactionPlanner::new(config.planning.clone());
 
-        let plan = compaction_planner
-            .plan_compaction(&table, self.compaction_type)
-            .await?;
+            let plan = compaction_planner
+                .plan_compaction(&table, self.compaction_type)
+                .await?;
 
-        // 2. execute the compaction with the plan
-        self.compact_with_plan(plan, &self.config.execution).await
+            // 2. execute the compaction with the plan
+            self.compact_with_plan(plan, &config.execution).await
+        } else {
+            Err(crate::error::CompactionError::Execution(
+                "CompactionConfig is required".to_owned(),
+            ))
+        }
     }
 
     /// Standard compaction implementation for simple file-based compaction types
@@ -343,7 +347,7 @@ impl Compaction {
         };
 
         // Step 2: Create rewrite request
-        let rewrite_files_request = self.create_rewrite_request(&table, &plan)?;
+        let rewrite_files_request = self.create_rewrite_request(&table, &plan, execution_config)?;
 
         // Step 3: Execute rewrite
         let RewriteFilesResponse {
@@ -428,6 +432,7 @@ impl Compaction {
         &self,
         table: &Table,
         plan: &CompactionPlan,
+        execution_config: &CompactionExecutionConfig,
     ) -> Result<RewriteFilesRequest> {
         let schema = table.metadata().current_schema();
         let default_location_generator =
@@ -442,7 +447,7 @@ impl Compaction {
             file_io: table.file_io().clone(),
             schema: schema.clone(),
             input_file_scan_tasks: plan.files_to_compact.clone(),
-            execution_config: Arc::new(self.config.execution.clone()),
+            execution_config: Arc::new(execution_config.clone()),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
@@ -1494,7 +1499,7 @@ mod tests {
             .await
             .unwrap();
 
-        let planner = CompactionPlanner::new(compaction.config.planning.clone());
+        let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
         // Get the files that would be selected for compaction
         let files_to_compact = planner
@@ -1702,7 +1707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let planner = CompactionPlanner::new(compaction.config.planning.clone());
+        let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
         // Test planning separately
         let plan = planner
@@ -1714,7 +1719,7 @@ mod tests {
 
         // Test execution with the plan
         let rewrite_files_resp = compaction
-            .compact_with_plan(plan, &compaction.config.execution)
+            .compact_with_plan(plan, &compaction.config.as_ref().unwrap().execution)
             .await
             .unwrap();
 
