@@ -42,6 +42,7 @@ pub struct CompactionValidator {
 }
 
 impl CompactionValidator {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         input_file_scan_tasks: InputFileScanTasks,
         output_files: Vec<DataFile>,
@@ -50,6 +51,7 @@ impl CompactionValidator {
         output_schema: Arc<Schema>,
         table: Table,
         catalog_name: String,
+        to_branch: String,
     ) -> Result<Self> {
         // TODO: Support different Schema for input and output
         if input_schema.schema_id() != output_schema.schema_id() {
@@ -58,10 +60,16 @@ impl CompactionValidator {
             ));
         }
 
-        let snapshot_id = table
-            .metadata()
-            .current_snapshot_id()
-            .ok_or_else(|| CompactionError::Execution("Snapshot id is not set".to_owned()))?;
+        let current_snapshot = table.metadata().snapshot_for_ref(&to_branch);
+
+        if current_snapshot.is_none() {
+            return Err(CompactionError::Execution(format!(
+                "Snapshot for branch '{}' not found",
+                to_branch
+            )));
+        }
+
+        let snapshot_id = current_snapshot.unwrap().snapshot_id();
 
         let scan = table.scan().snapshot_id(snapshot_id).build()?;
         let output_file_paths = output_files
