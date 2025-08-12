@@ -272,12 +272,6 @@ struct SqlBuilder<'a> {
 ///
 /// # Returns
 /// A safely quoted identifier that can be used in SQL queries
-///
-/// # Examples
-/// ```
-/// assert_eq!(quote_identifier("from"), r#""from""#);
-/// assert_eq!(quote_identifier("normal_table"), r#""normal_table""#);
-/// ```
 fn quote_identifier(identifier: &str) -> String {
     // Single-pass implementation with precise capacity allocation
     let quote_count = identifier.matches('"').count();
@@ -1615,6 +1609,76 @@ mod tests {
             let result = DFParser::parse_sql_with_dialect(sql, &dialect);
             assert!(result.is_ok(), "Failed to parse SQL: {}", sql);
         }
+    }
+
+    /// Test that SQL Builder correctly handles column names with SQL keywords
+    #[test]
+    fn test_sql_builder_with_keyword_column_names() {
+        // Test case 1: Simple case with keyword column names but normal table
+        let project_names = vec!["from".to_owned(), "select".to_owned(), "where".to_owned()];
+        let equality_delete_metadatas = vec![];
+
+        let builder = SqlBuilder::new(
+            &project_names,
+            None,
+            Some("normal_table".to_owned()),
+            &equality_delete_metadatas,
+            false,
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+        let expected_sql = r#"SELECT "from", "select", "where" FROM "normal_table""#;
+        assert_eq!(sql, expected_sql);
+
+        // Verify all keyword columns are properly quoted
+        assert!(sql.contains(r#""from""#));
+        assert!(sql.contains(r#""select""#));
+        assert!(sql.contains(r#""where""#));
+
+        // Test case 2: Keyword columns with position deletes
+        let builder_with_pos_deletes = SqlBuilder::new(
+            &project_names,
+            Some("pos_delete_table".to_owned()),
+            Some("data_table".to_owned()),
+            &equality_delete_metadatas,
+            true,
+        );
+
+        let sql_with_pos = builder_with_pos_deletes.build_merge_on_read_sql().unwrap();
+
+        // Should contain quoted keyword columns in SELECT and internal queries
+        assert!(sql_with_pos.contains(r#"SELECT "from", "select", "where" FROM"#));
+        assert!(sql_with_pos
+            .contains(r#""from", "select", "where", "sys_hidden_file_path", "sys_hidden_pos""#));
+
+        // Test case 3: Keyword columns with equality deletes
+        let equality_delete_metadata = EqualityDeleteMetadata::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::new(
+                    1,
+                    "from", // Using keyword column name in equality delete
+                    Type::Primitive(PrimitiveType::String),
+                    true,
+                ))])
+                .build()
+                .unwrap(),
+            "eq_delete_table".to_owned(),
+        );
+
+        let equality_delete_metadatas_with_keyword = vec![equality_delete_metadata];
+        let builder_with_eq_deletes = SqlBuilder::new(
+            &project_names,
+            Some("pos_delete_table".to_owned()),
+            Some("data_table".to_owned()),
+            &equality_delete_metadatas_with_keyword,
+            false,
+        );
+
+        let sql_with_eq = builder_with_eq_deletes.build_merge_on_read_sql().unwrap();
+
+        // Should contain quoted keyword columns and proper join conditions
+        assert!(sql_with_eq.contains(r#"SELECT "from", "select", "where" FROM"#));
+        assert!(sql_with_eq.contains(r#""eq_delete_table"."from" = "data_table"."from""#));
     }
 
     #[test]

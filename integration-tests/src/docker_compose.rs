@@ -16,9 +16,13 @@
 
 // Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 use core::net::{IpAddr, SocketAddr};
-use std::{collections::HashMap, process::Command, sync::RwLock};
+use std::{
+    collections::HashMap,
+    process::Command,
+    sync::{Once, RwLock},
+};
 
-use ctor::{ctor, dtor};
+use ctor::dtor;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use port_scanner::scan_port_addr;
 
@@ -43,18 +47,20 @@ const DEFAULT_MINIO_PORT: &str = "9000";
 const DEFAULT_PLATFORM_ENV: &str = "DOCKER_DEFAULT_PLATFORM";
 
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
+static INIT_ONCE: Once = Once::new();
 
-/// Constructor function that runs automatically when the module is loaded.
-/// Initializes and starts the Docker Compose environment for testing.
-#[ctor]
-fn before_all() {
-    let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
-    let docker_compose = DockerCompose::new(
-        module_path!().replace("::", "__").replace('.', "_"),
-        format!("{}/testdata", env!("CARGO_MANIFEST_DIR")),
-    );
-    docker_compose.up();
-    guard.replace(docker_compose);
+/// Initialize the Docker Compose environment if not already initialized.
+/// This function is called lazily when Docker resources are first needed.
+fn ensure_docker_initialized() {
+    INIT_ONCE.call_once(|| {
+        let mut guard = DOCKER_COMPOSE_ENV.write().unwrap();
+        let docker_compose = DockerCompose::new(
+            module_path!().replace("::", "__").replace('.', "_"),
+            format!("{}/testdata", env!("CARGO_MANIFEST_DIR")),
+        );
+        docker_compose.up();
+        guard.replace(docker_compose);
+    });
 }
 
 /// Destructor function that runs automatically when the module is unloaded.
@@ -70,13 +76,19 @@ fn after_all() {
 /// Creates and returns a configured REST Catalog instance.
 ///
 /// This function:
-/// 1. Retrieves necessary configuration from Docker containers
-/// 2. Waits for the REST Catalog service to be ready
-/// 3. Creates and returns a configured `RestCatalog` instance
+/// 1. Initializes Docker Compose environment if not already done
+/// 2. Retrieves necessary configuration from Docker containers
+/// 3. Waits for the REST Catalog service to be ready
+/// 4. Creates and returns a configured `RestCatalog` instance
 pub async fn get_rest_catalog() -> RestCatalog {
+    // Ensure Docker is initialized before proceeding
+    ensure_docker_initialized();
+
     let (rest_catalog_ip, props) = {
         let guard = DOCKER_COMPOSE_ENV.read().unwrap();
-        let docker_compose = guard.as_ref().unwrap();
+        let docker_compose = guard
+            .as_ref()
+            .expect("Docker Compose environment should be initialized at this point");
         let aws_access_key_id =
             docker_compose.get_container_env_value(REST_SERVICE, AWS_ACCESS_KEY_ID);
         let aws_secret_access_key =
