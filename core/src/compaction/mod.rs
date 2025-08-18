@@ -571,7 +571,7 @@ impl RewriteDataFilesCommitManager {
                         txn.rewrite_files(None, vec![])?
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
-                            .new_data_file_sequence_number(snapshot.sequence_number())?
+                            .with_starting_sequence_number(snapshot.sequence_number())?
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
