@@ -478,7 +478,7 @@ mod tests {
             schema: Arc::new(iceberg::spec::Schema::builder().build().unwrap()),
             project_field_ids: vec![1, 2],
             predicate: None,
-            deletes,
+            deletes: deletes.into_iter().map(Arc::new).collect(),
             sequence_number: 1,
             equality_ids: vec![],
             file_size_in_bytes: file_size,
