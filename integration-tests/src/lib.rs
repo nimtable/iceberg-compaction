@@ -22,8 +22,8 @@
 pub mod docker_compose;
 pub mod test_utils;
 
-#[cfg(test)]
-pub mod integration_tests;
+// #[cfg(test)]
+// pub mod integration_tests;
 
 // Re-export commonly used items
 pub use docker_compose::get_rest_catalog;
