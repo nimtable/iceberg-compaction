@@ -7,6 +7,7 @@ edition = "2024"
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 backon = "1.2.0"
+chrono = "0.4"
 ctor = { workspace = true }
 datafusion = { workspace = true }
 derive_builder = "0.20"
@@ -18,6 +19,7 @@ iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 itertools = "0.13.0"
 mixtrics = "0.2.0"
+object_store = { version = "0.11", features = ["aws"] }
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 rand = { workspace = true }
