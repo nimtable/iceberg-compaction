@@ -32,6 +32,7 @@ pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
 pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; //
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
+pub const DEFAULT_MODIFIED_FILE_THRESHOLD_SECONDS: u64 = 0; // 0 seconds means no threshold (include all files)
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -139,6 +140,11 @@ pub struct CompactionExecutionConfig {
     /// Smoothing factor for dynamic size estimation updates (default: 0.3)
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
+
+    /// Threshold in seconds for file modification time filtering (default: 0, means include all files)
+    /// Only files modified within this many seconds from now will be included in compaction
+    #[builder(default = "DEFAULT_MODIFIED_FILE_THRESHOLD_SECONDS")]
+    pub modified_file_threshold_seconds: u64,
 }
 
 impl Default for CompactionExecutionConfig {

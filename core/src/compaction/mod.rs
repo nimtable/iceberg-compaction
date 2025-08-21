@@ -15,6 +15,9 @@
  */
 
 use iceberg::io::FileIO;
+use chrono::{DateTime, Utc, Duration};
+use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
+use std::collections::HashMap;
 use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
@@ -315,9 +318,20 @@ impl Compaction {
                 None
             };
 
-            // Step 2: Create rewrite request
+            // Step 2: Create rewrite request with filtered files
+            
+            // Filter files based on modification time threshold
+            let filtered_files_to_compact = self.fetch_files_last_modified(&plan.files_to_compact, &table, execution_config.modified_file_threshold_seconds).await?;
+
+            // Check if any files remain after filtering
+            if filtered_files_to_compact.input_files_count() == 0 {
+                return Ok((CompactionResult::default(), None));
+            }
+            
+            let mut modified_plan = plan.clone();
+            modified_plan.files_to_compact = filtered_files_to_compact;
             let rewrite_files_request =
-                self.create_rewrite_request(&table, &plan, execution_config)?;
+                self.create_rewrite_request(&table, &modified_plan, execution_config)?;
 
             // Step 3: Execute rewrite
             let RewriteFilesResponse {
@@ -519,6 +533,92 @@ impl Compaction {
             self.metrics.clone(),
             consistency_params,
         )
+    }
+
+    async fn fetch_files_last_modified(
+        &self,
+        files_to_compact: &InputFileScanTasks,
+        table: &Table,
+        threshold_seconds: u64,
+    ) -> Result<InputFileScanTasks> {
+        let file_io = table.file_io();
+        let now = Utc::now();
+        let threshold_duration = Duration::seconds(threshold_seconds as i64);
+        
+        // If threshold is 0, return all files (no filtering)
+        if threshold_seconds == 0 {
+            return Ok(files_to_compact.clone());
+        }
+
+        let mut filtered_data_files = Vec::new();
+        let mut filtered_position_delete_files = Vec::new();
+        let mut filtered_equality_delete_files = Vec::new();
+
+        // Filter data files based on modification time
+        for task in &files_to_compact.data_files {
+            let file_path = &task.data_file_path;
+            if let Ok(last_modified) = self.get_file_last_modified(file_io, file_path).await {
+                // Check if file was modified within the threshold
+                if now.signed_duration_since(last_modified) <= threshold_duration {
+                    filtered_data_files.push(task.clone());
+                }
+            }
+        }
+
+        // Filter position delete files based on modification time  
+        for task in &files_to_compact.position_delete_files {
+            let file_path = &task.data_file_path;
+            if let Ok(last_modified) = self.get_file_last_modified(file_io, file_path).await {
+                // Check if file was modified within the threshold
+                if now.signed_duration_since(last_modified) <= threshold_duration {
+                    filtered_position_delete_files.push(task.clone());
+                }
+            }
+        }
+
+        // Filter equality delete files based on modification time
+        for task in &files_to_compact.equality_delete_files {
+            let file_path = &task.data_file_path;
+            if let Ok(last_modified) = self.get_file_last_modified(file_io, file_path).await {
+                // Check if file was modified within the threshold
+                if now.signed_duration_since(last_modified) <= threshold_duration {
+                    filtered_equality_delete_files.push(task.clone());
+                }
+            }
+        }
+
+        Ok(InputFileScanTasks {
+            data_files: filtered_data_files,
+            position_delete_files: filtered_position_delete_files,
+            equality_delete_files: filtered_equality_delete_files,
+        })
+    }
+
+    async fn get_file_last_modified(
+        &self,
+        _file_io: &FileIO,
+        file_path: &str,
+    ) -> Result<DateTime<Utc>> {
+        // Create S3 ObjectStore for metadata retrieval
+        // Note: In a production environment, these should come from the same config as FileIO
+        let object_store = AmazonS3Builder::from_env()
+            .build()
+            .map_err(|e| CompactionError::Iceberg(iceberg::Error::new(
+                ErrorKind::DataInvalid,
+                format!("Failed to build S3 client: {}", e),
+            )))?;
+
+        // Parse the file path and get metadata
+        let object_path = ObjectPath::from(file_path);
+        let object_meta = object_store
+            .head(&object_path)
+            .await
+            .map_err(|e| CompactionError::Iceberg(iceberg::Error::new(
+                ErrorKind::DataInvalid,
+                format!("Failed to get metadata for file {}: {}", file_path, e),
+            )))?;
+
+        Ok(object_meta.last_modified)
     }
 }
 
