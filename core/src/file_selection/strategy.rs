@@ -192,6 +192,87 @@ impl StaticFileStrategy for TaskSizeLimitStrategy {
     }
 }
 
+/// Strategy for ensuring minimum file count
+#[derive(Debug)]
+pub struct MinFileCountStrategy {
+    pub min_file_count: usize,
+}
+
+impl MinFileCountStrategy {
+    /// Create a new MinFileCountStrategy with minimum file count requirement
+    pub fn new(min_file_count: usize) -> Self {
+        Self { min_file_count }
+    }
+}
+
+/// Iterator that ensures minimum file count is met
+pub struct MinFileCountIterator<I> {
+    inner: I,
+    min_file_count: usize,
+    file_count: usize,
+    buffered_files: Vec<FileScanTask>,
+    bypass_mode: bool, // Once we have enough files, we bypass the check
+}
+
+impl<I: Iterator<Item = FileScanTask>> Iterator for MinFileCountIterator<I> {
+    type Item = FileScanTask;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // If we're in bypass mode, just pass through the iterator
+        if self.bypass_mode {
+            return self.inner.next();
+        }
+
+        // Continue collecting files until we reach min_file_count
+        while self.file_count < self.min_file_count {
+            if let Some(file) = self.inner.next() {
+                self.file_count += 1;
+                self.buffered_files.push(file);
+            } else {
+                // No more files available, and we don't have enough
+                // Return None to indicate no files should be processed
+                return None;
+            }
+        }
+
+        // We now have at least min_file_count files
+        if !self.buffered_files.is_empty() {
+            // Return the first buffered file
+            let file = self.buffered_files.remove(0);
+
+            // If buffer is empty and we have enough files, switch to bypass mode
+            if self.buffered_files.is_empty() {
+                self.bypass_mode = true;
+            }
+
+            Some(file)
+        } else {
+            // Buffer is empty, we're in bypass mode, pass through
+            self.bypass_mode = true;
+            self.inner.next()
+        }
+    }
+}
+
+impl StaticFileStrategy for MinFileCountStrategy {
+    fn filter_iter<I>(&self, data_files: I) -> impl Iterator<Item = FileScanTask>
+    where
+        I: Iterator<Item = FileScanTask>,
+    {
+        MinFileCountIterator {
+            inner: data_files,
+            min_file_count: self.min_file_count,
+            file_count: 0,
+            buffered_files: Vec::new(),
+            bypass_mode: false,
+        }
+    }
+
+    fn description(&self) -> String {
+        format!("MinFileCount[{}]", self.min_file_count)
+    }
+}
+
 /// Factory for creating file strategies based on compaction type and configuration
 pub struct FileStrategyFactory;
 
@@ -308,6 +389,7 @@ impl FileStrategyFactory {
     /// let strategy = FileStrategyFactory::builder()
     ///     .exclude_delete_files()                                 // Skip files with delete files
     ///     .filter_by_size(Some(1024*1024), Some(100*1024*1024))  // 1MB-100MB files only
+    ///     .require_min_files(3)                                   // Need at least 3 files to proceed
     ///     .limit_task_size(20 * 1024*1024*1024)                  // 20GB task limit
     ///     .build();
     /// ```
@@ -395,6 +477,18 @@ impl<T> StrategyBuilder<T> {
     ) -> StrategyBuilder<Compose<T, TaskSizeLimitStrategy>> {
         StrategyBuilder {
             strategy: Compose::new(self.strategy, TaskSizeLimitStrategy { max_total_size }),
+        }
+    }
+
+    /// Add minimum file count requirement to the strategy chain
+    /// If fewer than min_file_count files are available, no files will be returned
+    /// Once min_file_count is reached, all subsequent files are passed through
+    pub fn require_min_files(
+        self,
+        min_file_count: usize,
+    ) -> StrategyBuilder<Compose<T, MinFileCountStrategy>> {
+        StrategyBuilder {
+            strategy: Compose::new(self.strategy, MinFileCountStrategy::new(min_file_count)),
         }
     }
 
@@ -707,6 +801,116 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].data_file_path, "file1.parquet");
         assert_eq!(result[1].data_file_path, "file2.parquet");
+    }
+
+    #[test]
+    fn test_min_file_count_strategy() {
+        let strategy = MinFileCountStrategy::new(3);
+
+        // Test description
+        assert_eq!(
+            StaticFileStrategy::description(&strategy),
+            "MinFileCount[3]"
+        );
+
+        // Test with exactly minimum files
+        let data_files = vec![
+            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
+            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
+            create_test_file_scan_task("file3.parquet", 15 * 1024 * 1024),
+        ];
+
+        let result: Vec<FileScanTask> = strategy
+            .filter_iter(data_files.clone().into_iter())
+            .collect();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].data_file_path, "file1.parquet");
+        assert_eq!(result[1].data_file_path, "file2.parquet");
+        assert_eq!(result[2].data_file_path, "file3.parquet");
+
+        // Test with more than minimum files
+        let more_files = vec![
+            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
+            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
+            create_test_file_scan_task("file3.parquet", 15 * 1024 * 1024),
+            create_test_file_scan_task("file4.parquet", 25 * 1024 * 1024),
+            create_test_file_scan_task("file5.parquet", 30 * 1024 * 1024),
+        ];
+
+        let result_more: Vec<FileScanTask> = strategy.filter_iter(more_files.into_iter()).collect();
+        assert_eq!(result_more.len(), 5); // Returns all files when more than minimum
+
+        // Test with fewer than minimum files
+        let fewer_files = vec![
+            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
+            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
+        ];
+
+        let result_fewer: Vec<FileScanTask> =
+            strategy.filter_iter(fewer_files.into_iter()).collect();
+        assert_eq!(result_fewer.len(), 0); // Returns no files when not enough files
+
+        // Test with minimum count of 0 (should pass all files)
+        let zero_strategy = MinFileCountStrategy::new(0);
+        let result_zero: Vec<FileScanTask> = zero_strategy
+            .filter_iter(
+                vec![create_test_file_scan_task(
+                    "file1.parquet",
+                    10 * 1024 * 1024,
+                )]
+                .into_iter(),
+            )
+            .collect();
+        assert_eq!(result_zero.len(), 1);
+
+        // Test with minimum count of 1
+        let one_strategy = MinFileCountStrategy::new(1);
+        let result_one: Vec<FileScanTask> = one_strategy
+            .filter_iter(
+                vec![create_test_file_scan_task(
+                    "file1.parquet",
+                    10 * 1024 * 1024,
+                )]
+                .into_iter(),
+            )
+            .collect();
+        assert_eq!(result_one.len(), 1);
+    }
+
+    #[test]
+    fn test_strategy_builder_with_min_files() {
+        let strategy = FileStrategyFactory::builder()
+            .filter_by_size(None, Some(32 * 1024 * 1024))
+            .require_min_files(2)
+            .limit_task_size(10 * 1024 * 1024 * 1024)
+            .build();
+
+        let description = StaticFileStrategy::description(&strategy);
+        assert!(description.contains("SizeFilter"));
+        assert!(description.contains("MinFileCount[2]"));
+        assert!(description.contains("TaskSizeLimit"));
+
+        // Test functionality with the composed strategy - enough files after size filter
+        let data_files = vec![
+            create_test_file_scan_task("small1.parquet", 5 * 1024 * 1024), // 5MB - should pass size filter
+            create_test_file_scan_task("small2.parquet", 10 * 1024 * 1024), // 10MB - should pass size filter
+            create_test_file_scan_task("large.parquet", 50 * 1024 * 1024), // 50MB - should be filtered out by size
+        ];
+
+        let result: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter()).collect();
+        assert_eq!(result.len(), 2); // Two files pass size filter and meet minimum count
+
+        // Test with insufficient files after size filtering
+        let insufficient_files = vec![
+            create_test_file_scan_task("small1.parquet", 5 * 1024 * 1024), // 5MB - should pass size filter
+            create_test_file_scan_task("large1.parquet", 50 * 1024 * 1024), // 50MB - filtered out by size
+            create_test_file_scan_task("large2.parquet", 60 * 1024 * 1024), // 60MB - filtered out by size
+        ];
+
+        let insufficient_result: Vec<FileScanTask> = strategy
+            .filter_iter(insufficient_files.into_iter())
+            .collect();
+        assert_eq!(insufficient_result.len(), 0); // Only 1 file passes size filter, but need at least 2
     }
 
     #[test]
