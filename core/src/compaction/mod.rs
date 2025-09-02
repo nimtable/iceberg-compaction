@@ -228,7 +228,7 @@ impl CompactionBuilder {
 ///          plan.recommended_output_parallelism());
 ///
 /// // Step 2: Execute with the plan (commit is still automatic)
-/// if !plan.is_empty() {
+/// if let Some(plan) = plan {
 ///     let result = compaction.compact_with_plan(plan, &execution_config).await?;
 ///     println!("Compaction completed: {} -> {} files",
 ///              result.stats.input_files_count, result.stats.output_files_count);
@@ -260,18 +260,23 @@ pub struct CompactionResult {
 }
 
 impl Compaction {
-    pub async fn compact(&self) -> Result<CompactionResult> {
+    pub async fn compact(&self) -> Result<Option<CompactionResult>> {
         if let Some(config) = &self.config {
             let table = self.catalog.load_table(&self.table_ident).await?;
             // 1. plan the compaction
             let compaction_planner = CompactionPlanner::new(config.planning.clone());
 
-            let plan = compaction_planner
+            if let Some(plan) = compaction_planner
                 .plan_compaction_with_branch(&table, self.compaction_type, &self.to_branch)
-                .await?;
+                .await?
+            {
+                // 2. execute the compaction with the plan
+                let result = self.compact_with_plan(plan, &config.execution).await?;
 
-            // 2. execute the compaction with the plan
-            self.compact_with_plan(plan, &config.execution).await
+                Ok(Some(result))
+            } else {
+                Ok(None)
+            }
         } else {
             Err(crate::error::CompactionError::Execution(
                 "CompactionConfig is required".to_owned(),
@@ -873,11 +878,6 @@ impl CompactionPlan {
     pub fn recommended_output_parallelism(&self) -> usize {
         self.runtime_config.output_parallelism
     }
-
-    /// Check if there are any files to compact
-    pub fn is_empty(&self) -> bool {
-        self.file_count() == 0
-    }
 }
 
 pub struct DefaultParallelismCalculator;
@@ -954,12 +954,17 @@ impl CompactionPlanner {
         table: &Table,
         compaction_type: CompactionType,
         to_branch: &str,
-    ) -> Result<CompactionPlan> {
+    ) -> Result<Option<CompactionPlan>> {
         if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
             // Step 1: Select files for compaction (extensible)
             let input_file_scan_tasks = self
                 .select_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
                 .await?;
+
+            // If no files are selected for compaction, return a dummy plan
+            if input_file_scan_tasks.input_files_count() == 0 {
+                return Ok(None);
+            }
 
             let (executor_parallelism, output_parallelism) = DefaultParallelismCalculator
                 .calculate_parallelism(&input_file_scan_tasks, &self.config)
@@ -971,14 +976,14 @@ impl CompactionPlanner {
                 .build()
                 .map_err(|e| CompactionError::Config(e.to_string()))?;
 
-            Ok(CompactionPlan::new(
+            Ok(Some(CompactionPlan::new(
                 input_file_scan_tasks,
                 runtime_config,
                 to_branch.to_owned(),
                 branch_snapshot.snapshot_id(),
-            ))
+            )))
         } else {
-            Ok(CompactionPlan::dummy())
+            Ok(None)
         }
     }
 
@@ -986,7 +991,7 @@ impl CompactionPlanner {
         &self,
         table: &Table,
         compaction_type: CompactionType,
-    ) -> Result<CompactionPlan> {
+    ) -> Result<Option<CompactionPlan>> {
         self.plan_compaction_with_branch(table, compaction_type, MAIN_BRANCH)
             .await
     }
@@ -1334,6 +1339,7 @@ mod tests {
                 .build()
                 .compact()
                 .await
+                .unwrap()
                 .unwrap();
 
         assert_eq!(rewrite_files_resp.stats.input_files_count, 2);
@@ -1390,6 +1396,7 @@ mod tests {
                 .build()
                 .compact()
                 .await
+                .unwrap()
                 .unwrap();
 
         // Full compaction should rewrite all existing files
@@ -1555,7 +1562,7 @@ mod tests {
         );
 
         // Run the actual compaction
-        let rewrite_files_resp = compaction.compact().await.unwrap();
+        let rewrite_files_resp = compaction.compact().await.unwrap().unwrap();
 
         // Validate compaction results
         assert_eq!(
@@ -1637,9 +1644,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(plan.is_empty());
-        assert_eq!(plan.file_count(), 0);
-        assert_eq!(plan.total_bytes(), 0);
+        assert!(plan.is_none());
 
         // Create some data files
         let mut writer = build_simple_data_writer(&table, warehouse_location.clone(), "test").await;
@@ -1663,7 +1668,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!plan.is_empty());
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
         assert!(plan.file_count() > 0);
         assert!(plan.total_bytes() > 0);
         assert!(plan.recommended_executor_parallelism() > 0);
@@ -1716,7 +1722,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!plan.is_empty());
+        assert!(plan.is_some());
+
+        let plan = plan.unwrap();
 
         // Test execution with the plan
         let rewrite_files_resp = compaction
@@ -1782,6 +1790,7 @@ mod tests {
         let plan = planner
             .plan_compaction_with_branch(&updated_table, super::CompactionType::Full, branch_name)
             .await
+            .unwrap()
             .unwrap();
 
         assert_eq!(plan.file_count(), 2); // 2 files on main branch
@@ -1857,6 +1866,7 @@ mod tests {
                 new_branch,
             )
             .await
+            .unwrap()
             .unwrap();
 
         assert_eq!(branch_plan.file_count(), 1); // Only 1 small file on branch

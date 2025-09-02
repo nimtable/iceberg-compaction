@@ -142,7 +142,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
     .with_catalog_name("test_catalog".to_owned())
     .build();
 
-    let compaction_result = compaction.compact().await;
+    let compaction_result = compaction.compact().await.unwrap();
 
     let response = compaction_result.expect("Full compaction SQL generation should succeed");
 
@@ -279,7 +279,7 @@ async fn test_sqlbuilder_with_delete_files() {
     .with_catalog_name("test_catalog_with_deletes".to_owned())
     .build();
 
-    let compaction_result = compaction.compact().await;
+    let compaction_result = compaction.compact().await.unwrap();
 
     let response =
         compaction_result.expect("Full compaction with delete files SQL generation should succeed");
