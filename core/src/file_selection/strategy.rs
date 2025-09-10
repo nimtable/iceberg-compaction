@@ -286,8 +286,10 @@ impl StaticFileStrategy for MinFileCountStrategy {
 pub struct FileStrategyFactory;
 
 // Type aliases for common strategy combinations
-pub type SmallFilesStrategy =
-    Compose<Compose<NoDeleteFilesStrategy, SizeFilterStrategy>, TaskSizeLimitStrategy>;
+pub type SmallFilesStrategy = Compose<
+    Compose<Compose<NoDeleteFilesStrategy, SizeFilterStrategy>, MinFileCountStrategy>,
+    TaskSizeLimitStrategy,
+>;
 
 /// Unified strategy enum that can hold different static strategy types
 ///
@@ -366,14 +368,17 @@ impl FileStrategyFactory {
     /// let strategy = FileStrategyFactory::create_small_files_strategy(&config);
     /// ```
     pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> SmallFilesStrategy {
-        // Build the strategy: NoDeleteFiles -> SizeFilter -> TaskSizeLimit
+        // Build the strategy: NoDeleteFiles -> SizeFilter -> MinFileCount -> TaskSizeLimit
         Compose::new(
             Compose::new(
-                NoDeleteFilesStrategy,
-                SizeFilterStrategy {
-                    min_size: None,
-                    max_size: Some(config.small_file_threshold),
-                },
+                Compose::new(
+                    NoDeleteFilesStrategy,
+                    SizeFilterStrategy {
+                        min_size: None,
+                        max_size: Some(config.small_file_threshold),
+                    },
+                ),
+                MinFileCountStrategy::new(config.min_file_count),
             ),
             TaskSizeLimitStrategy {
                 max_total_size: config.max_task_total_size,
@@ -710,6 +715,7 @@ mod tests {
         let small_files_strategy = FileStrategyFactory::create_small_files_strategy(&config);
         assert!(StaticFileStrategy::description(&small_files_strategy).contains("NoDeleteFiles"));
         assert!(StaticFileStrategy::description(&small_files_strategy).contains("SizeFilter"));
+        assert!(StaticFileStrategy::description(&small_files_strategy).contains("MinFileCount"));
         assert!(StaticFileStrategy::description(&small_files_strategy).contains("TaskSizeLimit"));
 
         // Test unified strategy creation
@@ -719,6 +725,7 @@ mod tests {
         );
         assert!(small_files_unified.description().contains("NoDeleteFiles"));
         assert!(small_files_unified.description().contains("SizeFilter"));
+        assert!(small_files_unified.description().contains("MinFileCount"));
         assert!(small_files_unified.description().contains("TaskSizeLimit"));
 
         let full_unified = FileStrategyFactory::create_files_strategy(
@@ -1074,6 +1081,231 @@ mod tests {
         for file in &result {
             assert!(file.length <= config.small_file_threshold);
             assert!(file.deletes.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_small_files_strategy_with_min_file_count_comprehensive() {
+        // Test comprehensive min_file_count behavior with different values and scenarios
+
+        // Test case 1: min_file_count = 3, test description and various file count scenarios
+        let config = CompactionPlanningConfigBuilder::default()
+            .small_file_threshold(20 * 1024 * 1024) // 20MB threshold
+            .max_task_total_size(50 * 1024 * 1024) // 50MB task limit
+            .min_file_count(3) // Require at least 3 files
+            .build()
+            .unwrap();
+
+        let strategy = FileStrategyFactory::create_small_files_strategy(&config);
+
+        // Test description should include MinFileCount[3]
+        let description = StaticFileStrategy::description(&strategy);
+        assert!(description.contains("MinFileCount[3]"));
+        assert!(description.contains("NoDeleteFiles"));
+        assert!(description.contains("SizeFilter"));
+        assert!(description.contains("TaskSizeLimit"));
+
+        // Test with exactly minimum files (3) - should pass
+        let data_files = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false), // 10MB, no deletes
+            create_test_file_scan_task_with_deletes("small3.parquet", 15 * 1024 * 1024, false), // 15MB, no deletes
+        ];
+
+        let result: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter()).collect();
+        assert_eq!(
+            result.len(),
+            3,
+            "Should return all 3 files when exactly meeting minimum"
+        );
+
+        // Test with fewer than minimum files (2) - should return none
+        let insufficient_files = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false), // 10MB, no deletes
+        ];
+
+        let insufficient_result: Vec<FileScanTask> = strategy
+            .filter_iter(insufficient_files.into_iter())
+            .collect();
+        assert_eq!(
+            insufficient_result.len(),
+            0,
+            "Should return no files when not meeting minimum count"
+        );
+
+        // Test with more than minimum files (5) - should return all
+        let many_files = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false),
+            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false),
+            create_test_file_scan_task_with_deletes("small3.parquet", 15 * 1024 * 1024, false),
+            create_test_file_scan_task_with_deletes("small4.parquet", 8 * 1024 * 1024, false),
+            create_test_file_scan_task_with_deletes("small5.parquet", 12 * 1024 * 1024, false),
+        ];
+
+        let many_result: Vec<FileScanTask> = strategy.filter_iter(many_files.into_iter()).collect();
+        assert_eq!(
+            many_result.len(),
+            5,
+            "Should return all files when more than minimum"
+        );
+
+        // Verify all selected files are under the threshold and have no deletes
+        for file in &many_result {
+            assert!(file.length <= config.small_file_threshold);
+            assert!(file.deletes.is_empty());
+        }
+
+        // Test case 2: min_file_count = 1, provide 2 files
+        let config_min_1 = CompactionPlanningConfigBuilder::default()
+            .min_file_count(1)
+            .small_file_threshold(20 * 1024 * 1024) // 20MB
+            .build()
+            .unwrap();
+
+        let strategy_min_1 = FileStrategyFactory::create_small_files_strategy(&config_min_1);
+
+        let two_files = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false), // 10MB, no deletes
+        ];
+
+        let result: Vec<FileScanTask> = strategy_min_1.filter_iter(two_files.into_iter()).collect();
+        assert_eq!(
+            result.len(),
+            2,
+            "Should return all 2 files when minimum is 1"
+        );
+
+        // Test case 3: min_file_count = 0, should always return files (bypass mode)
+        let config_min_0 = CompactionPlanningConfigBuilder::default()
+            .min_file_count(0)
+            .small_file_threshold(20 * 1024 * 1024) // 20MB
+            .build()
+            .unwrap();
+
+        let strategy_min_0 = FileStrategyFactory::create_small_files_strategy(&config_min_0);
+
+        let single_file = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+        ];
+
+        let result: Vec<FileScanTask> = strategy_min_0
+            .filter_iter(single_file.into_iter())
+            .collect();
+        assert_eq!(
+            result.len(),
+            1,
+            "Should return single file when minimum is 0"
+        );
+    }
+
+    #[test]
+    fn test_default_config_behavior() {
+        // Test that the default configuration behaves correctly (min_file_count = 0 means unlimited)
+        let default_config = CompactionPlanningConfig::default();
+
+        // Verify that default min_file_count is 0 (unlimited)
+        assert_eq!(
+            default_config.min_file_count, 0,
+            "Default min_file_count should be 0 (unlimited)"
+        );
+
+        let strategy = FileStrategyFactory::create_small_files_strategy(&default_config);
+
+        // Test description should include MinFileCount[0] for unlimited behavior
+        let description = StaticFileStrategy::description(&strategy);
+        assert!(
+            description.contains("MinFileCount[0]"),
+            "Default strategy should show MinFileCount[0] for unlimited behavior, got: {}",
+            description
+        );
+
+        // Test with single file - should pass (no minimum requirement)
+        let single_file = vec![
+            create_test_file_scan_task_with_deletes("single.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+        ];
+
+        let result: Vec<FileScanTask> = strategy.filter_iter(single_file.into_iter()).collect();
+        assert_eq!(
+            result.len(),
+            1,
+            "Default config should accept single file (unlimited)"
+        );
+        assert_eq!(result[0].data_file_path, "single.parquet");
+
+        // Test with empty iterator - should return empty (no files available)
+        let empty_files: Vec<FileScanTask> = vec![];
+        let result: Vec<FileScanTask> = strategy.filter_iter(empty_files.into_iter()).collect();
+        assert_eq!(
+            result.len(),
+            0,
+            "Default config should return empty when no files available"
+        );
+
+        // Test with multiple files - should return all files (unlimited)
+        let multiple_files = vec![
+            create_test_file_scan_task_with_deletes("file1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+            create_test_file_scan_task_with_deletes("file2.parquet", 8 * 1024 * 1024, false), // 8MB, no deletes
+            create_test_file_scan_task_with_deletes("file3.parquet", 12 * 1024 * 1024, false), // 12MB, no deletes
+        ];
+
+        let result: Vec<FileScanTask> = strategy.filter_iter(multiple_files.into_iter()).collect();
+        assert_eq!(
+            result.len(),
+            3,
+            "Default config should return all files (unlimited)"
+        );
+
+        // Verify files are processed in order
+        assert_eq!(result[0].data_file_path, "file1.parquet");
+        assert_eq!(result[1].data_file_path, "file2.parquet");
+        assert_eq!(result[2].data_file_path, "file3.parquet");
+
+        // Verify all files meet the size and delete criteria
+        for file in &result {
+            assert!(
+                file.length <= default_config.small_file_threshold,
+                "File {} should be under threshold {} but was {}",
+                file.data_file_path,
+                default_config.small_file_threshold,
+                file.length
+            );
+            assert!(
+                file.deletes.is_empty(),
+                "File {} should have no delete files",
+                file.data_file_path
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_min_file_count_customization() {
+        // Test different min_file_count values
+        let configs_and_expected = vec![
+            (0, "MinFileCount[0]"),   // Should work for 0 files
+            (1, "MinFileCount[1]"),   // Should work for 1 file
+            (5, "MinFileCount[5]"),   // Should work for 5 files
+            (10, "MinFileCount[10]"), // Should work for 10 files
+        ];
+
+        for (min_count, expected_desc) in configs_and_expected {
+            let config = CompactionPlanningConfigBuilder::default()
+                .min_file_count(min_count)
+                .build()
+                .unwrap();
+
+            assert_eq!(config.min_file_count, min_count);
+
+            let strategy = FileStrategyFactory::create_small_files_strategy(&config);
+            let description = StaticFileStrategy::description(&strategy);
+            assert!(
+                description.contains(expected_desc),
+                "Expected '{}' to contain '{}' for min_count={}",
+                description,
+                expected_desc,
+                min_count
+            );
         }
     }
 }

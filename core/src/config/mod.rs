@@ -30,8 +30,9 @@ pub const DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION: bool = false;
 pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
 pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
 pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
-pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; //
+pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
+pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -93,6 +94,10 @@ pub struct CompactionPlanningConfig {
     /// Whether to enable heuristic output parallelism (default: true)
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
+
+    /// Minimum number of files required to trigger compaction (default: 2)
+    #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
+    pub min_file_count: usize,
 }
 
 impl Default for CompactionPlanningConfig {
