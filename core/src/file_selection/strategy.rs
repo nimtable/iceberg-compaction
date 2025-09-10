@@ -193,7 +193,7 @@ impl StaticFileStrategy for TaskSizeLimitStrategy {
     }
 }
 
-/// Strategy for ensuring minimum file count
+/// Strategy for ensuring minimum file count. If fewer than `min_file_count` files are available, no files will be returned.
 #[derive(Debug)]
 pub struct MinFileCountStrategy {
     pub min_file_count: usize,
@@ -211,8 +211,12 @@ struct MinFileCountIterator<I> {
     inner: I,
     min_file_count: usize,
     file_count: usize,
-    buffered_files: VecDeque<FileScanTask>, // Use VecDeque for O(1) front removal
-    bypass_mode: bool,                      // Once we have enough files, we bypass the check
+
+    // For buffering files until we reach min_file_count to decide if we can proceed or not
+    buffered_files: VecDeque<FileScanTask>,
+
+    // If true, we bypass the min_file_count check and pass through all files. The MinFileCountIterator behaves like a regular iterator.
+    bypass_mode: bool,
 }
 
 impl<I> MinFileCountIterator<I> {
