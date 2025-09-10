@@ -17,6 +17,7 @@
 use crate::compaction::CompactionType;
 use crate::config::CompactionPlanningConfig;
 use iceberg::scan::FileScanTask;
+use std::collections::VecDeque;
 
 /// Strategy trait for filtering files during compaction
 ///
@@ -199,19 +200,28 @@ pub struct MinFileCountStrategy {
 }
 
 impl MinFileCountStrategy {
-    /// Create a new MinFileCountStrategy with minimum file count requirement
+    /// Create a new `MinFileCountStrategy` with minimum file count requirement
     pub fn new(min_file_count: usize) -> Self {
         Self { min_file_count }
     }
 }
 
 /// Iterator that ensures minimum file count is met
-pub struct MinFileCountIterator<I> {
+struct MinFileCountIterator<I> {
     inner: I,
     min_file_count: usize,
     file_count: usize,
-    buffered_files: Vec<FileScanTask>,
-    bypass_mode: bool, // Once we have enough files, we bypass the check
+    buffered_files: VecDeque<FileScanTask>, // Use VecDeque for O(1) front removal
+    bypass_mode: bool,                      // Once we have enough files, we bypass the check
+}
+
+impl<I> MinFileCountIterator<I> {
+    /// Check if we should switch to bypass mode and set it accordingly
+    fn check_and_set_bypass_mode(&mut self) {
+        if self.buffered_files.is_empty() && self.file_count >= self.min_file_count {
+            self.bypass_mode = true;
+        }
+    }
 }
 
 impl<I: Iterator<Item = FileScanTask>> Iterator for MinFileCountIterator<I> {
@@ -223,34 +233,30 @@ impl<I: Iterator<Item = FileScanTask>> Iterator for MinFileCountIterator<I> {
             return self.inner.next();
         }
 
+        // If we have buffered files, return them first
+        if let Some(file) = self.buffered_files.pop_front() {
+            self.check_and_set_bypass_mode();
+            return Some(file);
+        }
+
         // Continue collecting files until we reach min_file_count
         while self.file_count < self.min_file_count {
             if let Some(file) = self.inner.next() {
                 self.file_count += 1;
-                self.buffered_files.push(file);
+                self.buffered_files.push_back(file);
             } else {
                 // No more files available, and we don't have enough
-                // Return None to indicate no files should be processed
                 return None;
             }
         }
 
-        // We now have at least min_file_count files
-        if !self.buffered_files.is_empty() {
-            // Return the first buffered file
-            let file = self.buffered_files.remove(0);
-
-            // If buffer is empty and we have enough files, switch to bypass mode
-            if self.buffered_files.is_empty() {
-                self.bypass_mode = true;
-            }
-
-            Some(file)
-        } else {
-            // Buffer is empty, we're in bypass mode, pass through
-            self.bypass_mode = true;
-            self.inner.next()
-        }
+        // We now have at least `min_file_count` files, return the first buffered file
+        let file = self
+            .buffered_files
+            .pop_front()
+            .expect("Buffer should not be empty after collection");
+        self.check_and_set_bypass_mode();
+        Some(file)
     }
 }
 
@@ -259,12 +265,15 @@ impl StaticFileStrategy for MinFileCountStrategy {
     where
         I: Iterator<Item = FileScanTask>,
     {
+        // optimize for bypass mode
+        let bypass_mode = self.min_file_count == 0;
+
         MinFileCountIterator {
             inner: data_files,
             min_file_count: self.min_file_count,
             file_count: 0,
-            buffered_files: Vec::new(),
-            bypass_mode: false,
+            buffered_files: VecDeque::new(),
+            bypass_mode,
         }
     }
 
@@ -481,8 +490,8 @@ impl<T> StrategyBuilder<T> {
     }
 
     /// Add minimum file count requirement to the strategy chain
-    /// If fewer than min_file_count files are available, no files will be returned
-    /// Once min_file_count is reached, all subsequent files are passed through
+    /// If fewer than `min_file_count` files are available, no files will be returned
+    /// Once `min_file_count` is reached, all subsequent files are passed through
     pub fn require_min_files(
         self,
         min_file_count: usize,
@@ -875,6 +884,130 @@ mod tests {
             )
             .collect();
         assert_eq!(result_one.len(), 1);
+    }
+
+    #[test]
+    fn test_min_file_count_strategy_edge_cases() {
+        // Test empty iterator
+        let strategy = MinFileCountStrategy::new(2);
+        let empty_files: Vec<FileScanTask> = vec![];
+        let result: Vec<FileScanTask> = strategy.filter_iter(empty_files.into_iter()).collect();
+        assert_eq!(result.len(), 0);
+
+        // Test with min_file_count = 0 and empty iterator
+        let zero_strategy = MinFileCountStrategy::new(0);
+        let empty_files: Vec<FileScanTask> = vec![];
+        let result: Vec<FileScanTask> =
+            zero_strategy.filter_iter(empty_files.into_iter()).collect();
+        assert_eq!(result.len(), 0);
+
+        // Test single file with requirement of 1
+        let single_strategy = MinFileCountStrategy::new(1);
+        let single_file = vec![create_test_file_scan_task(
+            "single.parquet",
+            10 * 1024 * 1024,
+        )];
+        let result: Vec<FileScanTask> = single_strategy
+            .filter_iter(single_file.into_iter())
+            .collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "single.parquet");
+
+        // Test large number of files with small requirement
+        let large_strategy = MinFileCountStrategy::new(2);
+        let many_files: Vec<FileScanTask> = (0..100)
+            .map(|i| create_test_file_scan_task(&format!("file{}.parquet", i), 10 * 1024 * 1024))
+            .collect();
+
+        let result: Vec<FileScanTask> =
+            large_strategy.filter_iter(many_files.into_iter()).collect();
+        assert_eq!(result.len(), 100); // All files should be returned
+        assert_eq!(result[0].data_file_path, "file0.parquet");
+        assert_eq!(result[99].data_file_path, "file99.parquet");
+    }
+
+    #[test]
+    fn test_min_file_count_strategy_streaming_behavior() {
+        // Test that the iterator doesn't collect all files upfront when bypassing
+        let strategy = MinFileCountStrategy::new(2);
+
+        // Create a custom iterator that tracks how many times next() was called
+        struct CountingIterator {
+            files: Vec<FileScanTask>,
+            index: usize,
+            next_call_count: std::rc::Rc<std::cell::RefCell<usize>>,
+        }
+
+        impl Iterator for CountingIterator {
+            type Item = FileScanTask;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                *self.next_call_count.borrow_mut() += 1;
+                if self.index < self.files.len() {
+                    let file = self.files[self.index].clone();
+                    self.index += 1;
+                    Some(file)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let call_count = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let files = vec![
+            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
+            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
+            create_test_file_scan_task("file3.parquet", 30 * 1024 * 1024),
+        ];
+
+        let counting_iter = CountingIterator {
+            files,
+            index: 0,
+            next_call_count: call_count.clone(),
+        };
+
+        let mut min_count_iter = strategy.filter_iter(counting_iter);
+
+        // Get first file - should cause collection of min_file_count files
+        let first = min_count_iter.next().unwrap();
+        assert_eq!(first.data_file_path, "file1.parquet");
+        assert_eq!(*call_count.borrow(), 2); // Should have called next() twice to collect minimum
+
+        // Get second file - should use buffered file
+        let second = min_count_iter.next().unwrap();
+        assert_eq!(second.data_file_path, "file2.parquet");
+        assert_eq!(*call_count.borrow(), 2); // No additional calls, using buffer
+
+        // Get third file - should switch to bypass mode
+        let third = min_count_iter.next().unwrap();
+        assert_eq!(third.data_file_path, "file3.parquet");
+        assert_eq!(*call_count.borrow(), 3); // One additional call in bypass mode
+    }
+
+    #[test]
+    fn test_min_file_count_strategy_performance() {
+        // Test with a large number of files to ensure performance is reasonable
+        let strategy = MinFileCountStrategy::new(10);
+        let large_files: Vec<FileScanTask> = (0..10000)
+            .map(|i| {
+                create_test_file_scan_task(
+                    &format!("file{}.parquet", i),
+                    (i as u64 + 1) * 1024 * 1024,
+                )
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let result: Vec<FileScanTask> = strategy.filter_iter(large_files.into_iter()).collect();
+        let duration = start.elapsed();
+
+        assert_eq!(result.len(), 10000);
+        assert!(duration.as_millis() < 100); // Should complete quickly (less than 100ms)
+
+        // Verify order is preserved
+        for (i, file) in result.iter().enumerate().take(100) {
+            assert_eq!(file.data_file_path, format!("file{}.parquet", i));
+        }
     }
 
     #[test]
