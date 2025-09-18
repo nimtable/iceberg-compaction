@@ -26,10 +26,10 @@ use crate::config::{
     CompactionExecutionConfig, CompactionPlanningConfig, RuntimeConfig, RuntimeConfigBuilder,
 };
 use crate::executor::{
-    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
-    RewriteFilesResponse, RewriteFilesStat,
+    create_compaction_executor, ExecutorType, RewriteFilesRequest, RewriteFilesResponse,
+    RewriteFilesStat,
 };
-use crate::file_selection::FileSelector;
+use crate::file_selection::{FileGroup, FileSelector};
 use crate::CompactionError;
 use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
@@ -425,7 +425,7 @@ impl Compaction {
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
             schema: schema.clone(),
-            input_file_scan_tasks: plan.files_to_compact.clone(),
+            file_group: plan.files_to_compact.clone(),
             execution_config: Arc::new(execution_config.clone()),
             dir_path: default_location_generator.dir_path,
             partition_spec: table.metadata().default_partition_spec().clone(),
@@ -440,7 +440,7 @@ impl Compaction {
         &self,
         table: &Table,
         output_data_files: Vec<DataFile>,
-        input_file_scan_tasks: &InputFileScanTasks,
+        file_group: &FileGroup,
         snapshot: &Arc<Snapshot>,
         file_io: &FileIO,
     ) -> Result<Table> {
@@ -464,11 +464,11 @@ impl Compaction {
             get_all_files_from_snapshot(snapshot, file_io, table.metadata()).await?;
 
         // Collect file paths from all input scan tasks
-        let input_file_paths: std::collections::HashSet<&str> = input_file_scan_tasks
+        let input_file_paths: std::collections::HashSet<&str> = file_group
             .data_files
             .iter()
-            .chain(&input_file_scan_tasks.position_delete_files)
-            .chain(&input_file_scan_tasks.equality_delete_files)
+            .chain(&file_group.position_delete_files)
+            .chain(&file_group.equality_delete_files)
             .map(|task| task.data_file_path())
             .collect();
 
@@ -829,7 +829,7 @@ impl CommitManager {
 
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    pub files_to_compact: InputFileScanTasks,
+    pub files_to_compact: FileGroup,
     pub runtime_config: RuntimeConfig,
     pub to_branch: Cow<'static, str>,
     pub snapshot_id: i64,
@@ -837,7 +837,7 @@ pub struct CompactionPlan {
 
 impl CompactionPlan {
     pub fn new(
-        files_to_compact: InputFileScanTasks,
+        files_to_compact: FileGroup,
         runtime_config: RuntimeConfig,
         to_branch: impl Into<Cow<'static, str>>,
         snapshot_id: i64,
@@ -852,7 +852,7 @@ impl CompactionPlan {
 
     pub fn dummy() -> Self {
         Self {
-            files_to_compact: InputFileScanTasks::default(),
+            files_to_compact: FileGroup::empty(),
             runtime_config: RuntimeConfig::default(),
             to_branch: Cow::Borrowed(MAIN_BRANCH),
             snapshot_id: UNASSIGNED_SNAPSHOT_ID,
@@ -885,7 +885,7 @@ pub struct DefaultParallelismCalculator;
 impl DefaultParallelismCalculator {
     fn calculate_parallelism(
         &self,
-        files_to_compact: &InputFileScanTasks,
+        files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
         let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
@@ -1005,7 +1005,7 @@ impl CompactionPlanner {
         table: &Table,
         snapshot_id: i64,
         compaction_type: CompactionType,
-    ) -> Result<InputFileScanTasks> {
+    ) -> Result<FileGroup> {
         use crate::file_selection::FileStrategyFactory;
 
         let strategy = FileStrategyFactory::create_files_strategy(compaction_type, &self.config);

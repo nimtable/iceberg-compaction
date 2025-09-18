@@ -57,7 +57,7 @@ impl CompactionExecutor for DataFusionExecutor {
         let RewriteFilesRequest {
             file_io,
             schema,
-            input_file_scan_tasks,
+            file_group,
             execution_config,
             dir_path,
             partition_spec,
@@ -66,11 +66,11 @@ impl CompactionExecutor for DataFusionExecutor {
         } = request;
 
         let mut stats = RewriteFilesStat::default();
-        stats.record_input(&input_file_scan_tasks);
+        stats.record_input(&file_group);
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
-            .with_input_data_files(input_file_scan_tasks)
+            .with_input_data_files(file_group)
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),

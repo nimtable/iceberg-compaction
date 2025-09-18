@@ -14,28 +14,27 @@
  * limitations under the License.
  */
 
-use crate::executor::InputFileScanTasks;
 use crate::Result;
 use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
-use std::collections::HashMap;
 
 pub mod strategy;
 
 // Re-export commonly used types for convenience
-pub use strategy::{FileStrategyFactory, StaticFileStrategy, UnifiedStrategy};
+pub use strategy::{FileGroup, FileStrategyFactory, ThreeLayerStrategy};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
 impl FileSelector {
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
-    pub async fn get_scan_tasks_with_strategy(
+    /// Returns grouped files maintaining the group structure from the strategy
+    pub async fn get_grouped_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
-        strategy: UnifiedStrategy,
-    ) -> Result<InputFileScanTasks> {
+        strategy: ThreeLayerStrategy,
+    ) -> Result<Vec<FileGroup>> {
         let scan = table
             .scan()
             .snapshot_id(snapshot_id)
@@ -57,45 +56,49 @@ impl FileSelector {
             .try_collect()
             .await?;
 
-        // Apply file filtering strategy using static dispatch
-        let filtered_data_files: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter());
+        // Apply the three-layer strategy to get groups
+        let file_groups: Vec<FileGroup> = strategy.execute(data_files);
 
-        // Extract delete files from the filtered data files
-        Self::build_input_file_scan_tasks(filtered_data_files)
+        Ok(file_groups)
     }
 
-    /// Build `InputFileScanTasks` from filtered data files
-    fn build_input_file_scan_tasks(
-        filtered_data_files: Vec<FileScanTask>,
-    ) -> Result<InputFileScanTasks> {
-        let mut position_delete_files = HashMap::new();
-        let mut equality_delete_files = HashMap::new();
+    /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
+    /// Returns a single flattened FileGroup (for backward compatibility)
+    pub async fn get_scan_tasks_with_strategy(
+        table: &Table,
+        snapshot_id: i64,
+        strategy: ThreeLayerStrategy,
+    ) -> Result<FileGroup> {
+        let scan = table
+            .scan()
+            .snapshot_id(snapshot_id)
+            .with_delete_file_processing_enabled(true)
+            .build()?;
 
-        for task in &filtered_data_files {
-            for delete_task in &task.deletes {
-                let mut delete_task = delete_task.as_ref().clone();
-                match &delete_task.data_file_content {
-                    iceberg::spec::DataContentType::PositionDeletes => {
-                        delete_task.project_field_ids = vec![];
-                        position_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
-                    }
-                    iceberg::spec::DataContentType::EqualityDeletes => {
-                        delete_task.project_field_ids = delete_task.equality_ids.clone();
-                        equality_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
-                    }
-                    _ => {
-                        unreachable!()
-                    }
-                }
-            }
-        }
+        let file_scan_stream = scan.plan_files().await?;
 
-        Ok(InputFileScanTasks {
-            data_files: filtered_data_files,
-            position_delete_files: position_delete_files.into_values().collect(),
-            equality_delete_files: equality_delete_files.into_values().collect(),
-        })
+        let data_files: Vec<FileScanTask> = file_scan_stream
+            .try_filter_map(|task| {
+                futures::future::ready(Ok(
+                    if matches!(task.data_file_content, iceberg::spec::DataContentType::Data) {
+                        Some(task)
+                    } else {
+                        None
+                    },
+                ))
+            })
+            .try_collect()
+            .await?;
+
+        // Apply the three-layer strategy and flatten the result
+        let file_groups = strategy.execute(data_files);
+        let filtered_data_files: Vec<FileScanTask> = file_groups
+            .into_iter()
+            .flat_map(|group| group.into_files())
+            .collect();
+
+        // Create a FileGroup from the filtered data files
+        // The FileGroup constructor will automatically extract delete files
+        Ok(FileGroup::new(filtered_data_files))
     }
 }

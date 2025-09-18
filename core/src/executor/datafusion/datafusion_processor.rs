@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::{
     config::{CompactionExecutionConfig, RuntimeConfig},
     error::{CompactionError, Result},
-    executor::InputFileScanTasks,
+    file_selection::FileGroup,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
@@ -504,10 +504,10 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_input_data_files(mut self, input_file_scan_tasks: InputFileScanTasks) -> Self {
-        self.data_files = input_file_scan_tasks.data_files;
-        self.position_delete_files = input_file_scan_tasks.position_delete_files;
-        self.equality_delete_files = input_file_scan_tasks.equality_delete_files;
+    pub fn with_input_data_files(mut self, file_group: FileGroup) -> Self {
+        self.data_files = file_group.data_files;
+        self.position_delete_files = file_group.position_delete_files;
+        self.equality_delete_files = file_group.equality_delete_files;
         self
     }
 

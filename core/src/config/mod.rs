@@ -34,6 +34,22 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 
+// Strategy configuration defaults
+pub const DEFAULT_GROUPING_STRATEGY: GroupingStrategy = GroupingStrategy::BinPack;
+pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB
+pub const DEFAULT_MAX_GROUP_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
+pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group
+pub const DEFAULT_MAX_GROUP_FILE_COUNT: usize = 32; // Maximum files per group
+
+/// Strategy for grouping files during compaction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupingStrategy {
+    /// No grouping - files are processed individually
+    Noop,
+    /// Binpack grouping - files are grouped to optimize size distribution
+    BinPack,
+}
+
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
@@ -98,6 +114,26 @@ pub struct CompactionPlanningConfig {
     /// Minimum number of files required to trigger compaction (default: 2)
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
     pub min_file_count: usize,
+
+    /// Strategy for grouping files (default: BinPack)
+    #[builder(default = "DEFAULT_GROUPING_STRATEGY")]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Minimum size for a compaction group (default: 512MB)
+    #[builder(default = "DEFAULT_MIN_GROUP_SIZE")]
+    pub min_group_size: u64,
+
+    /// Maximum size for a compaction group (default: 2GB)
+    #[builder(default = "DEFAULT_MAX_GROUP_SIZE")]
+    pub max_group_size: u64,
+
+    /// Minimum number of files per group (default: 2)
+    #[builder(default = "DEFAULT_MIN_GROUP_FILE_COUNT")]
+    pub min_group_file_count: usize,
+
+    /// Maximum number of files per group (default: 32)
+    #[builder(default = "DEFAULT_MAX_GROUP_FILE_COUNT")]
+    pub max_group_file_count: usize,
 }
 
 impl Default for CompactionPlanningConfig {

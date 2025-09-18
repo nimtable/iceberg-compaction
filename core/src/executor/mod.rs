@@ -17,11 +17,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::scan::FileScanTask;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
 use crate::common::CompactionMetricsRecorder;
 use crate::config::{CompactionExecutionConfig, RuntimeConfig};
+use crate::file_selection::FileGroup;
 use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
@@ -39,35 +39,12 @@ pub trait CompactionExecutor: Send + Sync + 'static {
 pub struct RewriteFilesRequest {
     pub file_io: FileIO,
     pub schema: Arc<Schema>,
-    pub input_file_scan_tasks: InputFileScanTasks,
+    pub file_group: FileGroup,
     pub execution_config: Arc<CompactionExecutionConfig>,
     pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
     pub runtime_config: RuntimeConfig,
-}
-
-#[derive(Debug, Clone, Default)]
-/// `InputFileScanTasks` contains the file scan tasks for data files, position delete files, and equality delete files.
-pub struct InputFileScanTasks {
-    pub data_files: Vec<FileScanTask>,
-    pub position_delete_files: Vec<FileScanTask>,
-    pub equality_delete_files: Vec<FileScanTask>,
-}
-
-impl InputFileScanTasks {
-    pub fn input_files_count(&self) -> usize {
-        self.data_files.len() + self.position_delete_files.len() + self.equality_delete_files.len()
-    }
-
-    pub fn input_total_bytes(&self) -> u64 {
-        self.data_files
-            .iter()
-            .chain(&self.position_delete_files)
-            .chain(&self.equality_delete_files)
-            .map(|task| task.file_size_in_bytes)
-            .sum()
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,24 +69,24 @@ pub struct RewriteFilesStat {
 }
 
 impl RewriteFilesStat {
-    pub fn record_input(&mut self, input_file_scan_tasks: &InputFileScanTasks) {
-        self.input_files_count = input_file_scan_tasks.input_files_count();
-        self.input_total_bytes = input_file_scan_tasks.input_total_bytes();
+    pub fn record_input(&mut self, file_group: &FileGroup) {
+        self.input_files_count = file_group.input_files_count();
+        self.input_total_bytes = file_group.input_total_bytes();
 
-        self.input_data_file_count = input_file_scan_tasks.data_files.len();
-        self.input_position_delete_file_count = input_file_scan_tasks.position_delete_files.len();
-        self.input_equality_delete_file_count = input_file_scan_tasks.equality_delete_files.len();
-        self.input_data_file_total_bytes = input_file_scan_tasks
+        self.input_data_file_count = file_group.data_files.len();
+        self.input_position_delete_file_count = file_group.position_delete_files.len();
+        self.input_equality_delete_file_count = file_group.equality_delete_files.len();
+        self.input_data_file_total_bytes = file_group
             .data_files
             .iter()
             .map(|task| task.file_size_in_bytes)
             .sum::<u64>();
-        self.input_position_delete_file_total_bytes = input_file_scan_tasks
+        self.input_position_delete_file_total_bytes = file_group
             .position_delete_files
             .iter()
             .map(|task| task.file_size_in_bytes)
             .sum::<u64>();
-        self.input_equality_delete_file_total_bytes = input_file_scan_tasks
+        self.input_equality_delete_file_total_bytes = file_group
             .equality_delete_files
             .iter()
             .map(|task| task.file_size_in_bytes)
