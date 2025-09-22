@@ -942,7 +942,7 @@ impl CommitManager {
 
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    pub file_group: FileGroup, // 单个 FileGroup 而不是 Vec
+    pub file_group: FileGroup,
     pub to_branch: Cow<'static, str>,
     pub snapshot_id: i64,
 }
@@ -1851,10 +1851,6 @@ mod tests {
 
         assert!(!plans.is_empty());
         let plan = &plans[0];
-
-        println!("group_count: {}", plan.group_count());
-
-        println!("plan {:?}", plan.file_group);
 
         assert_eq!(plan.file_count(), 2); // 2 files on main branch
 
