@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use iceberg::{io::FileIO, spec::PartitionSpec};
 
 use crate::common::CompactionMetricsRecorder;
-use crate::config::{CompactionExecutionConfig, RuntimeConfig};
+use crate::config::CompactionExecutionConfig;
 use crate::file_selection::FileGroup;
 use iceberg::spec::{DataFile, Schema};
 
@@ -44,7 +44,6 @@ pub struct RewriteFilesRequest {
     pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
-    pub runtime_config: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Default)]

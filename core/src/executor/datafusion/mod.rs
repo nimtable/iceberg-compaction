@@ -1,18 +1,37 @@
 /*
- * Copyright 2025 iceberg-compaction
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+* Copyright 2025 iceberg-compaction
+*
+* Licensed under the A        let mut stats = RewriteFilesStat::default();
+       stats.record_input(&file_group);
+
+       // Extract parallelism before file_group is moved
+       let executor_parallelism = file_group.executor_parallelism;
+       let output_parallelism = file_group.output_parallelism;
+
+       let datafusion_task_ctx = DataFusionTaskContext::builder()?
+           .with_schema(schema.clone())
+           .with_input_data_files(file_group)
+           .build()?;
+       let (batches, input_schema) = DatafusionProcessor::new(
+           execution_config.clone(),
+           executor_parallelism,
+           file_io.clone(),
+       )
+       .execute(datafusion_task_ctx, output_parallelism)
+       .await?;
+       let arc_input_schema = Arc::new(input_schema);
+       let mut futures = Vec::with_capacity(executor_parallelism);ersion 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
 
 use crate::{
     config::CompactionExecutionConfig, error::Result,
@@ -62,11 +81,14 @@ impl CompactionExecutor for DataFusionExecutor {
             dir_path,
             partition_spec,
             metrics_recorder,
-            runtime_config,
         } = request;
 
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
+
+        // Extract parallelism before file_group is moved
+        let executor_parallelism = file_group.executor_parallelism;
+        let output_parallelism = file_group.output_parallelism;
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
@@ -74,13 +96,13 @@ impl CompactionExecutor for DataFusionExecutor {
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),
-            runtime_config.clone(),
+            executor_parallelism,
             file_io.clone(),
         )
-        .execute(datafusion_task_ctx)
+        .execute(datafusion_task_ctx, output_parallelism)
         .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(runtime_config.executor_parallelism);
+        let mut futures = Vec::with_capacity(executor_parallelism);
 
         // build iceberg writer for each partition
         for mut batch_stream in batches {

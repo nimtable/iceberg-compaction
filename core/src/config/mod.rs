@@ -60,16 +60,6 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-#[derive(Builder, Debug, Default, Clone)]
-pub struct RuntimeConfig {
-    /// The number of parallel tasks to execute. used for scan and join.
-    #[builder(default = "DEFAULT_EXECUTOR_PARALLELISM")]
-    pub executor_parallelism: usize,
-    /// The number of parallel tasks to output. Only used for repartitioning.
-    #[builder(default = "DEFAULT_OUTPUT_PARALLELISM")]
-    pub output_parallelism: usize,
-}
-
 /// Common configuration for compaction
 /// Contains parameters that are shared across different compaction phases
 #[derive(Builder, Debug, Clone, Default)]
@@ -115,7 +105,7 @@ pub struct CompactionPlanningConfig {
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
     pub min_file_count: usize,
 
-    /// Strategy for grouping files (default: BinPack)
+    /// Strategy for grouping files (default: `BinPack`)
     #[builder(default = "DEFAULT_GROUPING_STRATEGY")]
     pub grouping_strategy: GroupingStrategy,
 

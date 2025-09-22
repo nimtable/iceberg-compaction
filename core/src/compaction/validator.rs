@@ -26,7 +26,7 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, Schema};
 use iceberg::table::Table;
 
-use crate::config::{CompactionExecutionConfigBuilder, RuntimeConfig};
+use crate::config::CompactionExecutionConfigBuilder;
 use crate::error::Result;
 use crate::executor::datafusion::datafusion_processor::{
     DataFusionTaskContext, DatafusionProcessor,
@@ -47,7 +47,7 @@ impl CompactionValidator {
     pub async fn new(
         file_group: FileGroup,
         output_files: Vec<DataFile>,
-        runtime_config: RuntimeConfig,
+        executor_parallelism: usize,
         input_schema: Arc<Schema>,
         output_schema: Arc<Schema>,
         table: Table,
@@ -109,8 +109,11 @@ impl CompactionValidator {
                 .map_err(|e| CompactionError::Config(e.to_string()))?,
         );
 
-        let datafusion_processor =
-            DatafusionProcessor::new(validator_config, runtime_config, table.file_io().clone());
+        let datafusion_processor = DatafusionProcessor::new(
+            validator_config,
+            executor_parallelism,
+            table.file_io().clone(),
+        );
 
         Ok(Self {
             datafusion_processor,
@@ -133,11 +136,11 @@ impl CompactionValidator {
             })?;
         let (mut input_batches_streams, _) = self
             .datafusion_processor
-            .execute(input_datafusion_task_ctx)
+            .execute(input_datafusion_task_ctx, 1)
             .await?;
         let (mut output_batches_streams, _) = self
             .datafusion_processor
-            .execute(output_datafusion_task_ctx)
+            .execute(output_datafusion_task_ctx, 1)
             .await?;
 
         let mut total_input_rows = 0;

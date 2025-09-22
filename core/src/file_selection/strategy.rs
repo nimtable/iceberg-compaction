@@ -45,28 +45,24 @@ impl FileGroup {
     /// Create a new file group from a collection of data files
     /// This will automatically extract and organize delete files from the data files
     pub fn new(data_files: Vec<FileScanTask>) -> Self {
-        use std::collections::HashMap;
-
         let total_size = data_files.iter().map(|task| task.length).sum();
         let data_file_count = data_files.len();
 
-        let mut position_delete_files = HashMap::new();
-        let mut equality_delete_files = HashMap::new();
-
         // Extract delete files from data files (similar to build_input_file_scan_tasks logic)
+        let mut position_delete_map = std::collections::HashMap::new();
+        let mut equality_delete_map = std::collections::HashMap::new();
+
         for task in &data_files {
             for delete_task in &task.deletes {
                 let mut delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
                         delete_task.project_field_ids = vec![];
-                        position_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
+                        position_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
                         delete_task.project_field_ids = delete_task.equality_ids.clone();
-                        equality_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
+                        equality_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
                     }
                     _ => {
                         // Skip other types
@@ -75,10 +71,14 @@ impl FileGroup {
             }
         }
 
+        // Convert maps to vectors
+        let position_delete_files = position_delete_map.into_values().collect();
+        let equality_delete_files = equality_delete_map.into_values().collect();
+
         Self {
             data_files,
-            position_delete_files: position_delete_files.into_values().collect(),
-            equality_delete_files: equality_delete_files.into_values().collect(),
+            position_delete_files,
+            equality_delete_files,
             total_size,
             data_file_count,
             executor_parallelism: 1, // default value, will be calculated later
@@ -306,7 +306,7 @@ impl GroupFilterStrategy for NoopGroupFilterStrategy {
     }
 }
 
-/// BinPack grouping strategy that optimizes file size distribution
+/// `BinPack` grouping strategy that optimizes file size distribution
 #[derive(Debug)]
 pub struct BinPackGroupingStrategy {
     pub target_group_size: u64,
@@ -367,7 +367,7 @@ impl BinPackGroupingStrategy {
 
         // Ensure we don't exceed max files per group constraints
         if !files.is_empty() {
-            let max_possible_groups = files.len() / self.max_files_per_group.max(1);
+            let max_possible_groups = files.len().div_ceil(self.max_files_per_group.max(1)); // Ceiling division
             split_num = split_num.max(max_possible_groups).max(1);
         }
 
@@ -463,15 +463,6 @@ pub struct TaskSizeLimitStrategy {
     pub max_total_size: u64,
 }
 
-impl TaskSizeLimitStrategy {
-    pub fn description(&self) -> String {
-        format!(
-            "TaskSizeLimit[{}GB]",
-            self.max_total_size / 1024 / 1024 / 1024
-        )
-    }
-}
-
 impl FileFilterStrategy for TaskSizeLimitStrategy {
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
         let mut current_total = 0u64;
@@ -507,10 +498,6 @@ impl MinFileCountStrategy {
     /// Create a new `MinFileCountStrategy` with minimum file count requirement
     pub fn new(min_file_count: usize) -> Self {
         Self { min_file_count }
-    }
-
-    pub fn description(&self) -> String {
-        format!("MinFileCount[{}]", self.min_file_count)
     }
 }
 
@@ -604,6 +591,112 @@ impl GroupFilterStrategy for MaxGroupFileCountStrategy {
     }
 }
 
+/// Configuration for creating custom file selection strategies
+#[derive(Debug, Clone)]
+pub struct CustomStrategyConfig {
+    pub exclude_delete_files: bool,
+    pub size_filter: Option<(Option<u64>, Option<u64>)>, // (min_size, max_size)
+    pub min_file_count: usize,
+    pub max_task_total_size: u64,
+    pub grouping_strategy: GroupingStrategy,
+    pub target_group_size: u64,
+    pub max_files_per_group: usize,
+    pub min_group_size: u64,
+    pub max_group_size: u64,
+    pub min_group_file_count: usize,
+    pub max_group_file_count: usize,
+}
+
+impl Default for CustomStrategyConfig {
+    fn default() -> Self {
+        Self {
+            exclude_delete_files: false,
+            size_filter: None,
+            min_file_count: 0,
+            max_task_total_size: u64::MAX,
+            grouping_strategy: GroupingStrategy::Noop,
+            target_group_size: 64 * 1024 * 1024, // 64MB
+            max_files_per_group: 100,
+            min_group_size: 0,
+            max_group_size: u64::MAX,
+            min_group_file_count: 0,
+            max_group_file_count: usize::MAX,
+        }
+    }
+}
+
+impl CustomStrategyConfig {
+    pub fn builder() -> CustomStrategyConfigBuilder {
+        CustomStrategyConfigBuilder::default()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CustomStrategyConfigBuilder {
+    config: CustomStrategyConfig,
+}
+
+impl CustomStrategyConfigBuilder {
+    pub fn exclude_delete_files(mut self, exclude: bool) -> Self {
+        self.config.exclude_delete_files = exclude;
+        self
+    }
+
+    pub fn size_filter(mut self, min_size: Option<u64>, max_size: Option<u64>) -> Self {
+        self.config.size_filter = Some((min_size, max_size));
+        self
+    }
+
+    pub fn min_file_count(mut self, count: usize) -> Self {
+        self.config.min_file_count = count;
+        self
+    }
+
+    pub fn max_task_total_size(mut self, size: u64) -> Self {
+        self.config.max_task_total_size = size;
+        self
+    }
+
+    pub fn grouping_strategy(mut self, strategy: GroupingStrategy) -> Self {
+        self.config.grouping_strategy = strategy;
+        self
+    }
+
+    pub fn target_group_size(mut self, size: u64) -> Self {
+        self.config.target_group_size = size;
+        self
+    }
+
+    pub fn max_files_per_group(mut self, count: usize) -> Self {
+        self.config.max_files_per_group = count;
+        self
+    }
+
+    pub fn min_group_size(mut self, size: u64) -> Self {
+        self.config.min_group_size = size;
+        self
+    }
+
+    pub fn max_group_size(mut self, size: u64) -> Self {
+        self.config.max_group_size = size;
+        self
+    }
+
+    pub fn min_group_file_count(mut self, count: usize) -> Self {
+        self.config.min_group_file_count = count;
+        self
+    }
+
+    pub fn max_group_file_count(mut self, count: usize) -> Self {
+        self.config.max_group_file_count = count;
+        self
+    }
+
+    pub fn build(self) -> CustomStrategyConfig {
+        self.config
+    }
+}
+
 /// Factory for creating file strategies based on compaction type and configuration
 pub struct FileStrategyFactory;
 
@@ -668,7 +761,7 @@ impl ThreeLayerStrategy {
     /// Get a description of this strategy for logging/debugging
     pub fn description(&self) -> String {
         let file_filter_desc = if self.file_filters.is_empty() {
-            "NoFileFilters".to_string()
+            "NoFileFilters".to_owned()
         } else {
             self.file_filters
                 .iter()
@@ -678,7 +771,7 @@ impl ThreeLayerStrategy {
         };
 
         let group_filter_desc = if self.group_filters.is_empty() {
-            "NoGroupFilters".to_string()
+            "NoGroupFilters".to_owned()
         } else {
             self.group_filters
                 .iter()
@@ -712,16 +805,17 @@ impl FileStrategyFactory {
     /// ```
     pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> ThreeLayerStrategy {
         // File filtering layer
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-        file_filters.push(Box::new(NoDeleteFilesStrategy));
-        file_filters.push(Box::new(SizeFilterStrategy {
-            min_size: None,
-            max_size: Some(config.small_file_threshold),
-        }));
-        file_filters.push(Box::new(MinFileCountStrategy::new(config.min_file_count)));
-        file_filters.push(Box::new(TaskSizeLimitStrategy {
-            max_total_size: config.max_task_total_size,
-        }));
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![
+            Box::new(NoDeleteFilesStrategy),
+            Box::new(SizeFilterStrategy {
+                min_size: None,
+                max_size: Some(config.small_file_threshold),
+            }),
+            Box::new(MinFileCountStrategy::new(config.min_file_count)),
+            Box::new(TaskSizeLimitStrategy {
+                max_total_size: config.max_task_total_size,
+            }),
+        ];
 
         // Grouping layer
         let grouping = match config.grouping_strategy {
@@ -733,17 +827,18 @@ impl FileStrategyFactory {
         };
 
         // Group filtering layer - for small files, use more permissive settings
-        let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
-        // For small files, allow very small groups (any size above 0)
-        group_filters.push(Box::new(MinGroupSizeStrategy { min_group_size: 0 }));
-        group_filters.push(Box::new(MaxGroupSizeStrategy {
-            max_group_size: config.max_group_size,
-        }));
-        // For small files, allow single-file groups
-        group_filters.push(Box::new(MinGroupFileCountStrategy { min_file_count: 1 }));
-        group_filters.push(Box::new(MaxGroupFileCountStrategy {
-            max_file_count: config.max_group_file_count,
-        }));
+        let group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![
+            // For small files, allow very small groups (any size above 0)
+            Box::new(MinGroupSizeStrategy { min_group_size: 0 }),
+            Box::new(MaxGroupSizeStrategy {
+                max_group_size: config.max_group_size,
+            }),
+            // For small files, allow single-file groups
+            Box::new(MinGroupFileCountStrategy { min_file_count: 1 }),
+            Box::new(MaxGroupFileCountStrategy {
+                max_file_count: config.max_group_file_count,
+            }),
+        ];
 
         ThreeLayerStrategy::new(file_filters, grouping, group_filters)
     }
@@ -757,9 +852,46 @@ impl FileStrategyFactory {
         )
     }
 
+    /// Create a custom strategy with structured configuration
+    ///
+    /// This method provides a more maintainable way to create custom strategies
+    /// using a builder pattern for configuration.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # use iceberg_compaction_core::file_selection::strategy::{FileStrategyFactory, CustomStrategyConfig};
+    /// # use iceberg_compaction_core::config::GroupingStrategy;
+    /// let config = CustomStrategyConfig::builder()
+    ///     .exclude_delete_files(true)
+    ///     .size_filter(None, Some(100 * 1024 * 1024)) // max 100MB
+    ///     .min_file_count(3)
+    ///     .grouping_strategy(GroupingStrategy::BinPack)
+    ///     .target_group_size(64 * 1024 * 1024) // 64MB
+    ///     .build();
+    /// let strategy = FileStrategyFactory::create_custom_strategy_v2(config);
+    /// ```
+    pub fn create_custom_strategy_v2(config: CustomStrategyConfig) -> ThreeLayerStrategy {
+        Self::create_custom_strategy(
+            config.exclude_delete_files,
+            config.size_filter,
+            config.min_file_count,
+            config.max_task_total_size,
+            config.grouping_strategy,
+            config.target_group_size,
+            config.max_files_per_group,
+            config.min_group_size,
+            config.max_group_size,
+            config.min_group_file_count,
+            config.max_group_file_count,
+        )
+    }
+
     /// Create a custom strategy with flexible configuration
     ///
     /// This method provides fine-grained control over which filters to include.
+    ///
+    /// **Note**: Consider using `create_custom_strategy_v2` with `CustomStrategyConfig`
+    /// for better maintainability with complex configurations.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -779,6 +911,7 @@ impl FileStrategyFactory {
     ///     50,                                    // max_group_file_count
     /// );
     /// ```
+    #[allow(clippy::too_many_arguments)]
     pub fn create_custom_strategy(
         exclude_delete_files: bool,
         size_filter: Option<(Option<u64>, Option<u64>)>, // (min_size, max_size)
@@ -919,25 +1052,129 @@ mod tests {
             .clone()
     }
 
+    /// Builder for creating test `FileScanTask` with fluent API
+    #[derive(Debug)]
+    pub struct TestFileBuilder {
+        path: String,
+        size: u64,
+        has_deletes: bool,
+        delete_types: Vec<iceberg::spec::DataContentType>,
+    }
+
+    impl TestFileBuilder {
+        pub fn new(path: &str) -> Self {
+            Self {
+                path: path.to_owned(),
+                size: 10 * 1024 * 1024, // Default 10MB
+                has_deletes: false,
+                delete_types: vec![],
+            }
+        }
+
+        pub fn size(mut self, size: u64) -> Self {
+            self.size = size;
+            self
+        }
+
+        pub fn with_equality_deletes(mut self) -> Self {
+            self.has_deletes = true;
+            self.delete_types
+                .push(iceberg::spec::DataContentType::EqualityDeletes);
+            self
+        }
+
+        pub fn with_deletes(self) -> Self {
+            self.with_equality_deletes()
+        }
+
+        pub fn build(self) -> FileScanTask {
+            use iceberg::spec::{DataContentType, DataFileFormat};
+            use std::sync::Arc;
+
+            let deletes = if self.has_deletes {
+                self.delete_types
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, delete_type)| {
+                        Arc::new(FileScanTask {
+                            start: 0,
+                            length: 1024,
+                            record_count: Some(10),
+                            data_file_path: format!(
+                                "{}_{}_delete.parquet",
+                                self.path.replace(".parquet", ""),
+                                i
+                            ),
+                            data_file_content: delete_type,
+                            data_file_format: DataFileFormat::Parquet,
+                            schema: get_test_schema(),
+                            project_field_ids: if delete_type == DataContentType::EqualityDeletes {
+                                vec![1, 2]
+                            } else {
+                                vec![1]
+                            },
+                            predicate: None,
+                            deletes: vec![],
+                            sequence_number: 1,
+                            equality_ids: if delete_type == DataContentType::EqualityDeletes {
+                                vec![1, 2]
+                            } else {
+                                vec![]
+                            },
+                            file_size_in_bytes: 1024,
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            FileScanTask {
+                start: 0,
+                length: self.size,
+                record_count: Some(100),
+                data_file_path: self.path,
+                data_file_content: DataContentType::Data,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes,
+                sequence_number: 1,
+                equality_ids: vec![],
+                file_size_in_bytes: self.size,
+            }
+        }
+    }
+
+    /// Helper functions for common test scenarios
+    pub struct TestUtils;
+
+    impl TestUtils {
+        /// Execute strategy and return flattened files for testing
+        pub fn execute_strategy_flat(
+            strategy: &ThreeLayerStrategy,
+            data_files: Vec<FileScanTask>,
+        ) -> Vec<FileScanTask> {
+            let config = CompactionPlanningConfigBuilder::default().build().unwrap();
+
+            strategy
+                .execute(data_files, &config)
+                .unwrap()
+                .into_iter()
+                .flat_map(|group| group.into_files())
+                .collect()
+        }
+
+        /// Create test config with common defaults
+        pub fn create_test_config() -> CompactionPlanningConfig {
+            CompactionPlanningConfigBuilder::default().build().unwrap()
+        }
+    }
+
     // Helper function to create test FileScanTask
     fn create_test_file_scan_task(file_path: &str, file_size: u64) -> FileScanTask {
-        use iceberg::spec::{DataContentType, DataFileFormat};
-
-        FileScanTask {
-            start: 0,
-            length: file_size,
-            record_count: Some(100),
-            data_file_path: file_path.to_owned(),
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: vec![],
-            file_size_in_bytes: file_size,
-        }
+        TestFileBuilder::new(file_path).size(file_size).build()
     }
 
     // Helper function to create test FileScanTask with delete files
@@ -946,45 +1183,11 @@ mod tests {
         file_size: u64,
         has_deletes: bool,
     ) -> FileScanTask {
-        use iceberg::spec::{DataContentType, DataFileFormat};
-        use std::sync::Arc;
-
-        let deletes = if has_deletes {
-            // Create a dummy delete file task for testing
-            vec![Arc::new(FileScanTask {
-                start: 0,
-                length: 1024,
-                record_count: Some(10),
-                data_file_path: format!("{}.delete", file_path),
-                data_file_content: DataContentType::EqualityDeletes,
-                data_file_format: DataFileFormat::Parquet,
-                schema: get_test_schema(),
-                project_field_ids: vec![1],
-                predicate: None,
-                deletes: vec![],
-                sequence_number: 1,
-                equality_ids: vec![],
-                file_size_in_bytes: 1024,
-            })]
-        } else {
-            vec![]
-        };
-
-        FileScanTask {
-            start: 0,
-            length: file_size,
-            record_count: Some(100),
-            data_file_path: file_path.to_owned(),
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes,
-            sequence_number: 1,
-            equality_ids: vec![],
-            file_size_in_bytes: file_size,
+        let mut builder = TestFileBuilder::new(file_path).size(file_size);
+        if has_deletes {
+            builder = builder.with_deletes();
         }
+        builder.build()
     }
 
     // Helper function to execute strategy and return flattened files for testing
@@ -992,24 +1195,12 @@ mod tests {
         strategy: &ThreeLayerStrategy,
         data_files: Vec<FileScanTask>,
     ) -> Vec<FileScanTask> {
-        // Create a default config for testing
-        let config = crate::config::CompactionPlanningConfigBuilder::default()
-            .build()
-            .unwrap();
-
-        strategy
-            .execute(data_files, &config)
-            .unwrap()
-            .into_iter()
-            .flat_map(|group| group.into_files())
-            .collect()
+        TestUtils::execute_strategy_flat(strategy, data_files)
     }
 
     // Helper function to create default config for testing
     fn create_test_config() -> crate::config::CompactionPlanningConfig {
-        crate::config::CompactionPlanningConfigBuilder::default()
-            .build()
-            .unwrap()
+        TestUtils::create_test_config()
     }
 
     #[test]
@@ -1039,26 +1230,67 @@ mod tests {
         // Test description
         assert_eq!(strategy.description(), "SizeFilter[5-50MB]");
 
-        // Test filtering logic
-        let data_files = vec![
-            create_test_file_scan_task("small_file.parquet", 2 * 1024 * 1024), // 2MB - should be filtered out
-            create_test_file_scan_task("medium_file1.parquet", 10 * 1024 * 1024), // 10MB - should pass
-            create_test_file_scan_task("medium_file2.parquet", 30 * 1024 * 1024), // 30MB - should pass
-            create_test_file_scan_task("large_file.parquet", 100 * 1024 * 1024), // 100MB - should be filtered out
+        // Test filtering logic with comprehensive validation
+        let test_files = vec![
+            create_test_file_scan_task("too_small.parquet", 2 * 1024 * 1024), // 2MB - should be filtered
+            create_test_file_scan_task("min_edge.parquet", 5 * 1024 * 1024), // 5MB - should pass (exactly min)
+            create_test_file_scan_task("medium1.parquet", 10 * 1024 * 1024), // 10MB - should pass
+            create_test_file_scan_task("medium2.parquet", 30 * 1024 * 1024), // 30MB - should pass
+            create_test_file_scan_task("max_edge.parquet", 50 * 1024 * 1024), // 50MB - should pass (exactly max)
+            create_test_file_scan_task("too_large.parquet", 100 * 1024 * 1024), // 100MB - should be filtered
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(data_files);
+        let result: Vec<FileScanTask> = strategy.filter(test_files);
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "medium_file1.parquet");
-        assert_eq!(result[1].data_file_path, "medium_file2.parquet");
+        // Verify correct files passed filter
+        assert_eq!(
+            result.len(),
+            4,
+            "Should pass exactly 4 files (5MB to 50MB inclusive)"
+        );
 
-        // Test edge cases
-        let edge_case_strategy = SizeFilterStrategy {
-            min_size: Some(1024 * 1024),
-            max_size: Some(32 * 1024 * 1024),
-        };
-        assert_eq!(edge_case_strategy.description(), "SizeFilter[1-32MB]");
+        let expected_files = [
+            "min_edge.parquet",
+            "medium1.parquet",
+            "medium2.parquet",
+            "max_edge.parquet",
+        ];
+        for (i, expected_name) in expected_files.iter().enumerate() {
+            assert_eq!(
+                result[i].data_file_path, *expected_name,
+                "File {} should be {}",
+                i, expected_name
+            );
+        }
+
+        // Verify all passed files meet size criteria
+        for file in &result {
+            assert!(
+                file.length >= 5 * 1024 * 1024,
+                "File {} size {} should be >= 5MB",
+                file.data_file_path,
+                file.length
+            );
+            assert!(
+                file.length <= 50 * 1024 * 1024,
+                "File {} size {} should be <= 50MB",
+                file.data_file_path,
+                file.length
+            );
+        }
+
+        // Test edge case: exactly matching min and max boundaries
+        let boundary_files = vec![
+            create_test_file_scan_task("exact_min.parquet", 5 * 1024 * 1024), // Exactly 5MB
+            create_test_file_scan_task("exact_max.parquet", 50 * 1024 * 1024), // Exactly 50MB
+        ];
+
+        let boundary_result = strategy.filter(boundary_files);
+        assert_eq!(
+            boundary_result.len(),
+            2,
+            "Boundary values should be inclusive"
+        );
     }
 
     #[test]
@@ -1160,18 +1392,69 @@ mod tests {
             max_total_size: 25 * 1024 * 1024, // 25MB total limit
         };
 
-        let data_files = vec![
+        assert_eq!(strategy.description(), "TaskSizeLimit[0GB]"); // 25MB rounds down to 0GB
+
+        // Test cumulative size limiting with precise validation
+        let test_files = vec![
             create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024), // 10MB - should pass (total: 10MB)
             create_test_file_scan_task("file2.parquet", 10 * 1024 * 1024), // 10MB - should pass (total: 20MB)
-            create_test_file_scan_task("file3.parquet", 10 * 1024 * 1024), // 10MB - should be filtered out (would exceed 25MB)
-            create_test_file_scan_task("file4.parquet", 5 * 1024 * 1024), // 5MB - should be filtered out
+            create_test_file_scan_task("file3.parquet", 5 * 1024 * 1024), // 5MB - should pass (total: 25MB exactly)
+            create_test_file_scan_task("file4.parquet", 1), // 1 byte - should be filtered (would exceed)
+            create_test_file_scan_task("file5.parquet", 5 * 1024 * 1024), // 5MB - should be filtered
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(data_files);
+        let result: Vec<FileScanTask> = strategy.filter(test_files);
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.len(),
+            3,
+            "Should pass first 3 files totaling exactly 25MB"
+        );
         assert_eq!(result[0].data_file_path, "file1.parquet");
         assert_eq!(result[1].data_file_path, "file2.parquet");
+        assert_eq!(result[2].data_file_path, "file3.parquet");
+
+        // Verify cumulative size constraint
+        let total_size: u64 = result.iter().map(|f| f.length).sum();
+        assert_eq!(
+            total_size,
+            25 * 1024 * 1024,
+            "Total size should be exactly 25MB"
+        );
+        assert!(
+            total_size <= strategy.max_total_size,
+            "Total should not exceed limit"
+        );
+
+        // Test with files that individually exceed limit
+        let large_limit_strategy = TaskSizeLimitStrategy {
+            max_total_size: 5 * 1024 * 1024, // 5MB limit
+        };
+
+        let large_files = vec![
+            create_test_file_scan_task("huge1.parquet", 10 * 1024 * 1024), // 10MB - exceeds limit alone
+            create_test_file_scan_task("huge2.parquet", 10 * 1024 * 1024), // 10MB - would also exceed
+        ];
+
+        let large_result: Vec<FileScanTask> = large_limit_strategy.filter(large_files);
+        assert_eq!(
+            large_result.len(),
+            0,
+            "Should filter all files when each exceeds limit"
+        );
+
+        // Test with exact boundary
+        let boundary_files = vec![
+            create_test_file_scan_task("exact.parquet", 5 * 1024 * 1024), // Exactly 5MB
+        ];
+
+        let boundary_result = large_limit_strategy.filter(boundary_files);
+        assert_eq!(
+            boundary_result.len(),
+            1,
+            "Should pass file that exactly matches limit"
+        );
+        assert_eq!(boundary_result[0].length, 5 * 1024 * 1024);
     }
 
     #[test]
@@ -1181,20 +1464,25 @@ mod tests {
         // Test description
         assert_eq!(strategy.description(), "MinFileCount[3]");
 
-        // Test with exactly minimum files
-        let data_files = vec![
+        // Test with exactly minimum files (3) - should pass all
+        let exact_files = vec![
             create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
             create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
             create_test_file_scan_task("file3.parquet", 15 * 1024 * 1024),
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(data_files.clone());
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].data_file_path, "file1.parquet");
-        assert_eq!(result[1].data_file_path, "file2.parquet");
-        assert_eq!(result[2].data_file_path, "file3.parquet");
+        let exact_result: Vec<FileScanTask> = strategy.filter(exact_files.clone());
+        assert_eq!(
+            exact_result.len(),
+            3,
+            "Should pass all files when exactly meeting minimum"
+        );
+        // Verify order preserved
+        for (i, file) in exact_result.iter().enumerate() {
+            assert_eq!(file.data_file_path, exact_files[i].data_file_path);
+        }
 
-        // Test with more than minimum files
+        // Test with more than minimum files (5 > 3) - should pass all
         let more_files = vec![
             create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
             create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
@@ -1203,184 +1491,121 @@ mod tests {
             create_test_file_scan_task("file5.parquet", 30 * 1024 * 1024),
         ];
 
-        let result_more: Vec<FileScanTask> = strategy.filter(more_files);
-        assert_eq!(result_more.len(), 5); // Returns all files when more than minimum
+        let more_result: Vec<FileScanTask> = strategy.filter(more_files);
+        assert_eq!(
+            more_result.len(),
+            5,
+            "Should pass all files when exceeding minimum"
+        );
 
-        // Test with fewer than minimum files
+        // Test with fewer than minimum files (2 < 3) - should pass none
         let fewer_files = vec![
             create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024),
             create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024),
         ];
 
-        let result_fewer: Vec<FileScanTask> = strategy.filter(fewer_files);
-        assert_eq!(result_fewer.len(), 0); // Returns no files when not enough files
+        let fewer_result: Vec<FileScanTask> = strategy.filter(fewer_files);
+        assert_eq!(
+            fewer_result.len(),
+            0,
+            "Should pass no files when below minimum"
+        );
 
-        // Test with minimum count of 0 (should pass all files)
+        // Test edge cases: min_count = 0 (bypass - should always pass)
         let zero_strategy = MinFileCountStrategy::new(0);
-        let result_zero: Vec<FileScanTask> =
-            zero_strategy.filter(vec![create_test_file_scan_task(
-                "file1.parquet",
-                10 * 1024 * 1024,
-            )]);
-        assert_eq!(result_zero.len(), 1);
+        assert_eq!(zero_strategy.description(), "MinFileCount[0]");
 
-        // Test with minimum count of 1
-        let one_strategy = MinFileCountStrategy::new(1);
-        let result_one: Vec<FileScanTask> = one_strategy.filter(vec![create_test_file_scan_task(
-            "file1.parquet",
+        let single_file = vec![create_test_file_scan_task(
+            "single.parquet",
             10 * 1024 * 1024,
-        )]);
-        assert_eq!(result_one.len(), 1);
+        )];
+        let zero_result: Vec<FileScanTask> = zero_strategy.filter(single_file.clone());
+        assert_eq!(zero_result.len(), 1, "min_count=0 should always pass files");
+        assert_eq!(zero_result[0].data_file_path, "single.parquet");
+
+        // Test edge case: min_count = 1 (minimal threshold)
+        let one_strategy = MinFileCountStrategy::new(1);
+        let one_result: Vec<FileScanTask> = one_strategy.filter(single_file);
+        assert_eq!(one_result.len(), 1, "min_count=1 should pass single file");
     }
 
     #[test]
-    fn test_small_files_strategy_end_to_end() {
+    fn test_small_files_strategy_comprehensive() {
+        // Comprehensive test for small files strategy with various configurations
+
+        // Test basic small files strategy
         let config = CompactionPlanningConfigBuilder::default()
             .small_file_threshold(20 * 1024 * 1024) // 20MB threshold
             .max_task_total_size(50 * 1024 * 1024) // 50MB task limit
-            .min_group_size(0) // Allow any group size for testing
-            .min_group_file_count(1) // Allow single-file groups for testing
-            .build()
-            .unwrap();
-
-        let strategy = FileStrategyFactory::create_small_files_strategy(&config);
-
-        let data_files = vec![
-            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes - should pass
-            create_test_file_scan_task_with_deletes("small2.parquet", 15 * 1024 * 1024, true), // 15MB, has deletes - should be filtered out
-            create_test_file_scan_task_with_deletes("small3.parquet", 10 * 1024 * 1024, false), // 10MB, no deletes - should pass
-            create_test_file_scan_task_with_deletes("small4.parquet", 25 * 1024 * 1024, false), // 25MB - should be filtered out (exceeds threshold)
-            create_test_file_scan_task_with_deletes("large.parquet", 100 * 1024 * 1024, false), // 100MB - should be filtered out
-        ];
-
-        let result = execute_strategy_flat(&strategy, data_files);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "small1.parquet");
-        assert_eq!(result[1].data_file_path, "small3.parquet");
-
-        // Verify all selected files are under the threshold and have no deletes
-        for file in &result {
-            assert!(file.length <= config.small_file_threshold);
-            assert!(file.deletes.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_small_files_strategy_with_min_file_count() {
-        // Test min_file_count behavior with different values and scenarios
-
-        // Test case 1: min_file_count = 3 with BinPack grouping
-        let config_binpack = CompactionPlanningConfigBuilder::default()
-            .small_file_threshold(20 * 1024 * 1024) // 20MB threshold
-            .max_task_total_size(50 * 1024 * 1024) // 50MB task limit
-            .min_file_count(3) // Require at least 3 files
-            .grouping_strategy(crate::config::GroupingStrategy::BinPack)
             .min_group_size(0)
             .min_group_file_count(1)
             .build()
             .unwrap();
 
-        let strategy_binpack = FileStrategyFactory::create_small_files_strategy(&config_binpack);
+        let strategy = FileStrategyFactory::create_small_files_strategy(&config);
 
-        // Test description
-        let description = strategy_binpack.description();
-        assert!(description.contains("MinFileCount[3]"));
-        assert!(description.contains("NoDeleteFiles"));
-        assert!(description.contains("SizeFilter"));
-        assert!(description.contains("TaskSizeLimit"));
-
-        // Test with exactly minimum files (3) - should pass
-        let exact_min_files = vec![
-            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false),
-            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false),
-            create_test_file_scan_task_with_deletes("small3.parquet", 15 * 1024 * 1024, false),
+        let test_files = vec![
+            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false), // 5MB, no deletes
+            create_test_file_scan_task_with_deletes("small2.parquet", 15 * 1024 * 1024, true), // 15MB, has deletes - filtered
+            create_test_file_scan_task_with_deletes("small3.parquet", 10 * 1024 * 1024, false), // 10MB, no deletes
+            create_test_file_scan_task_with_deletes("large.parquet", 25 * 1024 * 1024, false), // 25MB - filtered (exceeds threshold)
         ];
 
-        let exact_result = execute_strategy_flat(&strategy_binpack, exact_min_files);
-        assert_eq!(
-            exact_result.len(),
-            3,
-            "Should return all 3 files when exactly meeting minimum"
-        );
+        let result = execute_strategy_flat(&strategy, test_files);
 
-        // Test case 2: min_file_count = 3 with Noop grouping for faster tests
-        let config_noop = CompactionPlanningConfigBuilder::default()
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].data_file_path, "small1.parquet");
+        assert_eq!(result[1].data_file_path, "small3.parquet");
+
+        // Verify all selected files meet criteria
+        for file in &result {
+            assert!(file.length <= config.small_file_threshold);
+            assert!(file.deletes.is_empty());
+        }
+
+        // Test min_file_count behavior with different scenarios
+        let min_count_config = CompactionPlanningConfigBuilder::default()
             .small_file_threshold(20 * 1024 * 1024)
-            .max_task_total_size(50 * 1024 * 1024)
-            .min_file_count(3)
+            .min_file_count(3) // Require at least 3 files
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .min_group_size(0)
             .min_group_file_count(1)
             .build()
             .unwrap();
 
-        let strategy_noop = FileStrategyFactory::create_small_files_strategy(&config_noop);
+        let min_count_strategy =
+            FileStrategyFactory::create_small_files_strategy(&min_count_config);
 
-        // Test with fewer than minimum files (2) - should return none
+        // Test description includes min_file_count
+        assert!(min_count_strategy.description().contains("MinFileCount[3]"));
+
+        // Test with insufficient files (2 < 3)
         let insufficient_files = vec![
             create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false),
             create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false),
         ];
-
-        let insufficient_result = execute_strategy_flat(&strategy_noop, insufficient_files);
+        let insufficient_result = execute_strategy_flat(&min_count_strategy, insufficient_files);
         assert_eq!(
             insufficient_result.len(),
             0,
             "Should return no files when not meeting minimum count"
         );
 
-        // Test with more than minimum files (5) - should return all
-        let many_files = vec![
+        // Test with sufficient files (3 >= 3)
+        let sufficient_files = vec![
             create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false),
             create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false),
             create_test_file_scan_task_with_deletes("small3.parquet", 15 * 1024 * 1024, false),
-            create_test_file_scan_task_with_deletes("small4.parquet", 8 * 1024 * 1024, false),
-            create_test_file_scan_task_with_deletes("small5.parquet", 12 * 1024 * 1024, false),
         ];
-
-        let many_result = execute_strategy_flat(&strategy_noop, many_files);
+        let sufficient_result = execute_strategy_flat(&min_count_strategy, sufficient_files);
         assert_eq!(
-            many_result.len(),
-            5,
-            "Should return all files when more than minimum"
+            sufficient_result.len(),
+            3,
+            "Should return all files when meeting minimum count"
         );
 
-        // Verify all selected files are under the threshold and have no deletes
-        for file in &many_result {
-            assert!(file.length <= config_noop.small_file_threshold);
-            assert!(file.deletes.is_empty());
-        }
-
-        // Test case 3: min_file_count = 1, provide 2 files
-        let config_min_1 = CompactionPlanningConfigBuilder::default()
-            .min_file_count(1)
-            .small_file_threshold(20 * 1024 * 1024)
-            .grouping_strategy(crate::config::GroupingStrategy::Noop)
-            .min_group_size(0)
-            .min_group_file_count(1)
-            .build()
-            .unwrap();
-
-        let strategy_min_1 = FileStrategyFactory::create_small_files_strategy(&config_min_1);
-
-        let two_files = vec![
-            create_test_file_scan_task_with_deletes("small1.parquet", 5 * 1024 * 1024, false),
-            create_test_file_scan_task_with_deletes("small2.parquet", 10 * 1024 * 1024, false),
-        ];
-
-        let result = strategy_min_1
-            .execute(two_files, &create_test_config())
-            .unwrap();
-        assert_eq!(
-            result.len(),
-            1,
-            "Should return 1 group containing all files when minimum is 1"
-        );
-        assert_eq!(result[0].data_file_count, 2);
-
-        // Test case 4: min_file_count = 0, should always return files (bypass mode)
-        let config_min_0 = CompactionPlanningConfigBuilder::default()
+        // Test with min_file_count = 0 (bypass mode)
+        let bypass_config = CompactionPlanningConfigBuilder::default()
             .min_file_count(0)
             .small_file_threshold(20 * 1024 * 1024)
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
@@ -1389,21 +1614,19 @@ mod tests {
             .build()
             .unwrap();
 
-        let strategy_min_0 = FileStrategyFactory::create_small_files_strategy(&config_min_0);
+        let bypass_strategy = FileStrategyFactory::create_small_files_strategy(&bypass_config);
+        assert!(bypass_strategy.description().contains("MinFileCount[0]"));
 
         let single_file = vec![create_test_file_scan_task_with_deletes(
-            "small1.parquet",
+            "single.parquet",
             5 * 1024 * 1024,
             false,
         )];
-
-        let result = strategy_min_0
-            .execute(single_file, &create_test_config())
-            .unwrap();
+        let bypass_result = execute_strategy_flat(&bypass_strategy, single_file);
         assert_eq!(
-            result.len(),
+            bypass_result.len(),
             1,
-            "Should return single group when minimum is 0"
+            "Should accept single file with min_file_count=0"
         );
     }
 
@@ -1701,204 +1924,143 @@ mod tests {
     }
 
     #[test]
-    fn test_create_dynamic_strategy() {
-        // Test create_dynamic_strategy explicitly
-        let config = CompactionPlanningConfigBuilder::default().build().unwrap();
+    fn test_grouping_strategies() {
+        // Test different grouping strategies comprehensively
 
-        // Test with MergeSmallDataFiles - should behave like create_files_strategy
-        let dynamic_small_files = FileStrategyFactory::create_dynamic_strategy(
-            crate::compaction::CompactionType::MergeSmallDataFiles,
-            &config,
-        );
-        let regular_small_files = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::MergeSmallDataFiles,
-            &config,
-        );
-
-        // Both should have identical descriptions
-        assert_eq!(
-            dynamic_small_files.description(),
-            regular_small_files.description()
-        );
-
-        // Test with Full compaction - should behave like create_files_strategy
-        let dynamic_full = FileStrategyFactory::create_dynamic_strategy(
-            crate::compaction::CompactionType::Full,
-            &config,
-        );
-        let regular_full = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::Full,
-            &config,
-        );
-
-        // Both should have identical descriptions
-        assert_eq!(dynamic_full.description(), regular_full.description());
-
-        // Test functional equivalence
-        let test_files = vec![
-            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024), // 10MB
-            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024), // 20MB
-        ];
-
-        let dynamic_result = execute_strategy_flat(&dynamic_small_files, test_files.clone());
-        let regular_result = execute_strategy_flat(&regular_small_files, test_files.clone());
-
-        assert_eq!(dynamic_result.len(), regular_result.len());
-        for (dynamic_file, regular_file) in dynamic_result.iter().zip(regular_result.iter()) {
-            assert_eq!(dynamic_file.data_file_path, regular_file.data_file_path);
-            assert_eq!(dynamic_file.length, regular_file.length);
-        }
-    }
-
-    #[test]
-    fn test_create_custom_strategy_grouping_strategies() {
-        // Test different grouping strategies in create_custom_strategy
-
-        // Test BinPack grouping
+        // Test BinPack with 64MB target
         let bin_pack_strategy = FileStrategyFactory::create_custom_strategy(
-            false,                                    // exclude_delete_files
-            None,                                     // size_filter: disabled
-            0,                                        // min_file_count: disabled
-            u64::MAX,                                 // max_task_total_size: disabled
-            crate::config::GroupingStrategy::BinPack, // grouping_strategy
-            64 * 1024 * 1024,                         // target_group_size: 64MB
-            100,                                      // max_files_per_group
-            0,                                        // min_group_size: disabled
-            u64::MAX,                                 // max_group_size: disabled
-            0,                                        // min_group_file_count: disabled
-            usize::MAX,                               // max_group_file_count: disabled
+            false,
+            None,
+            0,
+            u64::MAX,
+            crate::config::GroupingStrategy::BinPack,
+            64 * 1024 * 1024,
+            100, // 64MB target, 100 max files per group
+            0,
+            u64::MAX,
+            0,
+            usize::MAX,
         );
 
-        let bin_pack_description = bin_pack_strategy.description();
-        assert!(bin_pack_description.contains("BinPackGrouping[target=64MB, max_files=100]"));
+        assert!(bin_pack_strategy
+            .description()
+            .contains("BinPackGrouping[target=64MB, max_files=100]"));
 
-        // Test Noop grouping
-        let noop_strategy = FileStrategyFactory::create_custom_strategy(
-            false,                                 // exclude_delete_files
-            None,                                  // size_filter: disabled
-            0,                                     // min_file_count: disabled
-            u64::MAX,                              // max_task_total_size: disabled
-            crate::config::GroupingStrategy::Noop, // grouping_strategy
-            0,                                     // target_group_size: not used
-            0,                                     // max_files_per_group: not used
-            0,                                     // min_group_size: disabled
-            u64::MAX,                              // max_group_size: disabled
-            0,                                     // min_group_file_count: disabled
-            usize::MAX,                            // max_group_file_count: disabled
-        );
-
-        let noop_description = noop_strategy.description();
-        assert!(noop_description.contains("NoopGrouping"));
-
-        // Test functional behavior with multiple files for grouping
-        let test_files = vec![
-            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024), // 10MB
+        // Test with files that fit in one group (60MB < 64MB target)
+        let small_files = vec![
+            create_test_file_scan_task("file1.parquet", 20 * 1024 * 1024), // 20MB
             create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024), // 20MB
-            create_test_file_scan_task("file3.parquet", 30 * 1024 * 1024), // 30MB
-            create_test_file_scan_task("file4.parquet", 40 * 1024 * 1024), // 40MB
-        ];
+            create_test_file_scan_task("file3.parquet", 20 * 1024 * 1024), // 20MB
+        ]; // Total: 60MB
 
         let config = create_test_config();
-        let bin_pack_groups = bin_pack_strategy
-            .execute(test_files.clone(), &config)
-            .unwrap();
-        let noop_groups = noop_strategy.execute(test_files.clone(), &config).unwrap();
+        let small_groups = bin_pack_strategy.execute(small_files, &config).unwrap();
 
-        // BinPack should create more or equal groups than noop (which creates one single group)
-        // Since noop consolidates all files into 1 group, binpack will typically create >= 1 groups
-        assert!(bin_pack_groups.len() >= noop_groups.len());
-
-        // Verify BinPack behavior: should actually create multiple groups for size balancing
-        // With files: 10MB + 20MB + 30MB + 40MB = 100MB total, and target 64MB,
-        // BinPack should create at least 2 groups to balance sizes
-        assert!(
-            bin_pack_groups.len() >= 1,
-            "BinPack should create at least 1 group"
-        );
-
-        // Verify all files are preserved across groups
-        let total_binpack_files: usize = bin_pack_groups.iter().map(|g| g.data_file_count).sum();
         assert_eq!(
-            total_binpack_files, 4,
-            "BinPack should preserve all 4 files"
-        );
-
-        // Noop should create one single group containing all files
-        assert_eq!(noop_groups.len(), 1);
-        assert_eq!(noop_groups[0].data_file_count, 4);
-
-        // Additional detailed BinPack behavior verification
-        println!("BinPack created {} groups:", bin_pack_groups.len());
-        for (i, group) in bin_pack_groups.iter().enumerate() {
-            println!(
-                "  Group {}: {} files, {} total bytes",
-                i + 1,
-                group.data_file_count,
-                group.total_size
-            );
-        }
-
-        // Verify BinPack behavior: For our test case (100MB total, 64MB target),
-        // the algorithm calculates: 100/64 = 1.56 -> max(1, 1) = 1 group
-        // So it should create exactly 1 group containing all files
-        assert_eq!(
-            bin_pack_groups.len(),
+            small_groups.len(),
             1,
-            "BinPack should create 1 group for this size distribution"
+            "Should create 1 group for 60MB with 64MB target"
         );
         assert_eq!(
-            bin_pack_groups[0].data_file_count, 4,
-            "Single group should contain all 4 files"
+            small_groups[0].data_file_count, 3,
+            "Group should contain all 3 files"
         );
         assert_eq!(
-            bin_pack_groups[0].total_size,
-            100 * 1024 * 1024,
-            "Total size should be 100MB"
+            small_groups[0].total_size,
+            60 * 1024 * 1024,
+            "Total size should be 60MB"
         );
 
-        // This demonstrates the key difference between Noop and BinPack:
-        // - Noop: Always creates 1 group (simple consolidation)
-        // - BinPack: Creates optimized number of groups based on size calculations
-        // In this specific case, both create 1 group, but with different reasoning
-
-        // Test with larger files to force BinPack to create multiple groups
-        let large_test_files = vec![
+        // Test with files that exceed target (200MB > 64MB)
+        let large_files = vec![
             create_test_file_scan_task("large1.parquet", 50 * 1024 * 1024), // 50MB
             create_test_file_scan_task("large2.parquet", 50 * 1024 * 1024), // 50MB
             create_test_file_scan_task("large3.parquet", 50 * 1024 * 1024), // 50MB
             create_test_file_scan_task("large4.parquet", 50 * 1024 * 1024), // 50MB
         ]; // Total: 200MB
 
-        let large_bin_pack_groups = bin_pack_strategy
-            .execute(large_test_files.clone(), &config)
-            .unwrap();
-        let large_noop_groups = noop_strategy.execute(large_test_files, &config).unwrap();
+        let large_groups = bin_pack_strategy.execute(large_files, &config).unwrap();
 
-        // With 200MB total and 64MB target: 200/64 = 3.125 -> max(1, 3) = 3 groups
-        println!(
-            "Large files - BinPack created {} groups",
-            large_bin_pack_groups.len()
-        );
+        // BinPack algorithm: 200MB / 64MB = 3.125 -> floor = 3 groups
         assert!(
-            large_bin_pack_groups.len() >= 3,
-            "BinPack should create multiple groups for 200MB total"
+            large_groups.len() >= 3,
+            "Should create at least 3 groups for 200MB with 64MB target, got: {}",
+            large_groups.len()
         );
 
-        // Noop should still create only 1 group
-        assert_eq!(
-            large_noop_groups.len(),
-            1,
-            "Noop should always create 1 group"
+        // Verify all files preserved
+        let total_files: usize = large_groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(total_files, 4, "All 4 files should be preserved");
+
+        // Test max_files_per_group constraint
+        let max_files_strategy = FileStrategyFactory::create_custom_strategy(
+            false,
+            None,
+            0,
+            u64::MAX,
+            crate::config::GroupingStrategy::BinPack,
+            1024 * 1024 * 1024,
+            2, // 1GB target (very large), 2 max files per group
+            0,
+            u64::MAX,
+            0,
+            usize::MAX,
         );
+
+        let many_files = vec![
+            create_test_file_scan_task("f1.parquet", 5 * 1024 * 1024), // 5MB
+            create_test_file_scan_task("f2.parquet", 5 * 1024 * 1024), // 5MB
+            create_test_file_scan_task("f3.parquet", 5 * 1024 * 1024), // 5MB
+            create_test_file_scan_task("f4.parquet", 5 * 1024 * 1024), // 5MB
+            create_test_file_scan_task("f5.parquet", 5 * 1024 * 1024), // 5MB
+        ]; // Total: 25MB << 1GB
+
+        let max_files_groups = max_files_strategy.execute(many_files, &config).unwrap();
+
+        // With ceiling division: ceil(5/2) = 3 groups to respect max_files_per_group=2
         assert_eq!(
-            large_noop_groups[0].data_file_count, 4,
+            max_files_groups.len(),
+            3,
+            "Should create 3 groups with max_files_per_group=2"
+        );
+
+        // Verify constraint respected
+        for (i, group) in max_files_groups.iter().enumerate() {
+            assert!(
+                group.data_file_count <= 2,
+                "Group {} has {} files, should be <= 2",
+                i + 1,
+                group.data_file_count
+            );
+        }
+
+        // Test Noop grouping (always creates single group)
+        let noop_strategy = FileStrategyFactory::create_custom_strategy(
+            false,
+            None,
+            0,
+            u64::MAX,
+            crate::config::GroupingStrategy::Noop,
+            0,
+            0,
+            0,
+            u64::MAX,
+            0,
+            usize::MAX,
+        );
+
+        assert!(noop_strategy.description().contains("NoopGrouping"));
+
+        let noop_files = vec![
+            create_test_file_scan_task("n1.parquet", 100 * 1024 * 1024), // 100MB
+            create_test_file_scan_task("n2.parquet", 100 * 1024 * 1024), // 100MB
+        ];
+
+        let noop_groups = noop_strategy.execute(noop_files, &config).unwrap();
+        assert_eq!(noop_groups.len(), 1, "Noop should always create 1 group");
+        assert_eq!(
+            noop_groups[0].data_file_count, 2,
             "Noop group should contain all files"
-        );
-
-        // Now we can see the real difference between strategies
-        assert!(
-            large_bin_pack_groups.len() > large_noop_groups.len(),
-            "BinPack should create more groups than Noop for large files"
         );
     }
 
@@ -2052,57 +2214,14 @@ mod tests {
     }
 
     #[test]
-    fn test_noop_grouping_vs_binpack_comparison() {
-        // Test to ensure NoopGrouping behavior is distinctly different from BinPack
-        let data_files = vec![
-            create_test_file_scan_task("file1.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file2.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file3.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file4.parquet", 1 * 1024 * 1024), // 1MB
-        ];
-
-        // NoopGrouping: All files in one group
-        let noop_strategy = NoopGroupingStrategy;
-        let noop_groups = noop_strategy.group_files(data_files.clone().into_iter());
-        assert_eq!(noop_groups.len(), 1, "Noop should create exactly 1 group");
-        assert_eq!(
-            noop_groups[0].data_file_count, 4,
-            "Noop group should contain all 4 files"
-        );
-
-        // BinPack with small target: Multiple groups
-        let binpack_strategy = BinPackGroupingStrategy {
-            target_group_size: 2 * 1024 * 1024, // 2MB target
-            max_files_per_group: 100,
-        };
-        let binpack_groups = binpack_strategy.group_files(data_files.into_iter());
-
-        // BinPack should create multiple groups due to size constraints
-        // Total size: 4MB, target: 2MB -> should create ~2 groups
-        assert!(
-            binpack_groups.len() >= 2,
-            "BinPack should create multiple groups for small target size"
-        );
-
-        // Verify total files are preserved
-        let total_noop_files: usize = noop_groups.iter().map(|g| g.data_file_count).sum();
-        let total_binpack_files: usize = binpack_groups.iter().map(|g| g.data_file_count).sum();
-        assert_eq!(total_noop_files, 4);
-        assert_eq!(total_binpack_files, 4);
-
-        // Key difference: Noop consolidates, BinPack may distribute
-        assert!(noop_groups.len() <= binpack_groups.len(),
-                "Noop should create fewer or equal groups compared to BinPack with restrictive settings");
-    }
-
-    #[test]
     fn test_binpack_grouping_strategy_normal_cases() {
-        // Test BinPack with normal target_group_size values
+        // Test BinPack with normal target_group_size values and strict validation
         let grouping_strategy = BinPackGroupingStrategy {
             target_group_size: 20 * 1024 * 1024, // 20MB target
             max_files_per_group: 100,
         };
 
+        // Test Case 1: Small files that should fit in one group (38MB < 2*20MB)
         let data_files = vec![
             create_test_file_scan_task("file1.parquet", 5 * 1024 * 1024), // 5MB
             create_test_file_scan_task("file2.parquet", 10 * 1024 * 1024), // 10MB
@@ -2110,20 +2229,115 @@ mod tests {
             create_test_file_scan_task("file4.parquet", 8 * 1024 * 1024), // 8MB
         ];
 
-        let total_size = 5 + 10 + 15 + 8; // 38MB total
-        let expected_groups = (total_size / 20).max(1); // Should be 1-2 groups
-
+        let total_size = 38 * 1024 * 1024; // 38MB total
         let groups = grouping_strategy.group_files(data_files.into_iter());
 
-        assert!(
-            groups.len() <= expected_groups as usize + 1,
-            "Should create reasonable number of groups"
+        // Algorithm calculates split_num = max(1, total_size / target_size) = max(1, 38/20) = max(1, 1) = 1
+        // But also considers max_files_per_group: max_possible_groups = ceil(4/100) = 1
+        // Final split_num = max(1, 1) = 1 group
+        assert_eq!(
+            groups.len(),
+            1,
+            "Should create exactly 1 group: total_size(38MB) / target_size(20MB) = 1.9 -> floor = 1"
         );
-        assert!(groups.len() >= 1, "Should create at least one group");
 
-        // Verify all files are included
-        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
-        assert_eq!(total_files, 4, "All files should be included in groups");
+        // Verify the single group contains all files
+        assert_eq!(
+            groups[0].data_file_count, 4,
+            "Single group should contain all 4 files"
+        );
+
+        // Verify total size is preserved
+        assert_eq!(
+            groups[0].total_size, total_size,
+            "Total size should be preserved: 38MB"
+        );
+
+        // Verify max_files_per_group constraint is respected
+        assert!(
+            groups[0].data_file_count <= 100,
+            "Group has {} files, should be <= 100",
+            groups[0].data_file_count
+        );
+
+        // Test Case 2: Large files that should trigger multiple groups (75MB > 3*20MB)
+        let large_files = vec![
+            create_test_file_scan_task("large1.parquet", 25 * 1024 * 1024), // 25MB
+            create_test_file_scan_task("large2.parquet", 25 * 1024 * 1024), // 25MB
+            create_test_file_scan_task("large3.parquet", 25 * 1024 * 1024), // 25MB
+        ]; // Total: 75MB
+
+        let large_groups = grouping_strategy.group_files(large_files.into_iter());
+
+        // Algorithm: split_num = max(1, 75MB / 20MB) = max(1, 3) = 3 groups
+        // max_possible_groups = ceil(3/100) = 1, final = max(3, 1) = 3
+        assert_eq!(
+            large_groups.len(),
+            3,
+            "Should create exactly 3 groups: 75MB / 20MB = 3.75 -> floor = 3"
+        );
+
+        // Verify all files preserved in large test
+        let total_large_files: usize = large_groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(
+            total_large_files, 3,
+            "All 3 large files should be preserved"
+        );
+
+        // Verify each group in large test respects constraints
+        for (i, group) in large_groups.iter().enumerate() {
+            assert!(
+                group.data_file_count <= 100,
+                "Group {} has {} files, should be <= 100",
+                i + 1,
+                group.data_file_count
+            );
+            assert!(
+                group.data_file_count > 0,
+                "Group {} should have at least 1 file",
+                i + 1
+            );
+
+            // Verify BinPack distribution: with 3 files and 3 groups, should be [1,1,1]
+            assert_eq!(
+                group.data_file_count, 1,
+                "Each of the 3 groups should contain exactly 1 file (3 files / 3 groups)"
+            );
+        }
+
+        // Test Case 3: Boundary case - exactly 2x target size (40MB = 2*20MB)
+        let boundary_files = vec![
+            create_test_file_scan_task("boundary1.parquet", 20 * 1024 * 1024), // 20MB
+            create_test_file_scan_task("boundary2.parquet", 20 * 1024 * 1024), // 20MB
+        ]; // Total: 40MB
+
+        let boundary_groups = grouping_strategy.group_files(boundary_files.into_iter());
+
+        // Algorithm: 40MB / 20MB = 2.0 -> floor = 2 groups
+        assert_eq!(
+            boundary_groups.len(),
+            2,
+            "Should create exactly 2 groups: 40MB / 20MB = 2.0 -> floor = 2"
+        );
+
+        // Verify boundary case file distribution
+        let boundary_file_counts: Vec<usize> =
+            boundary_groups.iter().map(|g| g.data_file_count).collect();
+        let total_boundary_files: usize = boundary_file_counts.iter().sum();
+        assert_eq!(
+            total_boundary_files, 2,
+            "All 2 boundary files should be preserved"
+        );
+
+        // With 2 files and 2 groups, BinPack should distribute as [1,1]
+        for (i, group) in boundary_groups.iter().enumerate() {
+            assert_eq!(
+                group.data_file_count,
+                1,
+                "Each boundary group {} should contain exactly 1 file",
+                i + 1
+            );
+        }
 
         // Test description
         assert_eq!(
@@ -2141,20 +2355,20 @@ mod tests {
         };
 
         let data_files = vec![
-            create_test_file_scan_task("file1.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file2.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file3.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file4.parquet", 1 * 1024 * 1024), // 1MB
-            create_test_file_scan_task("file5.parquet", 1 * 1024 * 1024), // 1MB
+            create_test_file_scan_task("file1.parquet", 1024 * 1024), // 1MB
+            create_test_file_scan_task("file2.parquet", 1024 * 1024), // 1MB
+            create_test_file_scan_task("file3.parquet", 1024 * 1024), // 1MB
+            create_test_file_scan_task("file4.parquet", 1024 * 1024), // 1MB
+            create_test_file_scan_task("file5.parquet", 1024 * 1024), // 1MB
         ];
 
         let groups = grouping_strategy.group_files(data_files.into_iter());
 
-        // With 5 files and max 2 files per group, should create at least 2 groups
-        // (actual algorithm does files.len() / max_files_per_group = 5/2 = 2)
+        // With 5 files and max 2 files per group, should create ceil(5/2) = 3 groups
+        // to ensure max_files_per_group constraint is respected
         assert!(
-            groups.len() >= 2,
-            "Should create at least 2 groups due to max_files_per_group constraint"
+            groups.len() >= 3,
+            "Should create at least 3 groups due to max_files_per_group constraint"
         );
 
         // Verify all files are included
@@ -2162,21 +2376,31 @@ mod tests {
         assert_eq!(total_files, 5, "All files should be included in groups");
 
         // Verify the algorithm behavior: with target_group_size very large and 5 files,
-        // split_num should be max(1, 2) = 2 groups due to max_files_per_group constraint
+        // split_num should be max(1, ceil(5/2)) = 3 groups due to max_files_per_group constraint
         assert_eq!(
             groups.len(),
-            2,
-            "Should create exactly 2 groups based on algorithm logic"
+            3,
+            "Should create exactly 3 groups based on ceiling division logic"
         );
 
-        // One group should have 3 files, another should have 2 files (5 files distributed across 2 groups)
+        // Groups should have [2, 2, 1] files to respect max_files_per_group=2 constraint
         let mut group_sizes: Vec<usize> = groups.iter().map(|g| g.data_file_count).collect();
         group_sizes.sort();
         assert_eq!(
             group_sizes,
-            vec![2, 3],
-            "Groups should have 2 and 3 files respectively"
+            vec![1, 2, 2],
+            "Groups should have [1, 2, 2] files to respect max_files_per_group constraint"
         );
+
+        // Verify no group exceeds max_files_per_group constraint
+        for (i, group) in groups.iter().enumerate() {
+            assert!(
+                group.data_file_count <= 2,
+                "Group {} has {} files, should be <= 2",
+                i,
+                group.data_file_count
+            );
+        }
     }
 
     #[test]
@@ -2213,7 +2437,7 @@ mod tests {
         });
         let binpack_groups = binpack_enum.group_files(data_files.into_iter());
         assert!(
-            binpack_groups.len() >= 1,
+            !binpack_groups.is_empty(),
             "BinPack should create at least one group"
         );
         assert_eq!(
@@ -2223,95 +2447,187 @@ mod tests {
     }
 
     #[test]
-    fn test_strategy_edge_cases() {
-        // Combined test for edge cases across different filter strategies
+    fn test_strategy_descriptions_and_edge_cases() {
+        // Combined test for filter strategies descriptions and edge cases
 
-        // Size filter edge cases - Test min_size only
-        let min_only_strategy = SizeFilterStrategy {
+        // Size filter edge cases
+        let min_only = SizeFilterStrategy {
             min_size: Some(10 * 1024 * 1024), // 10MB min
             max_size: None,
         };
-        assert_eq!(min_only_strategy.description(), "SizeFilter[>10MB]");
+        assert_eq!(min_only.description(), "SizeFilter[>10MB]");
 
-        let data_files = vec![
-            create_test_file_scan_task("small.parquet", 5 * 1024 * 1024), // 5MB - should be filtered out
-            create_test_file_scan_task("medium.parquet", 15 * 1024 * 1024), // 15MB - should pass
-            create_test_file_scan_task("large.parquet", 100 * 1024 * 1024), // 100MB - should pass
-        ];
-
-        let result = min_only_strategy.filter(data_files);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "medium.parquet");
-        assert_eq!(result[1].data_file_path, "large.parquet");
-
-        // Test max_size only
-        let max_only_strategy = SizeFilterStrategy {
+        let max_only = SizeFilterStrategy {
             min_size: None,
             max_size: Some(50 * 1024 * 1024), // 50MB max
         };
-        assert_eq!(max_only_strategy.description(), "SizeFilter[<50MB]");
+        assert_eq!(max_only.description(), "SizeFilter[<50MB]");
 
-        let data_files2 = vec![
-            create_test_file_scan_task("small.parquet", 5 * 1024 * 1024), // 5MB - should pass
-            create_test_file_scan_task("medium.parquet", 30 * 1024 * 1024), // 30MB - should pass
-            create_test_file_scan_task("large.parquet", 100 * 1024 * 1024), // 100MB - should be filtered out
-        ];
-
-        let result2 = max_only_strategy.filter(data_files2);
-        assert_eq!(result2.len(), 2);
-        assert_eq!(result2[0].data_file_path, "small.parquet");
-        assert_eq!(result2[1].data_file_path, "medium.parquet");
-
-        // Test no constraints (both None)
-        let no_filter_strategy = SizeFilterStrategy {
+        let no_filter = SizeFilterStrategy {
             min_size: None,
             max_size: None,
         };
-        assert_eq!(no_filter_strategy.description(), "SizeFilter[Any]");
+        assert_eq!(no_filter.description(), "SizeFilter[Any]");
 
-        let data_files3 = vec![
-            create_test_file_scan_task("file1.parquet", 1 * 1024), // 1KB - should pass
-            create_test_file_scan_task("file2.parquet", 1024 * 1024 * 1024), // 1GB - should pass
+        // Task size limit description formatting
+        let small_limit = TaskSizeLimitStrategy {
+            max_total_size: 20 * 1024 * 1024,
+        }; // 20MB
+        assert_eq!(small_limit.description(), "TaskSizeLimit[0GB]"); // Rounds down to 0GB
+
+        let large_limit = TaskSizeLimitStrategy {
+            max_total_size: 2 * 1024 * 1024 * 1024,
+        }; // 2GB
+        assert_eq!(large_limit.description(), "TaskSizeLimit[2GB]");
+
+        // Test functional behavior for edge cases
+        let test_files = vec![
+            create_test_file_scan_task("small.parquet", 5 * 1024 * 1024), // 5MB
+            create_test_file_scan_task("medium.parquet", 15 * 1024 * 1024), // 15MB
+            create_test_file_scan_task("large.parquet", 100 * 1024 * 1024), // 100MB
         ];
 
-        let result3 = no_filter_strategy.filter(data_files3);
-        assert_eq!(result3.len(), 2); // All files should pass
+        // Test min-only filter
+        let min_result = min_only.filter(test_files.clone());
+        assert_eq!(min_result.len(), 2); // medium and large should pass
+        assert_eq!(min_result[0].data_file_path, "medium.parquet");
+        assert_eq!(min_result[1].data_file_path, "large.parquet");
 
-        // Task size limit edge cases - Test with exact limit
-        let strategy = TaskSizeLimitStrategy {
-            max_total_size: 20 * 1024 * 1024, // 20MB total limit
-        };
+        // Test max-only filter
+        let max_result = max_only.filter(test_files.clone());
+        assert_eq!(max_result.len(), 2); // small and medium should pass
+        assert_eq!(max_result[0].data_file_path, "small.parquet");
+        assert_eq!(max_result[1].data_file_path, "medium.parquet");
 
-        let data_files = vec![
-            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024), // 10MB - should pass (total: 10MB)
-            create_test_file_scan_task("file2.parquet", 10 * 1024 * 1024), // 10MB - should pass (total: 20MB exactly)
-            create_test_file_scan_task("file3.parquet", 1), // 1 byte - should be filtered out (would exceed 20MB)
+        // Test no-filter (should pass all)
+        let no_filter_result = no_filter.filter(test_files.clone());
+        assert_eq!(no_filter_result.len(), 3);
+
+        // Test task size limit edge case
+        let limit_files = vec![
+            create_test_file_scan_task("file1.parquet", 10 * 1024 * 1024), // 10MB
+            create_test_file_scan_task("file2.parquet", 10 * 1024 * 1024), // 10MB
+            create_test_file_scan_task("file3.parquet", 1), // 1 byte - should be filtered
         ];
 
-        let result = strategy.filter(data_files);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "file1.parquet");
-        assert_eq!(result[1].data_file_path, "file2.parquet");
+        let limit_result = small_limit.filter(limit_files);
+        assert_eq!(limit_result.len(), 2); // Exactly 20MB limit
+        assert_eq!(limit_result[0].data_file_path, "file1.parquet");
+        assert_eq!(limit_result[1].data_file_path, "file2.parquet");
+    }
 
-        // Test with very small limit
-        let small_limit_strategy = TaskSizeLimitStrategy {
-            max_total_size: 5 * 1024 * 1024, // 5MB total limit
-        };
+    #[test]
+    fn test_file_group_parallelism_calculation() {
+        // Test FileGroup::calculate_parallelism functionality
+        let config = CompactionPlanningConfigBuilder::default()
+            .min_size_per_partition(10 * 1024 * 1024) // 10MB per partition
+            .max_file_count_per_partition(5) // 5 files per partition
+            .max_parallelism(8) // Max 8 parallel tasks
+            .enable_heuristic_output_parallelism(true)
+            .build()
+            .unwrap();
 
-        let large_files = vec![
-            create_test_file_scan_task("large1.parquet", 10 * 1024 * 1024), // 10MB - should be filtered out
-            create_test_file_scan_task("large2.parquet", 10 * 1024 * 1024), // 10MB - should be filtered out
+        // Test normal case
+        let files = vec![
+            create_test_file_scan_task("file1.parquet", 15 * 1024 * 1024), // 15MB
+            create_test_file_scan_task("file2.parquet", 20 * 1024 * 1024), // 20MB
+            create_test_file_scan_task("file3.parquet", 25 * 1024 * 1024), // 25MB
         ];
 
-        let result_small = small_limit_strategy.filter(large_files);
-        assert_eq!(result_small.len(), 0); // No files should pass
+        let group = FileGroup::new(files);
+        let (executor_parallelism, output_parallelism) =
+            FileGroup::calculate_parallelism(&group, &config).unwrap();
 
-        // Test description formatting
-        assert_eq!(strategy.description(), "TaskSizeLimit[0GB]"); // 20MB rounds down to 0GB
+        assert!(executor_parallelism >= 1);
+        assert!(output_parallelism >= 1);
+        assert!(output_parallelism <= executor_parallelism);
+        assert!(executor_parallelism <= config.max_parallelism);
 
-        let gb_strategy = TaskSizeLimitStrategy {
-            max_total_size: 2 * 1024 * 1024 * 1024, // 2GB
+        // Test error case - empty group
+        let empty_group = FileGroup::empty();
+        let result = FileGroup::calculate_parallelism(&empty_group, &config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No files to calculate_task_parallelism"));
+    }
+
+    #[test]
+    fn test_file_group_delete_files_extraction() {
+        // Test that FileGroup correctly extracts and organizes delete files
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        // Create a data file with both position and equality delete files
+        let position_delete = Arc::new(FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(10),
+            data_file_path: "pos_delete.parquet".to_owned(),
+            data_file_content: DataContentType::PositionDeletes,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 1,
+            equality_ids: vec![],
+            file_size_in_bytes: 1024,
+        });
+
+        let equality_delete = Arc::new(FileScanTask {
+            start: 0,
+            length: 2048,
+            record_count: Some(20),
+            data_file_path: "eq_delete.parquet".to_owned(),
+            data_file_content: DataContentType::EqualityDeletes,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 1,
+            equality_ids: vec![1, 2],
+            file_size_in_bytes: 2048,
+        });
+
+        let data_file = FileScanTask {
+            start: 0,
+            length: 10 * 1024 * 1024, // 10MB
+            record_count: Some(1000),
+            data_file_path: "data.parquet".to_owned(),
+            data_file_content: DataContentType::Data,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![position_delete, equality_delete],
+            sequence_number: 1,
+            equality_ids: vec![],
+            file_size_in_bytes: 10 * 1024 * 1024,
         };
-        assert_eq!(gb_strategy.description(), "TaskSizeLimit[2GB]");
+
+        let group = FileGroup::new(vec![data_file]);
+
+        // Verify that delete files were extracted correctly
+        assert_eq!(group.position_delete_files.len(), 1);
+        assert_eq!(group.equality_delete_files.len(), 1);
+
+        assert_eq!(
+            group.position_delete_files[0].data_file_path,
+            "pos_delete.parquet"
+        );
+        assert_eq!(
+            group.equality_delete_files[0].data_file_path,
+            "eq_delete.parquet"
+        );
+
+        // Verify total bytes calculation includes delete files
+        let expected_total = 10 * 1024 * 1024 + 1024 + 2048; // data + pos_delete + eq_delete
+        assert_eq!(group.input_total_bytes(), expected_total);
+
+        // Verify file count includes delete files
+        assert_eq!(group.input_files_count(), 3); // 1 data + 1 pos_delete + 1 eq_delete
     }
 }
