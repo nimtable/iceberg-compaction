@@ -22,7 +22,7 @@ use iceberg::table::Table;
 pub mod strategy;
 
 // Re-export commonly used types for convenience
-pub use strategy::{FileGroup, FileStrategyFactory, ThreeLayerStrategy};
+pub use strategy::{CompactionStrategy, FileGroup, FileStrategyFactory};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
@@ -33,7 +33,7 @@ impl FileSelector {
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
-        strategy: ThreeLayerStrategy,
+        strategy: CompactionStrategy,
         config: &crate::config::CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
         let scan = table

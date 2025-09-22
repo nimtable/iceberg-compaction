@@ -579,6 +579,7 @@ impl Compaction {
         let mut merged_data_files = Vec::new();
         let mut merged_stats = RewriteFilesStat::default();
         let mut final_table = None;
+        let mut latest_snapshot_id = i64::MIN;
 
         for result in results {
             merged_data_files.extend(result.data_files);
@@ -597,9 +598,18 @@ impl Compaction {
             merged_stats.input_equality_delete_file_total_bytes +=
                 result.stats.input_equality_delete_file_total_bytes;
 
-            // Use the last table as the final table
-            if result.table.is_some() {
-                final_table = result.table;
+            // Use the table with the latest (highest) snapshot_id as the final table
+            if let Some(table) = &result.table {
+                if let Some(current_snapshot) = table.metadata().snapshot_for_ref(&self.to_branch) {
+                    let current_snapshot_id = current_snapshot.snapshot_id();
+                    if current_snapshot_id > latest_snapshot_id {
+                        latest_snapshot_id = current_snapshot_id;
+                        final_table = result.table;
+                    }
+                } else if final_table.is_none() {
+                    // Fallback: if no snapshot found but we don't have any table yet, use this one
+                    final_table = result.table;
+                }
             }
         }
 
@@ -1004,9 +1014,9 @@ impl CompactionPlanner {
         to_branch: &str,
     ) -> Result<Vec<CompactionPlan>> {
         if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
-            // Step 1: Select files for compaction (extensible)
+            // Step 1: Group files for compaction (extensible)
             let file_groups: Vec<FileGroup> = self
-                .select_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
+                .group_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
                 .await?;
 
             // Convert each FileGroup to a separate CompactionPlan
@@ -1038,9 +1048,9 @@ impl CompactionPlanner {
 
     // Template method pattern: These methods can be overridden for specific compaction types
 
-    /// Hook for customizing file selection logic beyond simple `FileStrategy`
+    /// Hook for customizing file grouping logic beyond simple `FileStrategy`
     /// Default implementation uses `FileStrategy`, but complex compaction types can override
-    async fn select_files_for_compaction(
+    async fn group_files_for_compaction(
         &self,
         table: &Table,
         snapshot_id: i64,
@@ -1549,9 +1559,9 @@ mod tests {
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
-        // Get the files that would be selected for compaction
+        // Get the files that would be grouped for compaction
         let files_to_compact = planner
-            .select_files_for_compaction(
+            .group_files_for_compaction(
                 &updated_table,
                 snapshot_before.snapshot_id(),
                 super::CompactionType::MergeSmallDataFiles,

@@ -700,21 +700,21 @@ impl CustomStrategyConfigBuilder {
 /// Factory for creating file strategies based on compaction type and configuration
 pub struct FileStrategyFactory;
 
-/// Three-layer strategy that combines file filtering, grouping, and group filtering
+/// Compaction strategy that combines file filtering, grouping, and group filtering
 ///
 /// This strategy provides a flexible composition architecture where:
 /// - File filters are composable using Vec<Box<dyn FileFilterStrategy>>
 /// - Grouping is handled by a single enum-based strategy
 /// - Group filters are composable using Vec<Box<dyn GroupFilterStrategy>>
 #[derive(Debug)]
-pub struct ThreeLayerStrategy {
+pub struct CompactionStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
     grouping: GroupingStrategyEnum,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
 }
 
-impl ThreeLayerStrategy {
-    /// Create a new three-layer strategy
+impl CompactionStrategy {
+    /// Create a new compaction strategy
     pub fn new(
         file_filters: Vec<Box<dyn FileFilterStrategy>>,
         grouping: GroupingStrategyEnum,
@@ -727,7 +727,7 @@ impl ThreeLayerStrategy {
         }
     }
 
-    /// Apply the three-layer strategy to filter and group files
+    /// Apply the compaction strategy to filter and group files
     pub fn execute(
         &self,
         data_files: Vec<FileScanTask>,
@@ -792,7 +792,7 @@ impl ThreeLayerStrategy {
 impl FileStrategyFactory {
     /// Create strategy for small files compaction
     ///
-    /// Returns a three-layer strategy that filters out delete files,
+    /// Returns a compaction strategy that filters out delete files,
     /// applies size filtering, and limits total task size.
     /// For small files, we use more permissive group filtering.
     ///
@@ -803,7 +803,7 @@ impl FileStrategyFactory {
     /// # let config = CompactionPlanningConfig::default();
     /// let strategy = FileStrategyFactory::create_small_files_strategy(&config);
     /// ```
-    pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> ThreeLayerStrategy {
+    pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> CompactionStrategy {
         // File filtering layer
         let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![
             Box::new(NoDeleteFilesStrategy),
@@ -840,12 +840,12 @@ impl FileStrategyFactory {
             }),
         ];
 
-        ThreeLayerStrategy::new(file_filters, grouping, group_filters)
+        CompactionStrategy::new(file_filters, grouping, group_filters)
     }
 
     /// Create a no-op strategy that passes all files through
-    pub fn create_noop_strategy() -> ThreeLayerStrategy {
-        ThreeLayerStrategy::new(
+    pub fn create_noop_strategy() -> CompactionStrategy {
+        CompactionStrategy::new(
             vec![Box::new(NoopStrategy)],
             GroupingStrategyEnum::Noop(NoopGroupingStrategy),
             vec![Box::new(NoopGroupFilterStrategy)],
@@ -870,7 +870,7 @@ impl FileStrategyFactory {
     ///     .build();
     /// let strategy = FileStrategyFactory::create_custom_strategy_v2(config);
     /// ```
-    pub fn create_custom_strategy_v2(config: CustomStrategyConfig) -> ThreeLayerStrategy {
+    pub fn create_custom_strategy_v2(config: CustomStrategyConfig) -> CompactionStrategy {
         Self::create_custom_strategy(
             config.exclude_delete_files,
             config.size_filter,
@@ -924,7 +924,7 @@ impl FileStrategyFactory {
         max_group_size: u64,
         min_group_file_count: usize,
         max_group_file_count: usize,
-    ) -> ThreeLayerStrategy {
+    ) -> CompactionStrategy {
         // File filtering layer
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
@@ -978,13 +978,13 @@ impl FileStrategyFactory {
             }));
         }
 
-        ThreeLayerStrategy::new(file_filters, grouping, group_filters)
+        CompactionStrategy::new(file_filters, grouping, group_filters)
     }
 
     /// Create a file strategy based on compaction type and configuration
     ///
     /// This is the main entry point for creating file strategies. It returns
-    /// a `ThreeLayerStrategy` that uses the three-layer architecture
+    /// a `CompactionStrategy` that uses the composition architecture
     /// with file filtering, grouping, and group filtering.
     ///
     /// # Arguments
@@ -992,7 +992,7 @@ impl FileStrategyFactory {
     /// * `config` - The compaction configuration
     ///
     /// # Returns
-    /// A `ThreeLayerStrategy` containing the appropriate strategy for the given compaction type
+    /// A `CompactionStrategy` containing the appropriate strategy for the given compaction type
     ///
     /// # Examples
     /// ```rust,no_run
@@ -1008,7 +1008,7 @@ impl FileStrategyFactory {
     pub fn create_files_strategy(
         compaction_type: CompactionType,
         config: &CompactionPlanningConfig,
-    ) -> ThreeLayerStrategy {
+    ) -> CompactionStrategy {
         match compaction_type {
             CompactionType::MergeSmallDataFiles => {
                 // Use the small files strategy architecture
@@ -1020,18 +1020,18 @@ impl FileStrategyFactory {
 
     /// Create a dynamic strategy variant based on compaction type and configuration
     ///
-    /// This method returns a `ThreeLayerStrategy` for flexible composition based on config.
+    /// This method returns a `CompactionStrategy` for flexible composition based on config.
     ///
     /// # Arguments
     /// * `compaction_type` - The type of compaction to perform
     /// * `config` - The compaction configuration
     ///
     /// # Returns
-    /// A `ThreeLayerStrategy` containing the appropriate strategy for the given parameters
+    /// A `CompactionStrategy` containing the appropriate strategy for the given parameters
     pub fn create_dynamic_strategy(
         compaction_type: CompactionType,
         config: &CompactionPlanningConfig,
-    ) -> ThreeLayerStrategy {
+    ) -> CompactionStrategy {
         // Both strategies now use the same implementation
         Self::create_files_strategy(compaction_type, config)
     }
@@ -1153,7 +1153,7 @@ mod tests {
     impl TestUtils {
         /// Execute strategy and return flattened files for testing
         pub fn execute_strategy_flat(
-            strategy: &ThreeLayerStrategy,
+            strategy: &CompactionStrategy,
             data_files: Vec<FileScanTask>,
         ) -> Vec<FileScanTask> {
             let config = CompactionPlanningConfigBuilder::default().build().unwrap();
