@@ -265,14 +265,12 @@ impl CompactionMetricsRecorder {
     }
 
     /// Record compaction duration (milliseconds)
-    pub fn record_compaction_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 || !duration_secs.is_finite() {
+    pub fn record_compaction_duration(&self, duration_ms: f64) {
+        if duration_ms == 0.0 || !duration_ms.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
-
-        let duration_ms = duration_secs * 1000.0; // convert to ms
         self.metrics
             .compaction_duration
             .histogram(&label_vec)
@@ -280,14 +278,12 @@ impl CompactionMetricsRecorder {
     }
 
     /// Record commit duration (milliseconds)
-    pub fn record_commit_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 || !duration_secs.is_finite() {
+    pub fn record_commit_duration(&self, duration_ms: f64) {
+        if duration_ms == 0.0 || !duration_ms.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
-
-        let duration_ms = duration_secs * 1000.0; // convert to ms
         self.metrics
             .compaction_commit_duration
             .histogram(&label_vec)
@@ -295,16 +291,12 @@ impl CompactionMetricsRecorder {
     }
 
     /// Record individual plan execution duration (milliseconds)
-    pub fn record_plan_execution_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 || !duration_secs.is_finite() {
+    pub fn record_plan_execution_duration(&self, duration_ms: f64) {
+        if duration_ms == 0.0 || !duration_ms.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
-
-        // Convert seconds to milliseconds to match histogram units
-        let duration_ms = duration_secs * 1000.0;
-
         self.metrics
             .compaction_plan_execution_duration
             .histogram(&label_vec)
