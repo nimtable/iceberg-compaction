@@ -31,7 +31,10 @@ pub struct FileGroup {
     pub position_delete_files: Vec<FileScanTask>,
     /// Equality delete files associated with the data files
     pub equality_delete_files: Vec<FileScanTask>,
-    /// Total size of all files in this group (in bytes)
+    /// Total size of data files in this group (in bytes)
+    ///
+    /// Note: This only accounts for data file sizes. For sizing that includes
+    /// delete files as well, use [`FileGroup::input_total_bytes`].
     pub total_size: u64,
     /// Number of data files in this group
     pub data_file_count: usize,
@@ -124,7 +127,7 @@ impl FileGroup {
             // If the total data file size is 0, we cannot partition by size.
             // This means there are no data files to compact.
             return Err(CompactionError::Execution(
-                "No files to calculate_task_parallelism".to_owned(),
+                "No files to calculate task parallelism".to_owned(),
             ));
         }
 
@@ -149,24 +152,35 @@ impl FileGroup {
             .min(input_parallelism)
             .min(config.max_parallelism);
 
-        // Heuristic: If the total task data size is very small (less than target_file_size_bytes),
-        // force output_parallelism to 1 to encourage merging into a single, larger output file.
-        if config.enable_heuristic_output_parallelism {
-            let total_data_file_size = files_to_compact
-                .data_files
-                .iter()
-                .map(|f| f.file_size_in_bytes)
-                .sum::<u64>();
-
-            if total_data_file_size > 0 // Only apply if there's data
-            && total_data_file_size < config.base.target_file_size
-            && output_parallelism > 1
-            {
-                output_parallelism = 1;
-            }
-        }
+        // Apply small-output heuristic to encourage larger outputs when input data is tiny.
+        output_parallelism =
+            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
 
         Ok((input_parallelism, output_parallelism))
+    }
+
+    /// Heuristic: If the total data size is smaller than the target file size,
+    /// favor merging into a single output to avoid tiny files.
+    fn apply_output_parallelism_heuristic(
+        files_to_compact: &FileGroup,
+        config: &CompactionPlanningConfig,
+        current_output_parallelism: usize,
+    ) -> usize {
+        if !config.enable_heuristic_output_parallelism || current_output_parallelism <= 1 {
+            return current_output_parallelism;
+        }
+
+        let total_data_file_size = files_to_compact
+            .data_files
+            .iter()
+            .map(|f| f.file_size_in_bytes)
+            .sum::<u64>();
+
+        if total_data_file_size > 0 && total_data_file_size < config.base.target_file_size {
+            1
+        } else {
+            current_output_parallelism
+        }
     }
 
     /// Check if the group is empty
@@ -354,7 +368,10 @@ impl BinPackGroupingStrategy {
             }
         }
 
-        let files: Vec<FileScanTask> = data_files.collect();
+        let mut files: Vec<FileScanTask> = data_files.collect();
+
+        // Sort by file length descending to improve packing (First-Fit Decreasing)
+        files.sort_by(|a, b| b.length.cmp(&a.length));
 
         // Calculate a baseline number of groups based on total size and target group size.
         // Note: target_group_size is a heuristic target (not a hard cap per group).
@@ -365,13 +382,14 @@ impl BinPackGroupingStrategy {
         let mut split_num = if self.target_group_size == 0 {
             1 // Use single group when target_group_size is 0
         } else {
-            (total_size / self.target_group_size).max(1) as usize
+            total_size.div_ceil(self.target_group_size).max(1) as usize
         };
 
-        // Ensure we don't exceed max files per group constraints
+        // Ensure we satisfy max files per group constraints (i.e., require at least this many groups)
         if !files.is_empty() {
-            let max_possible_groups = files.len().div_ceil(self.max_files_per_group.max(1)); // Ceiling division
-            split_num = split_num.max(max_possible_groups).max(1);
+            let min_required_groups_by_file_count =
+                files.len().div_ceil(self.max_files_per_group.max(1)); // Ceiling division
+            split_num = split_num.max(min_required_groups_by_file_count).max(1);
         }
 
         let mut heap = BinaryHeap::new();
@@ -1533,8 +1551,9 @@ mod tests {
         let result = TestUtils::execute_strategy_flat(&strategy, test_files);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "small1.parquet");
-        assert_eq!(result[1].data_file_path, "small3.parquet");
+        let mut paths: Vec<_> = result.iter().map(|f| f.data_file_path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["small1.parquet", "small3.parquet"]);
 
         // Verify all selected files meet criteria
         for file in &result {
@@ -1788,8 +1807,10 @@ mod tests {
         ]; // Total: 30MB
 
         let groups = normal_strategy.group_files(small_files.into_iter());
-        assert_eq!(groups.len(), 1); // 30MB / 20MB = 1.5 -> floor = 1 group
-        assert_eq!(groups[0].data_file_count, 3);
+        assert_eq!(groups.len(), 2); // ceil(30MB / 20MB) = 2 groups
+        let mut counts: Vec<usize> = groups.iter().map(|g| g.data_file_count).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2]);
 
         // Test Case 2: Zero target size (regression test)
         let zero_strategy = BinPackGroupingStrategy {
@@ -2035,7 +2056,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("No files to calculate_task_parallelism"));
+            .contains("No files to calculate task parallelism"));
     }
 
     #[test]
@@ -2114,5 +2135,80 @@ mod tests {
 
         // Verify file count includes delete files
         assert_eq!(group.input_files_count(), 3); // 1 data + 1 pos_delete + 1 eq_delete
+    }
+
+    #[test]
+    fn test_file_group_delete_files_dedup_and_heuristic_output_parallelism() {
+        // Build two data files referencing the same delete file path to ensure dedup
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        let shared_pos_delete = Arc::new(FileScanTask {
+            start: 0,
+            length: 512,
+            record_count: Some(10),
+            data_file_path: "shared_pos_delete.parquet".to_owned(),
+            data_file_content: DataContentType::PositionDeletes,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 1,
+            equality_ids: vec![],
+            file_size_in_bytes: 512,
+        });
+
+        let f1 = FileScanTask {
+            start: 0,
+            length: 4 * 1024 * 1024,
+            record_count: Some(100),
+            data_file_path: "d1.parquet".to_owned(),
+            data_file_content: DataContentType::Data,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![shared_pos_delete.clone()],
+            sequence_number: 1,
+            equality_ids: vec![],
+            file_size_in_bytes: 4 * 1024 * 1024,
+        };
+
+        let f2 = FileScanTask {
+            start: 0,
+            length: 4 * 1024 * 1024,
+            record_count: Some(100),
+            data_file_path: "d2.parquet".to_owned(),
+            data_file_content: DataContentType::Data,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![shared_pos_delete],
+            sequence_number: 1,
+            equality_ids: vec![],
+            file_size_in_bytes: 4 * 1024 * 1024,
+        };
+
+        let group = FileGroup::new(vec![f1, f2]);
+        // Dedup should keep one position delete
+        assert_eq!(group.position_delete_files.len(), 1);
+
+        // Heuristic output parallelism: data total is 8MB, below default 1GB target, so 1 output
+        let config = CompactionPlanningConfigBuilder::default()
+            .min_size_per_partition(1) // allow partitioning to be driven by counts
+            .max_file_count_per_partition(1)
+            .max_parallelism(8)
+            .enable_heuristic_output_parallelism(true)
+            .build()
+            .unwrap();
+
+        let (exec_p, out_p) = FileGroup::calculate_parallelism(&group, &config).unwrap();
+        assert!(exec_p >= 1);
+        assert_eq!(
+            out_p, 1,
+            "Heuristic should force single output when data is tiny"
+        );
     }
 }

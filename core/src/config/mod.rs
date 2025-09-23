@@ -62,11 +62,19 @@ fn default_writer_properties() -> WriterProperties {
 
 /// Common configuration for compaction
 /// Contains parameters that are shared across different compaction phases
-#[derive(Builder, Debug, Clone, Default)]
+#[derive(Builder, Debug, Clone)]
 pub struct CompactionBaseConfig {
     /// Target size in bytes for each compacted file (default: 1GB)
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size: u64,
+}
+
+impl Default for CompactionBaseConfig {
+    fn default() -> Self {
+        Self {
+            target_file_size: DEFAULT_TARGET_FILE_SIZE,
+        }
+    }
 }
 
 /// Configuration for compaction planning phase

@@ -29,7 +29,7 @@ pub struct FileSelector;
 
 impl FileSelector {
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
-    /// Returns a single flattened `FileGroup` (for backward compatibility)
+    /// Returns groups of files selected and organized by the given strategy
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
