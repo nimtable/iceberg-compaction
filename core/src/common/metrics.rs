@@ -27,6 +27,11 @@ pub struct Metrics {
     pub compaction_commit_failed_counter: BoxedCounterVec,
     pub compaction_executor_error_counter: BoxedCounterVec,
 
+    // New hierarchical metrics for plan-level analysis
+    pub compaction_plan_execution_duration: BoxedHistogramVec, // Individual plan execution time
+    pub compaction_plan_file_count: BoxedHistogramVec,         // Number of files processed per plan
+    pub compaction_plan_size_bytes: BoxedHistogramVec,         // Bytes processed per plan
+
     // input/output metrics
     pub compaction_input_files_count: BoxedCounterVec,
     pub compaction_output_files_count: BoxedCounterVec,
@@ -81,6 +86,36 @@ impl Metrics {
             "iceberg_compaction_executor_error_counter".into(),
             "iceberg-compaction compaction executor error counts".into(),
             &["catalog_name", "table_ident"],
+        );
+
+        // === New plan-level metrics ===
+        let compaction_plan_execution_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_plan_execution_duration".into(),
+            "Duration for executing individual compaction plans in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(
+                50.0, 4.0, 10, // Start at 50ms, multiply each bucket by 4, up to 10 buckets
+            ),
+        );
+
+        let compaction_plan_file_count = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_plan_file_count".into(),
+            "Number of files processed by individual compaction plans".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(
+                1.0, 2.0, 12, // Start at 1 file, double each bucket, up to 4096 files
+            ),
+        );
+
+        let compaction_plan_size_bytes = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_plan_size_bytes".into(),
+            "Bytes processed by individual compaction plans".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(
+                1024.0 * 1024.0,
+                4.0,
+                12, // Start at 1MB, multiply by 4, up to ~16GB
+            ),
         );
 
         // === Input/Output metrics registration ===
@@ -163,6 +198,12 @@ impl Metrics {
             compaction_commit_duration,
             compaction_commit_failed_counter,
             compaction_executor_error_counter,
+
+            // New plan-level metrics
+            compaction_plan_execution_duration,
+            compaction_plan_file_count,
+            compaction_plan_size_bytes,
+
             compaction_input_files_count,
             compaction_output_files_count,
             compaction_input_bytes_total,
@@ -232,6 +273,48 @@ impl CompactionMetricsRecorder {
             .compaction_commit_duration
             .histogram(&label_vec)
             .record(duration_secs);
+    }
+
+    /// Record individual plan execution duration
+    pub fn record_plan_execution_duration(&self, duration_secs: f64) {
+        if duration_secs == 0.0 {
+            return; // Avoid recording zero duration
+        }
+
+        let label_vec = self.label_vec();
+
+        self.metrics
+            .compaction_plan_execution_duration
+            .histogram(&label_vec)
+            .record(duration_secs);
+    }
+
+    /// Record the number of files processed by a plan
+    pub fn record_plan_file_count(&self, file_count: usize) {
+        if file_count == 0 {
+            return; // Avoid recording zero file count
+        }
+
+        let label_vec = self.label_vec();
+
+        self.metrics
+            .compaction_plan_file_count
+            .histogram(&label_vec)
+            .record(file_count as f64);
+    }
+
+    /// Record the bytes processed by a plan
+    pub fn record_plan_size_bytes(&self, size_bytes: u64) {
+        if size_bytes == 0 {
+            return; // Avoid recording zero size
+        }
+
+        let label_vec = self.label_vec();
+
+        self.metrics
+            .compaction_plan_size_bytes
+            .histogram(&label_vec)
+            .record(size_bytes as f64);
     }
 
     /// Record successful compaction commit

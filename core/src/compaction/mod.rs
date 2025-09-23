@@ -304,9 +304,11 @@ impl Compaction {
             // 2. Validate plans based on compaction type
             self.validate_plans(&plans)?;
 
+            let table = self.catalog.load_table(&self.table_ident).await?;
+
             // 3. Concurrently execute rewrite for all plans
             let rewrite_results = self
-                .concurrent_rewrite_plans(plans, &config.execution)
+                .concurrent_rewrite_plans(plans, &config.execution, &table)
                 .await?;
 
             if rewrite_results.is_empty() {
@@ -356,6 +358,12 @@ impl Compaction {
         // Record total compaction duration
         metrics_recorder.record_compaction_duration(overall_start_time.elapsed().as_millis() as _);
 
+        // Record plan-level metrics for each rewrite result
+        for result in rewrite_results {
+            metrics_recorder.record_plan_file_count(result.stats.input_files_count);
+            metrics_recorder.record_plan_size_bytes(result.stats.input_total_bytes);
+        }
+
         // Merge all stats and record completion
         let merged_stats = self.merge_rewrite_stats(rewrite_results);
         metrics_recorder.record_compaction_complete(&merged_stats);
@@ -391,6 +399,7 @@ impl Compaction {
         &self,
         plan: CompactionPlan,
         execution_config: &CompactionExecutionConfig,
+        table: &Table,
     ) -> Result<RewriteResult> {
         if plan.to_branch != *self.to_branch {
             return Err(CompactionError::Execution(format!(
@@ -398,8 +407,6 @@ impl Compaction {
                 plan.to_branch, self.to_branch
             )));
         }
-
-        let table = self.catalog.load_table(&self.table_ident).await?;
 
         // Check if the current snapshot exists
         if let Some(branch_snapshot) = table.metadata().snapshot_by_id(plan.snapshot_id) {
@@ -412,7 +419,7 @@ impl Compaction {
 
             // Step 1: Create rewrite request
             let rewrite_files_request =
-                self.create_rewrite_request(&table, &plan.file_group, execution_config)?;
+                self.create_rewrite_request(table, &plan.file_group, execution_config)?;
 
             // Step 2: Execute rewrite
             let RewriteFilesResponse {
@@ -428,7 +435,7 @@ impl Compaction {
 
             // Step 3: Collect input files for commit
             let input_data_files = self
-                .collect_input_files(&table, &plan.file_group, branch_snapshot)
+                .collect_input_files(table, &plan.file_group, branch_snapshot)
                 .await?;
 
             // Step 4: Setup validation info if enabled
@@ -441,8 +448,10 @@ impl Compaction {
                 None
             };
 
-            // Step 5: Update metrics (excluding commit metrics)
-            metrics_recorder.record_compaction_duration(now.elapsed().as_millis() as _);
+            // Step 5: Update metrics - record plan-level metrics
+            metrics_recorder.record_plan_execution_duration(now.elapsed().as_millis() as _);
+            metrics_recorder.record_plan_file_count(stats.input_files_count);
+            metrics_recorder.record_plan_size_bytes(stats.input_total_bytes);
 
             Ok(RewriteResult {
                 output_data_files,
@@ -511,7 +520,7 @@ impl Compaction {
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
         if let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) {
             let consistency_params = CommitConsistencyParams {
-                starting_snapshot_id: snapshot_id,
+                starting_snapshot_id: snapshot.snapshot_id(),
                 use_starting_sequence_number: true,
                 basic_schema_id: table.metadata().current_schema().schema_id(),
             };
@@ -591,11 +600,12 @@ impl Compaction {
         &self,
         plans: Vec<CompactionPlan>,
         execution_config: &CompactionExecutionConfig,
+        table: &Table,
     ) -> Result<Vec<RewriteResult>> {
         use futures::stream::{self, StreamExt};
 
         let results: Result<Vec<RewriteResult>> = stream::iter(plans.into_iter())
-            .map(|plan| async move { self.rewrite_plan(plan, execution_config).await })
+            .map(|plan| async move { self.rewrite_plan(plan, execution_config, table).await })
             .buffer_unordered(4) // Limit concurrency to 4 plans at a time
             .collect::<Vec<_>>()
             .await
@@ -739,8 +749,10 @@ impl Compaction {
 
         let overall_start_time = std::time::Instant::now();
 
+        let table = self.catalog.load_table(&self.table_ident).await?;
+
         // Use the new rewrite_plan method
-        let rewrite_result = self.rewrite_plan(plan, execution_config).await?;
+        let rewrite_result = self.rewrite_plan(plan, execution_config, &table).await?;
 
         // Commit the single rewrite result
         let commit_start_time = std::time::Instant::now();
