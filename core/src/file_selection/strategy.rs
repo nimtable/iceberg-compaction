@@ -49,6 +49,8 @@ impl FileGroup {
         let data_file_count = data_files.len();
 
         // Extract delete files from data files (similar to build_input_file_scan_tasks logic)
+        // Note: de-duplicate delete files by path to avoid double-counting when
+        // multiple data files reference the same delete file.
         let mut position_delete_map = std::collections::HashMap::new();
         let mut equality_delete_map = std::collections::HashMap::new();
 
@@ -270,7 +272,7 @@ impl FileFilterStrategy for NoopStrategy {
     }
 }
 
-/// No-op grouping strategy that places each file in its own group
+/// No-op grouping strategy that places all files into a single group
 #[derive(Debug)]
 pub struct NoopGroupingStrategy;
 
@@ -354,7 +356,8 @@ impl BinPackGroupingStrategy {
 
         let files: Vec<FileScanTask> = data_files.collect();
 
-        // Calculate optimal number of groups based on total size and target group size
+        // Calculate a baseline number of groups based on total size and target group size.
+        // Note: target_group_size is a heuristic target (not a hard cap per group).
         let total_size: u64 = files.iter().map(|task| task.length).sum();
 
         // Handle edge case: when target_group_size is 0, use a single group
@@ -481,10 +484,13 @@ impl FileFilterStrategy for TaskSizeLimitStrategy {
     }
 
     fn description(&self) -> String {
-        format!(
-            "TaskSizeLimit[{}GB]",
-            self.max_total_size / 1024 / 1024 / 1024
-        )
+        let gb = self.max_total_size as f64 / (1024.0 * 1024.0 * 1024.0);
+        if gb < 1.0 {
+            let mb = self.max_total_size / (1024 * 1024);
+            format!("TaskSizeLimit[{}MB]", mb)
+        } else {
+            format!("TaskSizeLimit[{:.1}GB]", gb)
+        }
     }
 }
 
@@ -742,17 +748,17 @@ impl CompactionStrategy {
         // Step 2: Apply grouping - now returns FileGroup directly
         let mut file_groups = self.grouping.group_files(filtered_files.into_iter());
 
-        // Step 3: Calculate parallelism for each group
+        // Step 3: Apply group filtering before computing parallelism
+        for filter in &self.group_filters {
+            file_groups = filter.filter_groups(file_groups);
+        }
+
+        // Step 4: Calculate parallelism for each remaining group
         for group in &mut file_groups {
             let (executor_parallelism, output_parallelism) =
                 FileGroup::calculate_parallelism(group, config)?;
             group.executor_parallelism = executor_parallelism;
             group.output_parallelism = output_parallelism;
-        }
-
-        // Step 4: Apply group filtering
-        for filter in &self.group_filters {
-            file_groups = filter.filter_groups(file_groups);
         }
 
         Ok(file_groups)
@@ -1321,7 +1327,7 @@ mod tests {
             max_total_size: 25 * 1024 * 1024, // 25MB total limit
         };
 
-        assert_eq!(strategy.description(), "TaskSizeLimit[0GB]");
+        assert_eq!(strategy.description(), "TaskSizeLimit[25MB]");
 
         // Test cumulative size limiting with precise validation
         let test_files = vec![

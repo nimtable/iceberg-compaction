@@ -51,6 +51,19 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new(registry: BoxedRegistry) -> Self {
+        // Bucket constants for plan-level metrics (avoid magic numbers)
+        const PLAN_EXEC_DURATION_BUCKET_START_MS: f64 = 50.0; // 50ms
+        const PLAN_EXEC_DURATION_BUCKET_FACTOR: f64 = 4.0; // x4 per bucket
+        const PLAN_EXEC_DURATION_BUCKET_COUNT: usize = 10; // 10 buckets
+
+        const PLAN_FILE_COUNT_BUCKET_START: f64 = 1.0; // 1 file
+        const PLAN_FILE_COUNT_BUCKET_FACTOR: f64 = 2.0; // x2 per bucket
+        const PLAN_FILE_COUNT_BUCKET_COUNT: usize = 12; // up to 4096
+
+        const PLAN_SIZE_BUCKET_START_BYTES: f64 = 1024.0 * 1024.0; // 1MB
+        const PLAN_SIZE_BUCKET_FACTOR: f64 = 4.0; // x4 per bucket
+        const PLAN_SIZE_BUCKET_COUNT: usize = 12; // ~16GB
+
         let compaction_commit_counter = registry.register_counter_vec(
             "iceberg_compaction_commit_counter".into(),
             "iceberg-compaction compaction total commit counts".into(),
@@ -59,7 +72,7 @@ impl Metrics {
 
         let compaction_duration = registry.register_histogram_vec_with_buckets(
             "iceberg_compaction_duration".into(),
-            "iceberg-compaction compaction duration in seconds".into(),
+            "iceberg-compaction compaction duration in milliseconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
                 100.0, 4.0, 10, // Start at 100ms, multiply each bucket by 4, up to 10 buckets
@@ -94,7 +107,9 @@ impl Metrics {
             "Duration for executing individual compaction plans in milliseconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
-                50.0, 4.0, 10, // Start at 50ms, multiply each bucket by 4, up to 10 buckets
+                PLAN_EXEC_DURATION_BUCKET_START_MS,
+                PLAN_EXEC_DURATION_BUCKET_FACTOR,
+                PLAN_EXEC_DURATION_BUCKET_COUNT,
             ),
         );
 
@@ -103,7 +118,9 @@ impl Metrics {
             "Number of files processed by individual compaction plans".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
-                1.0, 2.0, 12, // Start at 1 file, double each bucket, up to 4096 files
+                PLAN_FILE_COUNT_BUCKET_START,
+                PLAN_FILE_COUNT_BUCKET_FACTOR,
+                PLAN_FILE_COUNT_BUCKET_COUNT,
             ),
         );
 
@@ -112,9 +129,9 @@ impl Metrics {
             "Bytes processed by individual compaction plans".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
-                1024.0 * 1024.0,
-                4.0,
-                12, // Start at 1MB, multiply by 4, up to ~16GB
+                PLAN_SIZE_BUCKET_START_BYTES,
+                PLAN_SIZE_BUCKET_FACTOR,
+                PLAN_SIZE_BUCKET_COUNT,
             ),
         );
 
@@ -247,46 +264,51 @@ impl CompactionMetricsRecorder {
         [self.catalog_name.clone(), self.table_ident.clone()]
     }
 
-    /// Record compaction duration
+    /// Record compaction duration (milliseconds)
     pub fn record_compaction_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 {
+        if duration_secs == 0.0 || !duration_secs.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
 
+        let duration_ms = duration_secs * 1000.0; // convert to ms
         self.metrics
             .compaction_duration
             .histogram(&label_vec)
-            .record(duration_secs);
+            .record(duration_ms);
     }
 
-    /// Record commit duration
+    /// Record commit duration (milliseconds)
     pub fn record_commit_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 {
+        if duration_secs == 0.0 || !duration_secs.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
 
+        let duration_ms = duration_secs * 1000.0; // convert to ms
         self.metrics
             .compaction_commit_duration
             .histogram(&label_vec)
-            .record(duration_secs);
+            .record(duration_ms);
     }
 
-    /// Record individual plan execution duration
+    /// Record individual plan execution duration (milliseconds)
     pub fn record_plan_execution_duration(&self, duration_secs: f64) {
-        if duration_secs == 0.0 {
+        if duration_secs == 0.0 || !duration_secs.is_finite() {
             return; // Avoid recording zero duration
         }
 
         let label_vec = self.label_vec();
+
+        // Convert seconds to milliseconds to match histogram units
+        let duration_ms = duration_secs * 1000.0;
 
         self.metrics
             .compaction_plan_execution_duration
             .histogram(&label_vec)
-            .record(duration_secs);
+            .record(duration_ms);
     }
 
     /// Record the number of files processed by a plan
