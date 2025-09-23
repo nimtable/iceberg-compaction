@@ -488,12 +488,30 @@ impl Compaction {
         }
 
         let table = self.catalog.load_table(&self.table_ident).await?;
+        let snapshot_id = rewrite_results[0].plan.snapshot_id;
+
+        // verify all rewrite results are from the same branch and snapshot
+        for result in &rewrite_results {
+            if result.plan.to_branch != *self.to_branch {
+                return Err(CompactionError::Execution(format!(
+                    "Compaction plan branch '{}' does not match configured branch '{}'",
+                    result.plan.to_branch, self.to_branch
+                )));
+            }
+
+            if result.plan.snapshot_id != snapshot_id {
+                return Err(CompactionError::Execution(format!(
+                    "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
+                    result.plan.snapshot_id, snapshot_id
+                )));
+            }
+        }
 
         // Use the snapshot from the first plan (they should all be from the same snapshot)
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
         if let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) {
             let consistency_params = CommitConsistencyParams {
-                starting_snapshot_id: snapshot.snapshot_id(),
+                starting_snapshot_id: snapshot_id,
                 use_starting_sequence_number: true,
                 basic_schema_id: table.metadata().current_schema().schema_id(),
             };
@@ -1252,6 +1270,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    // Additional imports for new tests
+    use crate::compaction::{CompactionPlan, RewriteResult};
+    use crate::executor::RewriteFilesStat;
 
     async fn create_namespace<C: Catalog>(catalog: &C, namespace_ident: &NamespaceIdent) {
         let _ = catalog
@@ -2350,5 +2372,283 @@ mod tests {
         } else {
             panic!("Compact should have returned a result");
         }
+    }
+
+    /// Test commit validation for branch consistency
+    #[tokio::test]
+    async fn test_commit_validation_branch_mismatch() {
+        use crate::file_selection::FileGroup;
+        use iceberg::io::FileIOBuilder;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use iceberg_catalog_memory::MemoryCatalog;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = Arc::new(MemoryCatalog::new(file_io, Some(warehouse_location)));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(catalog.as_ref(), &table_ident).await;
+
+        let compaction =
+            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
+                .with_to_branch("main".to_owned())
+                .build();
+
+        // Create mock rewrite results with different branches
+        let plan1 = CompactionPlan::new(FileGroup::empty(), "main", 1);
+        let plan2 = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1); // Different branch
+
+        let result1 = RewriteResult {
+            output_data_files: vec![],
+            input_data_files: vec![],
+            stats: RewriteFilesStat::default(),
+            plan: plan1,
+            validation_info: None,
+        };
+
+        let result2 = RewriteResult {
+            output_data_files: vec![],
+            input_data_files: vec![],
+            stats: RewriteFilesStat::default(),
+            plan: plan2,
+            validation_info: None,
+        };
+
+        // Test should fail due to branch mismatch
+        let commit_result = compaction
+            .commit_rewrite_results(vec![result1, result2])
+            .await;
+        assert!(commit_result.is_err());
+        let error_msg = commit_result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not match configured branch"),
+            "Error should mention branch mismatch, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test commit validation for snapshot consistency
+    #[tokio::test]
+    async fn test_commit_validation_snapshot_mismatch() {
+        use crate::file_selection::FileGroup;
+        use iceberg::io::FileIOBuilder;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use iceberg_catalog_memory::MemoryCatalog;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = Arc::new(MemoryCatalog::new(file_io, Some(warehouse_location)));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(catalog.as_ref(), &table_ident).await;
+
+        let compaction =
+            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
+                .build();
+
+        // Create mock rewrite results with different snapshots
+        let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 1); // Snapshot 1
+        let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 2); // Snapshot 2
+
+        let result1 = RewriteResult {
+            output_data_files: vec![],
+            input_data_files: vec![],
+            stats: RewriteFilesStat::default(),
+            plan: plan1,
+            validation_info: None,
+        };
+
+        let result2 = RewriteResult {
+            output_data_files: vec![],
+            input_data_files: vec![],
+            stats: RewriteFilesStat::default(),
+            plan: plan2,
+            validation_info: None,
+        };
+
+        // Test should fail due to snapshot mismatch
+        let commit_result = compaction
+            .commit_rewrite_results(vec![result1, result2])
+            .await;
+        assert!(commit_result.is_err());
+        let error_msg = commit_result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not match other plans snapshot"),
+            "Error should mention snapshot mismatch, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test commit validation with valid consistent plans
+    #[tokio::test]
+    async fn test_commit_validation_success() {
+        use crate::file_selection::FileGroup;
+        use iceberg::io::FileIOBuilder;
+        use iceberg::transaction::Transaction;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use iceberg_catalog_memory::MemoryCatalog;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = Arc::new(MemoryCatalog::new(
+            file_io,
+            Some(warehouse_location.clone()),
+        ));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(catalog.as_ref(), &table_ident).await;
+
+        // Load the table and create some data first
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        // Create and write some test data
+        let mut writer = build_simple_data_writer(&table, warehouse_location.clone(), "test").await;
+        let batch = create_test_record_batch(&simple_table_schema());
+        writer.write(batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        // Commit the data
+        let transaction = Transaction::new(&table);
+        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
+        append_action.add_data_files(data_files.clone()).unwrap();
+        let tx = append_action.apply().await.unwrap();
+        let updated_table = tx.commit(catalog.as_ref()).await.unwrap();
+
+        // Get the current snapshot
+        let current_snapshot = updated_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+        let snapshot_id = current_snapshot.snapshot_id();
+
+        let compaction =
+            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
+                .build();
+
+        // Create valid rewrite results with consistent branch and snapshot
+        let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, snapshot_id);
+        let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, snapshot_id);
+
+        let result1 = RewriteResult {
+            output_data_files: data_files.clone(),
+            input_data_files: data_files.clone(),
+            stats: RewriteFilesStat::default(),
+            plan: plan1,
+            validation_info: None,
+        };
+
+        let result2 = RewriteResult {
+            output_data_files: vec![],
+            input_data_files: vec![],
+            stats: RewriteFilesStat::default(),
+            plan: plan2,
+            validation_info: None,
+        };
+
+        // Test should succeed with consistent plans
+        let commit_result = compaction
+            .commit_rewrite_results(vec![result1, result2])
+            .await;
+        assert!(
+            commit_result.is_ok(),
+            "Commit should succeed with consistent plans"
+        );
+    }
+
+    /// Test branch validation in rewrite_plan method
+    #[tokio::test]
+    async fn test_rewrite_plan_branch_validation() {
+        use crate::config::CompactionExecutionConfigBuilder;
+        use crate::file_selection::FileGroup;
+        use iceberg::io::FileIOBuilder;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use iceberg_catalog_memory::MemoryCatalog;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = Arc::new(MemoryCatalog::new(file_io, Some(warehouse_location)));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(catalog.as_ref(), &table_ident).await;
+
+        // Create compaction configured for "main" branch
+        let compaction =
+            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
+                .with_to_branch("main".to_owned())
+                .build();
+
+        // Create a plan for a different branch
+        let plan = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1);
+
+        let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
+
+        // Test should fail due to branch mismatch
+        let rewrite_result = compaction.rewrite_plan(plan, &execution_config).await;
+        assert!(rewrite_result.is_err());
+        let error_msg = rewrite_result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not match configured branch"),
+            "Error should mention branch mismatch, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that empty rewrite results are properly rejected
+    #[tokio::test]
+    async fn test_commit_empty_results() {
+        use iceberg::io::FileIOBuilder;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use iceberg_catalog_memory::MemoryCatalog;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the warehouse location
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let catalog = Arc::new(MemoryCatalog::new(file_io, Some(warehouse_location)));
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        create_table(catalog.as_ref(), &table_ident).await;
+
+        let compaction =
+            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
+                .build();
+
+        // Test should fail with empty results
+        let commit_result = compaction.commit_rewrite_results(vec![]).await;
+        assert!(commit_result.is_err());
+        let error_msg = commit_result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("No rewrite results to commit"),
+            "Error should mention empty results, got: {}",
+            error_msg
+        );
     }
 }
