@@ -222,6 +222,16 @@ impl FileGroup {
             .map(|task| task.file_size_in_bytes)
             .sum()
     }
+
+    /// Iterator over all input file paths (data + delete files)
+    /// This provides a clean way to access all file paths without repetitive chaining
+    pub fn iter_all_input_paths(&self) -> impl Iterator<Item = &str> {
+        self.data_files
+            .iter()
+            .chain(&self.position_delete_files)
+            .chain(&self.equality_delete_files)
+            .map(|task| task.data_file_path.as_str())
+    }
 }
 
 /// Object-safe trait for file filtering strategies
@@ -814,19 +824,7 @@ impl CompactionStrategy {
 }
 
 impl FileStrategyFactory {
-    /// Create strategy for small files compaction
-    ///
-    /// Returns a compaction strategy that filters out delete files,
-    /// applies size filtering, and limits total task size.
-    /// For small files, we use more permissive group filtering.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// # use iceberg_compaction_core::file_selection::strategy::FileStrategyFactory;
-    /// # use iceberg_compaction_core::config::CompactionPlanningConfig;
-    /// # let config = CompactionPlanningConfig::default();
-    /// let strategy = FileStrategyFactory::create_small_files_strategy(&config);
-    /// ```
+    /// Create strategy for small files compaction with delete file filtering and size limits.
     pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> CompactionStrategy {
         // Delegate to the flexible factory to avoid duplication while preserving behavior
         Self::create_custom_strategy(
@@ -853,65 +851,7 @@ impl FileStrategyFactory {
         )
     }
 
-    /// Create a custom strategy with structured configuration
-    ///
-    /// This method provides a more maintainable way to create custom strategies
-    /// using a builder pattern for configuration.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// # use iceberg_compaction_core::file_selection::strategy::{FileStrategyFactory, CustomStrategyConfig};
-    /// # use iceberg_compaction_core::config::GroupingStrategy;
-    /// let config = CustomStrategyConfig::builder()
-    ///     .exclude_delete_files(true)
-    ///     .size_filter(None, Some(100 * 1024 * 1024)) // max 100MB
-    ///     .min_file_count(3)
-    ///     .grouping_strategy(GroupingStrategy::BinPack)
-    ///     .target_group_size(64 * 1024 * 1024) // 64MB
-    ///     .build();
-    /// let strategy = FileStrategyFactory::create_custom_strategy_v2(config);
-    /// ```
-    pub fn create_custom_strategy_v2(config: CustomStrategyConfig) -> CompactionStrategy {
-        Self::create_custom_strategy(
-            config.exclude_delete_files,
-            config.size_filter,
-            config.min_file_count,
-            config.max_task_total_size,
-            config.grouping_strategy,
-            config.target_group_size,
-            config.max_files_per_group,
-            config.min_group_size,
-            config.max_group_size,
-            config.min_group_file_count,
-            config.max_group_file_count,
-        )
-    }
-
-    /// Create a custom strategy with flexible configuration
-    ///
-    /// This method provides fine-grained control over which filters to include.
-    ///
-    /// **Note**: Consider using `create_custom_strategy_v2` with `CustomStrategyConfig`
-    /// for better maintainability with complex configurations.
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// # use iceberg_compaction_core::file_selection::strategy::FileStrategyFactory;
-    /// # use iceberg_compaction_core::config::GroupingStrategy;
-    /// let strategy = FileStrategyFactory::create_custom_strategy(
-    ///     true,                                  // exclude_delete_files
-    ///     Some((None, Some(100 * 1024 * 1024))), // size_filter: max 100MB
-    ///     3,                                     // min_file_count
-    ///     20 * 1024 * 1024 * 1024,              // max_task_total_size: 20GB
-    ///     GroupingStrategy::BinPack,             // grouping_strategy
-    ///     64 * 1024 * 1024,                     // target_group_size: 64MB
-    ///     100,                                   // max_files_per_group
-    ///     32 * 1024 * 1024,                     // min_group_size: 32MB
-    ///     1024 * 1024 * 1024,                   // max_group_size: 1GB
-    ///     2,                                     // min_group_file_count
-    ///     50,                                    // max_group_file_count
-    /// );
-    /// ```
+    /// Create custom strategy with fine-grained parameter control.
     #[allow(clippy::too_many_arguments)]
     pub fn create_custom_strategy(
         exclude_delete_files: bool,
@@ -982,30 +922,7 @@ impl FileStrategyFactory {
         CompactionStrategy::new(file_filters, grouping, group_filters)
     }
 
-    /// Create a file strategy based on compaction type and configuration
-    ///
-    /// This is the main entry point for creating file strategies. It returns
-    /// a `CompactionStrategy` that uses the composition architecture
-    /// with file filtering, grouping, and group filtering.
-    ///
-    /// # Arguments
-    /// * `compaction_type` - The type of compaction to perform
-    /// * `config` - The compaction configuration
-    ///
-    /// # Returns
-    /// A `CompactionStrategy` containing the appropriate strategy for the given compaction type
-    ///
-    /// # Examples
-    /// ```rust,no_run
-    /// # use iceberg_compaction_core::file_selection::strategy::FileStrategyFactory;
-    /// # use iceberg_compaction_core::compaction::CompactionType;
-    /// # use iceberg_compaction_core::config::CompactionPlanningConfig;
-    /// # let config = CompactionPlanningConfig::default();
-    /// let strategy = FileStrategyFactory::create_files_strategy(
-    ///     CompactionType::MergeSmallDataFiles,
-    ///     &config
-    /// );
-    /// ```
+    /// Create file strategy based on compaction type and configuration.
     pub fn create_files_strategy(
         compaction_type: CompactionType,
         config: &CompactionPlanningConfig,

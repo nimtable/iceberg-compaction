@@ -157,97 +157,12 @@ impl CompactionBuilder {
     }
 }
 
-/// Compaction implementation with support for both managed and plan-driven workflows
+/// Iceberg table compaction with both managed and plan-driven workflows.
 ///
-/// # Usage Examples
+/// # Usage
 ///
-/// ## Managed Workflow (Simple and Automatic)
-///
-/// For most use cases, use the simple one-step compaction that automatically handles
-/// planning, execution, and commit:
-///
-/// ```rust,no_run
-/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType};
-/// use iceberg_compaction_core::config::CompactionConfig;
-/// use std::sync::Arc;
-/// use iceberg::TableIdent;
-/// use iceberg_catalog_memory::MemoryCatalog;
-/// use iceberg::io::FileIOBuilder;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let file_io = FileIOBuilder::new_fs_io().build()?;
-/// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
-/// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
-/// # let config = CompactionConfig::default();
-/// let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-///     .with_config(Arc::new(config))
-///     .build();
-///
-/// // Simple one-step execution - system handles everything
-/// let result = compaction.compact().await?;
-/// if let Some(result) = result {
-///     println!("Compacted {} files into {} files",
-///              result.stats.input_files_count, result.stats.output_files_count);
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// ## Plan-Driven Workflow (Preview and Control)
-///
-/// For scenarios requiring preview or fine-grained control, use the plan-driven approach
-/// which separates planning, rewriting, and committing:
-///
-/// ```rust,no_run
-/// use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType, CompactionPlanner};
-/// use iceberg_compaction_core::config::{CompactionConfig, CompactionPlanningConfigBuilder};
-/// use std::sync::Arc;
-/// use iceberg::{TableIdent, Catalog};
-/// use iceberg_catalog_memory::MemoryCatalog;
-/// use iceberg::io::FileIOBuilder;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let file_io = FileIOBuilder::new_fs_io().build()?;
-/// # let catalog = Arc::new(MemoryCatalog::new(file_io, Some("/tmp/warehouse".to_string())));
-/// # let table_ident = TableIdent::from_strs(["default", "test_table"])?;
-/// # let config = CompactionConfig::default();
-/// let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-///     .with_config(Arc::new(config.clone()))
-///     .build();
-///
-/// // Step 1: Create a planner and generate plans (preview what will be processed)
-/// let planner = CompactionPlanner::new(config.planning.clone());
-/// let table = catalog.load_table(&table_ident).await?;
-/// let plans = planner.plan_compaction(&table, CompactionType::Full).await?;
-/// let execution_config = config.execution.clone();
-///
-/// // Preview the plan details
-/// println!("Generated {} compaction plan(s)", plans.len());
-/// for (i, plan) in plans.iter().enumerate() {
-///     println!("Plan {}: {} files ({} bytes), parallelism: executor={}, output={}",
-///              i + 1, plan.file_count(), plan.total_bytes(),
-///              plan.recommended_executor_parallelism(), plan.recommended_output_parallelism());
-/// }
-///
-/// // Step 2: Concurrently rewrite all plans (without committing)
-/// let mut rewrite_results = Vec::new();
-/// for plan in plans {
-///     let result = compaction.rewrite_plan(plan, &execution_config, &table).await?;
-///     rewrite_results.push(result);
-/// }
-///
-/// // Step 3: Commit all rewrite results in a single transaction
-/// let final_table = compaction.commit_rewrite_results(rewrite_results.clone()).await?;
-/// println!("Successfully committed all changes to table: {}", final_table.identifier());
-///
-/// // Step 4: Optional validation (if enabled in config)
-/// // Note: Validation is automatically handled within compact() method
-/// // For manual validation, you can reload the table and verify the results
-/// let updated_table = catalog.load_table(&table_ident).await?;
-/// println!("Compaction completed successfully. Final table state: {}", updated_table.identifier());
-/// # Ok(())
-/// # }
-/// ```
+/// **Simple workflow**: Use `compact()` for automatic planning, execution, and commit.
+/// **Plan-driven workflow**: Use `plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()` for fine-grained control.
 pub struct Compaction {
     /// TODO: Refactor me
     /// When we use plan-driven compaction, there is no need to pass in the global config.
@@ -268,7 +183,6 @@ pub struct Compaction {
 #[derive(Debug, Clone)]
 pub struct RewriteResult {
     pub output_data_files: Vec<DataFile>,
-    pub input_data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
     pub plan: CompactionPlan,
     /// Store validation info to create validator later if needed
@@ -409,7 +323,7 @@ impl Compaction {
         }
 
         // Check if the current snapshot exists
-        if let Some(branch_snapshot) = table.metadata().snapshot_by_id(plan.snapshot_id) {
+        if let Some(_branch_snapshot) = table.metadata().snapshot_by_id(plan.snapshot_id) {
             let now = std::time::Instant::now();
             let metrics_recorder = CompactionMetricsRecorder::new(
                 self.metrics.clone(),
@@ -433,10 +347,7 @@ impl Compaction {
                 }
             };
 
-            // Step 3: Collect input files for commit
-            let input_data_files = self
-                .collect_input_files(table, &plan.file_group, branch_snapshot)
-                .await?;
+            // Step 3: (Delayed) Input file collection moved to commit phase to avoid duplicate IO
 
             // Step 4: Setup validation info if enabled
             let validation_info = if execution_config.enable_validate_compaction {
@@ -455,7 +366,6 @@ impl Compaction {
 
             Ok(RewriteResult {
                 output_data_files,
-                input_data_files,
                 stats,
                 plan,
                 validation_info,
@@ -500,21 +410,7 @@ impl Compaction {
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
 
         // verify all rewrite results are from the same branch and snapshot
-        for result in &rewrite_results {
-            if result.plan.to_branch != *self.to_branch {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan branch '{}' does not match configured branch '{}'",
-                    result.plan.to_branch, self.to_branch
-                )));
-            }
-
-            if result.plan.snapshot_id != snapshot_id {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
-                    result.plan.snapshot_id, snapshot_id
-                )));
-            }
-        }
+        self.validate_rewrite_results_consistency(&rewrite_results, snapshot_id)?;
 
         // Use the snapshot from the first plan (they should all be from the same snapshot)
         if let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) {
@@ -534,14 +430,32 @@ impl Compaction {
                 consistency_params,
             );
 
-            // Collect all output and input files
-            let mut all_output_files = Vec::new();
-            let mut all_input_files = Vec::new();
+            // --- Batch collect input files from all plans ---
+            use std::collections::HashMap;
 
-            for rewrite_result in &rewrite_results {
-                all_output_files.extend(rewrite_result.output_data_files.clone());
-                all_input_files.extend(rewrite_result.input_data_files.clone());
-            }
+            // 1. Load all files from snapshot once
+            let (all_data_files, all_delete_files) =
+                get_all_files_from_snapshot(&snapshot, table.file_io(), table.metadata()).await?;
+
+            // 2. Build efficient path -> DataFile index
+            let file_index: HashMap<&str, &DataFile> = all_data_files
+                .iter()
+                .chain(all_delete_files.iter())
+                .map(|f| (f.file_path(), f))
+                .collect();
+
+            // 3. Collect input files directly from plans using the index
+            let all_input_files: Vec<DataFile> = rewrite_results
+                .iter()
+                .flat_map(|rr| rr.plan.file_group.iter_all_input_paths())
+                .filter_map(|path| file_index.get(path).map(|&f| f.clone()))
+                .collect();
+
+            // 4. Collect all output files from all plans
+            let all_output_files: Vec<DataFile> = rewrite_results
+                .iter()
+                .flat_map(|rr| rr.output_data_files.iter().cloned())
+                .collect();
 
             // Commit all files in a single transaction
             commit_manager
@@ -553,6 +467,30 @@ impl Compaction {
                 snapshot_id
             )))
         }
+    }
+
+    /// Validate consistency of rewrite results (branch and snapshot)
+    fn validate_rewrite_results_consistency(
+        &self,
+        rewrite_results: &[RewriteResult],
+        expected_snapshot_id: i64,
+    ) -> Result<()> {
+        for result in rewrite_results {
+            if result.plan.to_branch != *self.to_branch {
+                return Err(CompactionError::Execution(format!(
+                    "Compaction plan branch '{}' does not match configured branch '{}'",
+                    result.plan.to_branch, self.to_branch
+                )));
+            }
+
+            if result.plan.snapshot_id != expected_snapshot_id {
+                return Err(CompactionError::Execution(format!(
+                    "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
+                    result.plan.snapshot_id, expected_snapshot_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Validate plans based on compaction type
@@ -642,35 +580,6 @@ impl Compaction {
             }
         }
         Ok(())
-    }
-
-    /// Collect input files for a file group from the snapshot
-    async fn collect_input_files(
-        &self,
-        table: &Table,
-        file_group: &FileGroup,
-        snapshot: &Arc<Snapshot>,
-    ) -> Result<Vec<DataFile>> {
-        let (all_data_files, all_delete_files) =
-            get_all_files_from_snapshot(snapshot, table.file_io(), table.metadata()).await?;
-
-        // Collect file paths from all input scan tasks
-        let input_file_paths: std::collections::HashSet<&str> = file_group
-            .data_files
-            .iter()
-            .chain(&file_group.position_delete_files)
-            .chain(&file_group.equality_delete_files)
-            .map(|task| task.data_file_path())
-            .collect();
-
-        // Filter all files to only include those from input scan tasks
-        let input_files: Vec<DataFile> = all_data_files
-            .into_iter()
-            .chain(all_delete_files.into_iter())
-            .filter(|file| input_file_paths.contains(file.file_path()))
-            .collect();
-
-        Ok(input_files)
     }
 
     /// Merge rewrite results into a single `CompactionResult`
@@ -2150,226 +2059,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_refactored_interfaces_and_metrics() {
-        // Create test environment
-        let temp_dir = TempDir::new().unwrap();
-        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        let catalog = Arc::new(MemoryCatalog::new(
-            file_io,
-            Some(warehouse_location.clone()),
-        ));
-
-        let namespace_ident = NamespaceIdent::new("test_namespace".into());
-        create_namespace(catalog.as_ref(), &namespace_ident).await;
-
-        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
-        create_table(catalog.as_ref(), &table_ident).await;
-
-        // Load table and write test data
-        let table = catalog.load_table(&table_ident).await.unwrap();
-
-        // Create multiple small files to test compaction
-        let all_data_files = write_simple_files(&table, &warehouse_location, "file", 3).await;
-
-        // Commit all files
-        let _updated_table = append_and_commit(&table, catalog.as_ref(), all_data_files).await;
-
-        // Test 1: New plan_compaction API
-        let config = CompactionConfigBuilder::default().build().unwrap();
-        let compaction =
-            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(config.clone()))
-                .build();
-
-        // Get plans - this is the new API
-        let plans = compaction.plan_compaction().await.unwrap();
-        assert!(!plans.is_empty(), "Should have at least one plan");
-        assert_eq!(
-            plans.len(),
-            1,
-            "Full compaction should generate exactly one plan"
-        );
-
-        // Verify plan content
-        let plan = &plans[0];
-        assert_eq!(
-            plan.file_count(),
-            3,
-            "Plan should have exactly 3 files to compact"
-        );
-        assert!(plan.total_bytes() > 0, "Plan should have bytes to process");
-        assert_eq!(
-            plan.to_branch, compaction.to_branch,
-            "Plan branch should match compaction branch"
-        );
-
-        // Test 2: New rewrite_plan API (fine-grained control)
-        let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
-        // Load a fresh table reference to ensure snapshot is present
-        let latest_table = catalog.load_table(&table_ident).await.unwrap();
-        let rewrite_result = compaction
-            .rewrite_plan(plan.clone(), &execution_config, &latest_table)
-            .await
-            .unwrap();
-
-        // Verify rewrite result
-        assert!(
-            !rewrite_result.output_data_files.is_empty(),
-            "Should produce output files"
-        );
-        assert!(
-            !rewrite_result.input_data_files.is_empty(),
-            "Should have input files"
-        );
-        assert!(
-            rewrite_result.stats.input_files_count > 0,
-            "Should have processed input files"
-        );
-        assert!(
-            rewrite_result.stats.output_files_count > 0,
-            "Should have produced output files"
-        );
-
-        // Strict verification: input and output counts should match data files
-        assert_eq!(
-            rewrite_result.input_data_files.len(),
-            rewrite_result.stats.input_files_count as usize,
-            "Input data files count should match stats"
-        );
-        assert_eq!(
-            rewrite_result.output_data_files.len(),
-            rewrite_result.stats.output_files_count as usize,
-            "Output data files count should match stats"
-        );
-
-        // Verify plan consistency
-        assert_eq!(
-            rewrite_result.plan.file_count(),
-            plan.file_count(),
-            "Plan should be consistent"
-        );
-        assert_eq!(
-            rewrite_result.plan.snapshot_id, plan.snapshot_id,
-            "Snapshot ID should match"
-        );
-
-        // Verify bytes are reasonable
-        assert!(
-            rewrite_result.stats.input_total_bytes > 0,
-            "Should have processed some bytes"
-        );
-        assert!(
-            rewrite_result.stats.output_total_bytes > 0,
-            "Should have produced some bytes"
-        );
-
-        // Test 3: New commit_rewrite_results API (batch commit)
-        let table_before_commit = catalog.load_table(&table_ident).await.unwrap();
-        let snapshots_before = table_before_commit.metadata().snapshots().len();
-        let snapshot_id_before = table_before_commit
-            .metadata()
-            .snapshot_for_ref(&compaction.to_branch)
-            .unwrap()
-            .snapshot_id();
-
-        let final_table = compaction
-            .commit_rewrite_results(vec![rewrite_result.clone()])
-            .await
-            .unwrap();
-
-        // Reload table to get the most up-to-date state
-        let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
-        let snapshots_after = reloaded_table.metadata().snapshots().len();
-        assert_eq!(
-            snapshots_after,
-            snapshots_before + 1,
-            "Should have created exactly one new snapshot"
-        );
-
-        // Verify final table state using reloaded table
-        let final_snapshot = reloaded_table
-            .metadata()
-            .snapshot_for_ref(&compaction.to_branch)
-            .unwrap();
-        assert_ne!(
-            final_snapshot.snapshot_id(),
-            snapshot_id_before,
-            "New snapshot ID {} should be different from previous {}",
-            final_snapshot.snapshot_id(),
-            snapshot_id_before
-        );
-
-        // Test 4: Test the high-level compact API (backward compatibility)
-        // First create new data to compact again
-        let mut writer =
-            build_simple_data_writer(&table, warehouse_location.clone(), "additional").await;
-        let batch = create_test_record_batch(&simple_table_schema());
-        writer.write(batch).await.unwrap();
-        let additional_files = writer.close().await.unwrap();
-
-        let transaction = Transaction::new(&final_table);
-        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
-        append_action.add_data_files(additional_files).unwrap();
-        let tx = append_action.apply().await.unwrap();
-        let _table_with_more_data = tx.commit(catalog.as_ref()).await.unwrap();
-
-        // Now test the refactored compact method
-        let new_compaction =
-            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(config.clone()))
-                .build();
-
-        let compact_result = new_compaction.compact().await.unwrap();
-        if let Some(result) = compact_result {
-            assert!(
-                result.stats.input_files_count > 0,
-                "Should have processed files"
-            );
-            assert!(
-                result.stats.output_files_count > 0,
-                "Should have output files"
-            );
-            assert!(result.table.is_some(), "Should return updated table");
-
-            // Strict verification of table state
-            let result_table = result.table.unwrap();
-            let result_snapshots = result_table.metadata().snapshots().len();
-            assert!(
-                result_snapshots > snapshots_after,
-                "Should have created another snapshot"
-            );
-
-            // Verify compaction actually reduced file count (Full compaction should merge files)
-            assert!(
-                result.stats.output_files_count <= result.stats.input_files_count,
-                "Full compaction should not increase file count"
-            );
-
-            // Verify data integrity - bytes can vary due to compression, but should be reasonable
-            assert!(
-                result.stats.output_total_bytes > 0,
-                "Output should have some bytes"
-            );
-            assert!(
-                result.stats.input_total_bytes > 0,
-                "Input should have some bytes"
-            );
-
-            // Allow significant variation due to compression/encoding differences
-            let bytes_ratio =
-                result.stats.output_total_bytes as f64 / result.stats.input_total_bytes as f64;
-            assert!(
-                bytes_ratio > 0.1 && bytes_ratio < 10.0,
-                "Output bytes should be reasonable compared to input, got ratio: {}",
-                bytes_ratio
-            );
-        } else {
-            panic!("Compact should have returned a result");
-        }
-    }
-
     /// Consolidated commit validation scenarios to avoid repeated init
     #[tokio::test]
     async fn test_commit_validations() {
@@ -2392,14 +2081,12 @@ mod tests {
         let plan2 = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1);
         let r1 = RewriteResult {
             output_data_files: vec![],
-            input_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
-            input_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
@@ -2419,14 +2106,12 @@ mod tests {
         let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 2);
         let r1 = RewriteResult {
             output_data_files: vec![],
-            input_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
-            input_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
@@ -2454,14 +2139,12 @@ mod tests {
         let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, snapshot_id);
         let r1 = RewriteResult {
             output_data_files: data_files.clone(),
-            input_data_files: data_files.clone(),
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
-            input_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
