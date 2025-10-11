@@ -227,7 +227,7 @@ impl FileGroup {
 /// Object-safe trait for file filtering strategies
 ///
 /// This trait enables dynamic dispatch for composable file filter chains.
-pub trait FileFilterStrategy: std::fmt::Debug {
+pub trait FileFilterStrategy: std::fmt::Debug + Sync + Send {
     /// Filter the input data files, returning collected results
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
 
@@ -264,7 +264,7 @@ impl GroupingStrategyEnum {
 /// Object-safe trait for group filtering strategies
 ///
 /// This trait enables dynamic dispatch for composable group filter chains.
-pub trait GroupFilterStrategy: std::fmt::Debug {
+pub trait GroupFilterStrategy: std::fmt::Debug + Sync + Send {
     /// Filter groups of files based on group-level criteria
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup>;
 
@@ -834,7 +834,7 @@ impl FileStrategyFactory {
             /* size_filter */ Some((None, Some(config.small_file_threshold))),
             /* min_file_count */ config.min_file_count,
             /* max_task_total_size */ config.max_task_total_size,
-            /* grouping_strategy */ config.grouping_strategy.clone(),
+            /* grouping_strategy */ config.grouping_strategy,
             /* target_group_size */ config.max_group_size,
             /* max_files_per_group */ config.max_group_file_count,
             /* min_group_size */ 0,

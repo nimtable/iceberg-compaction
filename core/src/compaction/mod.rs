@@ -1896,17 +1896,17 @@ mod tests {
 
         // Test empty table
         let plan = planner
-            .plan_compaction(&table, super::CompactionType::Full)
+            .plan_compaction(table, super::CompactionType::Full)
             .await
             .unwrap();
 
         assert!(plan.is_empty());
 
         // Create some data files
-        let data_files = write_simple_files(&table, &env.warehouse_location, "test", 1).await;
+        let data_files = write_simple_files(table, &env.warehouse_location, "test", 1).await;
 
         // Commit the files
-        let updated_table = append_and_commit(&table, catalog, data_files).await;
+        let updated_table = append_and_commit(table, catalog, data_files).await;
 
         let planner =
             CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
