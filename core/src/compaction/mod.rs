@@ -792,7 +792,20 @@ impl Compaction {
         self.metrics.clone()
     }
 
-    // Note: commit manager is constructed inline where needed to keep API surface minimal.
+    pub fn build_commit_manager(
+        &self,
+        consistency_params: CommitConsistencyParams,
+    ) -> CommitManager {
+        CommitManager::new(
+            self.commit_retry_config.clone(),
+            self.catalog.clone(),
+            self.table_ident.clone(),
+            self.table_ident_name.clone(),
+            self.catalog_name.clone(),
+            self.metrics.clone(),
+            consistency_params,
+        )
+    }
 }
 
 async fn get_all_files_from_snapshot(
