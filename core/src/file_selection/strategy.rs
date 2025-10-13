@@ -414,6 +414,7 @@ impl BinPackGroupingStrategy {
         }
 
         for file_task in files {
+            // Safe: heap is guaranteed non-empty since max_files_per_group > 0
             let mut group = heap.peek_mut().unwrap();
             group.0.total_length += file_task.length;
             group.0.tasks.push(file_task);

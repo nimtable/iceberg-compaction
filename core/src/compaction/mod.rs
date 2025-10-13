@@ -516,7 +516,7 @@ impl Compaction {
 
         let results: Result<Vec<RewriteResult>> = stream::iter(plans.into_iter())
             .map(|plan| async move { self.rewrite_plan(plan, execution_config, table).await })
-            .buffer_unordered(4) // Limit concurrency to 4 plans at a time
+            .buffer_unordered(execution_config.max_concurrent_compaction_plans) // Limit concurrency based on config
             .collect::<Vec<_>>()
             .await
             .into_iter()

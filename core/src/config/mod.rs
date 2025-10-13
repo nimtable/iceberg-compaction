@@ -33,6 +33,7 @@ pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
+pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 
 // Strategy configuration defaults
 pub const DEFAULT_GROUPING_STRATEGY: GroupingStrategy = GroupingStrategy::BinPack;
@@ -178,6 +179,10 @@ pub struct CompactionExecutionConfig {
     /// Smoothing factor for dynamic size estimation updates (default: 0.3)
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
+
+    /// Maximum number of compaction plans to execute concurrently (default: 4)
+    #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
+    pub max_concurrent_compaction_plans: usize,
 }
 
 impl Default for CompactionExecutionConfig {
