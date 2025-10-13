@@ -43,6 +43,30 @@ use std::borrow::Cow;
 
 mod validator;
 
+/// Validate consistency of rewrite results (branch and snapshot)
+fn validate_rewrite_results_consistency(
+    rewrite_results: &[RewriteResult],
+    expected_snapshot_id: i64,
+    expected_branch: &str,
+) -> Result<()> {
+    for result in rewrite_results {
+        if result.plan.to_branch != expected_branch {
+            return Err(CompactionError::Execution(format!(
+                "Compaction plan branch '{}' does not match configured branch '{}'",
+                result.plan.to_branch, expected_branch
+            )));
+        }
+
+        if result.plan.snapshot_id != expected_snapshot_id {
+            return Err(CompactionError::Execution(format!(
+                "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
+                result.plan.snapshot_id, expected_snapshot_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionType {
     Full,
@@ -410,7 +434,7 @@ impl Compaction {
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
 
         // verify all rewrite results are from the same branch and snapshot
-        self.validate_rewrite_results_consistency(&rewrite_results, snapshot_id, &self.to_branch)?;
+        validate_rewrite_results_consistency(&rewrite_results, snapshot_id, &self.to_branch)?;
 
         // Create commit manager and delegate the complex logic to it
         if let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) {
@@ -440,31 +464,6 @@ impl Compaction {
                 snapshot_id
             )))
         }
-    }
-
-    /// Validate consistency of rewrite results (branch and snapshot)
-    fn validate_rewrite_results_consistency(
-        &self,
-        rewrite_results: &[RewriteResult],
-        expected_snapshot_id: i64,
-        expected_branch: &str,
-    ) -> Result<()> {
-        for result in rewrite_results {
-            if result.plan.to_branch != expected_branch {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan branch '{}' does not match configured branch '{}'",
-                    result.plan.to_branch, expected_branch
-                )));
-            }
-
-            if result.plan.snapshot_id != expected_snapshot_id {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
-                    result.plan.snapshot_id, expected_snapshot_id
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Validate plans based on compaction type
@@ -805,21 +804,7 @@ impl CommitManager {
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
 
         // Validate consistency across all rewrite results
-        for result in rewrite_results {
-            if result.plan.to_branch != to_branch {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan branch '{}' does not match configured branch '{}'",
-                    result.plan.to_branch, to_branch
-                )));
-            }
-
-            if result.plan.snapshot_id != snapshot_id {
-                return Err(CompactionError::Execution(format!(
-                    "Compaction plan snapshot '{}' does not match other plans snapshot '{}'",
-                    result.plan.snapshot_id, snapshot_id
-                )));
-            }
-        }
+        validate_rewrite_results_consistency(rewrite_results, snapshot_id, to_branch)?;
 
         // Load table and get snapshot
         let table = self.catalog.load_table(&self.table_ident).await?;
