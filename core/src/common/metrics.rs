@@ -51,18 +51,23 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new(registry: BoxedRegistry) -> Self {
-        // Bucket constants for plan-level metrics (avoid magic numbers)
-        const PLAN_EXEC_DURATION_BUCKET_START_MS: f64 = 50.0; // 50ms
+        // Bucket constants for large-scale compaction support
+        // Designed to handle: ~1 hour duration, ~1TB data size, ~4096 files
+        const COMPACTION_DURATION_BUCKET_START_MS: f64 = 1000.0; // 1s
+        const COMPACTION_DURATION_BUCKET_FACTOR: f64 = 4.0; // x4 per bucket
+        const COMPACTION_DURATION_BUCKET_COUNT: usize = 8; // 8 buckets: 1s ~ 16384s (~4.5 hours)
+
+        const PLAN_EXEC_DURATION_BUCKET_START_MS: f64 = 1000.0; // 1s
         const PLAN_EXEC_DURATION_BUCKET_FACTOR: f64 = 4.0; // x4 per bucket
-        const PLAN_EXEC_DURATION_BUCKET_COUNT: usize = 10; // 10 buckets
+        const PLAN_EXEC_DURATION_BUCKET_COUNT: usize = 8; // 8 buckets: 1s ~ 16384s (~4.5 hours)
 
         const PLAN_FILE_COUNT_BUCKET_START: f64 = 1.0; // 1 file
         const PLAN_FILE_COUNT_BUCKET_FACTOR: f64 = 2.0; // x2 per bucket
-        const PLAN_FILE_COUNT_BUCKET_COUNT: usize = 12; // up to 4096
+        const PLAN_FILE_COUNT_BUCKET_COUNT: usize = 13; // 13 buckets: 1 ~ 4096 files
 
         const PLAN_SIZE_BUCKET_START_BYTES: f64 = 1024.0 * 1024.0; // 1MB
         const PLAN_SIZE_BUCKET_FACTOR: f64 = 4.0; // x4 per bucket
-        const PLAN_SIZE_BUCKET_COUNT: usize = 12; // ~16GB
+        const PLAN_SIZE_BUCKET_COUNT: usize = 12; // 12 buckets: 1MB ~ 16TB
 
         let compaction_commit_counter = registry.register_counter_vec(
             "iceberg_compaction_commit_counter".into(),
@@ -75,7 +80,9 @@ impl Metrics {
             "iceberg-compaction compaction duration in milliseconds".into(),
             &["catalog_name", "table_ident"],
             Buckets::exponential(
-                100.0, 4.0, 10, // Start at 100ms, multiply each bucket by 4, up to 10 buckets
+                COMPACTION_DURATION_BUCKET_START_MS,
+                COMPACTION_DURATION_BUCKET_FACTOR,
+                COMPACTION_DURATION_BUCKET_COUNT,
             ),
         );
 
