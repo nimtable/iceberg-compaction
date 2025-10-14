@@ -17,9 +17,9 @@
 use std::sync::Arc;
 
 use crate::{
-    config::{CompactionExecutionConfig, RuntimeConfig},
+    config::CompactionExecutionConfig,
     error::{CompactionError, Result},
-    executor::InputFileScanTasks,
+    file_selection::FileGroup,
 };
 use datafusion::{
     execution::SendableRecordBatchStream,
@@ -48,17 +48,16 @@ const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SY
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
     ctx: Arc<SessionContext>,
-    runtime_config: RuntimeConfig,
 }
 
 impl DatafusionProcessor {
     pub fn new(
         execution_config: Arc<CompactionExecutionConfig>,
-        runtime_config: RuntimeConfig,
+        executor_parallelism: usize,
         file_io: FileIO,
     ) -> Self {
         let session_config = SessionConfig::new()
-            .with_target_partitions(runtime_config.executor_parallelism)
+            .with_target_partitions(executor_parallelism)
             .with_batch_size(execution_config.max_record_batch_rows)
             .set_bool(
                 "datafusion.sql_parser.enable_ident_normalization",
@@ -68,14 +67,13 @@ impl DatafusionProcessor {
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
-            runtime_config.executor_parallelism,
+            executor_parallelism,
             execution_config.max_record_batch_rows,
         );
 
         Self {
             table_register,
             ctx,
-            runtime_config,
         }
     }
 
@@ -138,6 +136,7 @@ impl DatafusionProcessor {
     pub async fn execute(
         &self,
         mut datafusion_task_ctx: DataFusionTaskContext,
+        output_parallelism: usize,
     ) -> Result<(Vec<SendableRecordBatchStream>, Schema)> {
         let input_schema = datafusion_task_ctx
             .input_schema
@@ -152,12 +151,10 @@ impl DatafusionProcessor {
 
         // Conditionally create a new physical_plan if repartitioning is needed
         let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
-            if physical_plan.output_partitioning().partition_count()
-                != self.runtime_config.output_parallelism
-            {
+            if physical_plan.output_partitioning().partition_count() != output_parallelism {
                 Arc::new(RepartitionExec::try_new(
                     physical_plan,
-                    Partitioning::RoundRobinBatch(self.runtime_config.output_parallelism),
+                    Partitioning::RoundRobinBatch(output_parallelism),
                 )?)
             } else {
                 physical_plan
@@ -504,10 +501,10 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_input_data_files(mut self, input_file_scan_tasks: InputFileScanTasks) -> Self {
-        self.data_files = input_file_scan_tasks.data_files;
-        self.position_delete_files = input_file_scan_tasks.position_delete_files;
-        self.equality_delete_files = input_file_scan_tasks.equality_delete_files;
+    pub fn with_input_data_files(mut self, file_group: FileGroup) -> Self {
+        self.data_files = file_group.data_files;
+        self.position_delete_files = file_group.position_delete_files;
+        self.equality_delete_files = file_group.equality_delete_files;
         self
     }
 

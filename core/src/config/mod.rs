@@ -33,6 +33,23 @@ pub const DEFAULT_MAX_TASK_TOTAL_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
 pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
+pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
+
+// Strategy configuration defaults
+pub const DEFAULT_GROUPING_STRATEGY: GroupingStrategy = GroupingStrategy::BinPack;
+pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB
+pub const DEFAULT_MAX_GROUP_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
+pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group
+pub const DEFAULT_MAX_GROUP_FILE_COUNT: usize = 32; // Maximum files per group
+
+/// Strategy for grouping files during compaction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupingStrategy {
+    /// No grouping - files are processed individually
+    Noop,
+    /// Binpack grouping - files are grouped to optimize size distribution
+    BinPack,
+}
 
 // Helper function for the default WriterProperties
 fn default_writer_properties() -> WriterProperties {
@@ -44,23 +61,21 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-#[derive(Builder, Debug, Default, Clone)]
-pub struct RuntimeConfig {
-    /// The number of parallel tasks to execute. used for scan and join.
-    #[builder(default = "DEFAULT_EXECUTOR_PARALLELISM")]
-    pub executor_parallelism: usize,
-    /// The number of parallel tasks to output. Only used for repartitioning.
-    #[builder(default = "DEFAULT_OUTPUT_PARALLELISM")]
-    pub output_parallelism: usize,
-}
-
 /// Common configuration for compaction
 /// Contains parameters that are shared across different compaction phases
-#[derive(Builder, Debug, Clone, Default)]
+#[derive(Builder, Debug, Clone)]
 pub struct CompactionBaseConfig {
     /// Target size in bytes for each compacted file (default: 1GB)
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size: u64,
+}
+
+impl Default for CompactionBaseConfig {
+    fn default() -> Self {
+        Self {
+            target_file_size: DEFAULT_TARGET_FILE_SIZE,
+        }
+    }
 }
 
 /// Configuration for compaction planning phase
@@ -98,6 +113,26 @@ pub struct CompactionPlanningConfig {
     /// Minimum number of files required to trigger compaction (default: 2)
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
     pub min_file_count: usize,
+
+    /// Strategy for grouping files (default: `BinPack`)
+    #[builder(default = "DEFAULT_GROUPING_STRATEGY")]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Minimum size for a compaction group (default: 512MB)
+    #[builder(default = "DEFAULT_MIN_GROUP_SIZE")]
+    pub min_group_size: u64,
+
+    /// Maximum size for a compaction group (default: 2GB)
+    #[builder(default = "DEFAULT_MAX_GROUP_SIZE")]
+    pub max_group_size: u64,
+
+    /// Minimum number of files per group (default: 2)
+    #[builder(default = "DEFAULT_MIN_GROUP_FILE_COUNT")]
+    pub min_group_file_count: usize,
+
+    /// Maximum number of files per group (default: 32)
+    #[builder(default = "DEFAULT_MAX_GROUP_FILE_COUNT")]
+    pub max_group_file_count: usize,
 }
 
 impl Default for CompactionPlanningConfig {
@@ -144,6 +179,10 @@ pub struct CompactionExecutionConfig {
     /// Smoothing factor for dynamic size estimation updates (default: 0.3)
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
+
+    /// Maximum number of compaction plans to execute concurrently (default: 4)
+    #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
+    pub max_concurrent_compaction_plans: usize,
 }
 
 impl Default for CompactionExecutionConfig {
