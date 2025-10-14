@@ -198,16 +198,6 @@ impl FileGroup {
         self.data_files
     }
 
-    /// Get a reference to the data files in this group
-    pub fn files(&self) -> &[FileScanTask] {
-        &self.data_files
-    }
-
-    /// Get a reference to the data files in this group (alias for backward compatibility)
-    pub fn data_files(&self) -> &[FileScanTask] {
-        &self.data_files
-    }
-
     /// Get total count of all input files (data + delete files)
     pub fn input_files_count(&self) -> usize {
         self.data_files.len() + self.position_delete_files.len() + self.equality_delete_files.len()
