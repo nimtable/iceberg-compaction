@@ -479,16 +479,14 @@ impl Compaction {
                     return Ok(());
                 }
 
+                // Allow multiple plans for Full compaction to support parallel execution
+                // The grouping strategy (e.g., BinPack) will control how files are split into plans
                 if plans.len() > 1 {
-                    tracing::warn!(
-                        "Full compaction for table '{}' contains multiple plans ({}).",
+                    tracing::info!(
+                        "Full compaction for table '{}' contains {} plans for parallel execution.",
                         self.table_ident,
                         plans.len()
                     );
-                    return Err(CompactionError::Execution(format!(
-                        "Full compaction contains multiple plans ({}).",
-                        plans.len()
-                    )));
                 }
             }
             CompactionType::MergeSmallDataFiles => {
@@ -819,30 +817,34 @@ impl CommitManager {
         use std::collections::HashMap;
 
         // 1. Load all files from snapshot once
-        let (all_data_files, all_delete_files) =
+        let (all_data_files, _all_delete_files) =
             get_all_files_from_snapshot(snapshot, table.file_io(), table.metadata()).await?;
 
-        // 2. Build efficient path -> DataFile index
-        let file_index: HashMap<&str, &DataFile> = all_data_files
+        // 2. Build efficient path -> DataFile index (only for data files)
+        let data_file_index: HashMap<&str, &DataFile> =
+            all_data_files.iter().map(|f| (f.file_path(), f)).collect();
+
+        // 3. Collect rewritten data files (to be replaced) from plans using the index
+        // Note: Only data files are collected, delete files are excluded
+        let rewritten_data_files: Vec<DataFile> = rewrite_results
             .iter()
-            .chain(all_delete_files.iter())
-            .map(|f| (f.file_path(), f))
+            .flat_map(|rr| {
+                rr.plan
+                    .file_group
+                    .data_files
+                    .iter()
+                    .map(|task| task.data_file_path.as_str())
+            })
+            .filter_map(|path| data_file_index.get(path).map(|&f| f.clone()))
             .collect();
 
-        // 3. Collect input files directly from plans using the index
-        let all_input_files: Vec<DataFile> = rewrite_results
-            .iter()
-            .flat_map(|rr| rr.plan.file_group.iter_all_input_paths())
-            .filter_map(|path| file_index.get(path).map(|&f| f.clone()))
-            .collect();
-
-        // 4. Collect all output files from all plans
-        let all_output_files: Vec<DataFile> = rewrite_results
+        // 4. Collect added data files (newly written) from all plans
+        let added_data_files: Vec<DataFile> = rewrite_results
             .iter()
             .flat_map(|rr| rr.output_data_files.iter().cloned())
             .collect();
 
-        Ok((all_output_files, all_input_files))
+        Ok((added_data_files, rewritten_data_files))
     }
 
     /// High-level interface: Rewrite files from compaction results
@@ -852,10 +854,10 @@ impl CommitManager {
         rewrite_results: Vec<RewriteResult>,
         to_branch: &str,
     ) -> Result<Table> {
-        let (output_files, input_files) = self
+        let (added_data_files, rewritten_data_files) = self
             .collect_files_from_results(&rewrite_results, to_branch)
             .await?;
-        self.rewrite_files(output_files, input_files, to_branch)
+        self.rewrite_files(added_data_files, rewritten_data_files, to_branch)
             .await
     }
 
@@ -866,22 +868,22 @@ impl CommitManager {
         rewrite_results: Vec<RewriteResult>,
         to_branch: &str,
     ) -> Result<Table> {
-        let (output_files, input_files) = self
+        let (added_data_files, rewritten_data_files) = self
             .collect_files_from_results(&rewrite_results, to_branch)
             .await?;
-        self.overwrite_files(output_files, input_files, to_branch)
+        self.overwrite_files(added_data_files, rewritten_data_files, to_branch)
             .await
     }
 
     /// Rewrites files in the table, handling retries and errors.
     pub async fn rewrite_files(
         &self,
-        output_files: Vec<DataFile>,
-        input_files: Vec<DataFile>,
+        added_data_files: Vec<DataFile>,
+        rewritten_data_files: Vec<DataFile>,
         to_branch: &str,
     ) -> Result<Table> {
-        let data_files = output_files;
-        let delete_files = input_files;
+        let data_files = added_data_files;
+        let delete_files = rewritten_data_files;
 
         let operation = || {
             let catalog = self.catalog.clone();
@@ -914,6 +916,7 @@ impl CommitManager {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
                         txn.rewrite_files(None, vec![])?
+                            .with_delete_filter_manager_enabled()
                             .add_data_files(data_files)?
                             .delete_files(delete_files)?
                             .with_to_branch(to_branch.to_owned())
@@ -928,6 +931,7 @@ impl CommitManager {
                     }
                 } else {
                     txn.rewrite_files(None, vec![])?
+                        .with_delete_filter_manager_enabled()
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
                         .with_to_branch(to_branch.to_owned())
@@ -976,12 +980,12 @@ impl CommitManager {
 
     pub async fn overwrite_files(
         &self,
-        output_files: Vec<DataFile>,
-        input_files: Vec<DataFile>,
+        added_data_files: Vec<DataFile>,
+        rewritten_data_files: Vec<DataFile>,
         to_branch: &str,
     ) -> Result<Table> {
-        let data_files = output_files;
-        let delete_files = input_files;
+        let data_files = added_data_files;
+        let delete_files = rewritten_data_files;
 
         let operation = || {
             let catalog = self.catalog.clone();

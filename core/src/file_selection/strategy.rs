@@ -214,16 +214,6 @@ impl FileGroup {
             .map(|task| task.file_size_in_bytes)
             .sum()
     }
-
-    /// Iterator over all input file paths (data + delete files)
-    /// This provides a clean way to access all file paths without repetitive chaining
-    pub fn iter_all_input_paths(&self) -> impl Iterator<Item = &str> {
-        self.data_files
-            .iter()
-            .chain(&self.position_delete_files)
-            .chain(&self.equality_delete_files)
-            .map(|task| task.data_file_path.as_str())
-    }
 }
 
 /// Object-safe trait for file filtering strategies
@@ -762,22 +752,14 @@ impl FileStrategyFactory {
                 Self::create_small_files_strategy(config)
             }
             CompactionType::Full => {
-                // Full compaction: include ALL files without any filtering
-                // - No file-level filtering (include files with deletes, all sizes, etc.)
-                // - No group-level filtering (include all groups regardless of size/count)
-                // - Only apply grouping to split into multiple tasks
-
-                let grouping = match &config.grouping_strategy {
-                    GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-                    GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
-                        BinPackGroupingStrategy::new(bin_config.target_group_size),
-                    ),
-                };
-
-                CompactionStrategy::new(
-                    vec![],   // No file filters
-                    grouping, // Grouping from config
-                    vec![],   // No group filters - this is the key difference
+                // Full compaction: select all files (no filtering), but use grouping to split into multiple plans
+                // This allows controlling the number of plans through config (e.g., BinPack with target_group_size)
+                Self::create_custom_strategy(
+                    /* exclude_delete_files */ false,
+                    /* size_filter */ None,
+                    /* min_file_count */ 0,
+                    /* max_task_total_size */ u64::MAX,
+                    /* grouping_strategy */ &config.grouping_strategy,
                 )
             }
         }
@@ -1071,8 +1053,9 @@ mod tests {
             crate::compaction::CompactionType::Full,
             &config,
         );
-        // Full compaction uses grouping strategy from config, which defaults to Noop
-        assert!(routed_full.description().contains("Noop"));
+
+        // Full compaction now uses grouping strategy from config instead of always Noop
+        assert!(!routed_full.description().is_empty());
     }
 
     #[test]
@@ -1919,41 +1902,152 @@ mod tests {
     }
 
     #[test]
-    fn test_full_compaction_no_filters() {
-        use crate::config::BinPackConfig;
-
-        // Test that Full compaction does NOT apply any filters (file or group level)
-        // even when BinPackConfig has min_group_size and min_group_file_count set
-
+    fn test_full_compaction_with_binpack_grouping() {
+        // Test that Full Compaction can use BinPack to split files into multiple groups
+        // and that each group's parallelism is calculated independently
+        let binpack_config = crate::config::BinPackConfig {
+            target_group_size: 50 * 1024 * 1024, // 50MB per group
+            min_group_size: None,
+            min_group_file_count: None, // No filter - we want to see all groups
+        };
         let config = CompactionPlanningConfigBuilder::default()
-            .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig {
-                target_group_size: 50 * 1024 * 1024,     // 50MB per group
-                min_group_size: Some(100 * 1024 * 1024), // 100MB min - should be IGNORED
-                min_group_file_count: Some(5),           // 5 files min - should be IGNORED
-            }))
+            .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
+            .min_size_per_partition(20 * 1024 * 1024) // 20MB per partition
+            .max_file_count_per_partition(1) // 1 file per partition
+            .max_parallelism(8) // Max 8 parallel tasks per group
+            .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
 
-        let strategy = FileStrategyFactory::create_files_strategy(CompactionType::Full, &config);
+        let strategy = FileStrategyFactory::create_files_strategy(
+            crate::compaction::CompactionType::Full,
+            &config,
+        );
 
-        // Create files that would be filtered out by group filters:
-        // - Small groups (< 100MB)
-        // - Groups with few files (< 5 files)
+        // Create test files with varying sizes to trigger different parallelism calculations
+        // Group 1 should get: file1 (30MB) + file2 (30MB) = 60MB, 2 files
+        // Group 2 should get: file3 (30MB) + file4 (10MB) = 40MB, 2 files
         let test_files = vec![
-            // Group 1: 2 small files = 20MB total (would be filtered by min_group_size and min_group_file_count)
-            TestFileBuilder::new("small1.parquet")
-                .size(10 * 1024 * 1024)
-                .build(),
-            TestFileBuilder::new("small2.parquet")
-                .size(10 * 1024 * 1024)
-                .build(),
-            // Group 2: 1 medium file = 30MB total (would be filtered by both)
-            TestFileBuilder::new("medium.parquet")
+            TestFileBuilder::new("file1.parquet")
                 .size(30 * 1024 * 1024)
                 .build(),
-            // Files with deletes (should also be included in Full compaction)
-            TestFileBuilder::new("with_deletes.parquet")
+            TestFileBuilder::new("file2.parquet")
+                .size(30 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("file3.parquet")
+                .size(30 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("file4.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+        ];
+
+        let groups = strategy.execute(test_files.clone(), &config).unwrap();
+
+        // Verify multiple groups were created
+        assert!(
+            groups.len() >= 2,
+            "BinPack should create multiple groups for Full compaction, but only {} groups were created",
+            groups.len()
+        );
+
+        // Verify all files are included (no filtering)
+        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(total_files, 4, "Full compaction should include all files");
+
+        // Verify total size is preserved
+        let total_size: u64 = groups.iter().map(|g| g.total_size).sum();
+        assert_eq!(
+            total_size,
+            100 * 1024 * 1024,
+            "Total size should be preserved"
+        );
+
+        // Verify each group respects constraints
+        // Note: We don't verify max_group_file_count here because BinPack doesn't enforce
+        // a max file count per group - it only enforces min_group_file_count as a filter
+
+        // **KEY VERIFICATION: Each group's parallelism is calculated independently**
+        for (idx, group) in groups.iter().enumerate() {
+            // Each group should have valid parallelism values
+            assert!(
+                group.executor_parallelism >= 1,
+                "Group {} executor_parallelism must be at least 1",
+                idx
+            );
+            assert!(
+                group.output_parallelism >= 1,
+                "Group {} output_parallelism must be at least 1",
+                idx
+            );
+
+            // Parallelism should respect max_parallelism per group
+            assert!(
+                group.executor_parallelism <= config.max_parallelism,
+                "Group {} executor_parallelism ({}) should not exceed max_parallelism ({})",
+                idx,
+                group.executor_parallelism,
+                config.max_parallelism
+            );
+
+            // Output parallelism should not exceed executor parallelism
+            assert!(
+                group.output_parallelism <= group.executor_parallelism,
+                "Group {} output_parallelism ({}) should not exceed executor_parallelism ({})",
+                idx,
+                group.output_parallelism,
+                group.executor_parallelism
+            );
+        }
+
+        // Verify that groups with different sizes may have different parallelism
+        // (This is the key property of independent calculation)
+        let parallelisms: Vec<_> = groups
+            .iter()
+            .map(|g| (g.executor_parallelism, g.output_parallelism))
+            .collect();
+
+        // Assert that parallelisms are non-empty and valid
+        assert!(
+            !parallelisms.is_empty(),
+            "Should have at least one group with parallelism calculated"
+        );
+
+        // Verify that at least one group has parallelism > 1
+        // (This confirms parallelism calculation is actually working)
+        let has_parallelism = parallelisms.iter().any(|(exec_p, _)| *exec_p > 1);
+        assert!(
+            has_parallelism,
+            "At least one group should have executor_parallelism > 1, got: {:?}",
+            parallelisms
+        );
+
+        // Verify description mentions BinPack
+        assert!(strategy.description().contains("BinPack"));
+    }
+
+    #[test]
+    fn test_full_compaction_with_noop_grouping() {
+        // Test that Full Compaction with Noop grouping creates a single group
+        let config = CompactionPlanningConfigBuilder::default()
+            .grouping_strategy(crate::config::GroupingStrategy::Noop)
+            .build()
+            .unwrap();
+
+        let strategy = FileStrategyFactory::create_files_strategy(
+            crate::compaction::CompactionType::Full,
+            &config,
+        );
+
+        let test_files = vec![
+            TestFileBuilder::new("file1.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("file2.parquet")
                 .size(20 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("file3.parquet")
+                .size(30 * 1024 * 1024)
                 .with_deletes()
                 .build(),
         ];

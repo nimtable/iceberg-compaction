@@ -148,7 +148,22 @@ pub struct CompactionPlanningConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
-    /// Maximum parallelism for the compaction process
+    /// Maximum parallelism for each individual compaction plan.
+    ///
+    /// This limits the executor parallelism within a *single* compaction plan (`FileGroup`).
+    /// When multiple plans run concurrently (controlled by `max_concurrent_compaction_plans`),
+    /// the theoretical maximum total system parallelism is:
+    /// ```text
+    /// max_parallelism × max_concurrent_compaction_plans
+    /// ```
+    ///
+    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
+    /// the theoretical maximum is 64 concurrent tasks across all plans.
+    ///
+    /// Note: Actual parallelism is dynamically calculated based on file sizes and counts,
+    /// so it typically won't reach the theoretical maximum.
+    ///
+    /// (default: number of CPU cores)
     #[builder(default = "available_parallelism().get()")]
     pub max_parallelism: usize,
 
@@ -212,7 +227,22 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
 
-    /// Maximum number of compaction plans to execute concurrently (default: 4)
+    /// Maximum number of compaction plans to execute concurrently.
+    ///
+    /// This controls how many compaction plans (`FileGroups`) can execute simultaneously.
+    /// Combined with `max_parallelism` (in `PlanningConfig`), this determines the theoretical
+    /// maximum total system parallelism:
+    /// ```text
+    /// max_parallelism × max_concurrent_compaction_plans
+    /// ```
+    ///
+    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
+    /// the theoretical maximum is 64 concurrent tasks across all plans.
+    ///
+    /// Note: Actual parallelism is typically lower because individual plans calculate
+    /// their parallelism based on file sizes and counts.
+    ///
+    /// (default: 4)
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
 }
