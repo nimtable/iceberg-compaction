@@ -30,15 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Configure the warehouse and catalog
     let mut iceberg_configs = HashMap::new();
 
-    let load_credentials_from_env = true;
+    let load_credentials_from_env = false;
     if load_credentials_from_env {
         iceberg_configs.insert(S3_DISABLE_CONFIG_LOAD.to_owned(), "false".to_owned());
     } else {
         iceberg_configs.insert(S3_DISABLE_CONFIG_LOAD.to_owned(), "true".to_owned());
         iceberg_configs.insert(S3_REGION.to_owned(), "us-east-1".to_owned());
-        iceberg_configs.insert(S3_ENDPOINT.to_owned(), "http://localhost:9000".to_owned());
-        iceberg_configs.insert(S3_ACCESS_KEY_ID.to_owned(), "xxxxxxx".to_owned());
-        iceberg_configs.insert(S3_SECRET_ACCESS_KEY.to_owned(), "yyyyyyy".to_owned());
+        iceberg_configs.insert(S3_ACCESS_KEY_ID.to_owned(), "xxxx".to_owned());
+        iceberg_configs.insert(S3_SECRET_ACCESS_KEY.to_owned(), "yyyy".to_owned());
     }
 
     // Optional configurations for authentication
@@ -49,8 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_builder =
         iceberg_compaction_core::iceberg_catalog_rest::RestCatalogConfig::builder()
-            .uri("http://localhost:8080/your/catalog/uri".to_owned())
-            .warehouse("your-warehouse-location".to_owned())
+            .uri("http://127.0.0.1:8181/catalog/".to_owned())
+            .warehouse("my-test".to_owned())
             .props(iceberg_configs);
 
     // 2. Create the catalog
@@ -58,15 +57,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         iceberg_compaction_core::iceberg_catalog_rest::RestCatalog::new(config_builder.build()),
     );
 
-    let namespace_ident = NamespaceIdent::new("my_namespace".into());
-    let table_ident = TableIdent::new(namespace_ident, "my_table".into());
+    let namespace_ident = NamespaceIdent::new("namespace".into());
+    let table_ident = TableIdent::new(namespace_ident, "datagen_t_iceberg".into());
 
     // 3. Configure compaction settings
     let compaction_config = CompactionConfigBuilder::default().build()?;
     let compaction =
         CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
             .with_config(Arc::new(compaction_config))
-            .with_catalog_name("my_rest_catalog".to_owned())
+            .with_catalog_name("demo".to_owned())
             .build();
 
     // 4. Perform the compaction
