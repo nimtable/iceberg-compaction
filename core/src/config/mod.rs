@@ -171,42 +171,7 @@ impl Default for CompactionPlanningConfig {
     }
 }
 
-impl CompactionPlanningConfigBuilder {
-    /// Use Noop grouping strategy (all files in one group)
-    pub fn noop_grouping(mut self) -> Self {
-        self.grouping_strategy = Some(GroupingStrategy::Noop);
-        self
-    }
-
-    /// Use `BinPack` grouping with the specified target size (no filters)
-    pub fn binpack_grouping(mut self, target_group_size: u64) -> Self {
-        self.grouping_strategy = Some(GroupingStrategy::BinPack(BinPackConfig::new(
-            target_group_size,
-        )));
-        self
-    }
-
-    /// Use `BinPack` grouping with default configuration (1GB target, no filters)
-    pub fn binpack_grouping_default(mut self) -> Self {
-        self.grouping_strategy = Some(GroupingStrategy::BinPack(BinPackConfig::default()));
-        self
-    }
-
-    /// Use `BinPack` grouping with filters (for small files compaction)
-    pub fn binpack_with_filters(
-        mut self,
-        target_group_size: u64,
-        min_group_size: Option<u64>,
-        min_group_file_count: Option<usize>,
-    ) -> Self {
-        self.grouping_strategy = Some(GroupingStrategy::BinPack(BinPackConfig::with_filters(
-            target_group_size,
-            min_group_size,
-            min_group_file_count,
-        )));
-        self
-    }
-}
+// CompactionPlanningConfigBuilder uses derive_builder, no custom methods needed
 
 /// Configuration for compaction execution phase
 /// Contains parameters that affect the actual compaction execution
