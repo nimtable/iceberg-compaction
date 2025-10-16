@@ -600,25 +600,6 @@ impl GroupFilterStrategy for MinGroupSizeStrategy {
     }
 }
 
-/// Group filter strategy that filters groups based on maximum group size
-#[derive(Debug)]
-pub struct MaxGroupSizeStrategy {
-    pub max_group_size: u64,
-}
-
-impl GroupFilterStrategy for MaxGroupSizeStrategy {
-    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
-        groups
-            .into_iter()
-            .filter(|group| group.total_size <= self.max_group_size)
-            .collect()
-    }
-
-    fn description(&self) -> String {
-        format!("MaxGroupSize[{}MB]", self.max_group_size / 1024 / 1024)
-    }
-}
-
 /// Group filter strategy that filters groups based on minimum file count
 #[derive(Debug)]
 pub struct MinGroupFileCountStrategy {
@@ -635,25 +616,6 @@ impl GroupFilterStrategy for MinGroupFileCountStrategy {
 
     fn description(&self) -> String {
         format!("MinGroupFileCount[{}]", self.min_file_count)
-    }
-}
-
-/// Group filter strategy that filters groups based on maximum file count
-#[derive(Debug)]
-pub struct MaxGroupFileCountStrategy {
-    pub max_file_count: usize,
-}
-
-impl GroupFilterStrategy for MaxGroupFileCountStrategy {
-    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
-        groups
-            .into_iter()
-            .filter(|group| group.data_file_count <= self.max_file_count)
-            .collect()
-    }
-
-    fn description(&self) -> String {
-        format!("MaxGroupFileCount[{}]", self.max_file_count)
     }
 }
 
@@ -1529,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_group_filter_strategies_with_file_groups() {
-        // Test that the new FileGroup-based group filter strategies work correctly
+        // Test that the FileGroup-based group filter strategies work correctly
 
         // Create test file groups
         let small_group = FileGroup::new(vec![
@@ -1573,22 +1535,10 @@ mod tests {
         assert_eq!(filtered_by_size.len(), 1); // Only large_group should pass (225MB total)
         assert_eq!(filtered_by_size[0].total_size, large_group.total_size);
 
-        // Test MaxGroupSizeStrategy
-        let max_size_strategy = MaxGroupSizeStrategy {
-            max_group_size: 50 * 1024 * 1024,
-        }; // 50MB max
-        let filtered_by_max_size = max_size_strategy.filter_groups(groups.clone());
-        assert_eq!(filtered_by_max_size.len(), 2); // small_group (15MB) and single_file_group (20MB) should pass
-
         // Test MinGroupFileCountStrategy
         let min_file_count_strategy = MinGroupFileCountStrategy { min_file_count: 2 };
         let filtered_by_min_count = min_file_count_strategy.filter_groups(groups.clone());
         assert_eq!(filtered_by_min_count.len(), 2); // small_group (2 files) and large_group (3 files) should pass
-
-        // Test MaxGroupFileCountStrategy
-        let max_file_count_strategy = MaxGroupFileCountStrategy { max_file_count: 2 };
-        let filtered_by_max_count = max_file_count_strategy.filter_groups(groups.clone());
-        assert_eq!(filtered_by_max_count.len(), 2); // small_group (2 files) and single_file_group (1 file) should pass
 
         // Test NoopGroupFilterStrategy
         let noop_strategy = NoopGroupFilterStrategy;
@@ -1597,14 +1547,9 @@ mod tests {
 
         // Test that descriptions are formatted correctly
         assert_eq!(min_size_strategy.description(), "MinGroupSize[100MB]");
-        assert_eq!(max_size_strategy.description(), "MaxGroupSize[50MB]");
         assert_eq!(
             min_file_count_strategy.description(),
             "MinGroupFileCount[2]"
-        );
-        assert_eq!(
-            max_file_count_strategy.description(),
-            "MaxGroupFileCount[2]"
         );
         assert_eq!(noop_strategy.description(), "NoopGroupFilter");
     }
@@ -1722,11 +1667,6 @@ mod tests {
         // With 1GB target and only 5MB total, all files go into 1 group
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].data_file_count, 5);
-
-        // If you need to enforce max files per group, use MaxGroupFileCountStrategy filter:
-        let filtered_groups = MaxGroupFileCountStrategy { max_file_count: 2 }.filter_groups(groups);
-        // This filters out groups with > 2 files
-        assert_eq!(filtered_groups.len(), 0);
 
         assert_eq!(
             normal_strategy.description(),
