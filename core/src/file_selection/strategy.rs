@@ -19,6 +19,8 @@ use crate::config::{CompactionPlanningConfig, GroupingStrategy};
 use crate::{CompactionError, Result};
 use iceberg::scan::FileScanTask;
 
+use super::packer::ListPacker;
+
 /// A group of files selected for compaction
 ///
 /// This struct encapsulates a collection of files that should be compacted together,
@@ -322,106 +324,6 @@ impl GroupFilterStrategy for NoopGroupFilterStrategy {
     }
 }
 
-/// Pure bin-packing algorithm - similar to Java's BinPacking.ListPacker
-///
-/// This struct implements the First-Fit Decreasing algorithm for packing items into bins.
-/// It is completely independent of business logic and only cares about the weight constraint.
-#[derive(Debug, Clone)]
-pub struct ListPacker {
-    /// Target weight (size) for each bin
-    pub target_weight: u64,
-    /// Number of bins to look back when finding a suitable bin for an item
-    /// Higher values may produce better packing but take more time
-    pub lookback: usize,
-}
-
-impl ListPacker {
-    /// Create a new `ListPacker` with the given target weight
-    pub fn new(target_weight: u64) -> Self {
-        Self {
-            target_weight,
-            lookback: 1, // Default lookback, matches Java's usage
-        }
-    }
-
-    /// Pack items into bins using the First-Fit Decreasing algorithm
-    ///
-    /// # Arguments
-    /// * `items` - Items to pack
-    /// * `weight_func` - Function to extract weight from each item
-    ///
-    /// # Returns
-    /// A vector of bins, where each bin is a vector of items
-    pub fn pack<T, F>(&self, mut items: Vec<T>, weight_func: F) -> Vec<Vec<T>>
-    where
-        F: Fn(&T) -> u64,
-    {
-        if items.is_empty() {
-            return vec![];
-        }
-
-        // Sort by weight descending (First-Fit Decreasing)
-        items.sort_by_key(|b| std::cmp::Reverse(weight_func(b)));
-
-        let mut bins: Vec<Bin<T>> = vec![];
-
-        for item in items {
-            let weight = weight_func(&item);
-
-            // Try to find a bin within the lookback window that can fit this item
-            let bin_to_use = bins
-                .iter_mut()
-                .rev()
-                .take(self.lookback)
-                .find(|bin| bin.can_add(weight));
-
-            if let Some(bin) = bin_to_use {
-                bin.add(item, weight);
-            } else {
-                // Create a new bin
-                let mut new_bin = Bin::new(self.target_weight);
-                new_bin.add(item, weight);
-                bins.push(new_bin);
-            }
-        }
-
-        // Extract items from bins
-        bins.into_iter().map(|bin| bin.items).collect()
-    }
-}
-
-/// Internal bin structure for the packing algorithm
-#[derive(Debug)]
-struct Bin<T> {
-    target_weight: u64,
-    items: Vec<T>,
-    current_weight: u64,
-}
-
-impl<T> Bin<T> {
-    fn new(target_weight: u64) -> Self {
-        Self {
-            target_weight,
-            items: Vec::new(),
-            current_weight: 0,
-        }
-    }
-
-    fn can_add(&self, weight: u64) -> bool {
-        // Special case: if target_weight is 0, always allow adding to existing bin
-        // This ensures all items go into a single bin when target is 0
-        if self.target_weight == 0 {
-            return true;
-        }
-        self.current_weight + weight <= self.target_weight
-    }
-
-    fn add(&mut self, item: T, weight: u64) {
-        self.current_weight += weight;
-        self.items.push(item);
-    }
-}
-
 /// `BinPack` grouping strategy that optimizes file size distribution
 ///
 /// This strategy uses a pure bin-packing algorithm (First-Fit Decreasing) to group files
@@ -450,7 +352,7 @@ impl BinPackGroupingStrategy {
         // Use the pure ListPacker algorithm
         // This only considers target_group_size, not max_files_per_group
         let packer = ListPacker::new(self.target_group_size);
-        let groups = packer.pack(files, |task| task.length);
+        let groups = packer.pack(files, |task| task.file_size_in_bytes);
 
         // Convert Vec<Vec<FileScanTask>> to Vec<FileGroup>
         groups
