@@ -690,15 +690,6 @@ impl FileStrategyFactory {
         )
     }
 
-    /// Create a no-op strategy that passes all files through
-    pub fn create_noop_strategy() -> CompactionStrategy {
-        CompactionStrategy::new(
-            vec![Box::new(NoopStrategy)],
-            GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-            vec![Box::new(NoopGroupFilterStrategy)],
-        )
-    }
-
     /// Create custom strategy with fine-grained parameter control.
     pub fn create_custom_strategy(
         exclude_delete_files: bool,
@@ -770,7 +761,25 @@ impl FileStrategyFactory {
                 // Use the small files strategy architecture
                 Self::create_small_files_strategy(config)
             }
-            CompactionType::Full => Self::create_noop_strategy(),
+            CompactionType::Full => {
+                // Full compaction: include ALL files without any filtering
+                // - No file-level filtering (include files with deletes, all sizes, etc.)
+                // - No group-level filtering (include all groups regardless of size/count)
+                // - Only apply grouping to split into multiple tasks
+
+                let grouping = match &config.grouping_strategy {
+                    GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
+                    GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
+                        BinPackGroupingStrategy::new(bin_config.target_group_size),
+                    ),
+                };
+
+                CompactionStrategy::new(
+                    vec![],   // No file filters
+                    grouping, // Grouping from config
+                    vec![],   // No group filters - this is the key difference
+                )
+            }
         }
     }
 
@@ -1045,10 +1054,6 @@ mod tests {
         // Keep this test minimal: verify factory outputs non-empty description and basic routing
         let config = CompactionPlanningConfigBuilder::default().build().unwrap();
 
-        // Noop factory
-        let noop_strategy = FileStrategyFactory::create_noop_strategy();
-        assert!(noop_strategy.description().contains("Noop"));
-
         // Small-files strategy should mention core filters
         let small_files_strategy = FileStrategyFactory::create_small_files_strategy(&config);
         let small_files_desc = small_files_strategy.description();
@@ -1066,6 +1071,7 @@ mod tests {
             crate::compaction::CompactionType::Full,
             &config,
         );
+        // Full compaction uses grouping strategy from config, which defaults to Noop
         assert!(routed_full.description().contains("Noop"));
     }
 
@@ -1909,6 +1915,85 @@ mod tests {
         assert_eq!(
             out_p, 1,
             "Heuristic should force single output when data is tiny"
+        );
+    }
+
+    #[test]
+    fn test_full_compaction_no_filters() {
+        use crate::config::BinPackConfig;
+
+        // Test that Full compaction does NOT apply any filters (file or group level)
+        // even when BinPackConfig has min_group_size and min_group_file_count set
+
+        let config = CompactionPlanningConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig {
+                target_group_size: 50 * 1024 * 1024,     // 50MB per group
+                min_group_size: Some(100 * 1024 * 1024), // 100MB min - should be IGNORED
+                min_group_file_count: Some(5),           // 5 files min - should be IGNORED
+            }))
+            .build()
+            .unwrap();
+
+        let strategy = FileStrategyFactory::create_files_strategy(CompactionType::Full, &config);
+
+        // Create files that would be filtered out by group filters:
+        // - Small groups (< 100MB)
+        // - Groups with few files (< 5 files)
+        let test_files = vec![
+            // Group 1: 2 small files = 20MB total (would be filtered by min_group_size and min_group_file_count)
+            TestFileBuilder::new("small1.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("small2.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            // Group 2: 1 medium file = 30MB total (would be filtered by both)
+            TestFileBuilder::new("medium.parquet")
+                .size(30 * 1024 * 1024)
+                .build(),
+            // Files with deletes (should also be included in Full compaction)
+            TestFileBuilder::new("with_deletes.parquet")
+                .size(20 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+        ];
+
+        let result = strategy.execute(test_files.clone(), &config).unwrap();
+
+        // Full compaction should include ALL files, creating groups but not filtering any
+        let total_files_in_groups: usize = result.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(
+            total_files_in_groups, 4,
+            "Full compaction should include all 4 files without any filtering"
+        );
+
+        // Verify files with deletes are included
+        let has_files_with_deletes = result
+            .iter()
+            .flat_map(|g| &g.data_files)
+            .any(|f| !f.deletes.is_empty());
+        assert!(
+            has_files_with_deletes,
+            "Full compaction should include files with deletes"
+        );
+
+        // Verify groups are created (BinPack should split into multiple groups)
+        assert!(
+            result.len() > 1,
+            "BinPack grouping should create multiple groups"
+        );
+
+        // Verify strategy description doesn't mention any filters
+        let desc = strategy.description();
+        assert!(
+            !desc.contains("MinGroupSize") && !desc.contains("MinGroupFileCount"),
+            "Full compaction strategy should not have group filters, got: {}",
+            desc
+        );
+        assert!(
+            !desc.contains("NoDeleteFiles") && !desc.contains("SizeFilter"),
+            "Full compaction strategy should not have file filters, got: {}",
+            desc
         );
     }
 }
