@@ -36,7 +36,7 @@ pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 
 // Strategy configuration defaults
-pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 1024 * 1024 * 1024; // 1GB - target size for BinPack algorithm
+pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - target size for BinPack algorithm
 pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
 pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
 
