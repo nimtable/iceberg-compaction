@@ -19,9 +19,11 @@ use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
+pub mod packer;
 pub mod strategy;
 
 // Re-export commonly used types for convenience
+pub use packer::ListPacker;
 pub use strategy::{CompactionStrategy, FileGroup, FileStrategyFactory};
 
 /// File selection service responsible for selecting files for various operations

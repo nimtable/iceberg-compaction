@@ -36,19 +36,65 @@ pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 
 // Strategy configuration defaults
-pub const DEFAULT_GROUPING_STRATEGY: GroupingStrategy = GroupingStrategy::BinPack;
-pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB
-pub const DEFAULT_MAX_GROUP_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
-pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group
-pub const DEFAULT_MAX_GROUP_FILE_COUNT: usize = 32; // Maximum files per group
+pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - target size for BinPack algorithm
+pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
+pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
+
+/// Configuration for `BinPack` grouping strategy
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinPackConfig {
+    /// Target size for each bin/group
+    /// The `BinPack` algorithm tries to fill each bin to approximately this size
+    pub target_group_size: u64,
+
+    /// Minimum size for a compaction group (filter out smaller groups)
+    /// Set to None to disable this filter (default: None)
+    pub min_group_size: Option<u64>,
+
+    /// Minimum number of files per group (filter out groups with fewer files)
+    /// Set to None to disable this filter (default: None)
+    pub min_group_file_count: Option<usize>,
+}
+
+impl BinPackConfig {
+    /// Create a `BinPack` config with only target size, no filters (recommended)
+    pub fn new(target_group_size: u64) -> Self {
+        Self {
+            target_group_size,
+            min_group_size: None,
+            min_group_file_count: None,
+        }
+    }
+
+    /// Create a `BinPack` config with all filters enabled (for small files compaction)
+    pub fn with_filters(
+        target_group_size: u64,
+        min_group_size: Option<u64>,
+        min_group_file_count: Option<usize>,
+    ) -> Self {
+        Self {
+            target_group_size,
+            min_group_size,
+            min_group_file_count,
+        }
+    }
+}
+
+impl Default for BinPackConfig {
+    fn default() -> Self {
+        // Default: just binpack, no filtering
+        Self::new(DEFAULT_TARGET_GROUP_SIZE)
+    }
+}
 
 /// Strategy for grouping files during compaction
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GroupingStrategy {
-    /// No grouping - files are processed individually
+    /// No grouping - all files go into a single group
+    #[default]
     Noop,
-    /// Binpack grouping - files are grouped to optimize size distribution
-    BinPack,
+    /// Bin-packing based grouping - files are grouped to optimize size distribution
+    BinPack(BinPackConfig),
 }
 
 // Helper function for the default WriterProperties
@@ -114,25 +160,9 @@ pub struct CompactionPlanningConfig {
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
     pub min_file_count: usize,
 
-    /// Strategy for grouping files (default: `BinPack`)
-    #[builder(default = "DEFAULT_GROUPING_STRATEGY")]
+    /// Strategy for grouping files (default: `Noop`)
+    #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
-
-    /// Minimum size for a compaction group (default: 512MB)
-    #[builder(default = "DEFAULT_MIN_GROUP_SIZE")]
-    pub min_group_size: u64,
-
-    /// Maximum size for a compaction group (default: 2GB)
-    #[builder(default = "DEFAULT_MAX_GROUP_SIZE")]
-    pub max_group_size: u64,
-
-    /// Minimum number of files per group (default: 2)
-    #[builder(default = "DEFAULT_MIN_GROUP_FILE_COUNT")]
-    pub min_group_file_count: usize,
-
-    /// Maximum number of files per group (default: 32)
-    #[builder(default = "DEFAULT_MAX_GROUP_FILE_COUNT")]
-    pub max_group_file_count: usize,
 }
 
 impl Default for CompactionPlanningConfig {
@@ -140,6 +170,8 @@ impl Default for CompactionPlanningConfig {
         CompactionPlanningConfigBuilder::default().build().unwrap()
     }
 }
+
+// CompactionPlanningConfigBuilder uses derive_builder, no custom methods needed
 
 /// Configuration for compaction execution phase
 /// Contains parameters that affect the actual compaction execution
