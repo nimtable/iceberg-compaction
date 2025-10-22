@@ -482,7 +482,7 @@ impl Compaction {
                 // Allow multiple plans for Full compaction to support parallel execution
                 // The grouping strategy (e.g., BinPack) will control how files are split into plans
                 if plans.len() > 1 {
-                    tracing::info!(
+                    tracing::debug!(
                         "Full compaction for table '{}' contains {} plans for parallel execution.",
                         self.table_ident,
                         plans.len()

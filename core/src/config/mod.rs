@@ -44,20 +44,17 @@ pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group fi
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinPackConfig {
     /// Target size for each bin/group
-    /// The `BinPack` algorithm tries to fill each bin to approximately this size
     pub target_group_size: u64,
 
-    /// Minimum size for a compaction group (filter out smaller groups)
-    /// Set to None to disable this filter (default: None)
+    /// Minimum size filter for compaction groups
     pub min_group_size: Option<u64>,
 
-    /// Minimum number of files per group (filter out groups with fewer files)
-    /// Set to None to disable this filter (default: None)
+    /// Minimum file count filter per group
     pub min_group_file_count: Option<usize>,
 }
 
 impl BinPackConfig {
-    /// Create a `BinPack` config with only target size, no filters (recommended)
+    /// Create a `BinPack` config with only target size (no filters)
     pub fn new(target_group_size: u64) -> Self {
         Self {
             target_group_size,
@@ -66,7 +63,7 @@ impl BinPackConfig {
         }
     }
 
-    /// Create a `BinPack` config with all filters enabled (for small files compaction)
+    /// Create a `BinPack` config with filters enabled
     pub fn with_filters(
         target_group_size: u64,
         min_group_size: Option<u64>,
@@ -82,7 +79,6 @@ impl BinPackConfig {
 
 impl Default for BinPackConfig {
     fn default() -> Self {
-        // Default: just binpack, no filtering
         Self::new(DEFAULT_TARGET_GROUP_SIZE)
     }
 }
@@ -107,11 +103,10 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-/// Common configuration for compaction
-/// Contains parameters that are shared across different compaction phases
+/// Common configuration shared across different compaction phases
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionBaseConfig {
-    /// Target size in bytes for each compacted file (default: 1GB)
+    /// Target size in bytes for each compacted file
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size: u64,
 }
@@ -125,18 +120,17 @@ impl Default for CompactionBaseConfig {
 }
 
 /// Configuration for compaction planning phase
-/// Contains parameters that affect file selection and parallelism calculation
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionPlanningConfig {
     /// Base configuration shared across all compaction phases
     #[builder(default)]
     pub base: CompactionBaseConfig,
 
-    /// Threshold for small file compaction (default: 32MB)
+    /// Threshold for small file compaction
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
     pub small_file_threshold: u64,
 
-    /// Maximum total size for a single compaction task (default: 50GB)
+    /// Maximum total size for a single compaction task
     #[builder(default = "DEFAULT_MAX_TASK_TOTAL_SIZE")]
     pub max_task_total_size: u64,
 
@@ -148,34 +142,19 @@ pub struct CompactionPlanningConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
-    /// Maximum parallelism for each individual compaction plan.
-    ///
-    /// This limits the executor parallelism within a *single* compaction plan (`FileGroup`).
-    /// When multiple plans run concurrently (controlled by `max_concurrent_compaction_plans`),
-    /// the theoretical maximum total system parallelism is:
-    /// ```text
-    /// max_parallelism × max_concurrent_compaction_plans
-    /// ```
-    ///
-    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
-    /// the theoretical maximum is 64 concurrent tasks across all plans.
-    ///
-    /// Note: Actual parallelism is dynamically calculated based on file sizes and counts,
-    /// so it typically won't reach the theoretical maximum.
-    ///
-    /// (default: number of CPU cores)
+    /// Maximum parallelism for the compaction process
     #[builder(default = "available_parallelism().get()")]
     pub max_parallelism: usize,
 
-    /// Whether to enable heuristic output parallelism (default: true)
+    /// Whether to enable heuristic output parallelism
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
 
-    /// Minimum number of files required to trigger compaction (default: 2)
+    /// Minimum number of files required to trigger compaction
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
     pub min_file_count: usize,
 
-    /// Strategy for grouping files (default: `Noop`)
+    /// Strategy for grouping files
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
 }
@@ -186,10 +165,9 @@ impl Default for CompactionPlanningConfig {
     }
 }
 
-// CompactionPlanningConfigBuilder uses derive_builder, no custom methods needed
+// CompactionPlanningConfigBuilder uses derive_builder
 
 /// Configuration for compaction execution phase
-/// Contains parameters that affect the actual compaction execution
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
     /// Base configuration shared across all compaction phases
@@ -215,34 +193,19 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
 
-    /// The executor engine will normalize un-quoted column identifiers to lowercase (default: true)
+    /// Normalize un-quoted column identifiers to lowercase
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
 
-    /// Whether to enable dynamic file size estimation for better rolling prediction (default: false)
+    /// Whether to enable dynamic file size estimation
     #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
     pub enable_dynamic_size_estimation: bool,
 
-    /// Smoothing factor for dynamic size estimation updates (default: 0.3)
+    /// Smoothing factor for dynamic size estimation updates
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
 
-    /// Maximum number of compaction plans to execute concurrently.
-    ///
-    /// This controls how many compaction plans (`FileGroups`) can execute simultaneously.
-    /// Combined with `max_parallelism` (in `PlanningConfig`), this determines the theoretical
-    /// maximum total system parallelism:
-    /// ```text
-    /// max_parallelism × max_concurrent_compaction_plans
-    /// ```
-    ///
-    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
-    /// the theoretical maximum is 64 concurrent tasks across all plans.
-    ///
-    /// Note: Actual parallelism is typically lower because individual plans calculate
-    /// their parallelism based on file sizes and counts.
-    ///
-    /// (default: 4)
+    /// Maximum number of compaction plans to execute concurrently
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
 }
@@ -254,7 +217,6 @@ impl Default for CompactionExecutionConfig {
 }
 
 /// Main configuration that combines planning and execution configs
-/// This provides clear separation between planning and execution phases
 #[derive(Builder, Debug, Clone)]
 #[builder(pattern = "owned")]
 pub struct CompactionConfig {

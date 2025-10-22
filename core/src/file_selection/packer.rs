@@ -293,10 +293,10 @@ mod tests {
     fn test_list_packer_generic_type_string() {
         let packer = ListPacker::new(20);
         let items = vec![
-            "hello".to_string(),       // length=5
-            "world".to_string(),       // length=5
-            "rust".to_string(),        // length=4
-            "programming".to_string(), // length=11
+            "hello".to_owned(),       // length=5
+            "world".to_owned(),       // length=5
+            "rust".to_owned(),        // length=4
+            "programming".to_owned(), // length=11
         ];
 
         let result = packer.pack(items, |s| s.len() as u64);
@@ -310,9 +310,9 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0],
-            vec!["programming".to_string(), "hello".to_string()]
+            vec!["programming".to_owned(), "hello".to_owned()]
         );
-        assert_eq!(result[1], vec!["world".to_string(), "rust".to_string()]);
+        assert_eq!(result[1], vec!["world".to_owned(), "rust".to_owned()]);
     }
 
     #[test]
@@ -326,19 +326,19 @@ mod tests {
         let packer = ListPacker::new(100);
         let items = vec![
             Item {
-                name: "A".to_string(),
+                name: "A".to_owned(),
                 weight: 70,
             },
             Item {
-                name: "B".to_string(),
+                name: "B".to_owned(),
                 weight: 30,
             },
             Item {
-                name: "C".to_string(),
+                name: "C".to_owned(),
                 weight: 25,
             },
             Item {
-                name: "D".to_string(),
+                name: "D".to_owned(),
                 weight: 40,
             },
         ];
