@@ -142,7 +142,22 @@ pub struct CompactionPlanningConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
-    /// Maximum parallelism for the compaction process
+    /// Maximum parallelism for each individual compaction plan
+    ///
+    /// This limits the number of concurrent tasks (executor parallelism) within a single
+    /// compaction plan execution. It applies to both `compact()` and plan-driven workflows.
+    ///
+    /// When using `compact()` with multiple plans running concurrently (controlled by
+    /// `max_concurrent_compaction_plans`), the theoretical maximum total system parallelism is:
+    /// ```text
+    /// max_parallelism × max_concurrent_compaction_plans
+    /// ```
+    ///
+    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
+    /// the theoretical maximum is 64 concurrent tasks across all plans.
+    ///
+    /// Note: Actual parallelism is dynamically calculated based on file sizes and counts,
+    /// so it may be lower than `max_parallelism`.
     #[builder(default = "available_parallelism().get()")]
     pub max_parallelism: usize,
 
@@ -206,6 +221,23 @@ pub struct CompactionExecutionConfig {
     pub size_estimation_smoothing_factor: f64,
 
     /// Maximum number of compaction plans to execute concurrently
+    ///
+    /// **Note**: This parameter only applies when using the `compact()` method (all-in-one workflow).
+    /// For plan-driven workflows (`plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()`),
+    /// users manage concurrency themselves.
+    ///
+    /// This controls how many compaction plans (`FileGroups`) can execute simultaneously.
+    /// Combined with `max_parallelism` (in `CompactionPlanningConfig`), this determines the
+    /// theoretical maximum total system parallelism:
+    /// ```text
+    /// max_parallelism × max_concurrent_compaction_plans
+    /// ```
+    ///
+    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
+    /// the theoretical maximum is 64 concurrent tasks across all plans.
+    ///
+    /// Note: Actual parallelism is typically lower because individual plans calculate
+    /// their own parallelism based on data characteristics.
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
 }
