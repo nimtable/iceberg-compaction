@@ -1,0 +1,28 @@
+RestCatalog:
+  CatalogName: demo
+  CatalogUri: http://127.0.0.1:8181/catalog
+  DatabaseName: demo
+  TableName: table_10w_1ws_10ww1
+  WarehousePath: my-test2
+  S3Region: us-east-1
+  S3AccessKey: xxx
+  S3SecretKey: xxx
+
+Schemas:
+  pk_indices: [0, 1]
+  columns:
+    - name: "v1"
+      type: "int"
+    - name: "v2"
+      type: "bigint"
+    - name: "v3"
+      type: "varchar"
+      length: 20
+WriterConfig:
+  data_file_row_count: 10000
+  equality_delete_row_count: 100
+  position_delete_row_count: 100
+  data_file_num: 5
+  batch_size: 1000
+
+  
