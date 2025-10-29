@@ -263,21 +263,19 @@ pub async fn mock_iceberg_table() -> Result<()> {
 
     // Commit data files and position deletes in one transaction
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn.fast_append(Some(rand::random::<i64>()), None, vec![])?;
+    let mut fast_append_action =
+        txn.fast_append(Some(rand::random::<u64>() as i64), None, vec![])?;
     fast_append_action
         .add_data_files(data_files)?
         .add_data_files(position_delete_files)?;
     let table = fast_append_action.apply().await?.commit(&catalog).await?;
 
     // Commit equality deletes in a separate transaction
-    if !equality_delete_files.is_empty() {
-        let snapshot = table.metadata().current_snapshot().unwrap();
-        let txn = Transaction::new(&table);
-        let mut fast_append_action =
-            txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
-        fast_append_action.add_data_files(equality_delete_files)?;
-        fast_append_action.apply().await?.commit(&catalog).await?;
-    }
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let txn = Transaction::new(&table);
+    let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
+    fast_append_action.add_data_files(equality_delete_files)?;
+    fast_append_action.apply().await?.commit(&catalog).await?;
 
     tracing::info!(
         "Successfully created table '{}' in namespace '{}' with {} data files",
