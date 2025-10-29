@@ -16,6 +16,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use futures::future::try_join_all;
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY},
@@ -105,6 +106,7 @@ pub struct WriterConfigYaml {
     pub position_delete_row_count: usize,
     pub data_file_num: usize,
     pub batch_size: usize,
+    pub concurrency: usize,
 }
 
 impl MockIcebergConfig {
@@ -199,21 +201,48 @@ pub async fn mock_iceberg_table() -> Result<()> {
 
     // Generate files
     let writer_config = WriterConfig::new(&table, Some(pk_indices));
+
+    // Generate files with concurrency
+    let concurrency = config.writer_config.concurrency;
+    let total_files = config.writer_config.data_file_num;
+
+    // Calculate files per task
+    let files_per_task = (total_files + concurrency - 1) / concurrency;
+
     let file_generator_config = FileGeneratorConfig::new()
-        .with_data_file_num(config.writer_config.data_file_num)
+        .with_data_file_num(files_per_task)
         .with_data_file_row_count(config.writer_config.data_file_row_count)
         .with_equality_delete_row_count(config.writer_config.equality_delete_row_count)
         .with_position_delete_row_count(config.writer_config.position_delete_row_count)
         .with_batch_size(config.writer_config.batch_size);
 
-    let mut file_generator = FileGenerator::new(
-        file_generator_config,
-        Arc::new(schema),
-        writer_config,
-        fields_length,
-    )?;
+    let mut tasks = Vec::new();
+    for _ in 0..concurrency {
+        let file_generator_config = file_generator_config.clone();
+        let schema = schema.clone();
+        let writer_config = writer_config.clone();
+        let fields_length = fields_length.clone();
 
-    let commit_data_files = file_generator.generate().await?;
+        let task: tokio::task::JoinHandle<Result<_>> = tokio::spawn(async move {
+            let mut file_generator = FileGenerator::new(
+                file_generator_config,
+                Arc::new(schema),
+                writer_config,
+                fields_length,
+            )?;
+
+            let commit_data_files = file_generator.generate().await?;
+            Ok(commit_data_files)
+        });
+        tasks.push(task);
+    }
+    let commit_data_files = try_join_all(tasks)
+        .await
+        .map_err(|e| iceberg_compaction_core::CompactionError::Execution(e.to_string()))?
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect::<Vec<_>>();
 
     // Separate data files by type
     let mut data_files = Vec::new();

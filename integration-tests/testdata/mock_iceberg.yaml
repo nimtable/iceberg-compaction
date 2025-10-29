@@ -24,5 +24,6 @@ WriterConfig:
   position_delete_row_count: 100
   data_file_num: 5
   batch_size: 1000
+  concurrency: 16
 
   
