@@ -67,9 +67,23 @@ fn validate_rewrite_results_consistency(
     Ok(())
 }
 
+/// Type of compaction operation to perform
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionType {
+    /// Compact all files in the table
+    ///
+    /// This will rewrite all data files and delete files in the table into optimally-sized files.
+    /// Use this for periodic full table optimization.
     Full,
+
+    /// Compact only small files (data and delete files)
+    ///
+    /// This will identify and compact files smaller than the configured threshold.
+    /// Unlike `Full`, this allows incremental compaction of problematic small files
+    /// without rewriting the entire table.
+    ///
+    /// **Note**: This now includes both data files and delete files since the commit
+    /// mechanism properly handles delete files.
     MergeSmallDataFiles,
 }
 
@@ -239,12 +253,9 @@ impl Compaction {
                 return Ok(None);
             }
 
-            // 2. Validate plans based on compaction type
-            self.validate_plans(&plans)?;
-
             let table = self.catalog.load_table(&self.table_ident).await?;
 
-            // 3. Concurrently execute rewrite for all plans
+            // 2. Concurrently execute rewrite for all plans
             let rewrite_results = self
                 .concurrent_rewrite_plans(plans, &config.execution, &table)
                 .await?;
@@ -253,11 +264,11 @@ impl Compaction {
                 return Ok(None);
             }
 
-            // 4. Commit all rewrite results in a single transaction
+            // 3. Commit all rewrite results in a single transaction
             let commit_start_time = std::time::Instant::now();
             let final_table = self.commit_rewrite_results(rewrite_results.clone()).await?;
 
-            // 5. Run validations if enabled
+            // 4. Run validations if enabled
             if config.execution.enable_validate_compaction {
                 self.run_validations(rewrite_results.clone(), &final_table)
                     .await?;
@@ -464,43 +475,6 @@ impl Compaction {
                 snapshot_id
             )))
         }
-    }
-
-    /// Validate plans based on compaction type
-    fn validate_plans(&self, plans: &[CompactionPlan]) -> Result<()> {
-        match self.compaction_type {
-            CompactionType::Full => {
-                let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                if total_files == 0 {
-                    tracing::info!(
-                        "No files to compact for table '{}', skipping.",
-                        self.table_ident
-                    );
-                    return Ok(());
-                }
-
-                // Allow multiple plans for Full compaction to support parallel execution
-                // The grouping strategy (e.g., BinPack) will control how files are split into plans
-                if plans.len() > 1 {
-                    tracing::debug!(
-                        "Full compaction for table '{}' contains {} plans for parallel execution.",
-                        self.table_ident,
-                        plans.len()
-                    );
-                }
-            }
-            CompactionType::MergeSmallDataFiles => {
-                let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                if total_files == 0 {
-                    tracing::info!(
-                        "No small files to compact for table '{}', skipping.",
-                        self.table_ident
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Execute rewrite for multiple plans concurrently
