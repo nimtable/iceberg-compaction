@@ -16,11 +16,11 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
+use iceberg::{ErrorKind, Result};
 use iceberg::{
     spec::DataFile,
     writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
 };
-use iceberg::{ErrorKind, Result};
 use tokio::task::JoinHandle;
 
 use crate::config::{

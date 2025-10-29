@@ -1246,9 +1246,11 @@ mod tests {
         let zero_strategy = MinFileCountStrategy::new(0);
         assert_eq!(zero_strategy.description(), "MinFileCount[0]");
 
-        let single_file = vec![TestFileBuilder::new("single.parquet")
-            .size(10 * 1024 * 1024)
-            .build()];
+        let single_file = vec![
+            TestFileBuilder::new("single.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+        ];
         let zero_result: Vec<FileScanTask> = zero_strategy.filter(single_file.clone());
         assert_eq!(zero_result.len(), 1, "min_count=0 should always pass files");
         TestUtils::assert_paths_eq(&["single.parquet"], &zero_result);
@@ -1353,9 +1355,11 @@ mod tests {
         let default_strategy = FileStrategyFactory::create_small_files_strategy(&default_config);
 
         // Single file passes
-        let single_file = vec![TestFileBuilder::new("single.parquet")
-            .size(5 * 1024 * 1024)
-            .build()];
+        let single_file = vec![
+            TestFileBuilder::new("single.parquet")
+                .size(5 * 1024 * 1024)
+                .build(),
+        ];
         let single_result = TestUtils::execute_strategy_flat(&default_strategy, single_file);
         assert_eq!(single_result.len(), 1);
         TestUtils::assert_paths_eq(&["single.parquet"], &single_result);
@@ -1622,9 +1626,11 @@ mod tests {
         assert_eq!(noop_enum.description(), "NoopGrouping");
 
         // Single-file case for Noop
-        let single = vec![TestFileBuilder::new("single.parquet")
-            .size(20 * 1024 * 1024)
-            .build()];
+        let single = vec![
+            TestFileBuilder::new("single.parquet")
+                .size(20 * 1024 * 1024)
+                .build(),
+        ];
         let single_groups = noop_enum.group_files(single.into_iter());
         assert_eq!(single_groups.len(), 1);
         assert_eq!(single_groups[0].data_file_count, 1);
@@ -1742,10 +1748,12 @@ mod tests {
         let empty_group = FileGroup::empty();
         let result = FileGroup::calculate_parallelism(&empty_group, &config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No files to calculate task parallelism"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No files to calculate task parallelism")
+        );
     }
 
     #[test]

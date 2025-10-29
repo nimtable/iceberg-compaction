@@ -30,10 +30,18 @@ parquet = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
 
 # Other utilities
 rand = { workspace = true }
 uuid = { workspace = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 
 [lints]
 workspace = true
