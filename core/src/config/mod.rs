@@ -44,10 +44,10 @@ pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group fi
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinPackConfig {
     /// Target size for each group in bytes.
-    pub target_group_size: u64,
+    pub target_group_size_bytes: u64,
 
     /// Minimum group size in bytes. Groups smaller than this will be filtered out.
-    pub min_group_size: Option<u64>,
+    pub min_group_size_bytes: Option<u64>,
 
     /// Minimum file count per group. Groups with fewer files will be filtered out.
     pub min_group_file_count: Option<usize>,
@@ -55,23 +55,23 @@ pub struct BinPackConfig {
 
 impl BinPackConfig {
     /// Creates a new bin-pack configuration with only target size.
-    pub fn new(target_group_size: u64) -> Self {
+    pub fn new(target_group_size_bytes: u64) -> Self {
         Self {
-            target_group_size,
-            min_group_size: None,
+            target_group_size_bytes,
+            min_group_size_bytes: None,
             min_group_file_count: None,
         }
     }
 
     /// Creates a new bin-pack configuration with filters.
     pub fn with_filters(
-        target_group_size: u64,
-        min_group_size: Option<u64>,
+        target_group_size_bytes: u64,
+        min_group_size_bytes: Option<u64>,
         min_group_file_count: Option<usize>,
     ) -> Self {
         Self {
-            target_group_size,
-            min_group_size,
+            target_group_size_bytes,
+            min_group_size_bytes,
             min_group_file_count,
         }
     }
@@ -99,17 +99,17 @@ pub enum GroupingStrategy {
 
 /// Configuration for small files compaction.
 ///
-/// Compacts data files smaller than `small_file_threshold`.
+/// Compacts data files smaller than `small_file_threshold_bytes`.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct SmallFilesConfig {
     /// Target output file size in bytes.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
+    pub target_file_size_bytes: u64,
 
-    /// Minimum partition size for parallelism calculation.
+    /// Minimum partition size in bytes for parallelism calculation.
     #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
+    pub min_partition_size_bytes: u64,
 
     /// Maximum file count per partition for parallelism calculation.
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
@@ -125,7 +125,7 @@ pub struct SmallFilesConfig {
 
     /// Small file threshold in bytes. Only files smaller than this will be compacted.
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
-    pub small_file_threshold: u64,
+    pub small_file_threshold_bytes: u64,
 
     /// Minimum number of files required to trigger compaction. 0 means no limit.
     #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
@@ -151,11 +151,11 @@ impl Default for SmallFilesConfig {
 pub struct FullCompactionConfig {
     /// Target output file size in bytes.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
+    pub target_file_size_bytes: u64,
 
-    /// Minimum partition size for parallelism calculation.
+    /// Minimum partition size in bytes for parallelism calculation.
     #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
+    pub min_partition_size_bytes: u64,
 
     /// Maximum file count per partition for parallelism calculation.
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
@@ -197,13 +197,13 @@ fn default_writer_properties() -> WriterProperties {
 pub struct CompactionBaseConfig {
     /// Target file size in bytes.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
+    pub target_file_size_bytes: u64,
 }
 
 impl Default for CompactionBaseConfig {
     fn default() -> Self {
         Self {
-            target_file_size: DEFAULT_TARGET_FILE_SIZE,
+            target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE,
         }
     }
 }
@@ -248,19 +248,19 @@ impl CompactionPlanningConfig {
         }
     }
 
-    /// Returns the target file size.
-    pub fn target_file_size(&self) -> u64 {
+    /// Returns the target file size in bytes.
+    pub fn target_file_size_bytes(&self) -> u64 {
         match self {
-            Self::MergeSmallDataFiles(c) => c.target_file_size,
-            Self::Full(c) => c.target_file_size,
+            Self::MergeSmallDataFiles(c) => c.target_file_size_bytes,
+            Self::Full(c) => c.target_file_size_bytes,
         }
     }
 
-    /// Returns the minimum size per partition.
-    pub fn min_size_per_partition(&self) -> u64 {
+    /// Returns the minimum partition size in bytes.
+    pub fn min_partition_size_bytes(&self) -> u64 {
         match self {
-            Self::MergeSmallDataFiles(c) => c.min_size_per_partition,
-            Self::Full(c) => c.min_size_per_partition,
+            Self::MergeSmallDataFiles(c) => c.min_partition_size_bytes,
+            Self::Full(c) => c.min_partition_size_bytes,
         }
     }
 
@@ -291,7 +291,7 @@ impl CompactionPlanningConfig {
 
 impl Default for CompactionPlanningConfig {
     fn default() -> Self {
-        Self::from_small_files(SmallFilesConfig::default())
+        Self::from_full_compaction(FullCompactionConfig::default())
     }
 }
 

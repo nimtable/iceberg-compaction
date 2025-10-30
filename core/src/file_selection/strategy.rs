@@ -133,7 +133,7 @@ impl FileGroup {
         }
 
         let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_size_per_partition())
+            .div_ceil(config.min_partition_size_bytes())
             .max(1) as usize; // Ensure at least one partition.
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
@@ -177,7 +177,7 @@ impl FileGroup {
             .map(|f| f.file_size_in_bytes)
             .sum::<u64>();
 
-        if total_data_file_size > 0 && total_data_file_size < config.target_file_size() {
+        if total_data_file_size > 0 && total_data_file_size < config.target_file_size_bytes() {
             1
         } else {
             current_output_parallelism
@@ -672,7 +672,7 @@ impl FileStrategyFactory {
         // Extract type-specific config fields via pattern matching
         let (small_file_threshold, min_file_count, grouping_strategy) = match config {
             CompactionPlanningConfig::MergeSmallDataFiles(small_files_config) => (
-                small_files_config.small_file_threshold,
+                small_files_config.small_file_threshold_bytes,
                 small_files_config.min_file_count,
                 &small_files_config.grouping_strategy,
             ),
@@ -721,7 +721,7 @@ impl FileStrategyFactory {
         let grouping = match grouping_strategy {
             GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
             GroupingStrategy::BinPack(config) => GroupingStrategyEnum::BinPack(
-                BinPackGroupingStrategy::new(config.target_group_size),
+                BinPackGroupingStrategy::new(config.target_group_size_bytes),
             ),
         };
 
@@ -729,7 +729,7 @@ impl FileStrategyFactory {
         let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
 
         if let GroupingStrategy::BinPack(config) = grouping_strategy {
-            if let Some(min_size) = config.min_group_size {
+            if let Some(min_size) = config.min_group_size_bytes {
                 if min_size > 0 {
                     group_filters.push(Box::new(MinGroupSizeStrategy {
                         min_group_size: min_size,
@@ -1277,7 +1277,7 @@ mod tests {
     fn test_small_files_strategy_comprehensive() {
         // Test small files strategy with basic functionality
         let small_files_config = SmallFilesConfigBuilder::default()
-            .small_file_threshold(20 * 1024 * 1024_u64) // 20MB threshold
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64) // 20MB threshold
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::from_small_files(small_files_config);
@@ -1314,7 +1314,7 @@ mod tests {
         // Verify all selected files meet criteria
         let small_file_threshold = match config {
             CompactionPlanningConfig::MergeSmallDataFiles(sf_config) => {
-                sf_config.small_file_threshold
+                sf_config.small_file_threshold_bytes
             }
             _ => panic!("Expected small files config"),
         };
@@ -1325,7 +1325,7 @@ mod tests {
 
         // Test min_file_count behavior
         let min_count_small_files_config = SmallFilesConfigBuilder::default()
-            .small_file_threshold(20 * 1024 * 1024_u64)
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64)
             .min_file_count(3_usize)
             .build()
             .unwrap();
@@ -1404,7 +1404,9 @@ mod tests {
         let multi_result = TestUtils::execute_strategy_flat(&default_strategy, multiple_files);
         assert_eq!(multi_result.len(), 3);
         let small_file_threshold_default = match &default_config {
-            CompactionPlanningConfig::MergeSmallDataFiles(config) => config.small_file_threshold,
+            CompactionPlanningConfig::MergeSmallDataFiles(config) => {
+                config.small_file_threshold_bytes
+            }
             _ => panic!("Expected small files config"),
         };
         for file in &multi_result {
@@ -1742,7 +1744,7 @@ mod tests {
     fn test_file_group_parallelism_calculation() {
         // Test FileGroup::calculate_parallelism functionality
         let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
+            .min_partition_size_bytes(10 * 1024 * 1024_u64) // 10MB per partition
             .max_file_count_per_partition(5_usize) // 5 files per partition
             .max_parallelism(8_usize) // Max 8 parallel tasks
             .enable_heuristic_output_parallelism(true)
@@ -1920,7 +1922,7 @@ mod tests {
 
         // Heuristic output parallelism: data total is 8MB, below default 1GB target, so 1 output
         let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
+            .min_partition_size_bytes(1_u64) // allow partitioning to be driven by counts
             .max_file_count_per_partition(1_usize)
             .max_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
@@ -1942,12 +1944,12 @@ mod tests {
         // and that each group's parallelism is calculated independently
         let binpack_config = crate::config::BinPackConfig {
             target_group_size: 50 * 1024 * 1024, // 50MB per group
-            min_group_size: None,
+            min_group_size_bytes: None,
             min_group_file_count: None, // No filter - we want to see all groups
         };
         let full_config = crate::config::FullCompactionConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
-            .min_size_per_partition(20 * 1024 * 1024_u64) // 20MB per partition
+            .min_partition_size_bytes(20 * 1024 * 1024_u64) // 20MB per partition
             .max_file_count_per_partition(1_usize) // 1 file per partition
             .max_parallelism(8_usize) // Max 8 parallel tasks per group
             .enable_heuristic_output_parallelism(true)
