@@ -85,6 +85,16 @@ pub enum CompactionType {
     /// **Note**: This now includes both data files and delete files since the commit
     /// mechanism properly handles delete files.
     MergeSmallDataFiles,
+
+    /// Compact files with high delete file count
+    ///
+    /// This will identify and compact data files that have accumulated many delete files,
+    /// which causes query overhead. By compacting these files, delete files are applied
+    /// directly to the data, reducing file count and improving query performance.
+    ///
+    /// This is particularly useful for tables with frequent updates/deletes where
+    /// delete files accumulate over time.
+    HighDeleteFileCount,
 }
 
 /// Builder for creating `Compaction` instances with flexible configuration

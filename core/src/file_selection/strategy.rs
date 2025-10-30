@@ -395,6 +395,45 @@ impl FileFilterStrategy for SizeFilterStrategy {
     }
 }
 
+/// Strategy for filtering files by delete file count threshold
+///
+/// This strategy identifies data files that have accumulated many delete files,
+/// which causes query overhead. Compacting these files removes the delete files
+/// by applying them directly to the data.
+#[derive(Debug)]
+pub struct DeleteFileCountFilterStrategy {
+    /// Minimum number of delete files a data file must have to be selected
+    pub min_delete_file_count: usize,
+}
+
+impl DeleteFileCountFilterStrategy {
+    /// Create a new `DeleteFileCountFilterStrategy` with minimum delete file count requirement
+    pub fn new(min_delete_file_count: usize) -> Self {
+        Self {
+            min_delete_file_count,
+        }
+    }
+}
+
+impl FileFilterStrategy for DeleteFileCountFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|task| {
+                let delete_count = task.deletes.len();
+                delete_count >= self.min_delete_file_count
+            })
+            .collect()
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "DeleteFileCountFilter[>={} deletes]",
+            self.min_delete_file_count
+        )
+    }
+}
+
 /// Strategy for ensuring minimum file count. If fewer than `min_file_count` files are available, no files will be returned.
 #[derive(Debug)]
 pub struct MinFileCountStrategy {
@@ -608,6 +647,23 @@ impl FileStrategyFactory {
         // Use the grouping strategy from config
         Self::create_custom_strategy(
             /* size_filter */ Some((None, Some(config.small_file_threshold))),
+            /* delete_file_count_filter */ None,
+            /* min_file_count */ config.min_file_count,
+            /* grouping_strategy */ &config.grouping_strategy,
+        )
+    }
+
+    /// Create strategy for high delete file count compaction
+    ///
+    /// This strategy identifies data files that have accumulated many delete files,
+    /// which causes query overhead. Files are filtered by delete file count threshold.
+    pub fn create_high_delete_file_count_strategy(
+        config: &CompactionPlanningConfig,
+    ) -> CompactionStrategy {
+        // Reuse create_custom_strategy with delete file count filter
+        Self::create_custom_strategy(
+            /* size_filter */ None,
+            /* delete_file_count_filter */ Some(config.min_delete_file_count_threshold),
             /* min_file_count */ config.min_file_count,
             /* grouping_strategy */ &config.grouping_strategy,
         )
@@ -616,6 +672,7 @@ impl FileStrategyFactory {
     /// Create custom strategy with fine-grained parameter control.
     pub fn create_custom_strategy(
         size_filter: Option<(Option<u64>, Option<u64>)>, // (min_size, max_size)
+        delete_file_count_filter: Option<usize>,         // min delete file count
         min_file_count: usize,
         grouping_strategy: &GroupingStrategy,
     ) -> CompactionStrategy {
@@ -624,6 +681,12 @@ impl FileStrategyFactory {
 
         if let Some((min_size, max_size)) = size_filter {
             file_filters.push(Box::new(SizeFilterStrategy { min_size, max_size }));
+        }
+
+        if let Some(min_delete_count) = delete_file_count_filter {
+            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+                min_delete_count,
+            )));
         }
 
         if min_file_count > 0 {
@@ -672,11 +735,16 @@ impl FileStrategyFactory {
                 // Use the small files strategy architecture
                 Self::create_small_files_strategy(config)
             }
+            CompactionType::HighDeleteFileCount => {
+                // Select files with high delete file count
+                Self::create_high_delete_file_count_strategy(config)
+            }
             CompactionType::Full => {
                 // Full compaction: select all files (no filtering), but use grouping to split into multiple plans
                 // This allows controlling the number of plans through config (e.g., BinPack with target_group_size)
                 Self::create_custom_strategy(
                     /* size_filter */ None,
+                    /* delete_file_count_filter */ None,
                     /* min_file_count */ 0,
                     /* grouping_strategy */ &config.grouping_strategy,
                 )
@@ -983,7 +1051,8 @@ mod tests {
 
         let strategy = FileStrategyFactory::create_custom_strategy(
             None,                                                             // no size filter
-            0,                                                                // no min file count
+            None, // no delete file count filter
+            0,    // no min file count
             &GroupingStrategy::BinPack(BinPackConfig::new(25 * 1024 * 1024)), // 25MB target group size
         );
 
@@ -1328,6 +1397,7 @@ mod tests {
         // Test case 1: Size filter enabled
         let strategy_with_size_filter = FileStrategyFactory::create_custom_strategy(
             Some((Some(1024 * 1024), Some(100 * 1024 * 1024))), // size_filter: 1MB-100MB
+            None,                                               // no delete file count filter
             0, // min_file_count: disabled for simpler test
             &GroupingStrategy::Noop,
         );
@@ -1337,7 +1407,7 @@ mod tests {
 
         // Test case 2: Minimal filters
         let strategy_minimal =
-            FileStrategyFactory::create_custom_strategy(None, 0, &GroupingStrategy::Noop);
+            FileStrategyFactory::create_custom_strategy(None, None, 0, &GroupingStrategy::Noop);
 
         // Test functional behavior
         let test_files = vec![
@@ -1435,6 +1505,7 @@ mod tests {
         // Mirrors prior factory-based test but keeps coverage centralized here.
         use crate::config::BinPackConfig;
         let bin_pack_strategy = FileStrategyFactory::create_custom_strategy(
+            None,
             None,
             0,
             &GroupingStrategy::BinPack(BinPackConfig::new(64 * 1024 * 1024)), // 64MB target, no filters
@@ -1889,6 +1960,195 @@ mod tests {
 
         // Verify description mentions BinPack
         assert!(strategy.description().contains("BinPack"));
+    }
+
+    #[test]
+    fn test_delete_file_count_filter_strategy() {
+        // Test description
+        let strategy = DeleteFileCountFilterStrategy::new(3);
+        assert_eq!(strategy.description(), "DeleteFileCountFilter[>=3 deletes]");
+
+        // Test with files having varying delete file counts
+        let test_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // 0 delete files
+            TestFileBuilder::new("one_delete.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(), // 1 delete file
+            TestFileBuilder::new("three_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // Will manually add 3 deletes
+            TestFileBuilder::new("five_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // Will manually add 5 deletes
+        ];
+
+        // Manually add multiple delete files to test files
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        let mut files_with_deletes = vec![
+            test_files[0].clone(), // no deletes
+            test_files[1].clone(), // one delete (already added)
+        ];
+
+        // Add file with 3 deletes
+        let mut file_with_3_deletes = test_files[2].clone();
+        for i in 0..3 {
+            file_with_3_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+        files_with_deletes.push(file_with_3_deletes);
+
+        // Add file with 5 deletes
+        let mut file_with_5_deletes = test_files[3].clone();
+        for i in 0..5 {
+            file_with_5_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+        files_with_deletes.push(file_with_5_deletes);
+
+        // Apply filter - should only pass files with >= 3 delete files
+        let result = strategy.filter(files_with_deletes);
+
+        assert_eq!(result.len(), 2); // Only files with 3 and 5 deletes should pass
+        assert_eq!(result[0].data_file_path, "three_deletes.parquet");
+        assert_eq!(result[1].data_file_path, "five_deletes.parquet");
+
+        // Verify delete counts
+        assert_eq!(result[0].deletes.len(), 3);
+        assert_eq!(result[1].deletes.len(), 5);
+
+        // Test edge case: threshold = 0 (should pass all files)
+        let zero_threshold_strategy = DeleteFileCountFilterStrategy::new(0);
+        let all_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("with_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+        ];
+        let zero_result = zero_threshold_strategy.filter(all_files);
+        assert_eq!(zero_result.len(), 2);
+
+        // Test edge case: threshold = 1 (should pass files with 1+ deletes)
+        let one_threshold_strategy = DeleteFileCountFilterStrategy::new(1);
+        let test_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("with_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+        ];
+        let one_result = one_threshold_strategy.filter(test_files);
+        assert_eq!(one_result.len(), 1);
+        assert_eq!(one_result[0].data_file_path, "with_deletes.parquet");
+    }
+
+    #[test]
+    fn test_high_delete_file_count_strategy() {
+        // Test the factory method for high delete file count strategy
+        let config = CompactionPlanningConfigBuilder::default()
+            .min_delete_file_count_threshold(2)
+            .min_file_count(0)
+            .build()
+            .unwrap();
+
+        let strategy = FileStrategyFactory::create_high_delete_file_count_strategy(&config);
+
+        // Verify description mentions the delete file count filter
+        let desc = strategy.description();
+        assert!(desc.contains("DeleteFileCountFilter"));
+
+        // Create test files with different delete counts
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        let file_no_deletes = TestFileBuilder::new("no_deletes.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let mut file_one_delete = TestFileBuilder::new("one_delete.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        file_one_delete.deletes.push(Arc::new(FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(10),
+            data_file_path: "delete_1.parquet".to_owned(),
+            data_file_content: DataContentType::EqualityDeletes,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 1,
+            equality_ids: vec![1, 2],
+            file_size_in_bytes: 1024,
+        }));
+
+        let mut file_two_deletes = TestFileBuilder::new("two_deletes.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        for i in 0..2 {
+            file_two_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+
+        let test_files = vec![file_no_deletes, file_one_delete, file_two_deletes];
+
+        // Execute strategy
+        let result = TestUtils::execute_strategy_flat(&strategy, test_files);
+
+        // Should only select file with >= 2 delete files
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "two_deletes.parquet");
+        assert_eq!(result[0].deletes.len(), 2);
     }
 
     #[test]
