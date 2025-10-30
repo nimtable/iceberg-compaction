@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use crate::compaction::CompactionType;
 use crate::config::{CompactionPlanningConfig, GroupingStrategy};
 use crate::{CompactionError, Result};
 use iceberg::scan::FileScanTask;
@@ -134,25 +133,25 @@ impl FileGroup {
         }
 
         let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_size_per_partition)
+            .div_ceil(config.min_size_per_partition())
             .max(1) as usize; // Ensure at least one partition.
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
 
         let partition_by_count = total_files_count_for_partitioning
-            .div_ceil(config.max_file_count_per_partition)
+            .div_ceil(config.max_file_count_per_partition())
             .max(1); // Ensure at least one partition.
 
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.max_parallelism);
+            .min(config.max_parallelism());
 
         // `output_parallelism` should not exceed `input_parallelism`
         // and should also not exceed max_parallelism.
         // It's primarily driven by size to avoid small output files.
         let mut output_parallelism = partition_by_size
             .min(input_parallelism)
-            .min(config.max_parallelism);
+            .min(config.max_parallelism());
 
         // Apply small-output heuristic to encourage larger outputs when input data is tiny.
         output_parallelism =
@@ -168,7 +167,7 @@ impl FileGroup {
         config: &CompactionPlanningConfig,
         current_output_parallelism: usize,
     ) -> usize {
-        if !config.enable_heuristic_output_parallelism || current_output_parallelism <= 1 {
+        if !config.enable_heuristic_output_parallelism() || current_output_parallelism <= 1 {
             return current_output_parallelism;
         }
 
@@ -178,7 +177,7 @@ impl FileGroup {
             .map(|f| f.file_size_in_bytes)
             .sum::<u64>();
 
-        if total_data_file_size > 0 && total_data_file_size < config.base.target_file_size {
+        if total_data_file_size > 0 && total_data_file_size < config.target_file_size() {
             1
         } else {
             current_output_parallelism
@@ -670,13 +669,22 @@ impl CompactionStrategy {
 impl FileStrategyFactory {
     /// Create strategy for small files compaction with delete file filtering and size limits.
     pub fn create_small_files_strategy(config: &CompactionPlanningConfig) -> CompactionStrategy {
-        // Use the grouping strategy from config
+        // Extract type-specific config fields via pattern matching
+        let (small_file_threshold, min_file_count, grouping_strategy) = match config {
+            CompactionPlanningConfig::MergeSmallDataFiles(small_files_config) => (
+                small_files_config.small_file_threshold,
+                small_files_config.min_file_count,
+                &small_files_config.grouping_strategy,
+            ),
+            _ => panic!("create_small_files_strategy called with non-small-files config"),
+        };
+
         Self::create_custom_strategy(
             /* exclude_delete_files */ true,
-            /* size_filter */ Some((None, Some(config.small_file_threshold))),
-            /* min_file_count */ config.min_file_count,
-            /* max_task_total_size */ config.max_task_total_size,
-            /* grouping_strategy */ &config.grouping_strategy,
+            /* size_filter */ Some((None, Some(small_file_threshold))),
+            /* min_file_count */ min_file_count,
+            /* max_task_total_size */ u64::MAX,
+            /* grouping_strategy */ grouping_strategy,
         )
     }
 
@@ -741,17 +749,22 @@ impl FileStrategyFactory {
         CompactionStrategy::new(file_filters, grouping, group_filters)
     }
 
-    /// Create file strategy based on compaction type and configuration.
-    pub fn create_files_strategy(
-        compaction_type: CompactionType,
-        config: &CompactionPlanningConfig,
-    ) -> CompactionStrategy {
-        match compaction_type {
-            CompactionType::MergeSmallDataFiles => {
+    /// Create file strategy based on configuration (type-safe).
+    ///
+    /// The compaction type is determined by the config enum variant.
+    pub fn create_files_strategy(config: &CompactionPlanningConfig) -> CompactionStrategy {
+        match config {
+            CompactionPlanningConfig::MergeSmallDataFiles(_) => {
                 // Use the small files strategy architecture
                 Self::create_small_files_strategy(config)
             }
-            CompactionType::Full => {
+            CompactionPlanningConfig::Full(_) => {
+                // Extract grouping_strategy for full compaction
+                let grouping_strategy = match config {
+                    CompactionPlanningConfig::Full(full_config) => &full_config.grouping_strategy,
+                    _ => unreachable!("Already matched Full variant"),
+                };
+
                 // Full compaction: select all files (no filtering), but use grouping to split into multiple plans
                 // This allows controlling the number of plans through config (e.g., BinPack with target_group_size)
                 Self::create_custom_strategy(
@@ -759,35 +772,31 @@ impl FileStrategyFactory {
                     /* size_filter */ None,
                     /* min_file_count */ 0,
                     /* max_task_total_size */ u64::MAX,
-                    /* grouping_strategy */ &config.grouping_strategy,
+                    /* grouping_strategy */ grouping_strategy,
                 )
             }
         }
     }
 
-    /// Create a dynamic strategy variant based on compaction type and configuration
+    /// Create a dynamic strategy variant based on configuration
     ///
     /// This method returns a `CompactionStrategy` for flexible composition based on config.
     ///
     /// # Arguments
-    /// * `compaction_type` - The type of compaction to perform
-    /// * `config` - The compaction configuration
+    /// * `config` - The compaction configuration (contains both type and parameters)
     ///
     /// # Returns
-    /// A `CompactionStrategy` containing the appropriate strategy for the given parameters
-    pub fn create_dynamic_strategy(
-        compaction_type: CompactionType,
-        config: &CompactionPlanningConfig,
-    ) -> CompactionStrategy {
-        // Both strategies now use the same implementation
-        Self::create_files_strategy(compaction_type, config)
+    /// A `CompactionStrategy` containing the appropriate strategy for the given configuration
+    pub fn create_dynamic_strategy(config: &CompactionPlanningConfig) -> CompactionStrategy {
+        // Delegate to the unified create_files_strategy
+        Self::create_files_strategy(config)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CompactionPlanningConfigBuilder;
+    use crate::config::{CompactionPlanningConfig, SmallFilesConfigBuilder};
 
     // Lazy static schema to avoid rebuilding it for every test
     use std::sync::{Arc, OnceLock};
@@ -903,7 +912,7 @@ mod tests {
             strategy: &CompactionStrategy,
             data_files: Vec<FileScanTask>,
         ) -> Vec<FileScanTask> {
-            let config = CompactionPlanningConfigBuilder::default().build().unwrap();
+            let config = CompactionPlanningConfig::default();
 
             strategy
                 .execute(data_files, &config)
@@ -915,7 +924,7 @@ mod tests {
 
         /// Create test config with common defaults
         pub fn create_test_config() -> CompactionPlanningConfig {
-            CompactionPlanningConfigBuilder::default().build().unwrap()
+            CompactionPlanningConfig::default()
         }
 
         /// Assert file paths (ordered) equal expected strings
@@ -1034,24 +1043,29 @@ mod tests {
     #[test]
     fn test_file_strategy_factory() {
         // Keep this test minimal: verify factory outputs non-empty description and basic routing
-        let config = CompactionPlanningConfigBuilder::default().build().unwrap();
+        let small_files_config = CompactionPlanningConfig::default();
 
         // Small-files strategy should mention core filters
-        let small_files_strategy = FileStrategyFactory::create_small_files_strategy(&config);
+        let small_files_strategy =
+            FileStrategyFactory::create_small_files_strategy(&small_files_config);
         let small_files_desc = small_files_strategy.description();
         assert!(small_files_desc.contains("NoDeleteFiles"));
         assert!(small_files_desc.contains("SizeFilter"));
 
-        // Compaction type routing
+        // Compaction type routing for small files
         let routed_small = FileStrategyFactory::create_files_strategy(
             crate::compaction::CompactionType::MergeSmallDataFiles,
-            &config,
+            &small_files_config,
         );
         assert!(!routed_small.description().is_empty());
 
+        // Full compaction with its own config
+        let full_config = CompactionPlanningConfig::from_full_compaction(
+            crate::config::FullCompactionConfig::default(),
+        );
         let routed_full = FileStrategyFactory::create_files_strategy(
             crate::compaction::CompactionType::Full,
-            &config,
+            &full_config,
         );
 
         // Full compaction now uses grouping strategy from config instead of always Noop
@@ -1262,11 +1276,11 @@ mod tests {
     #[test]
     fn test_small_files_strategy_comprehensive() {
         // Test small files strategy with basic functionality
-        let config = CompactionPlanningConfigBuilder::default()
-            .small_file_threshold(20 * 1024 * 1024) // 20MB threshold
-            .max_task_total_size(50 * 1024 * 1024) // 50MB task limit
+        let small_files_config = SmallFilesConfigBuilder::default()
+            .small_file_threshold(20 * 1024 * 1024_u64) // 20MB threshold
             .build()
             .unwrap();
+        let config = CompactionPlanningConfig::from_small_files(small_files_config);
 
         let strategy = FileStrategyFactory::create_small_files_strategy(&config);
 
@@ -1298,17 +1312,25 @@ mod tests {
         assert_eq!(paths, vec!["small1.parquet", "small3.parquet"]);
 
         // Verify all selected files meet criteria
+        let small_file_threshold = match config {
+            CompactionPlanningConfig::MergeSmallDataFiles(sf_config) => {
+                sf_config.small_file_threshold
+            }
+            _ => panic!("Expected small files config"),
+        };
         for file in &result {
-            assert!(file.length <= config.small_file_threshold);
+            assert!(file.length <= small_file_threshold);
             assert!(file.deletes.is_empty());
         }
 
         // Test min_file_count behavior
-        let min_count_config = CompactionPlanningConfigBuilder::default()
-            .small_file_threshold(20 * 1024 * 1024)
-            .min_file_count(3)
+        let min_count_small_files_config = SmallFilesConfigBuilder::default()
+            .small_file_threshold(20 * 1024 * 1024_u64)
+            .min_file_count(3_usize)
             .build()
             .unwrap();
+        let min_count_config =
+            CompactionPlanningConfig::from_small_files(min_count_small_files_config);
 
         let min_count_strategy =
             FileStrategyFactory::create_small_files_strategy(&min_count_config);
@@ -1343,12 +1365,19 @@ mod tests {
         assert_eq!(sufficient_result.len(), 3);
 
         // Also validate default configuration behavior (merge former test_config_behavior)
-        let default_config = CompactionPlanningConfigBuilder::default()
+        let default_small_files_config = SmallFilesConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .build()
             .unwrap();
+        let default_config = CompactionPlanningConfig::from_small_files(default_small_files_config);
 
-        assert_eq!(default_config.min_file_count, 0);
+        // Verify min_file_count default
+        match &default_config {
+            CompactionPlanningConfig::MergeSmallDataFiles(config) => {
+                assert_eq!(config.min_file_count, 0);
+            }
+            _ => panic!("Expected small files config"),
+        }
 
         let default_strategy = FileStrategyFactory::create_small_files_strategy(&default_config);
 
@@ -1374,8 +1403,12 @@ mod tests {
         ];
         let multi_result = TestUtils::execute_strategy_flat(&default_strategy, multiple_files);
         assert_eq!(multi_result.len(), 3);
+        let small_file_threshold_default = match &default_config {
+            CompactionPlanningConfig::MergeSmallDataFiles(config) => config.small_file_threshold,
+            _ => panic!("Expected small files config"),
+        };
         for file in &multi_result {
-            assert!(file.length <= default_config.small_file_threshold);
+            assert!(file.length <= small_file_threshold_default);
             assert!(file.deletes.is_empty());
         }
     }
@@ -1708,13 +1741,14 @@ mod tests {
     #[test]
     fn test_file_group_parallelism_calculation() {
         // Test FileGroup::calculate_parallelism functionality
-        let config = CompactionPlanningConfigBuilder::default()
-            .min_size_per_partition(10 * 1024 * 1024) // 10MB per partition
-            .max_file_count_per_partition(5) // 5 files per partition
-            .max_parallelism(8) // Max 8 parallel tasks
+        let small_files_config = SmallFilesConfigBuilder::default()
+            .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
+            .max_file_count_per_partition(5_usize) // 5 files per partition
+            .max_parallelism(8_usize) // Max 8 parallel tasks
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
+        let config = CompactionPlanningConfig::from_small_files(small_files_config);
 
         // Test normal case
         let files = vec![
@@ -1736,7 +1770,7 @@ mod tests {
         assert!(executor_parallelism >= 1);
         assert!(output_parallelism >= 1);
         assert!(output_parallelism <= executor_parallelism);
-        assert!(executor_parallelism <= config.max_parallelism);
+        assert!(executor_parallelism <= config.max_parallelism());
 
         // Test error case - empty group
         let empty_group = FileGroup::empty();
@@ -1885,13 +1919,14 @@ mod tests {
         assert_eq!(group.position_delete_files.len(), 1);
 
         // Heuristic output parallelism: data total is 8MB, below default 1GB target, so 1 output
-        let config = CompactionPlanningConfigBuilder::default()
-            .min_size_per_partition(1) // allow partitioning to be driven by counts
-            .max_file_count_per_partition(1)
-            .max_parallelism(8)
+        let small_files_config = SmallFilesConfigBuilder::default()
+            .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
+            .max_file_count_per_partition(1_usize)
+            .max_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
+        let config = CompactionPlanningConfig::from_small_files(small_files_config);
 
         let (exec_p, out_p) = FileGroup::calculate_parallelism(&group, &config).unwrap();
         assert!(exec_p >= 1);
@@ -1910,14 +1945,15 @@ mod tests {
             min_group_size: None,
             min_group_file_count: None, // No filter - we want to see all groups
         };
-        let config = CompactionPlanningConfigBuilder::default()
+        let full_config = crate::config::FullCompactionConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
-            .min_size_per_partition(20 * 1024 * 1024) // 20MB per partition
-            .max_file_count_per_partition(1) // 1 file per partition
-            .max_parallelism(8) // Max 8 parallel tasks per group
+            .min_size_per_partition(20 * 1024 * 1024_u64) // 20MB per partition
+            .max_file_count_per_partition(1_usize) // 1 file per partition
+            .max_parallelism(8_usize) // Max 8 parallel tasks per group
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
+        let config = CompactionPlanningConfig::from_full_compaction(full_config);
 
         let strategy = FileStrategyFactory::create_files_strategy(
             crate::compaction::CompactionType::Full,
@@ -1983,11 +2019,11 @@ mod tests {
 
             // Parallelism should respect max_parallelism per group
             assert!(
-                group.executor_parallelism <= config.max_parallelism,
+                group.executor_parallelism <= config.max_parallelism(),
                 "Group {} executor_parallelism ({}) should not exceed max_parallelism ({})",
                 idx,
                 group.executor_parallelism,
-                config.max_parallelism
+                config.max_parallelism()
             );
 
             // Output parallelism should not exceed executor parallelism
@@ -2029,10 +2065,11 @@ mod tests {
     #[test]
     fn test_full_compaction_with_noop_grouping() {
         // Test that Full Compaction with Noop grouping creates a single group
-        let config = CompactionPlanningConfigBuilder::default()
+        let full_config = crate::config::FullCompactionConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .build()
             .unwrap();
+        let config = CompactionPlanningConfig::from_full_compaction(full_config);
 
         let strategy = FileStrategyFactory::create_files_strategy(
             crate::compaction::CompactionType::Full,

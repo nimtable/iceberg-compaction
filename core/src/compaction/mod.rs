@@ -77,7 +77,6 @@ pub enum CompactionType {
 pub struct CompactionBuilder {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-    compaction_type: CompactionType,
 
     /// Optional configuration
     catalog_name: Option<Cow<'static, str>>,
@@ -90,15 +89,10 @@ pub struct CompactionBuilder {
 
 impl CompactionBuilder {
     /// Create a new `CompactionBuilder` with default settings
-    pub fn new(
-        catalog: Arc<dyn Catalog>,
-        table_ident: TableIdent,
-        compaction_type: CompactionType,
-    ) -> Self {
+    pub fn new(catalog: Arc<dyn Catalog>, table_ident: TableIdent) -> Self {
         Self {
             catalog,
             table_ident,
-            compaction_type,
 
             catalog_name: None,
             config: None,
@@ -173,7 +167,6 @@ impl CompactionBuilder {
             metrics,
             table_ident: self.table_ident,
             table_ident_name,
-            compaction_type: self.compaction_type,
             catalog_name,
             commit_retry_config,
             to_branch,
@@ -196,7 +189,6 @@ pub struct Compaction {
     pub metrics: Arc<Metrics>,
     pub table_ident: TableIdent,
     pub table_ident_name: Cow<'static, str>,
-    pub compaction_type: CompactionType,
     pub catalog_name: Cow<'static, str>,
 
     pub commit_retry_config: CommitManagerRetryConfig,
@@ -410,7 +402,7 @@ impl Compaction {
             let compaction_planner = CompactionPlanner::new(config.planning.clone());
 
             compaction_planner
-                .plan_compaction_with_branch(&table, self.compaction_type, &self.to_branch)
+                .plan_compaction_with_branch(&table, &self.to_branch)
                 .await
         } else {
             Err(crate::error::CompactionError::Execution(
@@ -466,37 +458,39 @@ impl Compaction {
         }
     }
 
-    /// Validate plans based on compaction type
+    /// Validate plans based on compaction type (from config)
     fn validate_plans(&self, plans: &[CompactionPlan]) -> Result<()> {
-        match self.compaction_type {
-            CompactionType::Full => {
-                let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                if total_files == 0 {
-                    tracing::info!(
-                        "No files to compact for table '{}', skipping.",
-                        self.table_ident
-                    );
-                    return Ok(());
-                }
+        if let Some(config) = &self.config {
+            match &config.planning {
+                crate::config::CompactionPlanningConfig::Full(_) => {
+                    let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
+                    if total_files == 0 {
+                        tracing::info!(
+                            "No files to compact for table '{}', skipping.",
+                            self.table_ident
+                        );
+                        return Ok(());
+                    }
 
-                // Allow multiple plans for Full compaction to support parallel execution
-                // The grouping strategy (e.g., BinPack) will control how files are split into plans
-                if plans.len() > 1 {
-                    tracing::debug!(
-                        "Full compaction for table '{}' contains {} plans for parallel execution.",
-                        self.table_ident,
-                        plans.len()
-                    );
+                    // Allow multiple plans for Full compaction to support parallel execution
+                    // The grouping strategy (e.g., BinPack) will control how files are split into plans
+                    if plans.len() > 1 {
+                        tracing::debug!(
+                            "Full compaction for table '{}' contains {} plans for parallel execution.",
+                            self.table_ident,
+                            plans.len()
+                        );
+                    }
                 }
-            }
-            CompactionType::MergeSmallDataFiles => {
-                let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                if total_files == 0 {
-                    tracing::info!(
-                        "No small files to compact for table '{}', skipping.",
-                        self.table_ident
-                    );
-                    return Ok(());
+                crate::config::CompactionPlanningConfig::MergeSmallDataFiles(_) => {
+                    let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
+                    if total_files == 0 {
+                        tracing::info!(
+                            "No small files to compact for table '{}', skipping.",
+                            self.table_ident
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1145,17 +1139,17 @@ impl CompactionPlanner {
         Self { config }
     }
 
-    /// Plan a compaction based on the provided table and compaction type
+    /// Plan a compaction based on the provided table
+    /// The compaction type is determined by the config variant
     pub async fn plan_compaction_with_branch(
         &self,
         table: &Table,
-        compaction_type: CompactionType,
         to_branch: &str,
     ) -> Result<Vec<CompactionPlan>> {
         if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
             // Step 1: Group files for compaction (extensible)
             let file_groups: Vec<FileGroup> = self
-                .group_files_for_compaction(table, branch_snapshot.snapshot_id(), compaction_type)
+                .group_files_for_compaction(table, branch_snapshot.snapshot_id())
                 .await?;
 
             // Convert each FileGroup to a separate CompactionPlan
@@ -1176,13 +1170,8 @@ impl CompactionPlanner {
         }
     }
 
-    pub async fn plan_compaction(
-        &self,
-        table: &Table,
-        compaction_type: CompactionType,
-    ) -> Result<Vec<CompactionPlan>> {
-        self.plan_compaction_with_branch(table, compaction_type, MAIN_BRANCH)
-            .await
+    pub async fn plan_compaction(&self, table: &Table) -> Result<Vec<CompactionPlan>> {
+        self.plan_compaction_with_branch(table, MAIN_BRANCH).await
     }
 
     // Template method pattern: These methods can be overridden for specific compaction types
@@ -1193,11 +1182,10 @@ impl CompactionPlanner {
         &self,
         table: &Table,
         snapshot_id: i64,
-        compaction_type: CompactionType,
     ) -> Result<Vec<FileGroup>> {
         use crate::file_selection::FileStrategyFactory;
 
-        let strategy = FileStrategyFactory::create_files_strategy(compaction_type, &self.config);
+        let strategy = FileStrategyFactory::create_files_strategy(&self.config);
         FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy, &self.config).await
     }
 }
@@ -1206,7 +1194,8 @@ impl CompactionPlanner {
 mod tests {
     use crate::compaction::{CompactionBuilder, CompactionPlanner, CompactionType};
     use crate::config::{
-        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfigBuilder,
+        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
+        SmallFilesConfigBuilder,
     };
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -1725,12 +1714,12 @@ mod tests {
         let catalog_arc = Arc::new(catalog);
 
         let compaction_config = CompactionConfigBuilder::default()
-            .planning(
-                CompactionPlanningConfigBuilder::default()
+            .planning(CompactionPlanningConfig::from_small_files(
+                SmallFilesConfigBuilder::default()
                     .small_file_threshold(small_file_threshold)
                     .build()
                     .unwrap(),
-            )
+            ))
             .build()
             .unwrap();
 
@@ -1861,8 +1850,7 @@ mod tests {
         let _table_ident = &env.table_ident;
         let table = &env.table;
 
-        let planner =
-            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
 
         // Test empty table
         let plan = planner
@@ -1878,8 +1866,9 @@ mod tests {
         // Commit the files
         let updated_table = append_and_commit(table, catalog, data_files).await;
 
-        let planner =
-            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::from_full_compaction(
+            crate::config::FullCompactionConfig::default(),
+        ));
 
         // Test plan with data
         let plan = planner
@@ -1911,11 +1900,15 @@ mod tests {
         let updated_table = append_and_commit(&table, catalog.as_ref(), data_files).await;
 
         // Create compaction instance
+        let full_compaction_config = CompactionConfigBuilder::default()
+            .planning(CompactionPlanningConfig::from_full_compaction(
+                crate::config::FullCompactionConfig::default(),
+            ))
+            .build()
+            .unwrap();
         let compaction =
             CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(
-                    CompactionConfigBuilder::default().build().unwrap(),
-                ))
+                .with_config(Arc::new(full_compaction_config))
                 .build();
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
@@ -1996,8 +1989,7 @@ mod tests {
                 .with_to_branch(branch_name.to_owned())
                 .build();
 
-        let planner =
-            CompactionPlanner::new(CompactionPlanningConfigBuilder::default().build().unwrap());
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
         let plans = planner
             .plan_compaction_with_branch(&updated_table, super::CompactionType::Full, branch_name)
             .await
@@ -2064,11 +2056,13 @@ mod tests {
         let updated_table = tx.commit(&catalog).await.unwrap();
 
         // Test small files compaction on main branch
-        let small_file_threshold = 900; // 900B threshold
-        let planning_config = CompactionPlanningConfigBuilder::default()
-            .small_file_threshold(small_file_threshold)
-            .build()
-            .unwrap();
+        let small_file_threshold = 900u64; // 900B threshold
+        let planning_config = CompactionPlanningConfig::from_small_files(
+            SmallFilesConfigBuilder::default()
+                .small_file_threshold(small_file_threshold)
+                .build()
+                .unwrap(),
+        );
 
         let branch_planner = CompactionPlanner::new(planning_config.clone());
 
