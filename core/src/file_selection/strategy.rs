@@ -987,7 +987,7 @@ mod tests {
             &GroupingStrategy::BinPack(BinPackConfig::new(25 * 1024 * 1024)), // 25MB target group size
         );
 
-        // Test cumulative size grouping with precise validation
+        // Test BinPack grouping behavior: groups should stay close to the target size, and files exceeding the target should be grouped separately
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")
                 .size(10 * 1024 * 1024)
