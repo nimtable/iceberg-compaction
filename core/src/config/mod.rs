@@ -42,7 +42,7 @@ pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - 
 pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
 pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
 
-/// Configuration for BinPack file grouping strategy.
+/// Configuration for `BinPack` file grouping strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinPackConfig {
     pub target_group_size_bytes: u64,
@@ -51,7 +51,7 @@ pub struct BinPackConfig {
 }
 
 impl BinPackConfig {
-    /// Creates a new BinPack config with the given target group size.
+    /// Creates a new `BinPack` config with the given target group size.
     pub fn new(target_group_size_bytes: u64) -> Self {
         Self {
             target_group_size_bytes,
@@ -60,7 +60,7 @@ impl BinPackConfig {
         }
     }
 
-    /// Creates a new BinPack config with target size and optional filters.
+    /// Creates a new `BinPack` config with target size and optional filters.
     pub fn with_filters(
         target_group_size_bytes: u64,
         min_group_size_bytes: Option<u64>,
@@ -80,7 +80,7 @@ impl Default for BinPackConfig {
     }
 }
 
-/// File grouping strategy: Noop (no grouping) or BinPack (size-based grouping).
+/// File grouping strategy: Noop (no grouping) or `BinPack` (size-based grouping).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GroupingStrategy {
     #[default]
@@ -184,7 +184,7 @@ impl Default for FilesWithDeletesConfig {
     }
 }
 
-/// Helper for default WriterProperties (SNAPPY compression).
+/// Helper for default `WriterProperties` (SNAPPY compression).
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
@@ -192,21 +192,6 @@ fn default_writer_properties() -> WriterProperties {
             concat!("iceberg-compaction version ", env!("CARGO_PKG_VERSION")).to_owned(),
         )
         .build()
-}
-
-/// Base configuration shared by all compaction strategies.
-#[derive(Builder, Debug, Clone)]
-pub struct CompactionBaseConfig {
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size_bytes: u64,
-}
-
-impl Default for CompactionBaseConfig {
-    fn default() -> Self {
-        Self {
-            target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE,
-        }
-    }
 }
 
 /// Planning configuration variants for different compaction strategies.
@@ -273,8 +258,8 @@ impl Default for CompactionPlanningConfig {
 /// Execution configuration for compaction operations.
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
-    #[builder(default)]
-    pub base: CompactionBaseConfig,
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
 
     #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,

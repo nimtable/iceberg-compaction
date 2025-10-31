@@ -180,7 +180,7 @@ pub async fn build_iceberg_data_file_writer(
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(execution_config.base.target_file_size_bytes)
+            .with_target_file_size(execution_config.target_file_size_bytes)
             .with_max_concurrent_closes(execution_config.max_concurrent_closes)
             .with_dynamic_size_estimation(execution_config.enable_dynamic_size_estimation)
             .with_size_estimation_smoothing_factor(

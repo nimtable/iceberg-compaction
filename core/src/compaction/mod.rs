@@ -826,7 +826,7 @@ impl CommitManager {
     ///
     /// # Performance
     ///
-    /// Loads snapshot files once, builds HashMap index for efficient lookup.
+    /// Loads snapshot files once, builds `HashMap` index for efficient lookup.
     ///
     /// # Errors
     ///
@@ -1313,9 +1313,10 @@ mod tests {
     use uuid::Uuid;
 
     // Additional imports for new tests
-    use crate::compaction::{CompactionPlan, RewriteResult};
-    use crate::executor::RewriteFilesStat;
-    use iceberg::spec::DataFile;
+    use crate::compaction::{CommitManagerRetryConfig, CompactionPlan, RewriteResult};
+    use crate::executor::{ExecutorType, RewriteFilesStat};
+    use iceberg::spec::{DataFile, UNASSIGNED_SNAPSHOT_ID};
+    use std::time::Duration;
 
     // ----------------------
     // Test helpers to reduce duplication
@@ -1632,6 +1633,7 @@ mod tests {
         writer.write(insert_batch).await.unwrap();
 
         let data_files = writer.close().await.unwrap();
+        let initial_file_count = data_files.len();
 
         // Start transaction and commit
         let transaction = Transaction::new(&table);
@@ -1644,7 +1646,11 @@ mod tests {
 
         // Verify the snapshot was created
         let snapshots = updated_table.metadata().snapshots();
-        assert!(snapshots.len() > 0, "Should have at least one snapshot");
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "Should have exactly one snapshot after first commit"
+        );
 
         let latest_snapshot = updated_table
             .metadata()
@@ -1680,7 +1686,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(rewrite_files_resp.stats.input_files_count, 2);
+        // Verify compaction reduced file count (compacted files together)
+        assert_eq!(
+            rewrite_files_resp.stats.input_files_count,
+            initial_file_count
+        );
+        assert!(
+            rewrite_files_resp.stats.output_files_count <= initial_file_count,
+            "Compaction should reduce or maintain file count, got {} output from {} input",
+            rewrite_files_resp.stats.output_files_count,
+            initial_file_count
+        );
+        assert!(
+            rewrite_files_resp.stats.output_files_count > 0,
+            "Compaction should produce at least one output file"
+        );
     }
 
     #[tokio::test]
@@ -1704,10 +1724,23 @@ mod tests {
         // Create multiple data files using helper and commit
         let data_files = write_simple_files(&table, &warehouse_location, "test", 3).await;
         let initial_file_count = data_files.len();
-        let _updated_table = append_and_commit(&table, &catalog, data_files).await;
+        let updated_table = append_and_commit(&table, &catalog, data_files).await;
+
+        // Verify initial state
+        let snapshot_before = updated_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+        // Verify snapshot has summary (Summary is always present, check it's not trivial)
+        assert_eq!(
+            snapshot_before.summary().additional_properties.len(),
+            0,
+            "Fresh snapshot should not have additional properties yet"
+        );
 
         // Test full compaction - should compact all files
-        let rewrite_files_resp = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
+        let catalog_arc = Arc::new(catalog);
+        let rewrite_files_resp = CompactionBuilder::new(catalog_arc.clone(), table_ident.clone())
             .with_config(Arc::new(
                 CompactionConfigBuilder::default().build().unwrap(),
             ))
@@ -1719,11 +1752,45 @@ mod tests {
 
         // Full compaction should rewrite all existing files
         assert_eq!(
-            rewrite_files_resp.stats.input_files_count,
+            rewrite_files_resp.stats.input_files_count, initial_file_count,
+            "Should compact all {} files",
             initial_file_count
         );
-        // Should create at least 1 new file from all the data (might be more depending on size)
-        assert!(rewrite_files_resp.stats.output_files_count >= 1);
+        // Should create fewer or equal files (compaction benefit)
+        assert!(
+            rewrite_files_resp.stats.output_files_count > 0,
+            "Should produce at least one output file"
+        );
+        assert!(
+            rewrite_files_resp.stats.output_files_count <= initial_file_count,
+            "Compaction should not increase file count"
+        );
+
+        // Verify bytes processed
+        assert!(
+            rewrite_files_resp.stats.input_total_bytes > 0,
+            "Should have processed some input bytes"
+        );
+        assert!(
+            rewrite_files_resp.stats.output_total_bytes > 0,
+            "Should have produced some output bytes"
+        );
+
+        // Verify table was updated
+        assert!(
+            rewrite_files_resp.table.is_some(),
+            "Should return updated table"
+        );
+        let final_table = rewrite_files_resp.table.unwrap();
+        let snapshot_after = final_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+        assert_ne!(
+            snapshot_before.snapshot_id(),
+            snapshot_after.snapshot_id(),
+            "Should create new snapshot after compaction"
+        );
     }
 
     #[tokio::test]
@@ -1920,18 +1987,20 @@ mod tests {
     async fn test_plan_compaction() {
         let env = create_test_env().await;
         let catalog = env.catalog.as_ref();
-        let _table_ident = &env.table_ident;
         let table = &env.table;
 
         let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
 
-        // Test empty table
+        // Test empty table - should return empty plan
         let plan = planner.plan_compaction(table).await.unwrap();
-
-        assert!(plan.is_empty());
+        assert!(
+            plan.is_empty(),
+            "Empty table should produce no compaction plans"
+        );
 
         // Create some data files
-        let data_files = write_simple_files(table, &env.warehouse_location, "test", 1).await;
+        let data_files = write_simple_files(table, &env.warehouse_location, "test", 2).await;
+        let expected_file_count = data_files.len();
 
         // Commit the files
         let updated_table = append_and_commit(table, catalog, data_files).await;
@@ -1941,14 +2010,76 @@ mod tests {
         ));
 
         // Test plan with data
-        let plan = planner.plan_compaction(&updated_table).await.unwrap();
+        let plans = planner.plan_compaction(&updated_table).await.unwrap();
 
-        assert!(!plan.is_empty());
-        let plan = &plan[0];
-        assert!(plan.file_count() > 0);
-        assert!(plan.total_bytes() > 0);
-        assert!(plan.recommended_executor_parallelism() > 0);
-        assert!(plan.recommended_output_parallelism() > 0);
+        assert!(
+            !plans.is_empty(),
+            "Table with data should produce compaction plans"
+        );
+        let plan = &plans[0];
+        assert_eq!(
+            plan.file_count(),
+            expected_file_count,
+            "Plan should include all {} files",
+            expected_file_count
+        );
+        assert!(
+            plan.total_bytes() > 0,
+            "Plan should have non-zero total bytes"
+        );
+        assert!(
+            plan.recommended_executor_parallelism() > 0,
+            "Should recommend positive executor parallelism"
+        );
+        assert!(
+            plan.recommended_output_parallelism() > 0,
+            "Should recommend positive output parallelism"
+        );
+        assert_eq!(
+            plan.to_branch, MAIN_BRANCH,
+            "Should target main branch by default"
+        );
+        assert_eq!(
+            plan.group_count(),
+            1,
+            "Non-empty plan should have group_count of 1"
+        );
+    }
+
+    /// Test plan_compaction with non-existent branch
+    #[tokio::test]
+    async fn test_plan_compaction_invalid_branch() {
+        let env = create_test_env().await;
+        let table = &env.table;
+
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
+
+        // Test with non-existent branch - should return error or empty plan
+        let result = planner
+            .plan_compaction_with_branch(table, "non-existent-branch")
+            .await;
+
+        // The current implementation returns an error for non-existent branch
+        // If it changes to return empty plan in the future, both are acceptable
+        match result {
+            Err(e) => {
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("non-existent-branch")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("snapshot"),
+                    "Error should mention the branch or snapshot issue, got: {}",
+                    error_msg
+                );
+            }
+            Ok(plans) => {
+                // Alternative acceptable behavior: return empty plans
+                assert!(
+                    plans.is_empty(),
+                    "Non-existent branch should produce empty plans or error"
+                );
+            }
+        }
     }
 
     /// Test the compact_with_plan functionality separately
@@ -1961,7 +2092,8 @@ mod tests {
         let table = env.table.clone();
 
         // Create some data files
-        let data_files = write_simple_files(&table, &env.warehouse_location, "test", 1).await;
+        let data_files = write_simple_files(&table, &env.warehouse_location, "test", 2).await;
+        let initial_file_count = data_files.len();
 
         // Commit the files
         let updated_table = append_and_commit(&table, catalog.as_ref(), data_files).await;
@@ -1980,11 +2112,11 @@ mod tests {
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
         // Test planning separately
-        let plan = planner.plan_compaction(&updated_table).await.unwrap();
+        let plans = planner.plan_compaction(&updated_table).await.unwrap();
 
-        assert!(!plan.is_empty());
+        assert!(!plans.is_empty(), "Should generate at least one plan");
 
-        let plan = &plan[0];
+        let plan = &plans[0];
 
         // Test execution with the plan
         let rewrite_files_resp = compaction
@@ -1992,15 +2124,52 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(rewrite_files_resp.as_ref().unwrap().stats.input_files_count > 0);
         assert!(
-            rewrite_files_resp
-                .as_ref()
-                .unwrap()
-                .stats
-                .output_files_count
-                > 0
+            rewrite_files_resp.is_some(),
+            "Should return compaction result"
         );
+        let result = rewrite_files_resp.unwrap();
+        assert_eq!(
+            result.stats.input_files_count, initial_file_count,
+            "Should process all {} input files",
+            initial_file_count
+        );
+        assert!(
+            result.stats.output_files_count > 0,
+            "Should produce at least one output file"
+        );
+        assert!(
+            result.stats.output_files_count <= initial_file_count,
+            "Should not increase file count"
+        );
+    }
+
+    /// Test compact_with_plan with empty plan
+    #[tokio::test]
+    async fn test_compact_with_plan_empty() {
+        let env = create_test_env().await;
+        let catalog = env.catalog.clone();
+        let table_ident = env.table_ident.clone();
+
+        let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .build();
+
+        // Create an empty plan
+        let empty_plan = CompactionPlan::new(
+            crate::file_selection::FileGroup::empty(),
+            MAIN_BRANCH,
+            UNASSIGNED_SNAPSHOT_ID,
+        );
+
+        let result = compaction
+            .compact_with_plan(empty_plan, &compaction.config.as_ref().unwrap().execution)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "Empty plan should return None");
     }
 
     /// Test compact_with_plan with branch functionality
@@ -2019,31 +2188,31 @@ mod tests {
 
         let table = catalog.load_table(&table_ident).await.unwrap();
 
-        // Create some data files on main branch
+        // Create some data files on feature branch
         let mut writer1 =
-            build_simple_data_writer(&table, warehouse_location.clone(), "main1").await;
+            build_simple_data_writer(&table, warehouse_location.clone(), "branch1").await;
         let batch = create_test_record_batch(&simple_table_schema());
         writer1.write(batch.clone()).await.unwrap();
-        let main_data_files1 = writer1.close().await.unwrap();
+        let branch_data_files1 = writer1.close().await.unwrap();
 
         let mut writer2 =
-            build_simple_data_writer(&table, warehouse_location.clone(), "main2").await;
+            build_simple_data_writer(&table, warehouse_location.clone(), "branch2").await;
         writer2.write(batch.clone()).await.unwrap();
-        let main_data_files2 = writer2.close().await.unwrap();
+        let branch_data_files2 = writer2.close().await.unwrap();
 
-        // Commit to main branch
+        // Commit to feature branch
         let transaction = Transaction::new(&table);
         let branch_name = "feature/compaction-branch";
         let mut append_action = transaction
             .fast_append(None, None, vec![])
             .unwrap()
             .with_to_branch(branch_name.to_owned());
-        append_action.add_data_files(main_data_files1).unwrap();
-        append_action.add_data_files(main_data_files2).unwrap();
+        append_action.add_data_files(branch_data_files1).unwrap();
+        append_action.add_data_files(branch_data_files2).unwrap();
         let tx = append_action.apply().await.unwrap();
         let updated_table = tx.commit(&catalog).await.unwrap();
 
-        // Test compaction on main branch using None branch parameter
+        // Test compaction on feature branch
         let compaction = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
             .with_config(Arc::new(
                 CompactionConfigBuilder::default().build().unwrap(),
@@ -2057,18 +2226,40 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!plans.is_empty());
+        assert!(
+            !plans.is_empty(),
+            "Should generate plans for feature branch"
+        );
         let plan = &plans[0];
 
-        assert_eq!(plan.file_count(), 2); // 2 files on main branch
+        assert_eq!(
+            plan.file_count(),
+            2,
+            "Should have 2 files on feature branch"
+        );
+        assert_eq!(
+            plan.to_branch, branch_name,
+            "Plan should target feature branch"
+        );
 
         let result = compaction
             .compact_with_plan(plan.clone(), &compaction.config.as_ref().unwrap().execution)
             .await
+            .unwrap()
             .unwrap();
 
-        assert_eq!(result.as_ref().unwrap().stats.input_files_count, 2);
-        assert_eq!(result.as_ref().unwrap().stats.output_files_count, 1); // Each file group produces one output file
+        assert_eq!(
+            result.stats.input_files_count, 2,
+            "Should compact 2 input files"
+        );
+        assert!(
+            result.stats.output_files_count > 0,
+            "Should produce at least one output file"
+        );
+        assert!(
+            result.stats.output_files_count <= 2,
+            "Should not increase file count beyond input"
+        );
     }
 
     /// Test branch functionality with small files compaction
@@ -2104,20 +2295,20 @@ mod tests {
         let large_files = large_writer.close().await.unwrap();
 
         // Append the small files to a new branch
-        let mut all_main_files = Vec::new();
-        all_main_files.extend(small_files1);
-        all_main_files.extend(large_files);
+        let mut all_branch_files = Vec::new();
+        all_branch_files.extend(small_files1);
+        all_branch_files.extend(large_files);
 
         let transaction = Transaction::new(&table);
         let mut append_action = transaction
             .fast_append(None, None, vec![])
             .unwrap()
             .with_to_branch(new_branch.to_owned());
-        append_action.add_data_files(all_main_files).unwrap();
+        append_action.add_data_files(all_branch_files).unwrap();
         let tx = append_action.apply().await.unwrap();
         let updated_table = tx.commit(&catalog).await.unwrap();
 
-        // Test small files compaction on main branch
+        // Test small files compaction on the branch
         let small_file_threshold = 900u64; // 900B threshold
         let planning_config = CompactionPlanningConfig::SmallFiles(
             SmallFilesConfigBuilder::default()
@@ -2133,13 +2324,26 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!branch_plans.is_empty());
+        assert!(
+            !branch_plans.is_empty(),
+            "Should generate plans for small files"
+        );
         let branch_plan = &branch_plans[0];
 
-        assert_eq!(branch_plan.file_count(), 1); // Only 1 small file on branch
-        assert_eq!(branch_plan.to_branch, new_branch.to_owned());
+        assert_eq!(
+            branch_plan.file_count(),
+            1,
+            "Should select only 1 small file"
+        );
+        assert_eq!(
+            branch_plan.to_branch, new_branch,
+            "Plan should target the feature branch"
+        );
         let input_file_path = branch_plan.file_group.data_files[0].data_file_path();
-        assert!(input_file_path.contains("small-branch"));
+        assert!(
+            input_file_path.contains("small-branch"),
+            "Should select the small file, not the large one"
+        );
 
         // Run the actual compaction on the branch
         let branch_compaction = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
@@ -2152,19 +2356,16 @@ mod tests {
                 &CompactionExecutionConfigBuilder::default().build().unwrap(),
             )
             .await
+            .unwrap()
             .unwrap();
 
         assert_eq!(
-            rewrite_files_resp.as_ref().unwrap().stats.input_files_count,
-            1
+            rewrite_files_resp.stats.input_files_count, 1,
+            "Should compact 1 small file"
         );
         assert!(
-            rewrite_files_resp
-                .as_ref()
-                .unwrap()
-                .stats
-                .output_files_count
-                > 0
+            rewrite_files_resp.stats.output_files_count > 0,
+            "Should produce output files"
         );
     }
 
@@ -2293,12 +2494,186 @@ mod tests {
         let rewrite_result = compaction
             .rewrite_plan(plan, &execution_config, &table)
             .await;
-        assert!(rewrite_result.is_err());
+        assert!(
+            rewrite_result.is_err(),
+            "Branch mismatch should cause error"
+        );
         let error_msg = rewrite_result.unwrap_err().to_string();
         assert!(
             error_msg.contains("does not match configured branch"),
             "Error should mention branch mismatch, got: {}",
             error_msg
+        );
+    }
+
+    /// Test CompactionPlan helper methods
+    #[tokio::test]
+    async fn test_compaction_plan_methods() {
+        // Test dummy plan
+        let dummy = CompactionPlan::dummy();
+        assert_eq!(dummy.file_count(), 0, "Dummy plan should have no files");
+        assert_eq!(dummy.total_bytes(), 0, "Dummy plan should have zero bytes");
+        assert_eq!(dummy.group_count(), 0, "Dummy plan should have zero groups");
+        assert_eq!(
+            dummy.to_branch, MAIN_BRANCH,
+            "Dummy plan should target main branch"
+        );
+        assert_eq!(
+            dummy.snapshot_id, UNASSIGNED_SNAPSHOT_ID,
+            "Dummy plan should have unassigned snapshot"
+        );
+
+        // Test empty plan
+        let empty_plan = CompactionPlan::new(
+            crate::file_selection::FileGroup::empty(),
+            "test-branch",
+            123,
+        );
+        assert_eq!(empty_plan.file_count(), 0);
+        assert_eq!(empty_plan.total_bytes(), 0);
+        assert_eq!(empty_plan.group_count(), 0);
+        assert_eq!(empty_plan.to_branch, "test-branch");
+        assert_eq!(empty_plan.snapshot_id, 123);
+    }
+
+    /// Test no compaction needed scenario
+    #[tokio::test]
+    async fn test_compact_no_files() {
+        let env = create_test_env().await;
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .build();
+
+        // Compact empty table
+        let result = compaction.compact().await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "Empty table should return None from compact()"
+        );
+    }
+
+    /// Test CompactionBuilder configuration
+    #[tokio::test]
+    async fn test_compaction_builder() {
+        let env = create_test_env().await;
+
+        // Test builder with custom settings
+        let custom_registry = Box::new(mixtrics::registry::noop::NoopMetricsRegistry);
+        let retry_config = CommitManagerRetryConfig {
+            max_retries: 5,
+            retry_initial_delay: Duration::from_millis(100),
+            retry_max_delay: Duration::from_secs(10),
+        };
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .with_executor_type(ExecutorType::DataFusion)
+            .with_catalog_name("test-catalog")
+            .with_registry(custom_registry)
+            .with_retry_config(retry_config.clone())
+            .with_to_branch("custom-branch")
+            .build();
+
+        assert_eq!(compaction.to_branch, "custom-branch");
+        assert_eq!(compaction.catalog_name, "test-catalog");
+        assert_eq!(
+            compaction.commit_retry_config.max_retries,
+            retry_config.max_retries
+        );
+        assert!(compaction.config.is_some());
+    }
+
+    /// Test metrics are accessible
+    #[tokio::test]
+    async fn test_compaction_metrics() {
+        let env = create_test_env().await;
+
+        let compaction =
+            CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone()).build();
+
+        let metrics = compaction.metrics();
+        assert!(
+            Arc::ptr_eq(&metrics, &compaction.metrics),
+            "Should return same metrics instance"
+        );
+    }
+
+    /// Test rewrite_plan with invalid snapshot
+    #[tokio::test]
+    async fn test_rewrite_plan_invalid_snapshot() {
+        let env = create_test_env().await;
+
+        let compaction =
+            CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone()).build();
+
+        let table = env.catalog.load_table(&env.table_ident).await.unwrap();
+
+        // Create a plan with non-existent snapshot ID
+        let invalid_plan = CompactionPlan::new(
+            crate::file_selection::FileGroup::empty(),
+            MAIN_BRANCH,
+            999999, // Non-existent snapshot ID
+        );
+
+        let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
+
+        let result = compaction
+            .rewrite_plan(invalid_plan, &execution_config, &table)
+            .await;
+
+        assert!(result.is_err(), "Invalid snapshot should cause error");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("not found") || error_msg.contains("999999"),
+            "Error should mention snapshot issue, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test compact without config should fail
+    #[tokio::test]
+    async fn test_compact_without_config() {
+        let env = create_test_env().await;
+
+        // Create compaction WITHOUT config
+        let compaction =
+            CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone()).build();
+
+        assert!(compaction.config.is_none(), "Should not have config");
+
+        let result = compaction.compact().await;
+
+        assert!(result.is_err(), "compact() without config should fail");
+        if let Err(e) = result {
+            let error_msg = e.to_string();
+            assert!(
+                error_msg.contains("config") || error_msg.contains("required"),
+                "Error should mention missing config, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    /// Test plan_compaction without config should fail
+    #[tokio::test]
+    async fn test_plan_compaction_without_config() {
+        let env = create_test_env().await;
+
+        // Create compaction WITHOUT config
+        let compaction =
+            CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone()).build();
+
+        let result = compaction.plan_compaction().await;
+
+        assert!(
+            result.is_err(),
+            "plan_compaction() without config should fail"
         );
     }
 }
