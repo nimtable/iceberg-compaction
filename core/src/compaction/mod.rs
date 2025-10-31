@@ -76,17 +76,17 @@ pub enum CompactionType {
     /// Use this for periodic full table optimization.
     Full,
 
-    /// Compact only small files (data and delete files)
+    /// Compact small-sized data files to reduce file count
     ///
     /// This will identify and compact files smaller than the configured threshold.
     /// Unlike `Full`, this allows incremental compaction of problematic small files
     /// without rewriting the entire table.
     ///
-    /// **Note**: This now includes both data files and delete files since the commit
+    /// **Note**: This includes both data files and delete files since the commit
     /// mechanism properly handles delete files.
-    MergeSmallDataFiles,
+    SmallFiles,
 
-    /// Compact files with high delete file count
+    /// Compact files with accumulated delete files
     ///
     /// This will identify and compact data files that have accumulated many delete files,
     /// which causes query overhead. By compacting these files, delete files are applied
@@ -94,7 +94,7 @@ pub enum CompactionType {
     ///
     /// This is particularly useful for tables with frequent updates/deletes where
     /// delete files accumulate over time.
-    HighDeleteFileCount,
+    FilesWithDeletes,
 }
 
 /// Builder for creating `Compaction` instances with flexible configuration
@@ -1754,7 +1754,7 @@ mod tests {
         let compaction = CompactionBuilder::new(
             catalog_arc.clone(),
             table_ident.clone(),
-            CompactionType::MergeSmallDataFiles,
+            CompactionType::SmallFiles,
         )
         .with_config(Arc::new(compaction_config))
         .build();
@@ -1766,7 +1766,7 @@ mod tests {
             .group_files_for_compaction(
                 &updated_table,
                 snapshot_before.snapshot_id(),
-                super::CompactionType::MergeSmallDataFiles,
+                super::CompactionType::SmallFiles,
             )
             .await
             .unwrap();
@@ -2092,7 +2092,7 @@ mod tests {
         let branch_plans = branch_planner
             .plan_compaction_with_branch(
                 &updated_table,
-                super::CompactionType::MergeSmallDataFiles,
+                super::CompactionType::SmallFiles,
                 new_branch,
             )
             .await
@@ -2110,7 +2110,7 @@ mod tests {
         let branch_compaction = CompactionBuilder::new(
             Arc::new(catalog),
             table_ident.clone(),
-            CompactionType::MergeSmallDataFiles,
+            CompactionType::SmallFiles,
         )
         .with_to_branch(new_branch.to_owned())
         .build();

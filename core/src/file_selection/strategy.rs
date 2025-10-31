@@ -653,11 +653,11 @@ impl FileStrategyFactory {
         )
     }
 
-    /// Create strategy for high delete file count compaction
+    /// Create strategy for files with deletes compaction
     ///
     /// This strategy identifies data files that have accumulated many delete files,
     /// which causes query overhead. Files are filtered by delete file count threshold.
-    pub fn create_high_delete_file_count_strategy(
+    pub fn create_files_with_deletes_strategy(
         config: &CompactionPlanningConfig,
     ) -> CompactionStrategy {
         // Reuse create_custom_strategy with delete file count filter
@@ -731,13 +731,13 @@ impl FileStrategyFactory {
         config: &CompactionPlanningConfig,
     ) -> CompactionStrategy {
         match compaction_type {
-            CompactionType::MergeSmallDataFiles => {
+            CompactionType::SmallFiles => {
                 // Use the small files strategy architecture
                 Self::create_small_files_strategy(config)
             }
-            CompactionType::HighDeleteFileCount => {
-                // Select files with high delete file count
-                Self::create_high_delete_file_count_strategy(config)
+            CompactionType::FilesWithDeletes => {
+                // Select files with accumulated delete files
+                Self::create_files_with_deletes_strategy(config)
             }
             CompactionType::Full => {
                 // Full compaction: select all files (no filtering), but use grouping to split into multiple plans
@@ -1030,7 +1030,7 @@ mod tests {
 
         // Compaction type routing
         let routed_small = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::MergeSmallDataFiles,
+            crate::compaction::CompactionType::SmallFiles,
             &config,
         );
         assert!(!routed_small.description().is_empty());
@@ -2078,15 +2078,15 @@ mod tests {
     }
 
     #[test]
-    fn test_high_delete_file_count_strategy() {
-        // Test the factory method for high delete file count strategy
+    fn test_files_with_deletes_strategy() {
+        // Test the factory method for files with deletes strategy
         let config = CompactionPlanningConfigBuilder::default()
             .min_delete_file_count_threshold(2)
             .min_file_count(0)
             .build()
             .unwrap();
 
-        let strategy = FileStrategyFactory::create_high_delete_file_count_strategy(&config);
+        let strategy = FileStrategyFactory::create_files_with_deletes_strategy(&config);
 
         // Verify description mentions the delete file count filter
         let desc = strategy.description();
