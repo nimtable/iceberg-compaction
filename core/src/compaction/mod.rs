@@ -67,12 +67,6 @@ fn validate_rewrite_results_consistency(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactionType {
-    Full,
-    MergeSmallDataFiles,
-}
-
 /// Builder for creating `Compaction` instances with flexible configuration
 pub struct CompactionBuilder {
     catalog: Arc<dyn Catalog>,
@@ -1192,7 +1186,7 @@ impl CompactionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::compaction::{CompactionBuilder, CompactionPlanner, CompactionType};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
         SmallFilesConfigBuilder,
@@ -1584,19 +1578,18 @@ mod tests {
             .build()
             .unwrap();
 
-        let rewrite_files_resp =
-            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(
-                    CompactionConfigBuilder::default()
-                        .execution(execution_config)
-                        .build()
-                        .unwrap(),
-                ))
-                .build()
-                .compact()
-                .await
-                .unwrap()
-                .unwrap();
+        let rewrite_files_resp = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .execution(execution_config)
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .compact()
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(rewrite_files_resp.stats.input_files_count, 2);
     }
@@ -1625,16 +1618,15 @@ mod tests {
         let _updated_table = append_and_commit(&table, &catalog, data_files).await;
 
         // Test full compaction - should compact all files
-        let rewrite_files_resp =
-            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(
-                    CompactionConfigBuilder::default().build().unwrap(),
-                ))
-                .build()
-                .compact()
-                .await
-                .unwrap()
-                .unwrap();
+        let rewrite_files_resp = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .build()
+            .compact()
+            .await
+            .unwrap()
+            .unwrap();
 
         // Full compaction should rewrite all existing files
         assert_eq!(
@@ -1716,30 +1708,22 @@ mod tests {
         let compaction_config = CompactionConfigBuilder::default()
             .planning(CompactionPlanningConfig::from_small_files(
                 SmallFilesConfigBuilder::default()
-                    .small_file_threshold(small_file_threshold)
+                    .small_file_threshold_bytes(small_file_threshold)
                     .build()
                     .unwrap(),
             ))
             .build()
             .unwrap();
 
-        let compaction = CompactionBuilder::new(
-            catalog_arc.clone(),
-            table_ident.clone(),
-            CompactionType::MergeSmallDataFiles,
-        )
-        .with_config(Arc::new(compaction_config))
-        .build();
+        let compaction = CompactionBuilder::new(catalog_arc.clone(), table_ident.clone())
+            .with_config(Arc::new(compaction_config))
+            .build();
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
         // Get the files that would be grouped for compaction
         let files_to_compact = planner
-            .group_files_for_compaction(
-                &updated_table,
-                snapshot_before.snapshot_id(),
-                super::CompactionType::MergeSmallDataFiles,
-            )
+            .group_files_for_compaction(&updated_table, snapshot_before.snapshot_id())
             .await
             .unwrap();
 
@@ -1853,10 +1837,7 @@ mod tests {
         let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
 
         // Test empty table
-        let plan = planner
-            .plan_compaction(table, super::CompactionType::Full)
-            .await
-            .unwrap();
+        let plan = planner.plan_compaction(table).await.unwrap();
 
         assert!(plan.is_empty());
 
@@ -1871,10 +1852,7 @@ mod tests {
         ));
 
         // Test plan with data
-        let plan = planner
-            .plan_compaction(&updated_table, super::CompactionType::Full)
-            .await
-            .unwrap();
+        let plan = planner.plan_compaction(&updated_table).await.unwrap();
 
         assert!(!plan.is_empty());
         let plan = &plan[0];
@@ -1906,18 +1884,14 @@ mod tests {
             ))
             .build()
             .unwrap();
-        let compaction =
-            CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(full_compaction_config))
-                .build();
+        let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone())
+            .with_config(Arc::new(full_compaction_config))
+            .build();
 
         let planner = CompactionPlanner::new(compaction.config.as_ref().unwrap().planning.clone());
 
         // Test planning separately
-        let plan = planner
-            .plan_compaction(&updated_table, super::CompactionType::Full)
-            .await
-            .unwrap();
+        let plan = planner.plan_compaction(&updated_table).await.unwrap();
 
         assert!(!plan.is_empty());
 
@@ -1981,17 +1955,16 @@ mod tests {
         let updated_table = tx.commit(&catalog).await.unwrap();
 
         // Test compaction on main branch using None branch parameter
-        let compaction =
-            CompactionBuilder::new(Arc::new(catalog), table_ident.clone(), CompactionType::Full)
-                .with_config(Arc::new(
-                    CompactionConfigBuilder::default().build().unwrap(),
-                ))
-                .with_to_branch(branch_name.to_owned())
-                .build();
+        let compaction = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .with_to_branch(branch_name.to_owned())
+            .build();
 
         let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
         let plans = planner
-            .plan_compaction_with_branch(&updated_table, super::CompactionType::Full, branch_name)
+            .plan_compaction_with_branch(&updated_table, branch_name)
             .await
             .unwrap();
 
@@ -2059,7 +2032,7 @@ mod tests {
         let small_file_threshold = 900u64; // 900B threshold
         let planning_config = CompactionPlanningConfig::from_small_files(
             SmallFilesConfigBuilder::default()
-                .small_file_threshold(small_file_threshold)
+                .small_file_threshold_bytes(small_file_threshold)
                 .build()
                 .unwrap(),
         );
@@ -2067,11 +2040,7 @@ mod tests {
         let branch_planner = CompactionPlanner::new(planning_config.clone());
 
         let branch_plans = branch_planner
-            .plan_compaction_with_branch(
-                &updated_table,
-                super::CompactionType::MergeSmallDataFiles,
-                new_branch,
-            )
+            .plan_compaction_with_branch(&updated_table, new_branch)
             .await
             .unwrap();
 
@@ -2084,13 +2053,9 @@ mod tests {
         assert!(input_file_path.contains("small-branch"));
 
         // Run the actual compaction on the branch
-        let branch_compaction = CompactionBuilder::new(
-            Arc::new(catalog),
-            table_ident.clone(),
-            CompactionType::MergeSmallDataFiles,
-        )
-        .with_to_branch(new_branch.to_owned())
-        .build();
+        let branch_compaction = CompactionBuilder::new(Arc::new(catalog), table_ident.clone())
+            .with_to_branch(new_branch.to_owned())
+            .build();
 
         let rewrite_files_resp = branch_compaction
             .compact_with_plan(
@@ -2123,13 +2088,9 @@ mod tests {
         let env = create_test_env().await;
 
         // Compaction configured for main branch for consistent checks
-        let compaction = CompactionBuilder::new(
-            env.catalog.clone(),
-            env.table_ident.clone(),
-            CompactionType::Full,
-        )
-        .with_to_branch(MAIN_BRANCH.to_owned())
-        .build();
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_to_branch(MAIN_BRANCH.to_owned())
+            .build();
 
         // 1) Branch mismatch
         let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 1);
@@ -2229,13 +2190,9 @@ mod tests {
         let env = create_test_env().await;
 
         // Create compaction configured for "main" branch
-        let compaction = CompactionBuilder::new(
-            env.catalog.clone(),
-            env.table_ident.clone(),
-            CompactionType::Full,
-        )
-        .with_to_branch("main".to_owned())
-        .build();
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_to_branch("main".to_owned())
+            .build();
 
         // Create a plan for a different branch
         let plan = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1);

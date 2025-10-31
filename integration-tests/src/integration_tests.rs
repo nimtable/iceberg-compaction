@@ -136,7 +136,6 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
     let compaction = iceberg_compaction_core::compaction::CompactionBuilder::new(
         catalog.clone(),
         table_ident.clone(),
-        iceberg_compaction_core::compaction::CompactionType::Full,
     )
     .with_config(Arc::new(config))
     .with_catalog_name("test_catalog".to_owned())
@@ -273,7 +272,6 @@ async fn test_sqlbuilder_with_delete_files() {
     let compaction = iceberg_compaction_core::compaction::CompactionBuilder::new(
         catalog.clone(),
         table_ident.clone(),
-        iceberg_compaction_core::compaction::CompactionType::Full,
     )
     .with_config(Arc::new(config))
     .with_catalog_name("test_catalog_with_deletes".to_owned())

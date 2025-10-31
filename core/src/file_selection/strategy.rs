@@ -133,7 +133,7 @@ impl FileGroup {
         }
 
         let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_partition_size_bytes())
+            .div_ceil(config.min_size_per_partition())
             .max(1) as usize; // Ensure at least one partition.
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
@@ -1053,20 +1053,14 @@ mod tests {
         assert!(small_files_desc.contains("SizeFilter"));
 
         // Compaction type routing for small files
-        let routed_small = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::MergeSmallDataFiles,
-            &small_files_config,
-        );
+        let routed_small = FileStrategyFactory::create_files_strategy(&small_files_config);
         assert!(!routed_small.description().is_empty());
 
         // Full compaction with its own config
         let full_config = CompactionPlanningConfig::from_full_compaction(
             crate::config::FullCompactionConfig::default(),
         );
-        let routed_full = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::Full,
-            &full_config,
-        );
+        let routed_full = FileStrategyFactory::create_files_strategy(&full_config);
 
         // Full compaction now uses grouping strategy from config instead of always Noop
         assert!(!routed_full.description().is_empty());
@@ -1744,7 +1738,7 @@ mod tests {
     fn test_file_group_parallelism_calculation() {
         // Test FileGroup::calculate_parallelism functionality
         let small_files_config = SmallFilesConfigBuilder::default()
-            .min_partition_size_bytes(10 * 1024 * 1024_u64) // 10MB per partition
+            .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
             .max_file_count_per_partition(5_usize) // 5 files per partition
             .max_parallelism(8_usize) // Max 8 parallel tasks
             .enable_heuristic_output_parallelism(true)
@@ -1922,7 +1916,7 @@ mod tests {
 
         // Heuristic output parallelism: data total is 8MB, below default 1GB target, so 1 output
         let small_files_config = SmallFilesConfigBuilder::default()
-            .min_partition_size_bytes(1_u64) // allow partitioning to be driven by counts
+            .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
             .max_file_count_per_partition(1_usize)
             .max_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
@@ -1943,13 +1937,13 @@ mod tests {
         // Test that Full Compaction can use BinPack to split files into multiple groups
         // and that each group's parallelism is calculated independently
         let binpack_config = crate::config::BinPackConfig {
-            target_group_size: 50 * 1024 * 1024, // 50MB per group
+            target_group_size_bytes: 50 * 1024 * 1024, // 50MB per group
             min_group_size_bytes: None,
             min_group_file_count: None, // No filter - we want to see all groups
         };
         let full_config = crate::config::FullCompactionConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
-            .min_partition_size_bytes(20 * 1024 * 1024_u64) // 20MB per partition
+            .min_size_per_partition(20 * 1024 * 1024_u64) // 20MB per partition
             .max_file_count_per_partition(1_usize) // 1 file per partition
             .max_parallelism(8_usize) // Max 8 parallel tasks per group
             .enable_heuristic_output_parallelism(true)
@@ -1957,10 +1951,7 @@ mod tests {
             .unwrap();
         let config = CompactionPlanningConfig::from_full_compaction(full_config);
 
-        let strategy = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::Full,
-            &config,
-        );
+        let strategy = FileStrategyFactory::create_files_strategy(&config);
 
         // Create test files with varying sizes to trigger different parallelism calculations
         // Group 1 should get: file1 (30MB) + file2 (30MB) = 60MB, 2 files
@@ -2073,10 +2064,7 @@ mod tests {
             .unwrap();
         let config = CompactionPlanningConfig::from_full_compaction(full_config);
 
-        let strategy = FileStrategyFactory::create_files_strategy(
-            crate::compaction::CompactionType::Full,
-            &config,
-        );
+        let strategy = FileStrategyFactory::create_files_strategy(&config);
 
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")

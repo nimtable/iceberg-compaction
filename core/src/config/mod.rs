@@ -109,7 +109,7 @@ pub struct SmallFilesConfig {
 
     /// Minimum partition size in bytes for parallelism calculation.
     #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_partition_size_bytes: u64,
+    pub min_size_per_partition: u64,
 
     /// Maximum file count per partition for parallelism calculation.
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
@@ -155,7 +155,7 @@ pub struct FullCompactionConfig {
 
     /// Minimum partition size in bytes for parallelism calculation.
     #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_partition_size_bytes: u64,
+    pub min_size_per_partition: u64,
 
     /// Maximum file count per partition for parallelism calculation.
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
@@ -257,10 +257,10 @@ impl CompactionPlanningConfig {
     }
 
     /// Returns the minimum partition size in bytes.
-    pub fn min_partition_size_bytes(&self) -> u64 {
+    pub fn min_size_per_partition(&self) -> u64 {
         match self {
-            Self::MergeSmallDataFiles(c) => c.min_partition_size_bytes,
-            Self::Full(c) => c.min_partition_size_bytes,
+            Self::MergeSmallDataFiles(c) => c.min_size_per_partition,
+            Self::Full(c) => c.min_size_per_partition,
         }
     }
 
