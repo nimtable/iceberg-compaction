@@ -33,7 +33,6 @@ pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
 pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
 pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
-pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 
@@ -42,34 +41,23 @@ pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - 
 pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
 pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
 
-/// Configuration for `BinPack` file grouping strategy.
+/// Configuration for bin-packing grouping strategy.
+///
+/// This struct wraps bin-packing parameters to allow future extensibility
+/// without breaking API compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinPackConfig {
+    /// Target size for each group (in bytes).
+    ///
+    /// The bin-packing algorithm will try to create groups close to this size.
     pub target_group_size_bytes: u64,
-    pub min_group_size_bytes: Option<u64>,
-    pub min_group_file_count: Option<usize>,
 }
 
 impl BinPackConfig {
-    /// Creates a new `BinPack` config with the given target group size.
+    /// Creates a new bin-pack configuration with the given target group size.
     pub fn new(target_group_size_bytes: u64) -> Self {
         Self {
             target_group_size_bytes,
-            min_group_size_bytes: None,
-            min_group_file_count: None,
-        }
-    }
-
-    /// Creates a new `BinPack` config with target size and optional filters.
-    pub fn with_filters(
-        target_group_size_bytes: u64,
-        min_group_size_bytes: Option<u64>,
-        min_group_file_count: Option<usize>,
-    ) -> Self {
-        Self {
-            target_group_size_bytes,
-            min_group_size_bytes,
-            min_group_file_count,
         }
     }
 }
@@ -80,15 +68,41 @@ impl Default for BinPackConfig {
     }
 }
 
-/// File grouping strategy: Noop (no grouping) or `BinPack` (size-based grouping).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// File grouping strategy: how to partition files into groups.
+///
+/// This determines the grouping algorithm only. Group filtering is handled
+/// separately by [`GroupFilters`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupingStrategy {
-    #[default]
-    Noop,
+    /// Put all files into a single group.
+    Single,
+    /// Group files using bin-packing algorithm to target a specific group size.
     BinPack(BinPackConfig),
 }
 
+/// Group-level filters applied after grouping.
+///
+/// These filters remove groups that don't meet certain criteria. They are
+/// orthogonal to the grouping strategy and can be used with any strategy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Builder)]
+#[builder(setter(into, strip_option), default)]
+pub struct GroupFilters {
+    /// Minimum total size (in bytes) for a group to be included.
+    pub min_group_size_bytes: Option<u64>,
+    /// Minimum number of files for a group to be included.
+    pub min_group_file_count: Option<usize>,
+}
+
+impl Default for GroupingStrategy {
+    fn default() -> Self {
+        Self::Single
+    }
+}
+
 /// Configuration for small files compaction strategy.
+///
+/// This strategy targets small files for compaction. It supports both grouping
+/// strategies and group-level filtering to control which groups get compacted.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct SmallFilesConfig {
@@ -110,11 +124,16 @@ pub struct SmallFilesConfig {
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
     pub small_file_threshold_bytes: u64,
 
-    #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
-    pub min_file_count: usize,
-
+    /// How to group files before compaction.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
+
+    /// Optional filters to apply after grouping.
+    ///
+    /// Groups that don't meet these criteria will be excluded from compaction.
+    /// This allows fine-grained control over which file groups get compacted.
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
 }
 
 impl Default for SmallFilesConfig {
@@ -124,6 +143,10 @@ impl Default for SmallFilesConfig {
 }
 
 /// Configuration for full compaction strategy.
+///
+/// This strategy performs full compaction of all files in a partition.
+/// Group filters are NOT supported because "full" compaction means processing
+/// ALL files without filtering.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FullCompactionConfig {
@@ -142,6 +165,10 @@ pub struct FullCompactionConfig {
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
 
+    /// How to group files before compaction.
+    ///
+    /// Note: Group filters are not supported for full compaction.
+    /// All groups will be compacted regardless of size or file count.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
 }
@@ -153,6 +180,9 @@ impl Default for FullCompactionConfig {
 }
 
 /// Configuration for files-with-deletes compaction strategy.
+///
+/// This strategy targets data files that have associated delete files.
+/// It supports group filtering to control which groups get compacted.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FilesWithDeletesConfig {
@@ -171,11 +201,19 @@ pub struct FilesWithDeletesConfig {
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
 
+    /// How to group files before compaction.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
 
+    /// Minimum number of delete files required to trigger compaction.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
+
+    /// Optional filters to apply after grouping.
+    ///
+    /// Groups that don't meet these criteria will be excluded from compaction.
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
 }
 
 impl Default for FilesWithDeletesConfig {

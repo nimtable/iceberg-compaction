@@ -18,7 +18,7 @@
 //!
 //! Implements a three-stage pipeline:
 //! 1. File filters: Exclude files by size, delete count, or minimum file threshold
-//! 2. Grouping: Combine files using Noop (all-in-one) or `BinPack` (First-Fit Decreasing)
+//! 2. Grouping: Combine files using Single (all-in-one) or `BinPack` (First-Fit Decreasing)
 //! 3. Group filters: Remove groups below size/count thresholds
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
@@ -254,7 +254,7 @@ pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send 
 /// Enum dispatching to grouping strategy implementations.
 #[derive(Debug)]
 pub enum GroupingStrategyEnum {
-    Noop(NoopGroupingStrategy),
+    Single(SingleGroupingStrategy),
     BinPack(BinPackGroupingStrategy),
 }
 
@@ -264,7 +264,7 @@ impl GroupingStrategyEnum {
         I: Iterator<Item = FileScanTask>,
     {
         match self {
-            GroupingStrategyEnum::Noop(strategy) => strategy.group_files(data_files),
+            GroupingStrategyEnum::Single(strategy) => strategy.group_files(data_files),
             GroupingStrategyEnum::BinPack(strategy) => strategy.group_files(data_files),
         }
     }
@@ -273,7 +273,7 @@ impl GroupingStrategyEnum {
 impl std::fmt::Display for GroupingStrategyEnum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GroupingStrategyEnum::Noop(strategy) => write!(f, "{}", strategy),
+            GroupingStrategyEnum::Single(strategy) => write!(f, "{}", strategy),
             GroupingStrategyEnum::BinPack(strategy) => write!(f, "{}", strategy),
         }
     }
@@ -304,13 +304,13 @@ impl std::fmt::Display for NoopStrategy {
     }
 }
 
-/// No-op grouping strategy. Groups all files into a single `FileGroup`.
+/// Single grouping strategy. Groups all files into a single `FileGroup`.
 ///
 /// Returns empty vec if input is empty.
 #[derive(Debug)]
-pub struct NoopGroupingStrategy;
+pub struct SingleGroupingStrategy;
 
-impl NoopGroupingStrategy {
+impl SingleGroupingStrategy {
     pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
     where
         I: Iterator<Item = FileScanTask>,
@@ -324,9 +324,9 @@ impl NoopGroupingStrategy {
     }
 }
 
-impl std::fmt::Display for NoopGroupingStrategy {
+impl std::fmt::Display for SingleGroupingStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NoopGrouping")
+        write!(f, "SingleGrouping")
     }
 }
 
@@ -473,56 +473,30 @@ impl std::fmt::Display for DeleteFileCountFilterStrategy {
     }
 }
 
-/// File filter requiring minimum file count.
-///
-/// Returns all files if `len >= min_file_count`, otherwise returns empty vec.
-#[derive(Debug)]
-pub struct MinFileCountStrategy {
-    pub min_file_count: usize,
-}
-
-impl MinFileCountStrategy {
-    pub fn new(min_file_count: usize) -> Self {
-        Self { min_file_count }
-    }
-}
-
-impl FileFilterStrategy for MinFileCountStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        if data_files.len() >= self.min_file_count {
-            data_files
-        } else {
-            vec![]
-        }
-    }
-}
-
-impl std::fmt::Display for MinFileCountStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MinFileCount[{}]", self.min_file_count)
-    }
-}
-
 /// Group filter by minimum total size.
 ///
 /// Filters by `group.total_size >= min_group_size`.
 #[derive(Debug)]
 pub struct MinGroupSizeStrategy {
-    pub min_group_size: u64,
+    pub min_group_size_bytes: u64,
 }
 
 impl GroupFilterStrategy for MinGroupSizeStrategy {
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
         groups
             .into_iter()
-            .filter(|group| group.total_size >= self.min_group_size)
+            .filter(|group| group.total_size >= self.min_group_size_bytes)
             .collect()
     }
 }
 
 impl std::fmt::Display for MinGroupSizeStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MinGroupSize[{}MB]", self.min_group_size / 1024 / 1024)
+        write!(
+            f,
+            "MinGroupSize[{}MB]",
+            self.min_group_size_bytes / 1024 / 1024
+        )
     }
 }
 
@@ -603,70 +577,74 @@ impl PlanStrategy {
             .collect()
     }
 
-    /// Constructs grouping enum and optional group filters from config.
+    /// Constructs grouping enum and group filters from config.
     ///
-    /// For `BinPack`, adds `MinGroupSizeStrategy` if `min_group_size_bytes > 0`,
-    /// and `MinGroupFileCountStrategy` if `min_group_file_count > 0`.
+    /// # Arguments
+    /// - `grouping_strategy`: Determines how files are partitioned into groups
+    /// - `group_filters`: Optional filters to apply after grouping
     fn build_grouping_and_filters(
         grouping_strategy: &GroupingStrategy,
+        group_filters: Option<&crate::config::GroupFilters>,
     ) -> (GroupingStrategyEnum, Vec<Box<dyn GroupFilterStrategy>>) {
+        // Build grouping strategy enum
         let grouping = match grouping_strategy {
-            GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-            GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
-                BinPackGroupingStrategy::new(bin_config.target_group_size_bytes),
+            GroupingStrategy::Single => GroupingStrategyEnum::Single(SingleGroupingStrategy),
+            GroupingStrategy::BinPack(config) => GroupingStrategyEnum::BinPack(
+                BinPackGroupingStrategy::new(config.target_group_size_bytes),
             ),
         };
 
-        let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
+        let mut group_filter_strategies: Vec<Box<dyn GroupFilterStrategy>> = vec![];
 
-        if let GroupingStrategy::BinPack(bin_config) = grouping_strategy {
-            if let Some(min_size) = bin_config.min_group_size_bytes {
-                if min_size > 0 {
-                    group_filters.push(Box::new(MinGroupSizeStrategy {
-                        min_group_size: min_size,
+        // Apply group filters if provided
+        if let Some(group_filters) = group_filters {
+            // Add size filter if specified
+            if let Some(min_group_size_bytes) = group_filters.min_group_size_bytes {
+                if min_group_size_bytes > 0 {
+                    group_filter_strategies.push(Box::new(MinGroupSizeStrategy {
+                        min_group_size_bytes,
                     }));
                 }
             }
 
-            if let Some(min_count) = bin_config.min_group_file_count {
-                if min_count > 0 {
-                    group_filters.push(Box::new(MinGroupFileCountStrategy {
-                        min_file_count: min_count,
-                    }));
+            // Add file count filter if specified
+            if let Some(min_file_count) = group_filters.min_group_file_count {
+                if min_file_count > 0 {
+                    group_filter_strategies
+                        .push(Box::new(MinGroupFileCountStrategy { min_file_count }));
                 }
             }
         }
 
-        (grouping, group_filters)
+        (grouping, group_filter_strategies)
     }
 
     /// Constructs strategy for small files compaction.
     ///
     /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
-    /// Adds `MinFileCountStrategy` if `min_file_count > 0`.
     pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> =
-            vec![Box::new(SizeFilterStrategy {
-                min_size: None,
-                max_size: Some(config.small_file_threshold_bytes),
-            })];
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(config.small_file_threshold_bytes),
+        })];
 
-        if config.min_file_count > 0 {
-            file_filters.push(Box::new(MinFileCountStrategy::new(config.min_file_count)));
-        }
-
-        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+        let (grouping, group_filters) = Self::build_grouping_and_filters(
+            &config.grouping_strategy,
+            config.group_filters.as_ref(),
+        );
 
         Self::new(file_filters, grouping, group_filters)
     }
 
     /// Constructs strategy for full compaction.
     ///
-    /// No file filters. Grouping and group filters from config.
+    /// No file filters. No group filters (full compaction processes all groups).
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
         let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+        // Full compaction never uses group filters
+        let (grouping, group_filters) =
+            Self::build_grouping_and_filters(&config.grouping_strategy, None);
 
         Self::new(file_filters, grouping, group_filters)
     }
@@ -683,7 +661,10 @@ impl PlanStrategy {
             )));
         }
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+        let (grouping, group_filters) = Self::build_grouping_and_filters(
+            &config.grouping_strategy,
+            config.group_filters.as_ref(),
+        );
 
         Self::new(file_filters, grouping, group_filters)
     }
@@ -693,14 +674,14 @@ impl PlanStrategy {
     /// # Arguments
     /// - `size_filter`: `(min_size, max_size)` for `SizeFilterStrategy`
     /// - `delete_file_count_filter`: Threshold for `DeleteFileCountFilterStrategy`
-    /// - `min_file_count`: Threshold for `MinFileCountStrategy`
     /// - `grouping_strategy`: Grouping algorithm config
+    /// - `group_filters`: Optional group-level filters
     #[cfg(test)]
     pub fn new_custom(
         size_filter: Option<(Option<u64>, Option<u64>)>,
         delete_file_count_filter: Option<usize>,
-        min_file_count: Option<usize>,
         grouping_strategy: GroupingStrategy,
+        group_filters: Option<crate::config::GroupFilters>,
     ) -> Self {
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
@@ -714,13 +695,10 @@ impl PlanStrategy {
             )));
         }
 
-        if let Some(min_file_count) = min_file_count {
-            file_filters.push(Box::new(MinFileCountStrategy::new(min_file_count)));
-        }
+        let (grouping, group_filter_strategies) =
+            Self::build_grouping_and_filters(&grouping_strategy, group_filters.as_ref());
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(&grouping_strategy);
-
-        Self::new(file_filters, grouping, group_filters)
+        Self::new(file_filters, grouping, group_filter_strategies)
     }
 }
 
@@ -1093,7 +1071,7 @@ mod tests {
         let small_files_desc = small_files_strategy.to_string();
         assert!(small_files_desc.contains("SizeFilter"));
         assert!(
-            small_files_desc.contains("NoopGrouping")
+            small_files_desc.contains("SingleGrouping")
                 || small_files_desc.contains("BinPackGrouping")
         );
 
@@ -1130,8 +1108,8 @@ mod tests {
         let strategy = PlanStrategy::new_custom(
             None,
             None,
-            None,
             GroupingStrategy::BinPack(BinPackConfig::new(25 * 1024 * 1024)),
+            None, // no group filters
         );
 
         let test_files = vec![
@@ -1186,20 +1164,36 @@ mod tests {
     }
 
     #[test]
-    fn test_min_file_count_strategy() {
-        assert_eq!(MinFileCountStrategy::new(3).to_string(), "MinFileCount[3]");
-        assert_eq!(MinFileCountStrategy::new(0).to_string(), "MinFileCount[0]");
+    fn test_min_group_file_count_with_single() {
+        assert_eq!(
+            MinGroupFileCountStrategy { min_file_count: 3 }.to_string(),
+            "MinGroupFileCount[3]"
+        );
+        assert_eq!(
+            MinGroupFileCountStrategy { min_file_count: 0 }.to_string(),
+            "MinGroupFileCount[0]"
+        );
 
         let test_cases = vec![
-            (3, 3, 3), // min=3, input=3, expect=3
-            (3, 5, 5), // min=3, input=5, expect=5
-            (3, 2, 0), // min=3, input=2, expect=0
-            (0, 1, 1), // min=0, input=1, expect=1
-            (1, 1, 1), // min=1, input=1, expect=1
+            (3, 3, 1), // min=3, input=3 files, expect 1 group
+            (3, 5, 1), // min=3, input=5 files, expect 1 group
+            (3, 2, 0), // min=3, input=2 files, expect 0 groups (filtered out)
+            (0, 1, 1), // min=0, input=1 file, expect 1 group
+            (1, 1, 1), // min=1, input=1 file, expect 1 group
         ];
 
-        for (min_count, input_count, expected_count) in test_cases {
-            let strategy = MinFileCountStrategy::new(min_count);
+        for (min_count, input_count, expected_groups) in test_cases {
+            // Use SmallFilesConfig with Single grouping + group filters
+            let small_files_config = SmallFilesConfigBuilder::default()
+                .grouping_strategy(GroupingStrategy::Single)
+                .group_filters(crate::config::GroupFilters {
+                    min_group_file_count: Some(min_count),
+                    min_group_size_bytes: None,
+                })
+                .build()
+                .unwrap();
+            let strategy = PlanStrategy::from_small_files(&small_files_config);
+
             let files: Vec<FileScanTask> = (0..input_count)
                 .map(|i| {
                     TestFileBuilder::new(&format!("file{}.parquet", i))
@@ -1208,15 +1202,24 @@ mod tests {
                 })
                 .collect();
 
-            let result = strategy.filter(files);
+            let result = strategy
+                .execute(
+                    files,
+                    &CompactionPlanningConfig::SmallFiles(small_files_config.clone()),
+                )
+                .unwrap();
             assert_eq!(
                 result.len(),
-                expected_count,
-                "min_count={}, input={} should yield {}",
+                expected_groups,
+                "min_count={}, input={} files should yield {} groups",
                 min_count,
                 input_count,
-                expected_count
+                expected_groups
             );
+
+            if expected_groups > 0 {
+                assert_eq!(result[0].data_file_count, input_count);
+            }
         }
     }
 
@@ -1272,7 +1275,11 @@ mod tests {
 
         let min_count_small_files_config = SmallFilesConfigBuilder::default()
             .small_file_threshold_bytes(20 * 1024 * 1024_u64)
-            .min_file_count(3_usize)
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(crate::config::GroupFilters {
+                min_group_file_count: Some(3),
+                min_group_size_bytes: None,
+            })
             .build()
             .unwrap();
         let min_count_config = CompactionPlanningConfig::SmallFiles(min_count_small_files_config);
@@ -1306,14 +1313,19 @@ mod tests {
         assert_eq!(sufficient_result.len(), 3);
 
         let default_small_files_config = SmallFilesConfigBuilder::default()
-            .grouping_strategy(crate::config::GroupingStrategy::Noop)
+            .grouping_strategy(crate::config::GroupingStrategy::Single)
             .build()
             .unwrap();
         let default_config = CompactionPlanningConfig::SmallFiles(default_small_files_config);
 
         match &default_config {
             CompactionPlanningConfig::SmallFiles(config) => {
-                assert_eq!(config.min_file_count, 0);
+                // Default config should have Single grouping strategy with no group filters
+                assert!(matches!(
+                    config.grouping_strategy,
+                    crate::config::GroupingStrategy::Single
+                ));
+                assert!(config.group_filters.is_none());
             }
             _ => panic!("Expected small files config"),
         }
@@ -1426,15 +1438,20 @@ mod tests {
         let strategy_with_size_filter = PlanStrategy::new_custom(
             Some((Some(1024 * 1024), Some(100 * 1024 * 1024))), // size_filter: 1MB-100MB
             None,                                               // no delete file count filter
-            None,                                               // no min_file_count
-            GroupingStrategy::Noop,
+            GroupingStrategy::Single,
+            None, // no group filters
         );
 
         let description = strategy_with_size_filter.to_string();
         assert!(description.contains("SizeFilter"));
 
         // Test case 2: Minimal filters
-        let strategy_minimal = PlanStrategy::new_custom(None, None, None, GroupingStrategy::Noop);
+        let strategy_minimal = PlanStrategy::new_custom(
+            None,
+            None,
+            GroupingStrategy::Single,
+            None, // no group filters
+        );
 
         // Test functional behavior
         let test_files = vec![
@@ -1532,8 +1549,8 @@ mod tests {
         let bin_pack_strategy = PlanStrategy::new_custom(
             None,
             None,
-            None,
             GroupingStrategy::BinPack(BinPackConfig::new(64 * 1024 * 1024)),
+            None, // no group filters
         );
 
         let config = TestUtils::create_test_config();
@@ -1578,26 +1595,26 @@ mod tests {
                 .build(),
         ];
 
-        // Test Noop variant
-        let noop_enum = GroupingStrategyEnum::Noop(NoopGroupingStrategy);
-        let noop_groups = noop_enum.group_files(data_files.clone().into_iter());
-        assert_eq!(noop_groups.len(), 1);
-        assert_eq!(noop_groups[0].data_file_count, 2);
-        assert_eq!(noop_enum.to_string(), "NoopGrouping");
+        // Test Single variant
+        let single_enum = GroupingStrategyEnum::Single(SingleGroupingStrategy);
+        let groups = single_enum.group_files(data_files.clone().into_iter());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].data_file_count, 2);
+        assert_eq!(single_enum.to_string(), "SingleGrouping");
 
-        // Single-file case for Noop
+        // Single-file case for Single
         let single = vec![TestFileBuilder::new("single.parquet")
             .size(20 * 1024 * 1024)
             .build()];
-        let single_groups = noop_enum.group_files(single.into_iter());
-        assert_eq!(single_groups.len(), 1);
-        assert_eq!(single_groups[0].data_file_count, 1);
-        TestUtils::assert_paths_eq(&["single.parquet"], &single_groups[0].data_files);
+        let single_file_groups = single_enum.group_files(single.into_iter());
+        assert_eq!(single_file_groups.len(), 1);
+        assert_eq!(single_file_groups[0].data_file_count, 1);
+        TestUtils::assert_paths_eq(&["single.parquet"], &single_file_groups[0].data_files);
 
         // Empty input
         let empty_files: Vec<FileScanTask> = vec![];
-        let noop_empty_groups = noop_enum.group_files(empty_files.into_iter());
-        assert_eq!(noop_empty_groups.len(), 0);
+        let single_empty_groups = single_enum.group_files(empty_files.into_iter());
+        assert_eq!(single_empty_groups.len(), 0);
 
         // Test BinPack variant
         let binpack_enum =
@@ -1939,11 +1956,7 @@ mod tests {
 
     #[test]
     fn test_full_compaction_with_binpack_grouping() {
-        let binpack_config = crate::config::BinPackConfig {
-            target_group_size_bytes: 50 * 1024 * 1024,
-            min_group_size_bytes: None,
-            min_group_file_count: None,
-        };
+        let binpack_config = crate::config::BinPackConfig::new(50 * 1024 * 1024);
         let full_config = crate::config::FullCompactionConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
             .min_size_per_partition(20 * 1024 * 1024_u64)
@@ -2142,10 +2155,10 @@ mod tests {
     }
 
     #[test]
-    fn test_full_compaction_with_noop_grouping() {
-        // Test that Full Compaction with Noop grouping creates a single group
+    fn test_full_compaction_with_single_grouping() {
+        // Test that Full Compaction with Single grouping creates a single group
         let full_config = crate::config::FullCompactionConfigBuilder::default()
-            .grouping_strategy(crate::config::GroupingStrategy::Noop)
+            .grouping_strategy(crate::config::GroupingStrategy::Single)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::Full(full_config);
