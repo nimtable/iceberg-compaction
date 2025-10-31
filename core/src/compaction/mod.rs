@@ -1177,9 +1177,9 @@ impl CompactionPlanner {
         table: &Table,
         snapshot_id: i64,
     ) -> Result<Vec<FileGroup>> {
-        use crate::file_selection::FileStrategyFactory;
+        use crate::file_selection::PlanStrategy;
 
-        let strategy = FileStrategyFactory::create_files_strategy(&self.config);
+        let strategy = PlanStrategy::from(&self.config);
         FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy, &self.config).await
     }
 }
