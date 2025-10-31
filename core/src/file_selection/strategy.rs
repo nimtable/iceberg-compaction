@@ -20,41 +20,25 @@ use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
 
-/// A group of files selected for compaction
-///
-/// This struct encapsulates a collection of files that should be compacted together,
-/// along with useful metadata about the group and associated delete files.
+/// A group of files selected for compaction.
 #[derive(Debug, Clone)]
 pub struct FileGroup {
-    /// The data files in this group
     pub data_files: Vec<FileScanTask>,
-    /// Position delete files associated with the data files
     pub position_delete_files: Vec<FileScanTask>,
-    /// Equality delete files associated with the data files
     pub equality_delete_files: Vec<FileScanTask>,
-    /// Total size of data files in this group (in bytes)
-    ///
-    /// Note: This only accounts for data file sizes. For sizing that includes
-    /// delete files as well, use [`FileGroup::input_total_bytes`].
+    /// Data files size only. Use [`Self::input_total_bytes`] for total including deletes.
     pub total_size: u64,
-    /// Number of data files in this group
     pub data_file_count: usize,
-    /// Executor parallelism for this file group
     pub executor_parallelism: usize,
-    /// Output parallelism for this file group
     pub output_parallelism: usize,
 }
 
 impl FileGroup {
-    /// Create a new file group from a collection of data files
-    /// This will automatically extract and organize delete files from the data files
     pub fn new(data_files: Vec<FileScanTask>) -> Self {
         let total_size = data_files.iter().map(|task| task.length).sum();
         let data_file_count = data_files.len();
 
-        // Extract delete files from data files (similar to build_input_file_scan_tasks logic)
-        // Note: de-duplicate delete files by path to avoid double-counting when
-        // multiple data files reference the same delete file.
+        // De-duplicate delete files by path
         let mut position_delete_map = std::collections::HashMap::new();
         let mut equality_delete_map = std::collections::HashMap::new();
 
@@ -70,14 +54,11 @@ impl FileGroup {
                         delete_task.project_field_ids = delete_task.equality_ids.clone();
                         equality_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
                     }
-                    _ => {
-                        // Skip other types
-                    }
+                    _ => {}
                 }
             }
         }
 
-        // Convert maps to vectors
         let position_delete_files = position_delete_map.into_values().collect();
         let equality_delete_files = equality_delete_map.into_values().collect();
 
@@ -87,12 +68,11 @@ impl FileGroup {
             equality_delete_files,
             total_size,
             data_file_count,
-            executor_parallelism: 1, // default value, will be calculated later
-            output_parallelism: 1,   // default value, will be calculated later
+            executor_parallelism: 1,
+            output_parallelism: 1,
         }
     }
 
-    /// Create a new file group with calculated parallelism
     pub fn with_parallelism(
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
@@ -105,7 +85,6 @@ impl FileGroup {
         Ok(file_group)
     }
 
-    /// Create an empty file group
     pub fn empty() -> Self {
         Self {
             data_files: Vec::new(),
@@ -118,7 +97,6 @@ impl FileGroup {
         }
     }
 
-    /// Calculate and apply parallelism to this group (immutable transformation)
     pub fn with_calculated_parallelism(
         mut self,
         config: &CompactionPlanningConfig,
@@ -130,15 +108,12 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Calculate parallelism for the file group based on configuration
     fn calculate_parallelism(
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
         let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
         if total_file_size_for_partitioning == 0 {
-            // If the total data file size is 0, we cannot partition by size.
-            // This means there are no data files to compact.
             return Err(CompactionError::Execution(
                 "No files to calculate task parallelism".to_owned(),
             ));
@@ -146,34 +121,29 @@ impl FileGroup {
 
         let partition_by_size = total_file_size_for_partitioning
             .div_ceil(config.min_size_per_partition())
-            .max(1) as usize; // Ensure at least one partition.
+            .max(1) as usize;
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
 
         let partition_by_count = total_files_count_for_partitioning
             .div_ceil(config.max_file_count_per_partition())
-            .max(1); // Ensure at least one partition.
+            .max(1);
 
         let input_parallelism = partition_by_size
             .max(partition_by_count)
             .min(config.max_parallelism());
 
-        // `output_parallelism` should not exceed `input_parallelism`
-        // and should also not exceed max_parallelism.
-        // It's primarily driven by size to avoid small output files.
         let mut output_parallelism = partition_by_size
             .min(input_parallelism)
             .min(config.max_parallelism());
 
-        // Apply small-output heuristic to encourage larger outputs when input data is tiny.
         output_parallelism =
             Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
 
         Ok((input_parallelism, output_parallelism))
     }
 
-    /// Heuristic: If the total data size is smaller than the target file size,
-    /// favor merging into a single output to avoid tiny files.
+    /// Heuristic: merge into single output if total data < target file size.
     fn apply_output_parallelism_heuristic(
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
@@ -196,27 +166,22 @@ impl FileGroup {
         }
     }
 
-    /// Check if the group is empty
     pub fn is_empty(&self) -> bool {
         self.data_files.is_empty()
     }
 
-    /// Get the total size in MB for display purposes
     pub fn total_size_mb(&self) -> u64 {
         self.total_size / 1024 / 1024
     }
 
-    /// Convert this group back to a flat list of data files
     pub fn into_files(self) -> Vec<FileScanTask> {
         self.data_files
     }
 
-    /// Get total count of all input files (data + delete files)
     pub fn input_files_count(&self) -> usize {
         self.data_files.len() + self.position_delete_files.len() + self.equality_delete_files.len()
     }
 
-    /// Get total bytes of all input files (data + delete files)
     pub fn input_total_bytes(&self) -> u64 {
         self.data_files
             .iter()
@@ -227,18 +192,11 @@ impl FileGroup {
     }
 }
 
-/// Object-safe trait for file filtering strategies
-///
-/// This trait enables dynamic dispatch for composable file filter chains.
 pub trait FileFilterStrategy: std::fmt::Debug + Sync + Send {
-    /// Filter the input data files, returning collected results
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
-
-    /// Get a description of this strategy for logging/debugging
     fn description(&self) -> String;
 }
 
-/// Enum-based grouping strategy for object-safe usage
 #[derive(Debug)]
 pub enum GroupingStrategyEnum {
     Noop(NoopGroupingStrategy),
@@ -264,18 +222,11 @@ impl GroupingStrategyEnum {
     }
 }
 
-/// Object-safe trait for group filtering strategies
-///
-/// This trait enables dynamic dispatch for composable group filter chains.
 pub trait GroupFilterStrategy: std::fmt::Debug + Sync + Send {
-    /// Filter groups of files based on group-level criteria
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup>;
-
-    /// Get a description of this group filter strategy for logging/debugging
     fn description(&self) -> String;
 }
 
-/// No-op strategy that passes through all files unchanged
 #[derive(Debug)]
 pub struct NoopStrategy;
 
@@ -289,7 +240,6 @@ impl FileFilterStrategy for NoopStrategy {
     }
 }
 
-/// No-op grouping strategy that places all files into a single group
 #[derive(Debug)]
 pub struct NoopGroupingStrategy;
 
@@ -311,7 +261,6 @@ impl NoopGroupingStrategy {
     }
 }
 
-/// No-op group filter strategy that passes through all groups
 #[derive(Debug)]
 pub struct NoopGroupFilterStrategy;
 
@@ -325,17 +274,13 @@ impl GroupFilterStrategy for NoopGroupFilterStrategy {
     }
 }
 
-/// `BinPack` grouping strategy that optimizes file size distribution
-///
-/// This strategy uses a pure bin-packing algorithm (First-Fit Decreasing) to group files
-/// based solely on the target group size. It does not enforce any file count limitations.
+/// Bin-packing grouping using First-Fit Decreasing algorithm.
 #[derive(Debug)]
 pub struct BinPackGroupingStrategy {
     pub target_group_size: u64,
 }
 
 impl BinPackGroupingStrategy {
-    /// Create a new `BinPackGroupingStrategy`
     pub fn new(target_group_size: u64) -> Self {
         Self { target_group_size }
     }
@@ -350,12 +295,9 @@ impl BinPackGroupingStrategy {
             return vec![];
         }
 
-        // Use the pure ListPacker algorithm
-        // This only considers target_group_size, not max_files_per_group
         let packer = ListPacker::new(self.target_group_size);
         let groups = packer.pack(files, |task| task.file_size_in_bytes);
 
-        // Convert Vec<Vec<FileScanTask>> to Vec<FileGroup>
         groups
             .into_iter()
             .map(FileGroup::new)
@@ -371,7 +313,6 @@ impl BinPackGroupingStrategy {
     }
 }
 
-/// Strategy for filtering out files that have associated delete files
 #[derive(Debug)]
 pub struct NoDeleteFilesStrategy;
 
@@ -388,7 +329,6 @@ impl FileFilterStrategy for NoDeleteFilesStrategy {
     }
 }
 
-/// Strategy for filtering files by size threshold
 #[derive(Debug)]
 pub struct SizeFilterStrategy {
     pub min_size: Option<u64>,
@@ -423,7 +363,6 @@ impl FileFilterStrategy for SizeFilterStrategy {
     }
 }
 
-/// Strategy for limiting total task size
 #[derive(Debug)]
 pub struct TaskSizeLimitStrategy {
     pub max_total_size: u64,
@@ -457,14 +396,13 @@ impl FileFilterStrategy for TaskSizeLimitStrategy {
     }
 }
 
-/// Strategy for ensuring minimum file count. If fewer than `min_file_count` files are available, no files will be returned.
+/// Filters out groups with fewer files than `min_file_count`.
 #[derive(Debug)]
 pub struct MinFileCountStrategy {
     pub min_file_count: usize,
 }
 
 impl MinFileCountStrategy {
-    /// Create a new `MinFileCountStrategy` with minimum file count requirement
     pub fn new(min_file_count: usize) -> Self {
         Self { min_file_count }
     }
@@ -484,7 +422,6 @@ impl FileFilterStrategy for MinFileCountStrategy {
     }
 }
 
-/// Group filter strategy that filters groups based on minimum group size
 #[derive(Debug)]
 pub struct MinGroupSizeStrategy {
     pub min_group_size: u64,
@@ -503,7 +440,6 @@ impl GroupFilterStrategy for MinGroupSizeStrategy {
     }
 }
 
-/// Group filter strategy that filters groups based on minimum file count
 #[derive(Debug)]
 pub struct MinGroupFileCountStrategy {
     pub min_file_count: usize,
@@ -522,12 +458,7 @@ impl GroupFilterStrategy for MinGroupFileCountStrategy {
     }
 }
 
-/// Planning strategy that combines file filtering, grouping, and group filtering
-///
-/// This strategy provides a flexible composition architecture where:
-/// - File filters are composable using Vec<Box<dyn FileFilterStrategy>>
-/// - Grouping is handled by a single enum-based strategy
-/// - Group filters are composable using Vec<Box<dyn GroupFilterStrategy>>
+/// Composable file planning strategy.
 #[derive(Debug)]
 pub struct PlanStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
@@ -536,7 +467,6 @@ pub struct PlanStrategy {
 }
 
 impl PlanStrategy {
-    /// Create a new planning strategy
     pub fn new(
         file_filters: Vec<Box<dyn FileFilterStrategy>>,
         grouping: GroupingStrategyEnum,
@@ -549,35 +479,29 @@ impl PlanStrategy {
         }
     }
 
-    /// Apply the planning strategy to filter and group files
     pub fn execute(
         &self,
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
-        // Step 1: Apply file filtering
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
         }
 
-        // Step 2: Apply grouping - now returns FileGroup directly
         let file_groups = self.grouping.group_files(filtered_files.into_iter());
 
-        // Step 3: Apply group filtering before computing parallelism
         let mut file_groups = file_groups;
         for filter in &self.group_filters {
             file_groups = filter.filter_groups(file_groups);
         }
 
-        // Step 4: Calculate parallelism for each remaining group (immutable transformation)
         file_groups
             .into_iter()
             .map(|group| group.with_calculated_parallelism(config))
             .collect()
     }
 
-    /// Get a description of this strategy for logging/debugging
     pub fn description(&self) -> String {
         let file_filter_desc = if self.file_filters.is_empty() {
             "NoFileFilters".to_owned()
@@ -607,7 +531,6 @@ impl PlanStrategy {
         )
     }
 
-    /// Create a strategy from small files configuration
     pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![
             Box::new(NoDeleteFilesStrategy),
@@ -651,7 +574,6 @@ impl PlanStrategy {
         Self::new(file_filters, grouping, group_filters)
     }
 
-    /// Create a strategy from full compaction configuration
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
         let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
@@ -685,11 +607,10 @@ impl PlanStrategy {
         Self::new(file_filters, grouping, group_filters)
     }
 
-    /// Create custom strategy with fine-grained parameter control.
-    /// Useful for testing and advanced use cases.
+    /// Advanced custom strategy builder for testing and fine-grained control.
     pub fn new_custom(
         exclude_delete_files: bool,
-        size_filter: Option<(Option<u64>, Option<u64>)>, // (min_size, max_size)
+        size_filter: Option<(Option<u64>, Option<u64>)>,
         min_file_count: usize,
         max_task_total_size: u64,
         grouping_strategy: &GroupingStrategy,
@@ -714,7 +635,6 @@ impl PlanStrategy {
             }));
         }
 
-        // Grouping layer
         let grouping = match grouping_strategy {
             GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
             GroupingStrategy::BinPack(config) => GroupingStrategyEnum::BinPack(
@@ -722,7 +642,6 @@ impl PlanStrategy {
             ),
         };
 
-        // Group filtering layer (from BinPackConfig)
         let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
 
         if let GroupingStrategy::BinPack(bin_config) = grouping_strategy {
@@ -747,7 +666,6 @@ impl PlanStrategy {
     }
 }
 
-/// Implement From trait for Rusty conversion from config to strategy
 impl From<&CompactionPlanningConfig> for PlanStrategy {
     fn from(config: &CompactionPlanningConfig) -> Self {
         match config {
@@ -759,7 +677,6 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
     }
 }
 
-/// Implement Display trait for idiomatic Rust formatting
 impl std::fmt::Display for PlanStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let file_filter_desc = if self.file_filters.is_empty() {
@@ -1042,8 +959,9 @@ mod tests {
     #[test]
     fn test_file_strategy_factory() {
         // Test the From trait implementation for creating strategies from config
-        let small_files_config =
-            CompactionPlanningConfig::from_small_files(crate::config::SmallFilesConfig::default());
+        let small_files_config = CompactionPlanningConfig::MergeSmallDataFiles(
+            crate::config::SmallFilesConfig::default(),
+        );
 
         // Small-files strategy should mention core filters
         let small_files_strategy = PlanStrategy::from(&small_files_config);
@@ -1059,9 +977,8 @@ mod tests {
         );
 
         // Full compaction with its own config
-        let full_config = CompactionPlanningConfig::from_full_compaction(
-            crate::config::FullCompactionConfig::default(),
-        );
+        let full_config =
+            CompactionPlanningConfig::Full(crate::config::FullCompactionConfig::default());
         let routed_full = PlanStrategy::from(&full_config);
 
         // Full compaction now uses grouping strategy from config instead of always Noop
@@ -1284,7 +1201,7 @@ mod tests {
             .small_file_threshold_bytes(20 * 1024 * 1024_u64) // 20MB threshold
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::from_small_files(small_files_config);
+        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
 
         let strategy = PlanStrategy::from(&config);
 
@@ -1334,7 +1251,7 @@ mod tests {
             .build()
             .unwrap();
         let min_count_config =
-            CompactionPlanningConfig::from_small_files(min_count_small_files_config);
+            CompactionPlanningConfig::MergeSmallDataFiles(min_count_small_files_config);
 
         let min_count_strategy = PlanStrategy::from(&min_count_config);
 
@@ -1372,7 +1289,8 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .build()
             .unwrap();
-        let default_config = CompactionPlanningConfig::from_small_files(default_small_files_config);
+        let default_config =
+            CompactionPlanningConfig::MergeSmallDataFiles(default_small_files_config);
 
         // Verify min_file_count default
         match &default_config {
@@ -1748,7 +1666,7 @@ mod tests {
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::from_small_files(small_files_config);
+        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
 
         // Test normal case
         let files = vec![
@@ -1926,7 +1844,7 @@ mod tests {
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::from_small_files(small_files_config);
+        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
 
         let (exec_p, out_p) = FileGroup::calculate_parallelism(&group, &config).unwrap();
         assert!(exec_p >= 1);
@@ -1953,7 +1871,7 @@ mod tests {
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::from_full_compaction(full_config);
+        let config = CompactionPlanningConfig::Full(full_config);
 
         let strategy = PlanStrategy::from(&config);
 
@@ -2066,7 +1984,7 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::from_full_compaction(full_config);
+        let config = CompactionPlanningConfig::Full(full_config);
 
         let strategy = PlanStrategy::from(&config);
 

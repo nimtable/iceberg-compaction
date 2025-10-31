@@ -1706,7 +1706,7 @@ mod tests {
         let catalog_arc = Arc::new(catalog);
 
         let compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::from_small_files(
+            .planning(CompactionPlanningConfig::MergeSmallDataFiles(
                 SmallFilesConfigBuilder::default()
                     .small_file_threshold_bytes(small_file_threshold)
                     .build()
@@ -1847,7 +1847,7 @@ mod tests {
         // Commit the files
         let updated_table = append_and_commit(table, catalog, data_files).await;
 
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::from_full_compaction(
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::Full(
             crate::config::FullCompactionConfig::default(),
         ));
 
@@ -1879,7 +1879,7 @@ mod tests {
 
         // Create compaction instance
         let full_compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::from_full_compaction(
+            .planning(CompactionPlanningConfig::Full(
                 crate::config::FullCompactionConfig::default(),
             ))
             .build()
@@ -2030,7 +2030,7 @@ mod tests {
 
         // Test small files compaction on main branch
         let small_file_threshold = 900u64; // 900B threshold
-        let planning_config = CompactionPlanningConfig::from_small_files(
+        let planning_config = CompactionPlanningConfig::MergeSmallDataFiles(
             SmallFilesConfigBuilder::default()
                 .small_file_threshold_bytes(small_file_threshold)
                 .build()
