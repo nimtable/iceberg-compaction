@@ -43,7 +43,11 @@ use std::borrow::Cow;
 
 mod validator;
 
-/// Validate consistency of rewrite results (branch and snapshot)
+/// Validates that all rewrite results target the same snapshot and branch.
+///
+/// # Errors
+///
+/// Returns `CompactionError::InvalidInput` if any result has mismatched `to_branch` or `snapshot_id`.
 fn validate_rewrite_results_consistency(
     rewrite_results: &[RewriteResult],
     expected_snapshot_id: i64,
@@ -67,12 +71,20 @@ fn validate_rewrite_results_consistency(
     Ok(())
 }
 
-/// Builder for creating `Compaction` instances with flexible configuration
+/// Builder for `Compaction` with optional configuration.
+///
+/// # Examples
+///
+/// ```ignore
+/// let compaction = CompactionBuilder::new(catalog, table_ident)
+///     .with_config(config)
+///     .with_executor_type(ExecutorType::DataFusion)
+///     .build();
+/// ```
 pub struct CompactionBuilder {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
 
-    /// Optional configuration
     catalog_name: Option<Cow<'static, str>>,
     config: Option<Arc<CompactionConfig>>,
     executor_type: Option<ExecutorType>,
@@ -82,7 +94,7 @@ pub struct CompactionBuilder {
 }
 
 impl CompactionBuilder {
-    /// Create a new `CompactionBuilder` with default settings
+    /// Creates a new builder with required catalog and table identifier.
     pub fn new(catalog: Arc<dyn Catalog>, table_ident: TableIdent) -> Self {
         Self {
             catalog,
@@ -97,41 +109,43 @@ impl CompactionBuilder {
         }
     }
 
-    /// Set the compaction configuration
+    /// Sets the compaction configuration.
     pub fn with_config(mut self, config: Arc<CompactionConfig>) -> Self {
         self.config = Some(config);
         self
     }
 
-    /// Set the executor type (defaults to `DataFusion`)
+    /// Sets the executor type. Defaults to `ExecutorType::DataFusion`.
     pub fn with_executor_type(mut self, executor_type: ExecutorType) -> Self {
         self.executor_type = Some(executor_type);
         self
     }
 
-    /// Set the catalog name for metrics label
+    /// Sets the catalog name for metrics labels.
     pub fn with_catalog_name(mut self, catalog_name: impl Into<Cow<'static, str>>) -> Self {
         self.catalog_name = Some(catalog_name.into());
         self
     }
 
-    /// Set the metrics registry (optional, defaults to `NoopMetricsRegistry`)
+    /// Sets the metrics registry. Defaults to `NoopMetricsRegistry`.
     pub fn with_registry(mut self, registry: BoxedRegistry) -> Self {
         self.registry = Some(registry);
         self
     }
 
+    /// Sets commit retry configuration for transient failures.
     pub fn with_retry_config(mut self, retry_config: CommitManagerRetryConfig) -> Self {
         self.commit_retry_config = Some(retry_config);
         self
     }
 
+    /// Sets the target branch for compaction commits. Defaults to `main`.
     pub fn with_to_branch(mut self, to_branch: impl Into<Cow<'static, str>>) -> Self {
         self.to_branch = Some(to_branch.into());
         self
     }
 
-    /// Build the `Compaction` instance
+    /// Builds the `Compaction` instance with configured values.
     pub fn build(self) -> Compaction {
         let executor_type = self.executor_type.unwrap_or(ExecutorType::DataFusion);
         let executor = create_compaction_executor(executor_type);
@@ -168,15 +182,22 @@ impl CompactionBuilder {
     }
 }
 
-/// Iceberg table compaction with both managed and plan-driven workflows.
+/// Iceberg table compaction orchestrator supporting managed and plan-driven workflows.
 ///
-/// # Usage
+/// # Workflows
 ///
-/// **Simple workflow**: Use `compact()` for automatic planning, execution, and commit.
-/// **Plan-driven workflow**: Use `plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()` for fine-grained control.
+/// **Managed workflow**: [`compact()`](Self::compact) handles planning, execution, and commit atomically.
+///
+/// **Plan-driven workflow**: Caller controls each phase:
+/// 1. [`plan_compaction()`](Self::plan_compaction) → generate plans
+/// 2. [`rewrite_plan()`](Self::rewrite_plan) → execute rewrites
+/// 3. [`commit_rewrite_results()`](Self::commit_rewrite_results) → commit transaction
+///
+/// # Fields
+///
+/// - `config`: Optional global config for managed workflow. Plan-driven workflow provides config per-plan.
 pub struct Compaction {
-    /// TODO: Refactor me
-    /// When we use plan-driven compaction, there is no need to pass in the global config.
+    /// Optional global configuration for managed workflows
     pub config: Option<Arc<CompactionConfig>>,
     pub executor: Box<dyn CompactionExecutor>,
     pub catalog: Arc<dyn Catalog>,
@@ -189,31 +210,48 @@ pub struct Compaction {
     pub to_branch: Cow<'static, str>,
 }
 
-/// Intermediate result from rewrite operation, before commit
+/// Intermediate result from `rewrite_plan()` before commit.
 #[derive(Debug, Clone)]
 pub struct RewriteResult {
     pub output_data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
     pub plan: CompactionPlan,
-    /// Store validation info to create validator later if needed
+    /// Validation info for creating `CompactionValidator` later
     pub validation_info: Option<ValidationInfo>,
 }
 
-/// Information needed to create a `CompactionValidator` later
+/// Information for deferred `CompactionValidator` creation.
 #[derive(Debug, Clone)]
 pub struct ValidationInfo {
     pub file_group: FileGroup,
     pub executor_parallelism: usize,
 }
 
+/// Result of a successful compaction containing rewritten files and metadata.
 #[derive(Default)]
 pub struct CompactionResult {
+    /// Newly written data files from compaction
     pub data_files: Vec<DataFile>,
+    /// Statistics about the compaction operation
     pub stats: RewriteFilesStat,
+    /// Updated table metadata after commit (if available)
     pub table: Option<Table>,
 }
 
 impl Compaction {
+    /// Runs managed compaction: planning, execution, commit, and optional validation.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(CompactionResult))` if files were compacted
+    /// - `Ok(None)` if no files needed compaction
+    /// - `Err(_)` if `config` is `None` or operation failed
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `self.config` is `None`
+    /// - Planning, execution, commit, or validation fails
     pub async fn compact(&self) -> Result<Option<CompactionResult>> {
         if let Some(config) = &self.config {
             let overall_start_time = std::time::Instant::now();
@@ -225,12 +263,9 @@ impl Compaction {
                 return Ok(None);
             }
 
-            // 2. Validate plans based on compaction type
-            self.validate_plans(&plans)?;
-
             let table = self.catalog.load_table(&self.table_ident).await?;
 
-            // 3. Concurrently execute rewrite for all plans
+            // 2. Concurrently execute rewrite for all plans
             let rewrite_results = self
                 .concurrent_rewrite_plans(plans, &config.execution, &table)
                 .await?;
@@ -239,11 +274,11 @@ impl Compaction {
                 return Ok(None);
             }
 
-            // 4. Commit all rewrite results in a single transaction
+            // 3. Commit all rewrite results in a single transaction
             let commit_start_time = std::time::Instant::now();
             let final_table = self.commit_rewrite_results(rewrite_results.clone()).await?;
 
-            // 5. Run validations if enabled
+            // 4. Run validations if enabled
             if config.execution.enable_validate_compaction {
                 self.run_validations(rewrite_results.clone(), &final_table)
                     .await?;
@@ -263,7 +298,7 @@ impl Compaction {
         }
     }
 
-    /// Record metrics for the overall compaction operation
+    /// Records metrics for overall compaction duration and statistics.
     fn record_overall_metrics(
         &self,
         rewrite_results: &[RewriteResult],
@@ -293,7 +328,7 @@ impl Compaction {
         metrics_recorder.record_compaction_complete(&merged_stats);
     }
 
-    /// Merge statistics from multiple rewrite results
+    /// Merges statistics from multiple rewrite results into a single aggregate.
     fn merge_rewrite_stats(&self, rewrite_results: &[RewriteResult]) -> RewriteFilesStat {
         let mut merged_stats = RewriteFilesStat::default();
 
@@ -317,8 +352,14 @@ impl Compaction {
         merged_stats
     }
 
-    /// Execute rewrite for a single plan without committing
-    /// This allows users to control the commit process separately
+    /// Executes rewrite for a single plan without committing.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `plan.to_branch != self.to_branch`
+    /// - Snapshot with `plan.snapshot_id` does not exist
+    /// - Executor rewrite operation fails
     pub async fn rewrite_plan(
         &self,
         plan: CompactionPlan,
@@ -388,8 +429,15 @@ impl Compaction {
         }
     }
 
-    /// Get compaction plans without executing them
-    /// This allows users to preview what will be compacted and control the execution
+    /// Generates compaction plans without executing them.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `CompactionPlan` based on `self.config.planning`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if `self.config` is `None` or planning fails.
     pub async fn plan_compaction(&self) -> Result<Vec<CompactionPlan>> {
         if let Some(config) = &self.config {
             let table = self.catalog.load_table(&self.table_ident).await?;
@@ -405,7 +453,15 @@ impl Compaction {
         }
     }
 
-    /// Commit multiple rewrite results in a single transaction
+    /// Commits multiple rewrite results in a single Iceberg transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `rewrite_results` is empty
+    /// - Results have inconsistent `to_branch` or `snapshot_id`
+    /// - Snapshot does not exist
+    /// - Commit fails
     pub async fn commit_rewrite_results(
         &self,
         rewrite_results: Vec<RewriteResult>,
@@ -452,46 +508,11 @@ impl Compaction {
         }
     }
 
-    /// Validate plans based on compaction type (from config)
-    fn validate_plans(&self, plans: &[CompactionPlan]) -> Result<()> {
-        if let Some(config) = &self.config {
-            match &config.planning {
-                crate::config::CompactionPlanningConfig::Full(_) => {
-                    let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                    if total_files == 0 {
-                        tracing::info!(
-                            "No files to compact for table '{}', skipping.",
-                            self.table_ident
-                        );
-                        return Ok(());
-                    }
-
-                    // Allow multiple plans for Full compaction to support parallel execution
-                    // The grouping strategy (e.g., BinPack) will control how files are split into plans
-                    if plans.len() > 1 {
-                        tracing::debug!(
-                            "Full compaction for table '{}' contains {} plans for parallel execution.",
-                            self.table_ident,
-                            plans.len()
-                        );
-                    }
-                }
-                crate::config::CompactionPlanningConfig::MergeSmallDataFiles(_) => {
-                    let total_files: usize = plans.iter().map(|p| p.file_count()).sum();
-                    if total_files == 0 {
-                        tracing::info!(
-                            "No small files to compact for table '{}', skipping.",
-                            self.table_ident
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Execute rewrite for multiple plans concurrently
+    /// Executes multiple plans concurrently using `futures::stream`.
+    ///
+    /// # Performance
+    ///
+    /// Uses buffered stream for concurrent execution.
     async fn concurrent_rewrite_plans(
         &self,
         plans: Vec<CompactionPlan>,
@@ -511,7 +532,7 @@ impl Compaction {
         results
     }
 
-    /// Run validations for all rewrite results
+    /// Runs `CompactionValidator` for each result if validation info is present.
     async fn run_validations(
         &self,
         rewrite_results: Vec<RewriteResult>,
@@ -541,7 +562,7 @@ impl Compaction {
         Ok(())
     }
 
-    /// Merge rewrite results into a single `CompactionResult`
+    /// Merges multiple rewrite results into a single `CompactionResult`.
     fn merge_rewrite_results_to_compaction_result(
         &self,
         results: Vec<RewriteResult>,
@@ -563,8 +584,9 @@ impl Compaction {
         }
     }
 
-    /// Hook for customizing the rewrite request configuration
-    /// Default implementation creates a standard request, but can be customized
+    /// Creates a `RewriteFilesRequest` for the executor.
+    ///
+    /// Default implementation creates standard request. Override for customization.
     fn create_rewrite_request(
         &self,
         table: &Table,
@@ -591,7 +613,16 @@ impl Compaction {
         })
     }
 
-    /// Compact the table with a single plan
+    /// Compacts the table using a single provided plan.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(_))` if files were compacted
+    /// - `Ok(None)` if plan has no files
+    ///
+    /// # Errors
+    ///
+    /// Returns error if rewrite, commit, or validation fails.
     pub async fn compact_with_plan(
         &self,
         plan: CompactionPlan,
@@ -655,11 +686,12 @@ impl Compaction {
         Ok(Some(result))
     }
 
-    /// Get the metrics registry for this compaction instance
+    /// Returns the metrics registry for this compaction instance.
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
     }
 
+    /// Builds a `CommitManager` with the given consistency parameters.
     pub fn build_commit_manager(
         &self,
         consistency_params: CommitConsistencyParams,
@@ -676,6 +708,11 @@ impl Compaction {
     }
 }
 
+/// Loads all data and delete files from a snapshot.
+///
+/// # Errors
+///
+/// Returns error if manifest list or manifest loading fails.
 async fn get_all_files_from_snapshot(
     snapshot: &Arc<Snapshot>,
     file_io: &FileIO,
@@ -708,12 +745,15 @@ async fn get_all_files_from_snapshot(
     Ok((data_file, delete_file))
 }
 
-/// Configuration for the commit manager, including retry strategies.
+/// Configuration for commit retry behavior with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct CommitManagerRetryConfig {
-    pub max_retries: u32, // This can be used to configure the backon strategy
-    pub retry_initial_delay: Duration, // For exponential backoff
-    pub retry_max_delay: Duration, // For exponential backoff
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial delay before the first retry
+    pub retry_initial_delay: Duration,
+    /// Maximum delay between retries (for exponential backoff)
+    pub retry_max_delay: Duration,
 }
 
 impl Default for CommitManagerRetryConfig {
@@ -726,28 +766,35 @@ impl Default for CommitManagerRetryConfig {
     }
 }
 
-/// Manages the commit process with retries
+/// Manages commit operations with retry logic and consistency validation.
+///
+/// Uses exponential backoff for transient failures (e.g., optimistic lock conflicts).
 pub struct CommitManager {
     config: CommitManagerRetryConfig,
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-    starting_snapshot_id: i64, // The snapshot ID to start from, used for consistency
-    use_starting_sequence_number: bool, // Whether to use the starting sequence number for commits
-
-    metrics_recorder: CompactionMetricsRecorder, // Metrics recorder for tracking commit operations
-
-    basic_schema_id: i32, // Schema ID for the table, used for validation
+    /// Snapshot ID for consistency checks during commit
+    starting_snapshot_id: i64,
+    /// Enable sequence number validation during commit
+    use_starting_sequence_number: bool,
+    /// Metrics recorder for commit operations
+    metrics_recorder: CompactionMetricsRecorder,
+    /// Schema ID for validation
+    basic_schema_id: i32,
 }
 
+/// Parameters for commit consistency validation.
 pub struct CommitConsistencyParams {
+    /// Base snapshot ID for consistency validation
     pub starting_snapshot_id: i64,
+    /// Enable sequence number validation
     pub use_starting_sequence_number: bool,
+    /// Table schema ID for validation
     pub basic_schema_id: i32,
 }
 
-/// Manages the commit process with retries
 impl CommitManager {
-    /// Creates a new `CommitManager` with the specified configuration
+    /// Creates a new `CommitManager` with retry configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: CommitManagerRetryConfig,
@@ -775,7 +822,18 @@ impl CommitManager {
         }
     }
 
-    /// Helper function to collect files from rewrite results
+    /// Collects added and rewritten files from rewrite results by loading snapshot.
+    ///
+    /// # Performance
+    ///
+    /// Loads snapshot files once, builds HashMap index for efficient lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `rewrite_results` is empty
+    /// - Results have inconsistent `to_branch` or `snapshot_id`
+    /// - Snapshot or file loading fails
     async fn collect_files_from_results(
         &self,
         rewrite_results: &[RewriteResult],
@@ -835,8 +893,11 @@ impl CommitManager {
         Ok((added_data_files, rewritten_data_files))
     }
 
-    /// High-level interface: Rewrite files from compaction results
-    /// This handles file collection, validation, and commit in a single operation
+    /// Rewrites files from results: file collection, validation, and commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from `collect_files_from_results()` and `rewrite_files()`.
     pub async fn rewrite_files_from_results(
         &self,
         rewrite_results: Vec<RewriteResult>,
@@ -849,8 +910,11 @@ impl CommitManager {
             .await
     }
 
-    /// High-level interface: Overwrite files from compaction results
-    /// This handles file collection, validation, and commit in a single operation
+    /// Overwrites files from results: file collection, validation, and commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from `collect_files_from_results()` and `overwrite_files()`.
     pub async fn overwrite_files_from_results(
         &self,
         rewrite_results: Vec<RewriteResult>,
@@ -863,7 +927,11 @@ impl CommitManager {
             .await
     }
 
-    /// Rewrites files in the table, handling retries and errors.
+    /// Rewrites files with retry on transient failures (e.g., optimistic lock).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if all retries exhausted or non-retryable error occurs.
     pub async fn rewrite_files(
         &self,
         added_data_files: Vec<DataFile>,
@@ -966,6 +1034,11 @@ impl CommitManager {
             .map_err(|e: iceberg::Error| CompactionError::from(e)) // Convert backon::Error to your CompactionError
     }
 
+    /// Overwrites files with retry on transient failures (e.g., optimistic lock).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if all retries exhausted or non-retryable error occurs.
     pub async fn overwrite_files(
         &self,
         added_data_files: Vec<DataFile>,
@@ -1067,14 +1140,19 @@ impl CommitManager {
     }
 }
 
+/// Compaction plan describing files to rewrite and target commit location.
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
+    /// Group of files to be compacted together
     pub file_group: FileGroup,
+    /// Target branch for committing the compaction result
     pub to_branch: Cow<'static, str>,
+    /// Snapshot ID from which files were selected
     pub snapshot_id: i64,
 }
 
 impl CompactionPlan {
+    /// Creates a new compaction plan.
     pub fn new(
         file_group: FileGroup,
         to_branch: impl Into<Cow<'static, str>>,
@@ -1087,6 +1165,7 @@ impl CompactionPlan {
         }
     }
 
+    /// Creates an empty plan for testing.
     pub fn dummy() -> Self {
         Self {
             file_group: FileGroup::empty(),
@@ -1095,16 +1174,17 @@ impl CompactionPlan {
         }
     }
 
-    /// Get the total number of files to be compacted
+    /// Returns total number of files to be compacted.
     pub fn file_count(&self) -> usize {
         self.file_group.input_files_count()
     }
 
-    /// Get the total size in bytes of files to be compacted
+    /// Returns total size in bytes of files to be compacted.
     pub fn total_bytes(&self) -> u64 {
         self.file_group.input_total_bytes()
     }
 
+    /// Returns group count: 0 if empty, 1 otherwise.
     pub fn group_count(&self) -> usize {
         if self.file_group.is_empty() {
             0
@@ -1113,28 +1193,37 @@ impl CompactionPlan {
         }
     }
 
-    /// Get the recommended executor parallelism
+    /// Returns recommended executor parallelism from file group.
     pub fn recommended_executor_parallelism(&self) -> usize {
         self.file_group.executor_parallelism
     }
 
-    /// Get the recommended output parallelism
+    /// Returns recommended output parallelism from file group.
     pub fn recommended_output_parallelism(&self) -> usize {
         self.file_group.output_parallelism
     }
 }
 
+/// Planner for generating compaction plans from table snapshots.
 pub struct CompactionPlanner {
     config: CompactionPlanningConfig,
 }
 
 impl CompactionPlanner {
+    /// Creates a new planner with the given configuration.
     pub fn new(config: CompactionPlanningConfig) -> Self {
         Self { config }
     }
 
-    /// Plan a compaction based on the provided table
-    /// The compaction type is determined by the config variant
+    /// Plans compaction for a specific branch.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `CompactionPlan` based on file grouping strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if branch snapshot not found or file grouping fails.
     pub async fn plan_compaction_with_branch(
         &self,
         table: &Table,
@@ -1164,14 +1253,14 @@ impl CompactionPlanner {
         }
     }
 
+    /// Plans compaction for the main branch.
     pub async fn plan_compaction(&self, table: &Table) -> Result<Vec<CompactionPlan>> {
         self.plan_compaction_with_branch(table, MAIN_BRANCH).await
     }
 
-    // Template method pattern: These methods can be overridden for specific compaction types
-
-    /// Hook for customizing file grouping logic beyond simple `FileStrategy`
-    /// Default implementation uses `FileStrategy`, but complex compaction types can override
+    /// Customization point for file grouping logic.
+    ///
+    /// Default implementation uses `FileStrategy`. Override for custom behavior.
     async fn group_files_for_compaction(
         &self,
         table: &Table,
@@ -1706,7 +1795,7 @@ mod tests {
         let catalog_arc = Arc::new(catalog);
 
         let compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::MergeSmallDataFiles(
+            .planning(CompactionPlanningConfig::SmallFiles(
                 SmallFilesConfigBuilder::default()
                     .small_file_threshold_bytes(small_file_threshold)
                     .build()
@@ -2030,7 +2119,7 @@ mod tests {
 
         // Test small files compaction on main branch
         let small_file_threshold = 900u64; // 900B threshold
-        let planning_config = CompactionPlanningConfig::MergeSmallDataFiles(
+        let planning_config = CompactionPlanningConfig::SmallFiles(
             SmallFilesConfigBuilder::default()
                 .small_file_threshold_bytes(small_file_threshold)
                 .build()

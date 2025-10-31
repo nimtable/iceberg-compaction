@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-//! File selection strategies for compaction planning.
+//! Compaction file selection and grouping strategies.
 //!
-//! This module implements a composable strategy pattern for selecting and grouping
-//! data files for compaction. The pipeline consists of:
-//! 1. **File filters** - Filter candidate files before grouping
-//! 2. **Grouping** - Group files into compaction tasks
-//! 3. **Group filters** - Filter groups after grouping
+//! Implements a three-stage pipeline:
+//! 1. File filters: Exclude files by size, delete count, or minimum file threshold
+//! 2. Grouping: Combine files using Noop (all-in-one) or BinPack (First-Fit Decreasing)
+//! 3. Group filters: Remove groups below size/count thresholds
+//!
+//! Parallelism is calculated per group based on file size and count constraints.
 
 use crate::config::{CompactionPlanningConfig, GroupingStrategy};
 use crate::{CompactionError, Result};
@@ -28,16 +29,21 @@ use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
 
-/// A group of files selected for compaction.
+/// Bundle of data files and associated delete files for compaction.
 ///
-/// Represents a bundle of data files and their associated delete files that should
-/// be compacted together. The group also tracks parallelism settings for execution.
+/// Delete files are deduplicated by path during construction. Position deletes
+/// have `project_field_ids` cleared; equality deletes use `equality_ids`.
+///
+/// # Fields
+/// - `total_size`: Sum of `data_files[*].length` (excludes delete file sizes)
+/// - `executor_parallelism`, `output_parallelism`: Set to 1 by default, calculated by
+///   [`with_parallelism`](Self::with_parallelism) or [`with_calculated_parallelism`](Self::with_calculated_parallelism)
 #[derive(Debug, Clone)]
 pub struct FileGroup {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,
     pub equality_delete_files: Vec<FileScanTask>,
-    /// Data files size only. Use [`Self::input_total_bytes`] for total including deletes.
+    /// Sum of data file sizes only. Use [`input_total_bytes`](Self::input_total_bytes) for all files.
     pub total_size: u64,
     pub data_file_count: usize,
     pub executor_parallelism: usize,
@@ -45,6 +51,13 @@ pub struct FileGroup {
 }
 
 impl FileGroup {
+    /// Constructs a FileGroup from data files.
+    ///
+    /// Deduplicates delete files by `data_file_path`. Position delete files have
+    /// `project_field_ids` reset to empty; equality delete files copy `equality_ids`
+    /// to `project_field_ids`.
+    ///
+    /// Sets `executor_parallelism` and `output_parallelism` to 1.
     pub fn new(data_files: Vec<FileScanTask>) -> Self {
         let total_size = data_files.iter().map(|task| task.length).sum();
         let data_file_count = data_files.len();
@@ -84,6 +97,10 @@ impl FileGroup {
         }
     }
 
+    /// Creates a FileGroup with calculated parallelism.
+    ///
+    /// # Errors
+    /// Returns [`CompactionError::Execution`] if `input_total_bytes()` is 0.
     pub fn with_parallelism(
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
@@ -96,6 +113,7 @@ impl FileGroup {
         Ok(file_group)
     }
 
+    /// Returns an empty FileGroup with parallelism set to 1.
     pub fn empty() -> Self {
         Self {
             data_files: Vec::new(),
@@ -108,6 +126,10 @@ impl FileGroup {
         }
     }
 
+    /// Calculates and sets parallelism fields.
+    ///
+    /// # Errors
+    /// Returns [`CompactionError::Execution`] if `input_total_bytes()` is 0.
     pub fn with_calculated_parallelism(
         mut self,
         config: &CompactionPlanningConfig,
@@ -119,6 +141,18 @@ impl FileGroup {
         Ok(self)
     }
 
+    /// Calculates executor and output parallelism.
+    ///
+    /// - `partition_by_size` = `ceil(input_total_bytes / min_size_per_partition)`
+    /// - `partition_by_count` = `ceil(input_files_count / max_file_count_per_partition)`
+    /// - `executor_parallelism` = `min(max(partition_by_size, partition_by_count), max_parallelism)`
+    /// - `output_parallelism` = `min(partition_by_size, executor_parallelism, max_parallelism)`
+    ///
+    /// If `enable_heuristic_output_parallelism` is true and total data file size
+    /// is below `target_file_size_bytes`, `output_parallelism` is set to 1.
+    ///
+    /// # Errors
+    /// Returns error if `input_total_bytes()` is 0.
     fn calculate_parallelism(
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
@@ -154,7 +188,8 @@ impl FileGroup {
         Ok((input_parallelism, output_parallelism))
     }
 
-    /// Heuristic: merge into single output if total data < target file size.
+    /// Returns 1 if heuristic enabled, current parallelism > 1, and total data file
+    /// size < target file size. Otherwise returns current parallelism unchanged.
     fn apply_output_parallelism_heuristic(
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
@@ -181,18 +216,22 @@ impl FileGroup {
         self.data_files.is_empty()
     }
 
+    /// Returns `total_size` in MB (divides by 1024²).
     pub fn total_size_mb(&self) -> u64 {
         self.total_size / 1024 / 1024
     }
 
+    /// Consumes self, returning the data files.
     pub fn into_files(self) -> Vec<FileScanTask> {
         self.data_files
     }
 
+    /// Returns count of data files + position deletes + equality deletes.
     pub fn input_files_count(&self) -> usize {
         self.data_files.len() + self.position_delete_files.len() + self.equality_delete_files.len()
     }
 
+    /// Returns sum of `file_size_in_bytes` for all data, position delete, and equality delete files.
     pub fn input_total_bytes(&self) -> u64 {
         self.data_files
             .iter()
@@ -203,22 +242,16 @@ impl FileGroup {
     }
 }
 
-/// Strategy for filtering data files before grouping.
+/// File filter applied before grouping.
 ///
-/// Implementations can exclude files based on size, delete file presence,
-/// or other criteria. Filters are applied sequentially in the order defined
+/// Implementations must be `Debug + Display + Sync + Send`. Applied sequentially
 /// by [`PlanStrategy`].
-pub trait FileFilterStrategy: std::fmt::Debug + Sync + Send {
-    /// Filters the given data files, returning only those that should be considered for compaction.
+pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
+    /// Returns filtered subset of data files.
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
-
-    /// Returns a human-readable description of this filter.
-    fn description(&self) -> String;
 }
 
-/// Grouping strategy dispatcher.
-///
-/// Delegates to concrete grouping implementations (e.g., no-op or bin-packing).
+/// Enum dispatching to grouping strategy implementations.
 #[derive(Debug)]
 pub enum GroupingStrategyEnum {
     Noop(NoopGroupingStrategy),
@@ -235,27 +268,27 @@ impl GroupingStrategyEnum {
             GroupingStrategyEnum::BinPack(strategy) => strategy.group_files(data_files),
         }
     }
+}
 
-    pub fn description(&self) -> String {
+impl std::fmt::Display for GroupingStrategyEnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GroupingStrategyEnum::Noop(strategy) => strategy.description(),
-            GroupingStrategyEnum::BinPack(strategy) => strategy.description(),
+            GroupingStrategyEnum::Noop(strategy) => write!(f, "{}", strategy),
+            GroupingStrategyEnum::BinPack(strategy) => write!(f, "{}", strategy),
         }
     }
 }
 
-/// Strategy for filtering file groups after grouping.
+/// Group filter applied after grouping.
 ///
-/// Implementations can exclude groups based on total size, file count,
-/// or other aggregate properties.
-pub trait GroupFilterStrategy: std::fmt::Debug + Sync + Send {
-    /// Filters the given groups, returning only those that should be compacted.
+/// Implementations must be `Debug + Display + Sync + Send`. Applied sequentially
+/// by [`PlanStrategy`].
+pub trait GroupFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
+    /// Returns filtered subset of groups.
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup>;
-
-    /// Returns a human-readable description of this filter.
-    fn description(&self) -> String;
 }
 
+/// No-op file filter. Returns input unchanged.
 #[derive(Debug)]
 pub struct NoopStrategy;
 
@@ -263,12 +296,17 @@ impl FileFilterStrategy for NoopStrategy {
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
         data_files
     }
+}
 
-    fn description(&self) -> String {
-        "Noop".to_owned()
+impl std::fmt::Display for NoopStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Noop")
     }
 }
 
+/// No-op grouping strategy. Groups all files into a single FileGroup.
+///
+/// Returns empty vec if input is empty.
 #[derive(Debug)]
 pub struct NoopGroupingStrategy;
 
@@ -284,12 +322,15 @@ impl NoopGroupingStrategy {
             vec![FileGroup::new(files)]
         }
     }
+}
 
-    pub fn description(&self) -> String {
-        "NoopGrouping".to_owned()
+impl std::fmt::Display for NoopGroupingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NoopGrouping")
     }
 }
 
+/// No-op group filter. Returns input unchanged.
 #[derive(Debug)]
 pub struct NoopGroupFilterStrategy;
 
@@ -297,16 +338,17 @@ impl GroupFilterStrategy for NoopGroupFilterStrategy {
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
         groups
     }
+}
 
-    fn description(&self) -> String {
-        "NoopGroupFilter".to_owned()
+impl std::fmt::Display for NoopGroupFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NoopGroupFilter")
     }
 }
 
-/// Bin-packing grouping using First-Fit Decreasing algorithm.
+/// Bin-packing grouping using First-Fit Decreasing with lookback=1.
 ///
-/// Groups files to approximately match a target size while minimizing
-/// the number of groups created.
+/// Uses [`ListPacker`] to pack files by `file_size_in_bytes`. Filters out empty groups.
 #[derive(Debug)]
 pub struct BinPackGroupingStrategy {
     pub target_group_size: u64,
@@ -336,32 +378,21 @@ impl BinPackGroupingStrategy {
             .filter(|group| !group.is_empty())
             .collect()
     }
+}
 
-    pub fn description(&self) -> String {
-        format!(
+impl std::fmt::Display for BinPackGroupingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "BinPackGrouping[target={}MB]",
             self.target_group_size / 1024 / 1024
         )
     }
 }
 
-#[derive(Debug)]
-pub struct NoDeleteFilesStrategy;
-
-impl FileFilterStrategy for NoDeleteFilesStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|task| task.deletes.is_empty())
-            .collect()
-    }
-
-    fn description(&self) -> String {
-        "NoDeleteFiles".to_owned()
-    }
-}
-
-/// Filters files based on size bounds (inclusive).
+/// File filter by size threshold.
+///
+/// Filters by `task.length`. Bounds are inclusive. If both `None`, passes all files.
 #[derive(Debug)]
 pub struct SizeFilterStrategy {
     pub min_size: Option<u64>,
@@ -383,56 +414,68 @@ impl FileFilterStrategy for SizeFilterStrategy {
             })
             .collect()
     }
+}
 
-    fn description(&self) -> String {
+impl std::fmt::Display for SizeFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (self.min_size, self.max_size) {
             (Some(min), Some(max)) => {
-                format!("SizeFilter[{}-{}MB]", min / 1024 / 1024, max / 1024 / 1024)
+                write!(
+                    f,
+                    "SizeFilter[{}-{}MB]",
+                    min / 1024 / 1024,
+                    max / 1024 / 1024
+                )
             }
-            (Some(min), None) => format!("SizeFilter[>{}MB]", min / 1024 / 1024),
-            (None, Some(max)) => format!("SizeFilter[<{}MB]", max / 1024 / 1024),
-            (None, None) => "SizeFilter[Any]".to_owned(),
+            (Some(min), None) => write!(f, "SizeFilter[>{}MB]", min / 1024 / 1024),
+            (None, Some(max)) => write!(f, "SizeFilter[<{}MB]", max / 1024 / 1024),
+            (None, None) => write!(f, "SizeFilter[Any]"),
         }
     }
 }
 
-/// Limits total task size by taking files until the cumulative size reaches the limit.
+/// File filter by delete file count.
+///
+/// Selects files where `task.deletes.len() >= min_delete_file_count`.
 #[derive(Debug)]
-pub struct TaskSizeLimitStrategy {
-    pub max_total_size: u64,
+pub struct DeleteFileCountFilterStrategy {
+    /// Minimum delete count threshold (inclusive).
+    pub min_delete_file_count: usize,
 }
 
-impl FileFilterStrategy for TaskSizeLimitStrategy {
+impl DeleteFileCountFilterStrategy {
+    pub fn new(min_delete_file_count: usize) -> Self {
+        Self {
+            min_delete_file_count,
+        }
+    }
+}
+
+impl FileFilterStrategy for DeleteFileCountFilterStrategy {
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        let mut current_total = 0u64;
         data_files
             .into_iter()
-            .take_while(|task| {
-                let file_size = task.length;
-                if current_total + file_size <= self.max_total_size {
-                    current_total += file_size;
-                    true
-                } else {
-                    false
-                }
+            .filter(|task| {
+                let delete_count = task.deletes.len();
+                delete_count >= self.min_delete_file_count
             })
             .collect()
     }
+}
 
-    fn description(&self) -> String {
-        let gb = self.max_total_size as f64 / (1024.0 * 1024.0 * 1024.0);
-        if gb < 1.0 {
-            let mb = self.max_total_size / (1024 * 1024);
-            format!("TaskSizeLimit[{}MB]", mb)
-        } else {
-            format!("TaskSizeLimit[{:.1}GB]", gb)
-        }
+impl std::fmt::Display for DeleteFileCountFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DeleteFileCountFilter[>={} deletes]",
+            self.min_delete_file_count
+        )
     }
 }
 
-/// Requires a minimum number of files before allowing compaction.
+/// File filter requiring minimum file count.
 ///
-/// Returns all files if the count meets the threshold, otherwise returns none.
+/// Returns all files if `len >= min_file_count`, otherwise returns empty vec.
 #[derive(Debug)]
 pub struct MinFileCountStrategy {
     pub min_file_count: usize,
@@ -452,13 +495,17 @@ impl FileFilterStrategy for MinFileCountStrategy {
             vec![]
         }
     }
+}
 
-    fn description(&self) -> String {
-        format!("MinFileCount[{}]", self.min_file_count)
+impl std::fmt::Display for MinFileCountStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MinFileCount[{}]", self.min_file_count)
     }
 }
 
-/// Filters groups smaller than a minimum total size.
+/// Group filter by minimum total size.
+///
+/// Filters by `group.total_size >= min_group_size`.
 #[derive(Debug)]
 pub struct MinGroupSizeStrategy {
     pub min_group_size: u64,
@@ -471,13 +518,17 @@ impl GroupFilterStrategy for MinGroupSizeStrategy {
             .filter(|group| group.total_size >= self.min_group_size)
             .collect()
     }
+}
 
-    fn description(&self) -> String {
-        format!("MinGroupSize[{}MB]", self.min_group_size / 1024 / 1024)
+impl std::fmt::Display for MinGroupSizeStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MinGroupSize[{}MB]", self.min_group_size / 1024 / 1024)
     }
 }
 
-/// Filters groups with fewer files than a minimum count.
+/// Group filter by minimum file count.
+///
+/// Filters by `group.data_file_count >= min_file_count`.
 #[derive(Debug)]
 pub struct MinGroupFileCountStrategy {
     pub min_file_count: usize,
@@ -490,20 +541,17 @@ impl GroupFilterStrategy for MinGroupFileCountStrategy {
             .filter(|group| group.data_file_count >= self.min_file_count)
             .collect()
     }
+}
 
-    fn description(&self) -> String {
-        format!("MinGroupFileCount[{}]", self.min_file_count)
+impl std::fmt::Display for MinGroupFileCountStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MinGroupFileCount[{}]", self.min_file_count)
     }
 }
 
-/// Composable file planning strategy.
+/// Three-stage pipeline: file filters → grouping → group filters → parallelism calculation.
 ///
-/// Executes a pipeline of file filters, grouping, and group filters to produce
-/// file groups ready for compaction. The pipeline is:
-/// 1. Apply file filters sequentially
-/// 2. Group files using the grouping strategy
-/// 3. Apply group filters sequentially
-/// 4. Calculate parallelism for each group
+/// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
 #[derive(Debug)]
 pub struct PlanStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
@@ -524,6 +572,14 @@ impl PlanStrategy {
         }
     }
 
+    /// Executes the pipeline:
+    /// 1. Apply each file filter sequentially
+    /// 2. Group files using grouping strategy
+    /// 3. Apply each group filter sequentially
+    /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
+    ///
+    /// # Errors
+    /// Propagates errors from parallelism calculation (fails if group has 0 bytes).
     pub fn execute(
         &self,
         data_files: Vec<FileScanTask>,
@@ -547,143 +603,17 @@ impl PlanStrategy {
             .collect()
     }
 
-    pub fn description(&self) -> String {
-        let file_filter_desc = if self.file_filters.is_empty() {
-            "NoFileFilters".to_owned()
-        } else {
-            self.file_filters
-                .iter()
-                .map(|f| f.description())
-                .collect::<Vec<_>>()
-                .join(" -> ")
-        };
-
-        let group_filter_desc = if self.group_filters.is_empty() {
-            "NoGroupFilters".to_owned()
-        } else {
-            self.group_filters
-                .iter()
-                .map(|f| f.description())
-                .collect::<Vec<_>>()
-                .join(" -> ")
-        };
-
-        format!(
-            "{} -> {} -> {}",
-            file_filter_desc,
-            self.grouping.description(),
-            group_filter_desc
-        )
-    }
-
-    pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![
-            Box::new(NoDeleteFilesStrategy),
-            Box::new(SizeFilterStrategy {
-                min_size: None,
-                max_size: Some(config.small_file_threshold_bytes),
-            }),
-        ];
-
-        if config.min_file_count > 0 {
-            file_filters.push(Box::new(MinFileCountStrategy::new(config.min_file_count)));
-        }
-
-        let grouping = match &config.grouping_strategy {
-            GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-            GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
-                BinPackGroupingStrategy::new(bin_config.target_group_size_bytes),
-            ),
-        };
-
-        let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
-
-        if let GroupingStrategy::BinPack(bin_config) = &config.grouping_strategy {
-            if let Some(min_size) = bin_config.min_group_size_bytes {
-                if min_size > 0 {
-                    group_filters.push(Box::new(MinGroupSizeStrategy {
-                        min_group_size: min_size,
-                    }));
-                }
-            }
-
-            if let Some(min_count) = bin_config.min_group_file_count {
-                if min_count > 0 {
-                    group_filters.push(Box::new(MinGroupFileCountStrategy {
-                        min_file_count: min_count,
-                    }));
-                }
-            }
-        }
-
-        Self::new(file_filters, grouping, group_filters)
-    }
-
-    pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
-        let grouping = match &config.grouping_strategy {
-            GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-            GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
-                BinPackGroupingStrategy::new(bin_config.target_group_size_bytes),
-            ),
-        };
-
-        let mut group_filters: Vec<Box<dyn GroupFilterStrategy>> = vec![];
-
-        if let GroupingStrategy::BinPack(bin_config) = &config.grouping_strategy {
-            if let Some(min_size) = bin_config.min_group_size_bytes {
-                if min_size > 0 {
-                    group_filters.push(Box::new(MinGroupSizeStrategy {
-                        min_group_size: min_size,
-                    }));
-                }
-            }
-
-            if let Some(min_count) = bin_config.min_group_file_count {
-                if min_count > 0 {
-                    group_filters.push(Box::new(MinGroupFileCountStrategy {
-                        min_file_count: min_count,
-                    }));
-                }
-            }
-        }
-
-        Self::new(file_filters, grouping, group_filters)
-    }
-
-    /// Advanced custom strategy builder for testing and fine-grained control.
-    pub fn new_custom(
-        exclude_delete_files: bool,
-        size_filter: Option<(Option<u64>, Option<u64>)>,
-        min_file_count: usize,
-        max_task_total_size: u64,
+    /// Constructs grouping enum and optional group filters from config.
+    ///
+    /// For `BinPack`, adds `MinGroupSizeStrategy` if `min_group_size_bytes > 0`,
+    /// and `MinGroupFileCountStrategy` if `min_group_file_count > 0`.
+    fn build_grouping_and_filters(
         grouping_strategy: &GroupingStrategy,
-    ) -> Self {
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
-        if exclude_delete_files {
-            file_filters.push(Box::new(NoDeleteFilesStrategy));
-        }
-
-        if let Some((min_size, max_size)) = size_filter {
-            file_filters.push(Box::new(SizeFilterStrategy { min_size, max_size }));
-        }
-
-        if min_file_count > 0 {
-            file_filters.push(Box::new(MinFileCountStrategy::new(min_file_count)));
-        }
-
-        if max_task_total_size < u64::MAX {
-            file_filters.push(Box::new(TaskSizeLimitStrategy {
-                max_total_size: max_task_total_size,
-            }));
-        }
-
+    ) -> (GroupingStrategyEnum, Vec<Box<dyn GroupFilterStrategy>>) {
         let grouping = match grouping_strategy {
             GroupingStrategy::Noop => GroupingStrategyEnum::Noop(NoopGroupingStrategy),
-            GroupingStrategy::BinPack(config) => GroupingStrategyEnum::BinPack(
-                BinPackGroupingStrategy::new(config.target_group_size_bytes),
+            GroupingStrategy::BinPack(bin_config) => GroupingStrategyEnum::BinPack(
+                BinPackGroupingStrategy::new(bin_config.target_group_size_bytes),
             ),
         };
 
@@ -707,6 +637,89 @@ impl PlanStrategy {
             }
         }
 
+        (grouping, group_filters)
+    }
+
+    /// Constructs strategy for small files compaction.
+    ///
+    /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
+    /// Adds `MinFileCountStrategy` if `min_file_count > 0`.
+    pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> =
+            vec![Box::new(SizeFilterStrategy {
+                min_size: None,
+                max_size: Some(config.small_file_threshold_bytes),
+            })];
+
+        if config.min_file_count > 0 {
+            file_filters.push(Box::new(MinFileCountStrategy::new(config.min_file_count)));
+        }
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+
+        Self::new(file_filters, grouping, group_filters)
+    }
+
+    /// Constructs strategy for full compaction.
+    ///
+    /// No file filters. Grouping and group filters from config.
+    pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+
+        Self::new(file_filters, grouping, group_filters)
+    }
+
+    /// Constructs strategy for files with delete files.
+    ///
+    /// Adds `DeleteFileCountFilterStrategy` if `min_delete_file_count_threshold > 0`.
+    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+
+        if config.min_delete_file_count_threshold > 0 {
+            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+                config.min_delete_file_count_threshold,
+            )));
+        }
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(&config.grouping_strategy);
+
+        Self::new(file_filters, grouping, group_filters)
+    }
+
+    /// Test-only builder accepting raw filter parameters.
+    ///
+    /// # Arguments
+    /// - `size_filter`: `(min_size, max_size)` for `SizeFilterStrategy`
+    /// - `delete_file_count_filter`: Threshold for `DeleteFileCountFilterStrategy`
+    /// - `min_file_count`: Threshold for `MinFileCountStrategy`
+    /// - `grouping_strategy`: Grouping algorithm config
+    #[cfg(test)]
+    pub fn new_custom(
+        size_filter: Option<(Option<u64>, Option<u64>)>,
+        delete_file_count_filter: Option<usize>,
+        min_file_count: Option<usize>,
+        grouping_strategy: GroupingStrategy,
+    ) -> Self {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+
+        if let Some((min_size, max_size)) = size_filter {
+            file_filters.push(Box::new(SizeFilterStrategy { min_size, max_size }));
+        }
+
+        if let Some(min_delete_count) = delete_file_count_filter {
+            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+                min_delete_count,
+            )));
+        }
+
+        if let Some(min_file_count) = min_file_count {
+            file_filters.push(Box::new(MinFileCountStrategy::new(min_file_count)));
+        }
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(&grouping_strategy);
+
         Self::new(file_filters, grouping, group_filters)
     }
 }
@@ -714,10 +727,14 @@ impl PlanStrategy {
 impl From<&CompactionPlanningConfig> for PlanStrategy {
     fn from(config: &CompactionPlanningConfig) -> Self {
         match config {
-            CompactionPlanningConfig::MergeSmallDataFiles(small_files_config) => {
+            CompactionPlanningConfig::SmallFiles(small_files_config) => {
                 PlanStrategy::from_small_files(small_files_config)
             }
             CompactionPlanningConfig::Full(full_config) => PlanStrategy::from_full(full_config),
+
+            CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
+                PlanStrategy::from_files_with_deletes(deletes_config)
+            }
         }
     }
 }
@@ -729,7 +746,7 @@ impl std::fmt::Display for PlanStrategy {
         } else {
             self.file_filters
                 .iter()
-                .map(|filter| filter.description())
+                .map(|filter| filter.to_string())
                 .collect::<Vec<_>>()
                 .join(" -> ")
         };
@@ -739,7 +756,7 @@ impl std::fmt::Display for PlanStrategy {
         } else {
             self.group_filters
                 .iter()
-                .map(|filter| filter.description())
+                .map(|filter| filter.to_string())
                 .collect::<Vec<_>>()
                 .join(" -> ")
         };
@@ -747,9 +764,7 @@ impl std::fmt::Display for PlanStrategy {
         write!(
             f,
             "{} -> {} -> {}",
-            file_filter_desc,
-            self.grouping.description(),
-            group_filter_desc
+            file_filter_desc, self.grouping, group_filter_desc
         )
     }
 }
@@ -915,7 +930,7 @@ mod tests {
             .collect();
 
         assert_eq!(result_data.len(), data_files.len());
-        assert_eq!(strategy.description(), "Noop");
+        assert_eq!(strategy.to_string(), "Noop");
     }
 
     #[test]
@@ -925,7 +940,7 @@ mod tests {
             max_size: Some(50 * 1024 * 1024),
         };
 
-        assert_eq!(strategy.description(), "SizeFilter[5-50MB]");
+        assert_eq!(strategy.to_string(), "SizeFilter[5-50MB]");
 
         let test_files = vec![
             TestFileBuilder::new("too_small.parquet")
@@ -978,13 +993,11 @@ mod tests {
 
     #[test]
     fn test_file_strategy_factory() {
-        let small_files_config = CompactionPlanningConfig::MergeSmallDataFiles(
-            crate::config::SmallFilesConfig::default(),
-        );
+        let small_files_config =
+            CompactionPlanningConfig::SmallFiles(crate::config::SmallFilesConfig::default());
 
         let small_files_strategy = PlanStrategy::from(&small_files_config);
-        let small_files_desc = small_files_strategy.description();
-        assert!(small_files_desc.contains("NoDeleteFiles"));
+        let small_files_desc = small_files_strategy.to_string();
         assert!(small_files_desc.contains("SizeFilter"));
 
         let display_output = format!("{}", small_files_strategy);
@@ -994,78 +1007,83 @@ mod tests {
             CompactionPlanningConfig::Full(crate::config::FullCompactionConfig::default());
         let routed_full = PlanStrategy::from(&full_config);
 
-        assert!(!routed_full.description().is_empty());
+        assert!(!routed_full.to_string().is_empty());
 
         let full_display = format!("{}", routed_full);
-        assert_eq!(full_display, routed_full.description());
+        assert_eq!(full_display, routed_full.to_string());
     }
 
     #[test]
-    fn test_no_delete_files_strategy() {
-        let strategy = NoDeleteFilesStrategy;
+    fn test_binpack_grouping_size_limit() {
+        // Test that BinPack grouping can limit the total size per group
+        use crate::config::BinPackConfig;
 
-        let data_files = vec![
-            TestFileBuilder::new("file1.parquet")
-                .size(10 * 1024 * 1024)
-                .build(),
-            TestFileBuilder::new("file2.parquet")
-                .size(20 * 1024 * 1024)
-                .with_deletes()
-                .build(),
-            TestFileBuilder::new("file3.parquet")
-                .size(15 * 1024 * 1024)
-                .build(),
-        ];
+        let strategy = PlanStrategy::new_custom(
+            None,                                                            // no size filter
+            None, // no delete file count filter
+            None, // no min file count
+            GroupingStrategy::BinPack(BinPackConfig::new(25 * 1024 * 1024)), // 25MB target group size
+        );
 
-        let result: Vec<FileScanTask> = strategy.filter(data_files);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].data_file_path, "file1.parquet");
-        assert_eq!(result[1].data_file_path, "file3.parquet");
-        assert_eq!(strategy.description(), "NoDeleteFiles");
-    }
-
-    #[test]
-    fn test_task_size_limit_strategy() {
-        let strategy = TaskSizeLimitStrategy {
-            max_total_size: 25 * 1024 * 1024,
-        };
-
-        assert_eq!(strategy.description(), "TaskSizeLimit[25MB]");
-
+        // Test BinPack grouping behavior: groups should stay close to the target size, and files exceeding the target should be grouped separately
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")
                 .size(10 * 1024 * 1024)
-                .build(),
+                .build(), // 10MB
             TestFileBuilder::new("file2.parquet")
                 .size(10 * 1024 * 1024)
-                .build(),
+                .build(), // 10MB
             TestFileBuilder::new("file3.parquet")
                 .size(5 * 1024 * 1024)
-                .build(),
-            TestFileBuilder::new("file4.parquet").size(1).build(),
+                .build(), // 5MB
+            TestFileBuilder::new("file4.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // 10MB
             TestFileBuilder::new("file5.parquet")
                 .size(5 * 1024 * 1024)
-                .build(),
+                .build(), // 5MB
+        ]; // Total: 40MB
+
+        let config = TestUtils::create_test_config();
+        let groups = strategy.execute(test_files, &config).unwrap();
+
+        // Should create multiple groups, each trying to stay around 25MB
+        assert!(
+            groups.len() >= 2,
+            "Should create at least 2 groups for 40MB with 25MB target"
+        );
+
+        // Verify all files are included
+        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(total_files, 5, "All 5 files should be in groups");
+
+        // Test with files that individually exceed target size
+        let large_files = vec![
+            TestFileBuilder::new("huge1.parquet")
+                .size(30 * 1024 * 1024)
+                .build(), // 30MB - exceeds 25MB target
+            TestFileBuilder::new("huge2.parquet")
+                .size(30 * 1024 * 1024)
+                .build(), // 30MB - exceeds 25MB target
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(test_files);
+        let large_groups = strategy.execute(large_files, &config).unwrap();
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].data_file_path, "file1.parquet");
-        assert_eq!(result[1].data_file_path, "file2.parquet");
-        assert_eq!(result[2].data_file_path, "file3.parquet");
-
-        let total_size: u64 = result.iter().map(|f| f.length).sum();
-        assert_eq!(total_size, 25 * 1024 * 1024);
-        assert!(total_size <= strategy.max_total_size);
+        // Each large file should be in its own group
+        assert_eq!(
+            large_groups.len(),
+            2,
+            "Large files should be grouped separately"
+        );
+        assert_eq!(large_groups[0].data_file_count, 1);
+        assert_eq!(large_groups[1].data_file_count, 1);
     }
 
     #[test]
     fn test_min_file_count_strategy() {
         let strategy = MinFileCountStrategy::new(3);
 
-        assert_eq!(strategy.description(), "MinFileCount[3]");
+        assert_eq!(strategy.to_string(), "MinFileCount[3]");
 
         let exact_files = vec![
             TestFileBuilder::new("file1.parquet")
@@ -1119,7 +1137,7 @@ mod tests {
         assert_eq!(fewer_result.len(), 0);
 
         let zero_strategy = MinFileCountStrategy::new(0);
-        assert_eq!(zero_strategy.description(), "MinFileCount[0]");
+        assert_eq!(zero_strategy.to_string(), "MinFileCount[0]");
 
         let single_file = vec![TestFileBuilder::new("single.parquet")
             .size(10 * 1024 * 1024)
@@ -1141,13 +1159,13 @@ mod tests {
             .small_file_threshold_bytes(20 * 1024 * 1024_u64) // 20MB threshold
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
+        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         let strategy = PlanStrategy::from(&config);
 
         // Description should reflect core filters
-        let desc = strategy.description();
-        assert!(desc.contains("NoDeleteFiles") && desc.contains("SizeFilter"));
+        let desc = strategy.to_string();
+        assert!(desc.contains("SizeFilter"));
 
         let test_files = vec![
             TestFileBuilder::new("small1.parquet")
@@ -1167,21 +1185,23 @@ mod tests {
 
         let result = TestUtils::execute_strategy_flat(&strategy, test_files);
 
-        assert_eq!(result.len(), 2);
+        // Now includes small2 with deletes since we removed the NoDeleteFilesStrategy
+        assert_eq!(result.len(), 3);
         let mut paths: Vec<_> = result.iter().map(|f| f.data_file_path.as_str()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["small1.parquet", "small3.parquet"]);
+        assert_eq!(
+            paths,
+            vec!["small1.parquet", "small2.parquet", "small3.parquet"]
+        );
 
         // Verify all selected files meet criteria
         let small_file_threshold = match config {
-            CompactionPlanningConfig::MergeSmallDataFiles(sf_config) => {
-                sf_config.small_file_threshold_bytes
-            }
+            CompactionPlanningConfig::SmallFiles(sf_config) => sf_config.small_file_threshold_bytes,
             _ => panic!("Expected small files config"),
         };
         for file in &result {
             assert!(file.length <= small_file_threshold);
-            assert!(file.deletes.is_empty());
+            // Don't check deletes.is_empty() as small files can have deletes
         }
 
         // Test min_file_count behavior
@@ -1190,8 +1210,7 @@ mod tests {
             .min_file_count(3_usize)
             .build()
             .unwrap();
-        let min_count_config =
-            CompactionPlanningConfig::MergeSmallDataFiles(min_count_small_files_config);
+        let min_count_config = CompactionPlanningConfig::SmallFiles(min_count_small_files_config);
 
         let min_count_strategy = PlanStrategy::from(&min_count_config);
 
@@ -1229,12 +1248,11 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::Noop)
             .build()
             .unwrap();
-        let default_config =
-            CompactionPlanningConfig::MergeSmallDataFiles(default_small_files_config);
+        let default_config = CompactionPlanningConfig::SmallFiles(default_small_files_config);
 
         // Verify min_file_count default
         match &default_config {
-            CompactionPlanningConfig::MergeSmallDataFiles(config) => {
+            CompactionPlanningConfig::SmallFiles(config) => {
                 assert_eq!(config.min_file_count, 0);
             }
             _ => panic!("Expected small files config"),
@@ -1265,9 +1283,7 @@ mod tests {
         let multi_result = TestUtils::execute_strategy_flat(&default_strategy, multiple_files);
         assert_eq!(multi_result.len(), 3);
         let small_file_threshold_default = match &default_config {
-            CompactionPlanningConfig::MergeSmallDataFiles(config) => {
-                config.small_file_threshold_bytes
-            }
+            CompactionPlanningConfig::SmallFiles(config) => config.small_file_threshold_bytes,
             _ => panic!("Expected small files config"),
         };
         for file in &multi_result {
@@ -1333,12 +1349,9 @@ mod tests {
         assert_eq!(noop_result.len(), 3); // All groups should pass through
 
         // Test that descriptions are formatted correctly
-        assert_eq!(min_size_strategy.description(), "MinGroupSize[100MB]");
-        assert_eq!(
-            min_file_count_strategy.description(),
-            "MinGroupFileCount[2]"
-        );
-        assert_eq!(noop_strategy.description(), "NoopGroupFilter");
+        assert_eq!(min_size_strategy.to_string(), "MinGroupSize[100MB]");
+        assert_eq!(min_file_count_strategy.to_string(), "MinGroupFileCount[2]");
+        assert_eq!(noop_strategy.to_string(), "NoopGroupFilter");
     }
 
     #[test]
@@ -1347,21 +1360,19 @@ mod tests {
 
         // Test create_custom_strategy with basic parameter combinations
 
-        // Test case 1: All filters enabled
-        let strategy_all_enabled = PlanStrategy::new_custom(
-            true,                                               // exclude_delete_files
+        // Test case 1: With size filter
+        let strategy_with_size_filter = PlanStrategy::new_custom(
             Some((Some(1024 * 1024), Some(100 * 1024 * 1024))), // size_filter: 1MB-100MB
-            0,                       // min_file_count: disabled for simpler test
-            10 * 1024 * 1024 * 1024, // max_task_total_size: 10GB
-            &GroupingStrategy::Noop,
+            None,                                               // no delete file count filter
+            None,                                               // no min_file_count
+            GroupingStrategy::Noop,
         );
 
-        let description = strategy_all_enabled.description();
-        assert!(description.contains("NoDeleteFiles") && description.contains("SizeFilter"));
+        let description = strategy_with_size_filter.to_string();
+        assert!(description.contains("SizeFilter"));
 
         // Test case 2: Minimal filters
-        let strategy_minimal =
-            PlanStrategy::new_custom(false, None, 0, u64::MAX, &GroupingStrategy::Noop);
+        let strategy_minimal = PlanStrategy::new_custom(None, None, None, GroupingStrategy::Noop);
 
         // Test functional behavior
         let test_files = vec![
@@ -1380,10 +1391,10 @@ mod tests {
                 .build(),
         ];
 
-        // Strategy with filters should exclude files with deletes and large files
+        // Strategy with size filter should exclude large files (>100MB)
         let result_filtered =
-            TestUtils::execute_strategy_flat(&strategy_all_enabled, test_files.clone());
-        assert_eq!(result_filtered.len(), 2); // small.parquet and medium.parquet
+            TestUtils::execute_strategy_flat(&strategy_with_size_filter, test_files.clone());
+        assert_eq!(result_filtered.len(), 3); // small, medium, and with_deletes (all under 100MB)
 
         // Minimal strategy should pass all files
         let result_minimal = TestUtils::execute_strategy_flat(&strategy_minimal, test_files);
@@ -1450,20 +1461,16 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].data_file_count, 5);
 
-        assert_eq!(
-            normal_strategy.description(),
-            "BinPackGrouping[target=20MB]"
-        );
+        assert_eq!(normal_strategy.to_string(), "BinPackGrouping[target=20MB]");
 
         // Test Case 4: Large total size relative to target produces multiple groups (via factory)
         // Mirrors prior factory-based test but keeps coverage centralized here.
         use crate::config::BinPackConfig;
         let bin_pack_strategy = PlanStrategy::new_custom(
-            false,
             None,
-            0,
-            u64::MAX,
-            &GroupingStrategy::BinPack(BinPackConfig::new(64 * 1024 * 1024)), // 64MB target, no filters
+            None,
+            None,
+            GroupingStrategy::BinPack(BinPackConfig::new(64 * 1024 * 1024)), // 64MB target, no filters
         );
 
         let config = TestUtils::create_test_config();
@@ -1510,7 +1517,7 @@ mod tests {
             "Noop should create one single group containing all files"
         );
         assert_eq!(noop_groups[0].data_file_count, 2);
-        assert_eq!(noop_enum.description(), "NoopGrouping");
+        assert_eq!(noop_enum.to_string(), "NoopGrouping");
 
         // Single-file case for Noop
         let single = vec![TestFileBuilder::new("single.parquet")
@@ -1538,7 +1545,7 @@ mod tests {
             !binpack_groups.is_empty(),
             "BinPack should create at least one group"
         );
-        assert_eq!(binpack_enum.description(), "BinPackGrouping[target=20MB]");
+        assert_eq!(binpack_enum.to_string(), "BinPackGrouping[target=20MB]");
     }
 
     #[test]
@@ -1550,19 +1557,19 @@ mod tests {
             min_size: Some(10 * 1024 * 1024), // 10MB min
             max_size: None,
         };
-        assert_eq!(min_only.description(), "SizeFilter[>10MB]");
+        assert_eq!(min_only.to_string(), "SizeFilter[>10MB]");
 
         let max_only = SizeFilterStrategy {
             min_size: None,
             max_size: Some(50 * 1024 * 1024), // 50MB max
         };
-        assert_eq!(max_only.description(), "SizeFilter[<50MB]");
+        assert_eq!(max_only.to_string(), "SizeFilter[<50MB]");
 
         let no_filter = SizeFilterStrategy {
             min_size: None,
             max_size: None,
         };
-        assert_eq!(no_filter.description(), "SizeFilter[Any]");
+        assert_eq!(no_filter.to_string(), "SizeFilter[Any]");
 
         // Test functional behavior for edge cases
         let test_files = vec![
@@ -1606,7 +1613,7 @@ mod tests {
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
+        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         // Test normal case
         let files = vec![
@@ -1784,7 +1791,7 @@ mod tests {
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::MergeSmallDataFiles(small_files_config);
+        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         let (exec_p, out_p) = FileGroup::calculate_parallelism(&group, &config).unwrap();
         assert!(exec_p >= 1);
@@ -1816,8 +1823,13 @@ mod tests {
         let strategy = PlanStrategy::from(&config);
 
         // Create test files with varying sizes to trigger different parallelism calculations
-        // Group 1 should get: file1 (30MB) + file2 (30MB) = 60MB, 2 files
-        // Group 2 should get: file3 (30MB) + file4 (10MB) = 40MB, 2 files
+        // First-Fit Decreasing with lookback=1:
+        // After sorting: [30MB, 30MB, 30MB, 10MB]
+        // Group 1: file1 (30MB), remaining 20MB
+        // Group 2: file2 (30MB), remaining 20MB (file2 doesn't fit in Group 1 due to lookback=1)
+        // Group 3: file3 (30MB), remaining 20MB (file3 doesn't fit in Group 2 due to lookback=1)
+        //          file4 (10MB) fits in Group 3 (10MB < 20MB remaining)
+        // Result: 3 groups
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")
                 .size(30 * 1024 * 1024)
@@ -1836,9 +1848,10 @@ mod tests {
         let groups = strategy.execute(test_files.clone(), &config).unwrap();
 
         // Verify multiple groups were created
-        assert!(
-            groups.len() >= 2,
-            "BinPack should create multiple groups for Full compaction, but only {} groups were created",
+        assert_eq!(
+            3,
+            groups.len(),
+            "BinPack with lookback=1 should create 3 groups, but {} groups were created",
             groups.len()
         );
 
@@ -1914,7 +1927,198 @@ mod tests {
         );
 
         // Verify description mentions BinPack
-        assert!(strategy.description().contains("BinPack"));
+        assert!(strategy.to_string().contains("BinPack"));
+    }
+
+    #[test]
+    fn test_delete_file_count_filter_strategy() {
+        // Test description
+        let strategy = DeleteFileCountFilterStrategy::new(3);
+        assert_eq!(strategy.to_string(), "DeleteFileCountFilter[>=3 deletes]");
+
+        // Test with files having varying delete file counts
+        let test_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // 0 delete files
+            TestFileBuilder::new("one_delete.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(), // 1 delete file
+            TestFileBuilder::new("three_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // Will manually add 3 deletes
+            TestFileBuilder::new("five_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(), // Will manually add 5 deletes
+        ];
+
+        // Manually add multiple delete files to test files
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        let mut files_with_deletes = vec![
+            test_files[0].clone(), // no deletes
+            test_files[1].clone(), // one delete (already added)
+        ];
+
+        // Add file with 3 deletes
+        let mut file_with_3_deletes = test_files[2].clone();
+        for i in 0..3 {
+            file_with_3_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+        files_with_deletes.push(file_with_3_deletes);
+
+        // Add file with 5 deletes
+        let mut file_with_5_deletes = test_files[3].clone();
+        for i in 0..5 {
+            file_with_5_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+        files_with_deletes.push(file_with_5_deletes);
+
+        // Apply filter - should only pass files with >= 3 delete files
+        let result = strategy.filter(files_with_deletes);
+
+        assert_eq!(result.len(), 2); // Only files with 3 and 5 deletes should pass
+        assert_eq!(result[0].data_file_path, "three_deletes.parquet");
+        assert_eq!(result[1].data_file_path, "five_deletes.parquet");
+
+        // Verify delete counts
+        assert_eq!(result[0].deletes.len(), 3);
+        assert_eq!(result[1].deletes.len(), 5);
+
+        // Test edge case: threshold = 0 (should pass all files)
+        let zero_threshold_strategy = DeleteFileCountFilterStrategy::new(0);
+        let all_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("with_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+        ];
+        let zero_result = zero_threshold_strategy.filter(all_files);
+        assert_eq!(zero_result.len(), 2);
+
+        // Test edge case: threshold = 1 (should pass files with 1+ deletes)
+        let one_threshold_strategy = DeleteFileCountFilterStrategy::new(1);
+        let test_files = vec![
+            TestFileBuilder::new("no_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("with_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+        ];
+        let one_result = one_threshold_strategy.filter(test_files);
+        assert_eq!(one_result.len(), 1);
+        assert_eq!(one_result[0].data_file_path, "with_deletes.parquet");
+    }
+
+    #[test]
+    fn test_files_with_deletes_strategy() {
+        // Test the factory method for files with deletes strategy
+        use crate::config::FilesWithDeletesConfigBuilder;
+
+        let files_with_deletes_config = FilesWithDeletesConfigBuilder::default()
+            .min_delete_file_count_threshold(2_usize)
+            .build()
+            .unwrap();
+        let config = CompactionPlanningConfig::FilesWithDeletes(files_with_deletes_config);
+
+        let strategy = PlanStrategy::from(&config);
+
+        // Verify description mentions the delete file count filter
+        let desc = strategy.to_string();
+        assert!(desc.contains("DeleteFileCountFilter"));
+
+        // Create test files with different delete counts
+        use iceberg::spec::{DataContentType, DataFileFormat};
+        use std::sync::Arc;
+
+        let file_no_deletes = TestFileBuilder::new("no_deletes.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let mut file_one_delete = TestFileBuilder::new("one_delete.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        file_one_delete.deletes.push(Arc::new(FileScanTask {
+            start: 0,
+            length: 1024,
+            record_count: Some(10),
+            data_file_path: "delete_1.parquet".to_owned(),
+            data_file_content: DataContentType::EqualityDeletes,
+            data_file_format: DataFileFormat::Parquet,
+            schema: get_test_schema(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 1,
+            equality_ids: vec![1, 2],
+            file_size_in_bytes: 1024,
+        }));
+
+        let mut file_two_deletes = TestFileBuilder::new("two_deletes.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        for i in 0..2 {
+            file_two_deletes.deletes.push(Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(10),
+                data_file_path: format!("delete_{}.parquet", i),
+                data_file_content: DataContentType::EqualityDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1, 2],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: vec![1, 2],
+                file_size_in_bytes: 1024,
+            }));
+        }
+
+        let test_files = vec![file_no_deletes, file_one_delete, file_two_deletes];
+
+        // Execute strategy
+        let result = TestUtils::execute_strategy_flat(&strategy, test_files);
+
+        // Should only select file with >= 2 delete files
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "two_deletes.parquet");
+        assert_eq!(result[0].deletes.len(), 2);
     }
 
     #[test]
@@ -1939,6 +2143,9 @@ mod tests {
                 .size(30 * 1024 * 1024)
                 .with_deletes()
                 .build(),
+            TestFileBuilder::new("file4.parquet")
+                .size(15 * 1024 * 1024)
+                .build(),
         ];
 
         let result = strategy.execute(test_files.clone(), &config).unwrap();
@@ -1946,8 +2153,8 @@ mod tests {
         // Full compaction should include ALL files, creating groups but not filtering any
         let total_files_in_groups: usize = result.iter().map(|g| g.data_file_count).sum();
         assert_eq!(
-            total_files_in_groups, 3,
-            "Full compaction should include all 3 files without any filtering"
+            total_files_in_groups, 4,
+            "Full compaction should include all 4 files without any filtering"
         );
 
         // Verify files with deletes are included
@@ -1968,14 +2175,14 @@ mod tests {
         );
 
         // Verify strategy description doesn't mention any filters
-        let desc = strategy.description();
+        let desc = strategy.to_string();
         assert!(
             !desc.contains("MinGroupSize") && !desc.contains("MinGroupFileCount"),
             "Full compaction strategy should not have group filters, got: {}",
             desc
         );
         assert!(
-            !desc.contains("NoDeleteFiles") && !desc.contains("SizeFilter"),
+            !desc.contains("SizeFilter"),
             "Full compaction strategy should not have file filters, got: {}",
             desc
         );
