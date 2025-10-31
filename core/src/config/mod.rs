@@ -33,6 +33,7 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
+pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - target size for BinPack algorithm
@@ -167,6 +168,10 @@ pub struct CompactionPlanningConfig {
     /// Strategy for grouping files
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
+
+    /// Minimum delete file count threshold for high-delete-file-count compaction
+    #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub min_delete_file_count_threshold: usize,
 }
 
 impl Default for CompactionPlanningConfig {
