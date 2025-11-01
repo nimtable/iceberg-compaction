@@ -21,8 +21,6 @@ use derive_builder::Builder;
 use parquet::{basic::Compression, file::properties::WriterProperties};
 
 pub const DEFAULT_PREFIX: &str = "iceberg-compact";
-pub const DEFAULT_EXECUTOR_PARALLELISM: usize = 1;
-pub const DEFAULT_OUTPUT_PARALLELISM: usize = 1;
 pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
 pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
@@ -38,8 +36,6 @@ pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minim
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
-pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
-pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
 
 /// Configuration for bin-packing grouping strategy.
 ///
@@ -138,7 +134,9 @@ pub struct SmallFilesConfig {
 
 impl Default for SmallFilesConfig {
     fn default() -> Self {
-        SmallFilesConfigBuilder::default().build().unwrap()
+        SmallFilesConfigBuilder::default()
+            .build()
+            .expect("SmallFilesConfig default should always build")
     }
 }
 
@@ -175,7 +173,9 @@ pub struct FullCompactionConfig {
 
 impl Default for FullCompactionConfig {
     fn default() -> Self {
-        FullCompactionConfigBuilder::default().build().unwrap()
+        FullCompactionConfigBuilder::default()
+            .build()
+            .expect("FullCompactionConfig default should always build")
     }
 }
 
@@ -218,7 +218,9 @@ pub struct FilesWithDeletesConfig {
 
 impl Default for FilesWithDeletesConfig {
     fn default() -> Self {
-        FilesWithDeletesConfigBuilder::default().build().unwrap()
+        FilesWithDeletesConfigBuilder::default()
+            .build()
+            .expect("FilesWithDeletesConfig default should always build")
     }
 }
 
@@ -337,7 +339,9 @@ pub struct CompactionExecutionConfig {
 
 impl Default for CompactionExecutionConfig {
     fn default() -> Self {
-        CompactionExecutionConfigBuilder::default().build().unwrap()
+        CompactionExecutionConfigBuilder::default()
+            .build()
+            .expect("CompactionExecutionConfig default should always build")
     }
 }
 
@@ -363,6 +367,8 @@ impl CompactionConfig {
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        CompactionConfigBuilder::default().build().unwrap()
+        CompactionConfigBuilder::default()
+            .build()
+            .expect("CompactionConfig default should always build")
     }
 }

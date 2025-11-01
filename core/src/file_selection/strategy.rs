@@ -288,22 +288,6 @@ pub trait GroupFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send
     fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup>;
 }
 
-/// No-op file filter. Returns input unchanged.
-#[derive(Debug)]
-pub struct NoopStrategy;
-
-impl FileFilterStrategy for NoopStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-    }
-}
-
-impl std::fmt::Display for NoopStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Noop")
-    }
-}
-
 /// Single grouping strategy. Groups all files into a single `FileGroup`.
 ///
 /// Returns empty vec if input is empty.
@@ -327,22 +311,6 @@ impl SingleGroupingStrategy {
 impl std::fmt::Display for SingleGroupingStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SingleGrouping")
-    }
-}
-
-/// No-op group filter. Returns input unchanged.
-#[derive(Debug)]
-pub struct NoopGroupFilterStrategy;
-
-impl GroupFilterStrategy for NoopGroupFilterStrategy {
-    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
-        groups
-    }
-}
-
-impl std::fmt::Display for NoopGroupFilterStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NoopGroupFilter")
     }
 }
 
@@ -599,20 +567,21 @@ impl PlanStrategy {
         // Apply group filters if provided
         if let Some(group_filters) = group_filters {
             // Add size filter if specified
-            if let Some(min_group_size_bytes) = group_filters.min_group_size_bytes {
-                if min_group_size_bytes > 0 {
-                    group_filter_strategies.push(Box::new(MinGroupSizeStrategy {
-                        min_group_size_bytes,
-                    }));
-                }
+            if let Some(min_group_size_bytes) =
+                group_filters.min_group_size_bytes.filter(|&size| size > 0)
+            {
+                group_filter_strategies.push(Box::new(MinGroupSizeStrategy {
+                    min_group_size_bytes,
+                }));
             }
 
             // Add file count filter if specified
-            if let Some(min_file_count) = group_filters.min_group_file_count {
-                if min_file_count > 0 {
-                    group_filter_strategies
-                        .push(Box::new(MinGroupFileCountStrategy { min_file_count }));
-                }
+            if let Some(min_file_count) = group_filters
+                .min_group_file_count
+                .filter(|&count| count > 0)
+            {
+                group_filter_strategies
+                    .push(Box::new(MinGroupFileCountStrategy { min_file_count }));
             }
         }
 
@@ -923,38 +892,6 @@ mod tests {
             }
             task
         }
-    }
-
-    #[test]
-    fn test_noop_strategy() {
-        let strategy = NoopStrategy;
-        let data_files = vec![
-            TestFileBuilder::new("file1.parquet")
-                .size(10 * 1024 * 1024)
-                .build(),
-            TestFileBuilder::new("file2.parquet")
-                .size(20 * 1024 * 1024)
-                .build(),
-        ];
-
-        let original_count = data_files.len();
-        let result_data = strategy.filter(data_files.clone());
-
-        // Verify all files pass through unchanged
-        assert_eq!(result_data.len(), original_count);
-        TestUtils::assert_paths_eq(&["file1.parquet", "file2.parquet"], &result_data);
-
-        // Verify original is not mutated
-        assert_eq!(data_files.len(), original_count);
-
-        // Verify file properties are preserved
-        for (original, filtered) in data_files.iter().zip(result_data.iter()) {
-            assert_eq!(original.data_file_path, filtered.data_file_path);
-            assert_eq!(original.length, filtered.length);
-            assert_eq!(original.file_size_in_bytes, filtered.file_size_in_bytes);
-        }
-
-        assert_eq!(strategy.to_string(), "Noop");
     }
 
     #[test]
@@ -1393,7 +1330,7 @@ mod tests {
             (
                 "MinGroupSize[100MB]",
                 MinGroupSizeStrategy {
-                    min_group_size: 100 * 1024 * 1024,
+                    min_group_size_bytes: 100 * 1024 * 1024,
                 }
                 .to_string(),
             ),
@@ -1401,7 +1338,6 @@ mod tests {
                 "MinGroupFileCount[2]",
                 MinGroupFileCountStrategy { min_file_count: 2 }.to_string(),
             ),
-            ("NoopGroupFilter", NoopGroupFilterStrategy.to_string()),
         ];
 
         for (expected_desc, actual_desc) in test_cases {
@@ -1409,7 +1345,7 @@ mod tests {
         }
 
         let min_size_strategy = MinGroupSizeStrategy {
-            min_group_size: 100 * 1024 * 1024,
+            min_group_size_bytes: 100 * 1024 * 1024,
         };
         assert_eq!(min_size_strategy.filter_groups(groups.clone()).len(), 1);
 
@@ -1418,14 +1354,6 @@ mod tests {
             min_file_count_strategy.filter_groups(groups.clone()).len(),
             2
         );
-
-        let noop_strategy = NoopGroupFilterStrategy;
-        let noop_result = noop_strategy.filter_groups(groups.clone());
-        assert_eq!(noop_result.len(), 3);
-        for (original, filtered) in groups.iter().zip(noop_result.iter()) {
-            assert_eq!(original.data_file_count, filtered.data_file_count);
-            assert_eq!(original.total_size, filtered.total_size);
-        }
     }
 
     #[test]
@@ -2200,12 +2128,7 @@ mod tests {
             "Full compaction should include files with deletes"
         );
 
-        // Verify Noop grouping creates a single group
-        assert_eq!(
-            result.len(),
-            1,
-            "Noop grouping should create a single group"
-        );
+        assert_eq!(result.len(), 1,);
 
         // Verify strategy description doesn't mention any filters
         let desc = strategy.to_string();
