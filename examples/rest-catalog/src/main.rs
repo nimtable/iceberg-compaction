@@ -22,7 +22,7 @@ use iceberg_compaction_core::iceberg::io::{
 };
 use iceberg_compaction_core::iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use iceberg_compaction_core::compaction::{CompactionBuilder, CompactionType};
+use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::CompactionConfigBuilder;
 
 #[tokio::main]
@@ -63,11 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Configure compaction settings
     let compaction_config = CompactionConfigBuilder::default().build()?;
-    let compaction =
-        CompactionBuilder::new(catalog.clone(), table_ident.clone(), CompactionType::Full)
-            .with_config(Arc::new(compaction_config))
-            .with_catalog_name("my_rest_catalog".to_owned())
-            .build();
+    let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone())
+        .with_config(Arc::new(compaction_config))
+        .with_catalog_name("my_rest_catalog".to_owned())
+        .build();
 
     // 4. Perform the compaction
     println!("Starting compaction for table: {}", table_ident);

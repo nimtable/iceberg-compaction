@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
+//! Compaction configuration types and constants.
+
 use crate::common::available_parallelism;
 use derive_builder::Builder;
 use parquet::{basic::Compression, file::properties::WriterProperties};
 
 pub const DEFAULT_PREFIX: &str = "iceberg-compact";
-pub const DEFAULT_EXECUTOR_PARALLELISM: usize = 1;
-pub const DEFAULT_OUTPUT_PARALLELISM: usize = 1;
 pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
 pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
@@ -31,48 +31,29 @@ pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
 pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
 pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
-pub const DEFAULT_MIN_FILE_COUNT: usize = 0; // default unlimited
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 
 // Strategy configuration defaults
-pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - target size for BinPack algorithm
-pub const DEFAULT_MIN_GROUP_SIZE: u64 = 512 * 1024 * 1024; // 512MB - minimum group size filter
-pub const DEFAULT_MIN_GROUP_FILE_COUNT: usize = 2; // Minimum files per group filter
+pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
 
-/// Configuration for `BinPack` grouping strategy
+/// Configuration for bin-packing grouping strategy.
+///
+/// This struct wraps bin-packing parameters to allow future extensibility
+/// without breaking API compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinPackConfig {
-    /// Target size for each bin/group
-    pub target_group_size: u64,
-
-    /// Minimum size filter for compaction groups
-    pub min_group_size: Option<u64>,
-
-    /// Minimum file count filter per group
-    pub min_group_file_count: Option<usize>,
+    /// Target size for each group (in bytes).
+    ///
+    /// The bin-packing algorithm will try to create groups close to this size.
+    pub target_group_size_bytes: u64,
 }
 
 impl BinPackConfig {
-    /// Create a `BinPack` config with only target size (no filters)
-    pub fn new(target_group_size: u64) -> Self {
+    /// Creates a new bin-pack configuration with the given target group size.
+    pub fn new(target_group_size_bytes: u64) -> Self {
         Self {
-            target_group_size,
-            min_group_size: None,
-            min_group_file_count: None,
-        }
-    }
-
-    /// Create a `BinPack` config with filters enabled
-    pub fn with_filters(
-        target_group_size: u64,
-        min_group_size: Option<u64>,
-        min_group_file_count: Option<usize>,
-    ) -> Self {
-        Self {
-            target_group_size,
-            min_group_size,
-            min_group_file_count,
+            target_group_size_bytes,
         }
     }
 }
@@ -83,17 +64,167 @@ impl Default for BinPackConfig {
     }
 }
 
-/// Strategy for grouping files during compaction
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// File grouping strategy: how to partition files into groups.
+///
+/// This determines the grouping algorithm only. Group filtering is handled
+/// separately by [`GroupFilters`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupingStrategy {
-    /// No grouping - all files go into a single group
-    #[default]
-    Noop,
-    /// Bin-packing based grouping - files are grouped to optimize size distribution
+    /// Put all files into a single group.
+    Single,
+    /// Group files using bin-packing algorithm to target a specific group size.
     BinPack(BinPackConfig),
 }
 
-// Helper function for the default WriterProperties
+/// Group-level filters applied after grouping.
+///
+/// These filters remove groups that don't meet certain criteria. They are
+/// orthogonal to the grouping strategy and can be used with any strategy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Builder)]
+#[builder(setter(into, strip_option), default)]
+pub struct GroupFilters {
+    /// Minimum total size (in bytes) for a group to be included.
+    pub min_group_size_bytes: Option<u64>,
+    /// Minimum number of files for a group to be included.
+    pub min_group_file_count: Option<usize>,
+}
+
+impl Default for GroupingStrategy {
+    fn default() -> Self {
+        Self::Single
+    }
+}
+
+/// Configuration for small files compaction strategy.
+///
+/// This strategy targets small files for compaction. It supports both grouping
+/// strategies and group-level filtering to control which groups get compacted.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct SmallFilesConfig {
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    #[builder(default = "available_parallelism().get()")]
+    pub max_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
+    pub small_file_threshold_bytes: u64,
+
+    /// How to group files before compaction.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Optional filters to apply after grouping.
+    ///
+    /// Groups that don't meet these criteria will be excluded from compaction.
+    /// This allows fine-grained control over which file groups get compacted.
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
+}
+
+impl Default for SmallFilesConfig {
+    fn default() -> Self {
+        SmallFilesConfigBuilder::default()
+            .build()
+            .expect("SmallFilesConfig default should always build")
+    }
+}
+
+/// Configuration for full compaction strategy.
+///
+/// This strategy performs full compaction of all files in a partition.
+/// Group filters are NOT supported because "full" compaction means processing
+/// ALL files without filtering.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct FullCompactionConfig {
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    #[builder(default = "available_parallelism().get()")]
+    pub max_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    /// How to group files before compaction.
+    ///
+    /// Note: Group filters are not supported for full compaction.
+    /// All groups will be compacted regardless of size or file count.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+}
+
+impl Default for FullCompactionConfig {
+    fn default() -> Self {
+        FullCompactionConfigBuilder::default()
+            .build()
+            .expect("FullCompactionConfig default should always build")
+    }
+}
+
+/// Configuration for files-with-deletes compaction strategy.
+///
+/// This strategy targets data files that have associated delete files.
+/// It supports group filtering to control which groups get compacted.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct FilesWithDeletesConfig {
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    #[builder(default = "available_parallelism().get()")]
+    pub max_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    /// How to group files before compaction.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Minimum number of delete files required to trigger compaction.
+    #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub min_delete_file_count_threshold: usize,
+
+    /// Optional filters to apply after grouping.
+    ///
+    /// Groups that don't meet these criteria will be excluded from compaction.
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
+}
+
+impl Default for FilesWithDeletesConfig {
+    fn default() -> Self {
+        FilesWithDeletesConfigBuilder::default()
+            .build()
+            .expect("FilesWithDeletesConfig default should always build")
+    }
+}
+
+/// Helper for default `WriterProperties` (SNAPPY compression).
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
@@ -103,152 +234,118 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-/// Common configuration shared across different compaction phases
-#[derive(Builder, Debug, Clone)]
-pub struct CompactionBaseConfig {
-    /// Target size in bytes for each compacted file
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size: u64,
+/// Planning configuration variants for different compaction strategies.
+#[derive(Debug, Clone)]
+pub enum CompactionPlanningConfig {
+    SmallFiles(SmallFilesConfig),
+    Full(FullCompactionConfig),
+    FilesWithDeletes(FilesWithDeletesConfig),
 }
 
-impl Default for CompactionBaseConfig {
-    fn default() -> Self {
-        Self {
-            target_file_size: DEFAULT_TARGET_FILE_SIZE,
+impl CompactionPlanningConfig {
+    /// Returns target file size in bytes for the strategy.
+    pub fn target_file_size_bytes(&self) -> u64 {
+        match self {
+            Self::SmallFiles(c) => c.target_file_size_bytes,
+            Self::Full(c) => c.target_file_size_bytes,
+            Self::FilesWithDeletes(c) => c.target_file_size_bytes,
+        }
+    }
+
+    /// Returns minimum size per partition for the strategy.
+    pub fn min_size_per_partition(&self) -> u64 {
+        match self {
+            Self::SmallFiles(c) => c.min_size_per_partition,
+            Self::Full(c) => c.min_size_per_partition,
+            Self::FilesWithDeletes(c) => c.min_size_per_partition,
+        }
+    }
+
+    /// Returns maximum file count per partition for the strategy.
+    pub fn max_file_count_per_partition(&self) -> usize {
+        match self {
+            Self::SmallFiles(c) => c.max_file_count_per_partition,
+            Self::Full(c) => c.max_file_count_per_partition,
+            Self::FilesWithDeletes(c) => c.max_file_count_per_partition,
+        }
+    }
+
+    /// Returns maximum parallelism for the strategy.
+    pub fn max_parallelism(&self) -> usize {
+        match self {
+            Self::SmallFiles(c) => c.max_parallelism,
+            Self::Full(c) => c.max_parallelism,
+            Self::FilesWithDeletes(c) => c.max_parallelism,
+        }
+    }
+
+    /// Returns whether heuristic output parallelism is enabled.
+    pub fn enable_heuristic_output_parallelism(&self) -> bool {
+        match self {
+            Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
+            Self::Full(c) => c.enable_heuristic_output_parallelism,
+            Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
         }
     }
 }
 
-/// Configuration for compaction planning phase
-#[derive(Builder, Debug, Clone)]
-pub struct CompactionPlanningConfig {
-    /// Base configuration shared across all compaction phases
-    #[builder(default)]
-    pub base: CompactionBaseConfig,
-
-    /// Threshold for small file compaction
-    #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
-    pub small_file_threshold: u64,
-
-    /// Expected minimum size in bytes for each partition when partitioning by size
-    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
-
-    /// Expected maximum file count per partition when partitioning by file count
-    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
-    pub max_file_count_per_partition: usize,
-
-    /// Maximum parallelism for each individual compaction plan
-    ///
-    /// This limits the number of concurrent tasks (executor parallelism) within a single
-    /// compaction plan execution. It applies to both `compact()` and plan-driven workflows.
-    ///
-    /// When using `compact()` with multiple plans running concurrently (controlled by
-    /// `max_concurrent_compaction_plans`), the theoretical maximum total system parallelism is:
-    /// ```text
-    /// max_parallelism × max_concurrent_compaction_plans
-    /// ```
-    ///
-    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
-    /// the theoretical maximum is 64 concurrent tasks across all plans.
-    ///
-    /// Note: Actual parallelism is dynamically calculated based on file sizes and counts,
-    /// so it may be lower than `max_parallelism`.
-    #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
-
-    /// Whether to enable heuristic output parallelism
-    #[builder(default = "true")]
-    pub enable_heuristic_output_parallelism: bool,
-
-    /// Minimum number of files required to trigger compaction
-    #[builder(default = "DEFAULT_MIN_FILE_COUNT")]
-    pub min_file_count: usize,
-
-    /// Strategy for grouping files
-    #[builder(default)]
-    pub grouping_strategy: GroupingStrategy,
-
-    /// Minimum delete file count threshold for high-delete-file-count compaction
-    #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
-    pub min_delete_file_count_threshold: usize,
-}
-
 impl Default for CompactionPlanningConfig {
     fn default() -> Self {
-        CompactionPlanningConfigBuilder::default().build().unwrap()
+        Self::Full(FullCompactionConfig::default())
     }
 }
 
-// CompactionPlanningConfigBuilder uses derive_builder
-
-/// Configuration for compaction execution phase
+/// Execution configuration for compaction operations.
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
-    /// Base configuration shared across all compaction phases
-    #[builder(default)]
-    pub base: CompactionBaseConfig,
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
 
     #[builder(default = "DEFAULT_PREFIX.to_owned()")]
     pub data_file_prefix: String,
 
-    /// Whether to enable validation after compaction completes
     #[builder(default = "DEFAULT_VALIDATE_COMPACTION")]
     pub enable_validate_compaction: bool,
 
-    /// Maximum number of rows in each record batch
     #[builder(default = "DEFAULT_MAX_RECORD_BATCH_ROWS")]
     pub max_record_batch_rows: usize,
 
-    /// Maximum number of concurrent file close operations
     #[builder(default = "DEFAULT_MAX_CONCURRENT_CLOSES")]
     pub max_concurrent_closes: usize,
 
-    /// Parquet writer properties for output files
     #[builder(default = "default_writer_properties()")]
     pub write_parquet_properties: WriterProperties,
 
-    /// Normalize un-quoted column identifiers to lowercase
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
 
-    /// Whether to enable dynamic file size estimation
     #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
     pub enable_dynamic_size_estimation: bool,
 
-    /// Smoothing factor for dynamic size estimation updates
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     pub size_estimation_smoothing_factor: f64,
 
-    /// Maximum number of compaction plans to execute concurrently
+    /// Maximum concurrent compaction plans in `compact()` method.
     ///
-    /// **Note**: This parameter only applies when using the `compact()` method (all-in-one workflow).
-    /// For plan-driven workflows (`plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()`),
-    /// users manage concurrency themselves.
+    /// **Note**: Only applies to managed workflow (`compact()`). Plan-driven workflow
+    /// (`plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()`) manages
+    /// concurrency externally.
     ///
-    /// This controls how many compaction plans (`FileGroups`) can execute simultaneously.
-    /// Combined with `max_parallelism` (in `CompactionPlanningConfig`), this determines the
-    /// theoretical maximum total system parallelism:
-    /// ```text
-    /// max_parallelism × max_concurrent_compaction_plans
-    /// ```
-    ///
-    /// For example, with `max_parallelism = 16` and `max_concurrent_compaction_plans = 4`,
-    /// the theoretical maximum is 64 concurrent tasks across all plans.
-    ///
-    /// Note: Actual parallelism is typically lower because individual plans calculate
-    /// their own parallelism based on data characteristics.
+    /// Theoretical max parallelism = `max_parallelism` × `max_concurrent_compaction_plans`.
+    /// Actual parallelism is typically lower due to per-plan heuristics.
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
 }
 
 impl Default for CompactionExecutionConfig {
     fn default() -> Self {
-        CompactionExecutionConfigBuilder::default().build().unwrap()
+        CompactionExecutionConfigBuilder::default()
+            .build()
+            .expect("CompactionExecutionConfig default should always build")
     }
 }
 
-/// Main configuration that combines planning and execution configs
+/// Combined planning and execution configuration for compaction.
 #[derive(Builder, Debug, Clone)]
 #[builder(pattern = "owned")]
 pub struct CompactionConfig {
@@ -259,6 +356,7 @@ pub struct CompactionConfig {
 }
 
 impl CompactionConfig {
+    /// Creates a new config with planning and execution configurations.
     pub fn new(planning: CompactionPlanningConfig, execution: CompactionExecutionConfig) -> Self {
         Self {
             planning,
@@ -269,6 +367,8 @@ impl CompactionConfig {
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        CompactionConfigBuilder::default().build().unwrap()
+        CompactionConfigBuilder::default()
+            .build()
+            .expect("CompactionConfig default should always build")
     }
 }
