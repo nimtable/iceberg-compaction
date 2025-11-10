@@ -977,6 +977,7 @@ impl CommitManager {
                             .delete_files(delete_files)?
                             .with_to_branch(to_branch.to_owned())
                             .with_starting_sequence_number(snapshot.sequence_number())?
+                            .with_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -991,6 +992,7 @@ impl CommitManager {
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
                         .with_to_branch(to_branch.to_owned())
+                        .with_check_file_existence(true)
                 };
 
                 let txn = rewrite_action.apply().await?;
@@ -1083,6 +1085,7 @@ impl CommitManager {
                             .delete_files(delete_files)?
                             .with_to_branch(to_branch.to_owned())
                             .with_starting_sequence_number(snapshot.sequence_number())?
+                            .with_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -1096,6 +1099,7 @@ impl CommitManager {
                         .add_data_files(data_files)?
                         .delete_files(delete_files)?
                         .with_to_branch(to_branch.to_owned())
+                        .with_check_file_existence(true)
                 };
 
                 let txn = overwrite_action.apply().await?;
