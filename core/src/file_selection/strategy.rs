@@ -68,13 +68,16 @@ impl FileGroup {
 
         for task in &data_files {
             for delete_task in &task.deletes {
-                let delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
-                        position_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
+                        position_delete_map
+                            .entry(&delete_task.data_file_path)
+                            .or_insert(delete_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
-                        equality_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
+                        equality_delete_map
+                            .entry(&delete_task.data_file_path)
+                            .or_insert(delete_task);
                     }
                     _ => {}
                 }
@@ -83,7 +86,8 @@ impl FileGroup {
 
         let position_delete_files = position_delete_map
             .into_values()
-            .map(|mut file| {
+            .map(|file| {
+                let mut file = file.as_ref().clone();
                 file.project_field_ids = vec![];
                 file
             })
@@ -91,7 +95,8 @@ impl FileGroup {
 
         let equality_delete_files = equality_delete_map
             .into_values()
-            .map(|mut file| {
+            .map(|file| {
+                let mut file = file.as_ref().clone();
                 file.project_field_ids = file.equality_ids.clone();
                 file
             })
