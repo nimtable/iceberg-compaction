@@ -17,9 +17,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{
-    Catalog, NamespaceIdent, TableCreation,
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
+    Catalog, NamespaceIdent, TableCreation,
 };
 use iceberg_compaction_core::error::Result;
 
