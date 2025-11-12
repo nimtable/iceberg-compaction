@@ -68,23 +68,39 @@ impl FileGroup {
 
         for task in &data_files {
             for delete_task in &task.deletes {
-                let mut delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
-                        delete_task.project_field_ids = vec![];
-                        position_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
+                        position_delete_map
+                            .entry(&delete_task.data_file_path)
+                            .or_insert(delete_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
-                        delete_task.project_field_ids = delete_task.equality_ids.clone();
-                        equality_delete_map.insert(delete_task.data_file_path.clone(), delete_task);
+                        equality_delete_map
+                            .entry(&delete_task.data_file_path)
+                            .or_insert(delete_task);
                     }
                     _ => {}
                 }
             }
         }
 
-        let position_delete_files = position_delete_map.into_values().collect();
-        let equality_delete_files = equality_delete_map.into_values().collect();
+        let position_delete_files = position_delete_map
+            .into_values()
+            .map(|file| {
+                let mut file = file.as_ref().clone();
+                file.project_field_ids = vec![];
+                file
+            })
+            .collect::<Vec<FileScanTask>>();
+
+        let equality_delete_files = equality_delete_map
+            .into_values()
+            .map(|file| {
+                let mut file = file.as_ref().clone();
+                file.project_field_ids = file.equality_ids.clone();
+                file
+            })
+            .collect::<Vec<FileScanTask>>();
 
         Self {
             data_files,
