@@ -15,23 +15,23 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
+use crate::CompactionError;
+use crate::Result;
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{
     CompactionExecutionConfig, CompactionPlanningConfig, RuntimeConfig, RuntimeConfigBuilder,
 };
 use crate::executor::{
-    create_compaction_executor, ExecutorType, InputFileScanTasks, RewriteFilesRequest,
-    RewriteFilesResponse, RewriteFilesStat,
+    ExecutorType, InputFileScanTasks, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
+    create_compaction_executor,
 };
 use crate::file_selection::FileSelector;
-use crate::CompactionError;
-use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
@@ -1023,24 +1023,24 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIOBuilder;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, MAIN_BRANCH};
+    use iceberg::spec::{MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::Table;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
+        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
+        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
     };
     use iceberg::writer::{
-        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;

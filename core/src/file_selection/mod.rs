@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-use crate::executor::InputFileScanTasks;
 use crate::Result;
+use crate::executor::InputFileScanTasks;
 use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
@@ -73,17 +73,12 @@ impl FileSelector {
 
         for task in &filtered_data_files {
             for delete_task in &task.deletes {
-                let mut delete_task = delete_task.as_ref().clone();
                 match &delete_task.data_file_content {
                     iceberg::spec::DataContentType::PositionDeletes => {
-                        delete_task.project_field_ids = vec![];
-                        position_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
+                        position_delete_files.insert(&delete_task.data_file_path, delete_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
-                        delete_task.project_field_ids = delete_task.equality_ids.clone();
-                        equality_delete_files
-                            .insert(delete_task.data_file_path.clone(), delete_task);
+                        equality_delete_files.insert(&delete_task.data_file_path, delete_task);
                     }
                     _ => {
                         unreachable!()
@@ -91,11 +86,27 @@ impl FileSelector {
                 }
             }
         }
+        let position_delete_files = position_delete_files
+            .into_values()
+            .map(|file| {
+                let mut file = file.as_ref().clone();
+                file.project_field_ids = vec![];
+                file
+            })
+            .collect::<Vec<FileScanTask>>();
+        let equality_delete_files = equality_delete_files
+            .into_values()
+            .map(|file| {
+                let mut file = file.as_ref().clone();
+                file.project_field_ids = file.equality_ids.clone();
+                file
+            })
+            .collect::<Vec<FileScanTask>>();
 
         Ok(InputFileScanTasks {
             data_files: filtered_data_files,
-            position_delete_files: position_delete_files.into_values().collect(),
-            equality_delete_files: equality_delete_files.into_values().collect(),
+            position_delete_files,
+            equality_delete_files,
         })
     }
 }

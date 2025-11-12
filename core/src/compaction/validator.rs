@@ -26,13 +26,13 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, Schema};
 use iceberg::table::Table;
 
+use crate::CompactionError;
 use crate::config::{CompactionExecutionConfigBuilder, RuntimeConfig};
 use crate::error::Result;
+use crate::executor::InputFileScanTasks;
 use crate::executor::datafusion::datafusion_processor::{
     DataFusionTaskContext, DatafusionProcessor,
 };
-use crate::executor::InputFileScanTasks;
-use crate::CompactionError;
 
 pub struct CompactionValidator {
     datafusion_processor: DatafusionProcessor,
