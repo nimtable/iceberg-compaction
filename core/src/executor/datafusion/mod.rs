@@ -1,18 +1,18 @@
 /*
- * Copyright 2025 iceberg-compaction
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+* Copyright 2025 iceberg-compaction
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
 
 use crate::{
     config::CompactionExecutionConfig, error::Result,
@@ -20,18 +20,18 @@ use crate::{
 };
 use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
+use futures::{future::try_join_all, StreamExt};
 use iceberg::{
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::data_file_writer::DataFileWriterBuilder,
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use parquet::file::properties::WriterProperties;
@@ -57,30 +57,33 @@ impl CompactionExecutor for DataFusionExecutor {
         let RewriteFilesRequest {
             file_io,
             schema,
-            input_file_scan_tasks,
+            file_group,
             execution_config,
             dir_path,
             partition_spec,
             metrics_recorder,
-            runtime_config,
         } = request;
 
         let mut stats = RewriteFilesStat::default();
-        stats.record_input(&input_file_scan_tasks);
+        stats.record_input(&file_group);
+
+        // Extract parallelism before file_group is moved
+        let executor_parallelism = file_group.executor_parallelism;
+        let output_parallelism = file_group.output_parallelism;
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
-            .with_input_data_files(input_file_scan_tasks)
+            .with_input_data_files(file_group)
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),
-            runtime_config.clone(),
+            executor_parallelism,
             file_io.clone(),
         )
-        .execute(datafusion_task_ctx)
+        .execute(datafusion_task_ctx, output_parallelism)
         .await?;
         let arc_input_schema = Arc::new(input_schema);
-        let mut futures = Vec::with_capacity(runtime_config.executor_parallelism);
+        let mut futures = Vec::with_capacity(executor_parallelism);
 
         // build iceberg writer for each partition
         for mut batch_stream in batches {
@@ -177,7 +180,7 @@ pub async fn build_iceberg_data_file_writer(
         DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
     let data_file_size_writer =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(execution_config.base.target_file_size)
+            .with_target_file_size(execution_config.target_file_size_bytes)
             .with_max_concurrent_closes(execution_config.max_concurrent_closes)
             .with_dynamic_size_estimation(execution_config.enable_dynamic_size_estimation)
             .with_size_estimation_smoothing_factor(

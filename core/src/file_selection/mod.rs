@@ -15,27 +15,29 @@
  */
 
 use crate::Result;
-use crate::executor::InputFileScanTasks;
 use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
-use std::collections::HashMap;
 
+pub mod packer;
 pub mod strategy;
 
 // Re-export commonly used types for convenience
-pub use strategy::{FileStrategyFactory, StaticFileStrategy, UnifiedStrategy};
+pub use packer::ListPacker;
+pub use strategy::{FileGroup, PlanStrategy};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
 impl FileSelector {
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
+    /// Returns groups of files selected and organized by the given strategy
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
-        strategy: UnifiedStrategy,
-    ) -> Result<InputFileScanTasks> {
+        strategy: PlanStrategy,
+        config: &crate::config::CompactionPlanningConfig,
+    ) -> Result<Vec<FileGroup>> {
         let scan = table
             .scan()
             .snapshot_id(snapshot_id)
@@ -57,56 +59,6 @@ impl FileSelector {
             .try_collect()
             .await?;
 
-        // Apply file filtering strategy using static dispatch
-        let filtered_data_files: Vec<FileScanTask> = strategy.filter_iter(data_files.into_iter());
-
-        // Extract delete files from the filtered data files
-        Self::build_input_file_scan_tasks(filtered_data_files)
-    }
-
-    /// Build `InputFileScanTasks` from filtered data files
-    fn build_input_file_scan_tasks(
-        filtered_data_files: Vec<FileScanTask>,
-    ) -> Result<InputFileScanTasks> {
-        let mut position_delete_files = HashMap::new();
-        let mut equality_delete_files = HashMap::new();
-
-        for task in &filtered_data_files {
-            for delete_task in &task.deletes {
-                match &delete_task.data_file_content {
-                    iceberg::spec::DataContentType::PositionDeletes => {
-                        position_delete_files.insert(&delete_task.data_file_path, delete_task);
-                    }
-                    iceberg::spec::DataContentType::EqualityDeletes => {
-                        equality_delete_files.insert(&delete_task.data_file_path, delete_task);
-                    }
-                    _ => {
-                        unreachable!()
-                    }
-                }
-            }
-        }
-        let position_delete_files = position_delete_files
-            .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = vec![];
-                file
-            })
-            .collect::<Vec<FileScanTask>>();
-        let equality_delete_files = equality_delete_files
-            .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone();
-                file
-            })
-            .collect::<Vec<FileScanTask>>();
-
-        Ok(InputFileScanTasks {
-            data_files: filtered_data_files,
-            position_delete_files,
-            equality_delete_files,
-        })
+        strategy.execute(data_files, config)
     }
 }
