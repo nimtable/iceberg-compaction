@@ -16,11 +16,11 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
+use iceberg::{ErrorKind, Result};
 use iceberg::{
     spec::DataFile,
     writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
 };
-use iceberg::{ErrorKind, Result};
 use tokio::task::JoinHandle;
 
 use crate::config::{
@@ -227,7 +227,7 @@ where
     B: IcebergWriterBuilder<R = D>,
     D: IcebergWriter + CurrentFileStatus,
 {
-    /// Write a RecordBatch. If the current file size plus the new batch size
+    /// Write a `RecordBatch`. If the current file size plus the new batch size
     /// exceeds the target, close the current file and start a new one.
     async fn write(&mut self, input: RecordBatch) -> Result<()> {
         let input_size = input.get_array_memory_size() as u64;
