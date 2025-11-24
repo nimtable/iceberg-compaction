@@ -15,21 +15,21 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
+use crate::CompactionError;
+use crate::Result;
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
-    create_compaction_executor, ExecutorType, RewriteFilesRequest, RewriteFilesResponse,
-    RewriteFilesStat,
+    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
+    create_compaction_executor,
 };
 use crate::file_selection::{FileGroup, FileSelector};
-use crate::CompactionError;
-use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
@@ -647,31 +647,31 @@ impl Compaction {
             .await?;
 
         // Run validation if enabled
-        if execution_config.enable_validate_compaction {
-            if let Some(validation_info) = &rewrite_result.validation_info {
-                let mut validator = CompactionValidator::new(
-                    validation_info.file_group.clone(),
-                    rewrite_result.output_data_files.clone(),
-                    validation_info.executor_parallelism,
-                    final_table.metadata().current_schema().clone(),
-                    final_table.metadata().current_schema().clone(),
-                    final_table.clone(),
-                    self.catalog_name.clone(),
-                    self.to_branch.clone(),
-                )
-                .await?;
+        if execution_config.enable_validate_compaction
+            && let Some(validation_info) = &rewrite_result.validation_info
+        {
+            let mut validator = CompactionValidator::new(
+                validation_info.file_group.clone(),
+                rewrite_result.output_data_files.clone(),
+                validation_info.executor_parallelism,
+                final_table.metadata().current_schema().clone(),
+                final_table.metadata().current_schema().clone(),
+                final_table.clone(),
+                self.catalog_name.clone(),
+                self.to_branch.clone(),
+            )
+            .await?;
 
-                validator.validate().await?;
-                tracing::info!(
-                    "Compaction validation completed successfully for table '{}'",
-                    self.table_ident
-                );
-            }
+            validator.validate().await?;
+            tracing::info!(
+                "Compaction validation completed successfully for table '{}'",
+                self.table_ident
+            );
         }
 
         // Record metrics for single plan compaction
         self.record_overall_metrics(
-            &[rewrite_result.clone()],
+            std::slice::from_ref(&rewrite_result),
             overall_start_time,
             commit_start_time,
         );
@@ -1190,11 +1190,7 @@ impl CompactionPlan {
 
     /// Returns group count: 0 if empty, 1 otherwise.
     pub fn group_count(&self) -> usize {
-        if self.file_group.is_empty() {
-            0
-        } else {
-            1
-        }
+        if self.file_group.is_empty() { 0 } else { 1 }
     }
 
     /// Returns recommended executor parallelism from file group.
@@ -1288,24 +1284,24 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIOBuilder;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, MAIN_BRANCH};
+    use iceberg::spec::{MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::Table;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
+        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
+        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
     };
     use iceberg::writer::{
-        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
+        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;
@@ -1857,7 +1853,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// Test the plan_compaction functionality
+    /// Test the `plan_compaction` functionality
     #[tokio::test]
     async fn test_plan_compaction() {
         let env = create_test_env().await;
@@ -1883,7 +1879,7 @@ mod tests {
         assert_eq!(plan.group_count(), 1);
     }
 
-    /// Test plan_compaction with non-existent branch
+    /// Test `plan_compaction` with non-existent branch
     #[tokio::test]
     async fn test_plan_compaction_invalid_branch() {
         let env = create_test_env().await;
@@ -1919,7 +1915,7 @@ mod tests {
         }
     }
 
-    /// Test the compact_with_plan functionality
+    /// Test the `compact_with_plan` functionality
     #[tokio::test]
     async fn test_compact_with_plan() {
         let env = create_test_env().await;
@@ -1954,7 +1950,7 @@ mod tests {
         assert_compaction_stats(&result.stats, initial_file_count, false);
     }
 
-    /// Test compact_with_plan with empty plan (merged from test_compact_with_plan_empty and test_compact_no_files)
+    /// Test `compact_with_plan` with empty plan (merged from `test_compact_with_plan_empty` an`test_compact_no_files`es)
     #[tokio::test]
     async fn test_compact_with_empty_plan() {
         use crate::file_selection::FileGroup;
@@ -2008,7 +2004,7 @@ mod tests {
         }
     }
 
-    /// Test compact_with_plan with branch functionality
+    /// Test `compact_with_plan` with branch functionality
     #[tokio::test]
     async fn test_compact_with_plan_with_branch() {
         let env = create_branch_test_env().await;
@@ -2242,7 +2238,7 @@ mod tests {
         );
     }
 
-    /// Test branch validation in rewrite_plan method
+    /// Test branch validation in `rewrite_plan` method
     #[tokio::test]
     async fn test_rewrite_plan_branch_validation() {
         use crate::config::CompactionExecutionConfigBuilder;
@@ -2278,7 +2274,7 @@ mod tests {
         );
     }
 
-    /// Test CompactionBuilder configuration
+    /// Test `CompactionBuilder` configuration
     #[tokio::test]
     async fn test_compaction_builder() {
         let env = create_test_env().await;
@@ -2326,7 +2322,7 @@ mod tests {
         );
     }
 
-    /// Test rewrite_plan with invalid snapshot
+    /// Test `rewrite_plan` with invalid snapshot
     #[tokio::test]
     async fn test_rewrite_plan_invalid_snapshot() {
         let env = create_test_env().await;
@@ -2382,7 +2378,7 @@ mod tests {
         }
     }
 
-    /// Test plan_compaction without config should fail
+    /// Test `plan_compaction` without config should fail
     #[tokio::test]
     async fn test_plan_compaction_without_config() {
         let env = create_test_env().await;
