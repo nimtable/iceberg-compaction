@@ -6,7 +6,6 @@ repos:
     rev: v2.3.0
     hooks:
     -   id: end-of-file-fixer
-        exclude: 'src/frontend/planner_test/tests/testdata/.*'
     -   id: trailing-whitespace
 -   repo: https://github.com/crate-ci/typos
     rev: v1.30.2
