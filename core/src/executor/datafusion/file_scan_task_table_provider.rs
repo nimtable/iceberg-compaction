@@ -78,7 +78,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
     /// Scans the iceberg file scan tasks
     ///
     /// This function creates an execution plan for scanning the iceberg file scan tasks.
-    /// It uses the IcebergFileTaskScan struct to create the execution plan.
+    /// It uses the `IcebergFileTaskScan` struct to create the execution plan.
     async fn scan(
         &self,
         _state: &dyn Session,

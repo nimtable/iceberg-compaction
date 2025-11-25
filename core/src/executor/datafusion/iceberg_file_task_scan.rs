@@ -262,7 +262,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         self
     }
 
-    fn children(&self) -> Vec<&Arc<(dyn ExecutionPlan + 'static)>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
     }
 
