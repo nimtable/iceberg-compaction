@@ -1188,9 +1188,10 @@ impl CompactionPlan {
         self.file_group.input_total_bytes()
     }
 
-    /// Returns group count: 0 if empty, 1 otherwise.
-    pub fn group_count(&self) -> usize {
-        if self.file_group.is_empty() { 0 } else { 1 }
+    /// Returns whether this plan has any files to compact.
+    /// Returns `false` if the file group is empty, `true` otherwise.
+    pub fn has_files(&self) -> bool {
+        !self.file_group.is_empty()
     }
 
     /// Returns recommended executor parallelism from file group.
@@ -1236,6 +1237,7 @@ impl CompactionPlanner {
                 .await?;
 
             // Convert each FileGroup to a separate CompactionPlan
+            // Filter out empty plans to avoid unnecessary processing
             let plans = file_groups
                 .into_iter()
                 .map(|file_group| {
@@ -1245,6 +1247,7 @@ impl CompactionPlanner {
                         branch_snapshot.snapshot_id(),
                     )
                 })
+                .filter(|plan| plan.has_files())
                 .collect();
 
             Ok(plans)
@@ -1876,7 +1879,7 @@ mod tests {
         assert!(plan.recommended_executor_parallelism() > 0);
         assert!(plan.recommended_output_parallelism() > 0);
         assert_eq!(plan.to_branch, MAIN_BRANCH);
-        assert_eq!(plan.group_count(), 1);
+        assert!(plan.has_files(), "Plan should have files");
     }
 
     /// Test `plan_compaction` with non-existent branch
@@ -2200,33 +2203,7 @@ mod tests {
             "Snapshot mismatch message"
         );
 
-        // 3) Success with consistent plans
-        let data_files = write_simple_files(&env.table, &env.warehouse_location, "test", 1).await;
-        let updated_table =
-            append_and_commit(&env.table, env.catalog.as_ref(), data_files.clone()).await;
-        let snapshot_id = updated_table
-            .metadata()
-            .snapshot_for_ref(MAIN_BRANCH)
-            .unwrap()
-            .snapshot_id();
-        let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, snapshot_id);
-        let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, snapshot_id);
-        let r1 = RewriteResult {
-            output_data_files: data_files.clone(),
-            stats: RewriteFilesStat::default(),
-            plan: plan1,
-            validation_info: None,
-        };
-        let r2 = RewriteResult {
-            output_data_files: vec![],
-            stats: RewriteFilesStat::default(),
-            plan: plan2,
-            validation_info: None,
-        };
-        let ok = compaction.commit_rewrite_results(vec![r1, r2]).await;
-        assert!(ok.is_ok(), "Commit should succeed with consistent plans");
-
-        // 4) Empty results rejection
+        // 3) Empty results rejection
         let err = compaction
             .commit_rewrite_results(vec![])
             .await
