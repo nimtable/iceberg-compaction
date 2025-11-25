@@ -21,35 +21,35 @@ use iceberg::{
     spec::{DataFile, Schema},
     table::Table,
     writer::{
-        IcebergWriter, IcebergWriterBuilder,
         base_writer::{
             data_file_writer::DataFileWriterBuilder,
             equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
             sort_position_delete_writer::{
-                POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+                SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
             },
         },
         file_writer::{
-            ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            ParquetWriterBuilder,
         },
         function_writer::equality_delta_writer::{
-            DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+            EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
         },
+        IcebergWriter, IcebergWriterBuilder,
     },
 };
 use iceberg_compaction_core::{
-    CompactionError, error::Result, executor::datafusion::build_parquet_writer_builder,
+    error::Result, executor::datafusion::build_parquet_writer_builder, CompactionError,
 };
 use parquet::file::properties::WriterProperties;
-use rand::{Rng, distr::Alphanumeric};
+use rand::{distr::Alphanumeric, Rng};
 use std::sync::Arc;
 
 use datafusion::arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
     },
     compute::filter,
     datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},

@@ -15,21 +15,21 @@
  */
 
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::spec::{DataFile, Snapshot, MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
-    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
-    create_compaction_executor,
+    create_compaction_executor, ExecutorType, RewriteFilesRequest, RewriteFilesResponse,
+    RewriteFilesStat,
 };
 use crate::file_selection::{FileGroup, FileSelector};
+use crate::CompactionError;
+use crate::Result;
 use crate::{CompactionConfig, CompactionExecutor};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
@@ -1190,7 +1190,11 @@ impl CompactionPlan {
 
     /// Returns group count: 0 if empty, 1 otherwise.
     pub fn group_count(&self) -> usize {
-        if self.file_group.is_empty() { 0 } else { 1 }
+        if self.file_group.is_empty() {
+            0
+        } else {
+            1
+        }
     }
 
     /// Returns recommended executor parallelism from file group.
@@ -1284,24 +1288,24 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::io::FileIOBuilder;
-    use iceberg::spec::{MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, MAIN_BRANCH};
     use iceberg::table::Table;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_SCHEMA,
     };
-    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
     };
     use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder, IcebergWriter, IcebergWriterBuilder,
     };
     use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use iceberg_catalog_memory::MemoryCatalog;

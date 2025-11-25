@@ -24,8 +24,8 @@ use crate::{
 use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
+        execute_stream_partitioned, repartition::RepartitionExec, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -1645,10 +1645,8 @@ mod tests {
 
         // Should contain quoted keyword columns in SELECT and internal queries
         assert!(sql_with_pos.contains(r#"SELECT "from", "select", "where" FROM"#));
-        assert!(
-            sql_with_pos
-                .contains(r#""from", "select", "where", "sys_hidden_file_path", "sys_hidden_pos""#)
-        );
+        assert!(sql_with_pos
+            .contains(r#""from", "select", "where", "sys_hidden_file_path", "sys_hidden_pos""#));
 
         // Test case 3: Keyword columns with equality deletes
         let equality_delete_metadata = EqualityDeleteMetadata::new(

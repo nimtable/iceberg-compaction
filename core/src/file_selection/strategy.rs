@@ -1008,11 +1008,9 @@ mod tests {
             min_size: Some(50 * 1024 * 1024),
             max_size: Some(10 * 1024 * 1024),
         };
-        let test_files = vec![
-            TestFileBuilder::new("any.parquet")
-                .size(30 * 1024 * 1024)
-                .build(),
-        ];
+        let test_files = vec![TestFileBuilder::new("any.parquet")
+            .size(30 * 1024 * 1024)
+            .build()];
         let result = invalid_strategy.filter(test_files);
         assert_eq!(result.len(), 0, "Invalid range should filter out all files");
     }
@@ -1287,11 +1285,9 @@ mod tests {
 
         let default_strategy = PlanStrategy::from(&default_config);
 
-        let single_file = vec![
-            TestFileBuilder::new("single.parquet")
-                .size(5 * 1024 * 1024)
-                .build(),
-        ];
+        let single_file = vec![TestFileBuilder::new("single.parquet")
+            .size(5 * 1024 * 1024)
+            .build()];
         let single_result = TestUtils::execute_strategy_flat(&default_strategy, single_file);
         assert_eq!(single_result.len(), 1);
         TestUtils::assert_paths_eq(&["single.parquet"], &single_result);
@@ -1341,11 +1337,9 @@ mod tests {
                     .size(75 * 1024 * 1024)
                     .build(),
             ]), // 225MB, 3 files
-            FileGroup::new(vec![
-                TestFileBuilder::new("single.parquet")
-                    .size(20 * 1024 * 1024)
-                    .build(),
-            ]), // 20MB, 1 file
+            FileGroup::new(vec![TestFileBuilder::new("single.parquet")
+                .size(20 * 1024 * 1024)
+                .build()]), // 20MB, 1 file
         ];
 
         let test_cases = vec![
@@ -1553,11 +1547,9 @@ mod tests {
         assert_eq!(single_enum.to_string(), "SingleGrouping");
 
         // Single-file case for Single
-        let single = vec![
-            TestFileBuilder::new("single.parquet")
-                .size(20 * 1024 * 1024)
-                .build(),
-        ];
+        let single = vec![TestFileBuilder::new("single.parquet")
+            .size(20 * 1024 * 1024)
+            .build()];
         let single_file_groups = single_enum.group_files(single.into_iter());
         assert_eq!(single_file_groups.len(), 1);
         assert_eq!(single_file_groups[0].data_file_count, 1);
@@ -1627,11 +1619,9 @@ mod tests {
     #[test]
     fn test_file_group_parallelism_immutability() {
         // Verify that with_calculated_parallelism doesn't mutate original
-        let files = vec![
-            TestFileBuilder::new("file1.parquet")
-                .size(15 * 1024 * 1024)
-                .build(),
-        ];
+        let files = vec![TestFileBuilder::new("file1.parquet")
+            .size(15 * 1024 * 1024)
+            .build()];
 
         let original_group = FileGroup::new(files);
         let original_exec_p = original_group.executor_parallelism;
