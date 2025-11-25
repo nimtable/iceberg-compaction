@@ -42,6 +42,8 @@ pub struct MockIcebergConfig {
     pub schemas: SchemasConfig,
     #[serde(rename = "WriterConfig")]
     pub writer_config: WriterConfigYaml,
+    #[serde(rename = "WithCompactionValidations", default)]
+    pub with_compaction_validations: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,9 +170,7 @@ impl MockIcebergConfig {
 }
 
 /// Create a mock Iceberg table based on YAML configuration
-pub async fn mock_iceberg_table() -> Result<()> {
-    // Load configuration
-    let config = MockIcebergConfig::from_yaml_file(DEFAULT_CONFIG_PATH)?;
+pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
     let pk_indices = config.get_pk_field_ids();
     // Get catalog from config
     let catalog = config.rest_catalog.load_catalog();
@@ -285,4 +285,20 @@ pub async fn mock_iceberg_table() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Delete table defined in YAML configuration (if exists)
+pub async fn delete_table_from_config(config: &MockIcebergConfig) -> Result<()> {
+    let catalog = config.rest_catalog.load_catalog();
+    let namespace_ident = NamespaceIdent::new(config.rest_catalog.database_name.clone());
+    let table_ident =
+        iceberg::TableIdent::new(namespace_ident, config.rest_catalog.table_name.clone());
+
+    // Attempt to drop the table; ignore errors if it doesn't exist
+    match catalog.drop_table(&table_ident).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(iceberg_compaction_core::CompactionError::Execution(
+            format!("Failed to drop table: {}", e),
+        )),
+    }
 }
