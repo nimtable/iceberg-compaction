@@ -18,10 +18,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::future::try_join_all;
 use iceberg::{
+    Catalog, NamespaceIdent, TableCreation,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY},
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
-    Catalog, NamespaceIdent, TableCreation,
 };
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use iceberg_compaction_core::error::Result;

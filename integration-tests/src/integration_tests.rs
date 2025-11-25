@@ -21,9 +21,9 @@ use std::{collections::HashMap, sync::Arc};
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
 use iceberg::{
+    Catalog, NamespaceIdent, TableCreation, TableIdent,
     spec::{NestedField, PrimitiveType, Schema, Type},
     transaction::Transaction,
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
 };
 
 #[tokio::test]
