@@ -32,7 +32,7 @@ use crate::executor::{
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionExecutor};
 use iceberg::table::Table;
-use iceberg::transaction::Transaction;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::sync::Arc;
 use std::time::Duration;
@@ -593,9 +593,8 @@ impl Compaction {
         file_group: &FileGroup,
         execution_config: &CompactionExecutionConfig,
     ) -> Result<RewriteFilesRequest> {
-        let schema = table.metadata().current_schema();
-        let default_location_generator =
-            DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let schema = table.metadata().current_schema().clone();
+        let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
@@ -604,10 +603,10 @@ impl Compaction {
 
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
-            schema: schema.clone(),
+            schema,
             file_group: file_group.clone(),
             execution_config: Arc::new(execution_config.clone()),
-            dir_path: default_location_generator.dir_path,
+            location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
         })
@@ -971,13 +970,13 @@ impl CommitManager {
                 let rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        txn.rewrite_files(None, vec![])?
-                            .with_delete_filter_manager_enabled()
-                            .add_data_files(data_files)?
-                            .delete_files(delete_files)?
-                            .with_to_branch(to_branch.to_owned())
-                            .with_starting_sequence_number(snapshot.sequence_number())?
-                            .with_check_file_existence(true)
+                        txn.rewrite_files()
+                            .set_enable_delete_filter_manager(true)
+                            .add_data_files(data_files)
+                            .delete_files(delete_files)
+                            .set_target_branch(to_branch.to_owned())
+                            .set_new_data_file_sequence_number(snapshot.sequence_number())
+                            .set_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -987,15 +986,15 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    txn.rewrite_files(None, vec![])?
-                        .with_delete_filter_manager_enabled()
-                        .add_data_files(data_files)?
-                        .delete_files(delete_files)?
-                        .with_to_branch(to_branch.to_owned())
-                        .with_check_file_existence(true)
+                    txn.rewrite_files()
+                        .set_enable_delete_filter_manager(true)
+                        .add_data_files(data_files)
+                        .delete_files(delete_files)
+                        .set_target_branch(to_branch.to_owned())
+                        .set_check_file_existence(true)
                 };
 
-                let txn = rewrite_action.apply().await?;
+                let txn = rewrite_action.apply(txn)?;
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
@@ -1080,12 +1079,12 @@ impl CommitManager {
                 let overwrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        txn.overwrite_files(None, vec![])?
-                            .add_data_files(data_files)?
-                            .delete_files(delete_files)?
-                            .with_to_branch(to_branch.to_owned())
-                            .with_starting_sequence_number(snapshot.sequence_number())?
-                            .with_check_file_existence(true)
+                        txn.overwrite_files()
+                            .add_data_files(data_files)
+                            .delete_files(delete_files)
+                            .set_target_branch(to_branch.to_owned())
+                            .set_new_data_file_sequence_number(snapshot.sequence_number())
+                            .set_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -1095,14 +1094,14 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    txn.overwrite_files(None, vec![])?
-                        .add_data_files(data_files)?
-                        .delete_files(delete_files)?
-                        .with_to_branch(to_branch.to_owned())
-                        .with_check_file_existence(true)
+                    txn.overwrite_files()
+                        .add_data_files(data_files)
+                        .delete_files(delete_files)
+                        .set_target_branch(to_branch.to_owned())
+                        .set_check_file_existence(true)
                 };
 
-                let txn = overwrite_action.apply().await?;
+                let txn = overwrite_action.apply(txn)?;
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
@@ -1300,9 +1299,9 @@ mod tests {
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
-    use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
-    };
+    // use iceberg::writer::function_writer::equality_delta_writer::{
+    //     DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
+    // };
     use iceberg::writer::{
         IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };

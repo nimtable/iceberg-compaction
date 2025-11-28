@@ -543,29 +543,33 @@ impl DataFusionTaskContextBuilder {
         Ok(position_delete_schema)
     }
 
-    // build data fusion task context
+    // build datafusion task context
     pub fn build(self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
         // Build schema for equality delete file, equality_ids + seq_num
-        let mut equality_ids: Option<Vec<i32>> = None;
+        let mut prev_equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
         for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
-            if equality_ids
+            let task_equality_ids = task.equality_ids.as_ref().ok_or_else(|| {
+                CompactionError::Execution("Equality delete file missing equality_ids".to_owned())
+            })?;
+
+            if prev_equality_ids
                 .as_ref()
-                .is_none_or(|ids| !ids.eq(&task.equality_ids))
+                .is_none_or(|ids| ids != task_equality_ids)
             {
                 // If ids are different or not assigned, create a new metadata
                 let equality_delete_schema =
-                    self.build_equality_delete_schema(&task.equality_ids, &mut highest_field_id)?;
+                    self.build_equality_delete_schema(task_equality_ids, &mut highest_field_id)?;
                 let equality_delete_table_name =
                     table_name::build_equality_delete_table_name(&self.table_prefix, table_idx);
                 equality_delete_metadatas.push(EqualityDeleteMetadata::new(
                     equality_delete_schema,
                     equality_delete_table_name,
                 ));
-                equality_ids = Some(task.equality_ids.clone());
+                prev_equality_ids = Some(task_equality_ids.clone());
             }
 
             // Add the file scan task to the last metadata

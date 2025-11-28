@@ -16,6 +16,7 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
+use iceberg::spec::PartitionKey;
 use iceberg::{ErrorKind, Result};
 use iceberg::{
     spec::DataFile,
@@ -219,6 +220,8 @@ pub struct RollingIcebergWriter<B, D> {
     close_futures: CloseFuture,
     /// Maximum number of concurrent close operations allowed.
     max_concurrent_closes: usize,
+    /// Optional partition key for the writer.
+    partition_key: Option<PartitionKey>,
 }
 
 #[async_trait::async_trait]
@@ -304,7 +307,12 @@ where
 
         // Write the batch to the current writer.
         if self.inner_writer.is_none() {
-            self.inner_writer = Some(self.inner_writer_builder.clone().build().await?);
+            self.inner_writer = Some(
+                self.inner_writer_builder
+                    .clone()
+                    .build(self.partition_key.clone())
+                    .await?,
+            );
         }
         self.inner_writer.as_mut().unwrap().write(input).await?;
 
@@ -428,6 +436,7 @@ pub struct RollingIcebergWriterBuilder<B> {
     max_concurrent_closes: Option<usize>,
     enable_dynamic_size_estimation: Option<bool>,
     size_estimation_smoothing_factor: Option<f64>,
+    partition_key: Option<PartitionKey>,
 }
 
 impl<B> RollingIcebergWriterBuilder<B> {
@@ -438,6 +447,7 @@ impl<B> RollingIcebergWriterBuilder<B> {
             max_concurrent_closes: None,
             enable_dynamic_size_estimation: None,
             size_estimation_smoothing_factor: None,
+            partition_key: None,
         }
     }
 
@@ -463,6 +473,11 @@ impl<B> RollingIcebergWriterBuilder<B> {
         self.size_estimation_smoothing_factor = Some(factor);
         self
     }
+
+    pub fn with_partition_key(mut self, partition_key: PartitionKey) -> Self {
+        self.partition_key = Some(partition_key);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -473,7 +488,7 @@ where
 {
     type R = RollingIcebergWriter<B, B::R>;
 
-    async fn build(self) -> Result<Self::R> {
+    async fn build(self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         let enable_estimation = self
             .enable_dynamic_size_estimation
             .unwrap_or(DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION);
@@ -483,7 +498,7 @@ where
 
         Ok(RollingIcebergWriter {
             inner_writer_builder: self.inner_builder.clone(),
-            inner_writer: Some(self.inner_builder.build().await?),
+            inner_writer: Some(self.inner_builder.build(partition_key.clone()).await?),
             target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
             data_files: Vec::new(),
             size_tracker: SizeEstimationTracker::new(enable_estimation, smoothing_factor),
@@ -491,6 +506,7 @@ where
             max_concurrent_closes: self
                 .max_concurrent_closes
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_CLOSES),
+            partition_key: self.partition_key,
         })
     }
 }

@@ -97,7 +97,7 @@ impl FileGroup {
             .into_values()
             .map(|file| {
                 let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone();
+                file.project_field_ids = file.equality_ids.clone().unwrap_or_default();
                 file
             })
             .collect::<Vec<FileScanTask>>();

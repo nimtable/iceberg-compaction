@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::{io::FileIO, spec::PartitionSpec};
+use iceberg::{
+    io::FileIO, spec::PartitionSpec,
+    writer::file_writer::location_generator::DefaultLocationGenerator,
+};
 
 use crate::common::CompactionMetricsRecorder;
 use crate::config::CompactionExecutionConfig;
@@ -41,9 +44,9 @@ pub struct RewriteFilesRequest {
     pub schema: Arc<Schema>,
     pub file_group: FileGroup,
     pub execution_config: Arc<CompactionExecutionConfig>,
-    pub dir_path: String,
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
+    pub location_generator: DefaultLocationGenerator,
 }
 
 #[derive(Debug, Clone, Default)]
