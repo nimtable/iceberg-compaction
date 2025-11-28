@@ -20,7 +20,7 @@ tokio = { workspace = true }
 
 # Iceberg and catalog
 iceberg = { workspace = true }
-iceberg-catalog-memory = { workspace = true }
+# iceberg-catalog-memory = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 
