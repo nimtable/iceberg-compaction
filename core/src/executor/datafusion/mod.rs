@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::{StreamExt, future::try_join_all};
 use iceberg::{
+    arrow::RecordBatchPartitionSplitter,
     io::FileIO,
     spec::{DataFile, PartitionSpec, Schema},
     writer::{
@@ -202,8 +203,22 @@ pub async fn build_iceberg_data_file_writer(
                 execution_config.size_estimation_smoothing_factor,
             );
 
-    let iceberg_task_writer =
-        TaskWriter::new(rolling_iceberg_writer_builder, true, schema, partition_spec);
+    let partition_splitter = if partition_spec.is_unpartitioned() {
+        None
+    } else {
+        Some(RecordBatchPartitionSplitter::new_with_computed_values(
+            schema.clone(),
+            partition_spec.clone(),
+        )?)
+    };
+
+    let iceberg_task_writer = TaskWriter::new_with_partition_splitter(
+        rolling_iceberg_writer_builder,
+        true,
+        schema,
+        partition_spec,
+        partition_splitter,
+    );
 
     Ok(Box::new(iceberg_task_writer))
 }
