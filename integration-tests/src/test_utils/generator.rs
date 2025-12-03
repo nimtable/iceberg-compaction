@@ -18,29 +18,26 @@ use async_stream::try_stream;
 use iceberg::{
     arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
     io::FileIO,
-    spec::{DataFile, Schema},
+    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
     table::Table,
     writer::{
         IcebergWriter, IcebergWriterBuilder,
         base_writer::{
             data_file_writer::DataFileWriterBuilder,
             equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
-            sort_position_delete_writer::{
-                POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
-            },
+            position_delete_file_writer::PositionDeleteFileWriterBuilder,
         },
         file_writer::{
             ParquetWriterBuilder,
             location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            rolling_writer::RollingFileWriterBuilder,
         },
         function_writer::equality_delta_writer::{
             DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
         },
     },
 };
-use iceberg_compaction_core::{
-    CompactionError, error::Result, executor::datafusion::build_parquet_writer_builder,
-};
+use iceberg_compaction_core::{CompactionError, error::Result};
 use parquet::file::properties::WriterProperties;
 use rand::{Rng, distr::Alphanumeric};
 use std::sync::Arc;
@@ -66,12 +63,16 @@ const DEFAULT_DATA_FILE_PREFIX: &str = "test_berg_loom";
 const DEFAULT_DATA_SUBDIR: &str = "/data";
 
 pub type EqualityDeleteDeltaWriterBuilder = EqualityDeltaWriterBuilder<
-    DataFileWriterBuilder<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>>,
-    SortPositionDeleteWriterBuilder<
-        ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>,
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>,
+    PositionDeleteFileWriterBuilder<
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
     >,
     EqualityDeleteFileWriterBuilder<
-        ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>,
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
     >,
 >;
 
@@ -360,51 +361,73 @@ impl FileGenerator {
             file_io,
             equality_ids,
         } = self.writer_config.clone();
-        let parquet_writer_builder = build_parquet_writer_builder(
-            data_file_prefix.clone(),
-            dir_path.clone(),
-            self.schema.clone(),
-            file_io.clone(),
-            WriterProperties::default(),
-        )?;
-        let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
-
-        let parquet_writer_builder = build_parquet_writer_builder(
-            data_file_prefix.clone(),
-            dir_path.clone(),
-            POSITION_DELETE_SCHEMA.clone(),
-            file_io.clone(),
-            WriterProperties::default(),
-        )?;
-        let position_delete_file_writer_builder = SortPositionDeleteWriterBuilder::new(
-            parquet_writer_builder.clone(),
-            self.config.position_delete_row_count,
+        let location_generator = DefaultLocationGenerator::with_data_location(dir_path);
+        let file_name_generator = DefaultFileNameGenerator::new(
+            data_file_prefix,
             None,
-            None,
+            iceberg::spec::DataFileFormat::Parquet,
         );
+
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::default(), self.schema.clone());
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            file_io.clone(),
+            location_generator.clone(),
+            file_name_generator.clone(),
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+        let position_delete_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        2147483546,
+                        "file_path",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(2147483545, "pos", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                ])
+                .build()?,
+        );
+        let position_delete_writer_builder = PositionDeleteFileWriterBuilder::new(
+            RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(
+                    WriterProperties::default(),
+                    position_delete_schema.clone(),
+                ),
+                file_io.clone(),
+                location_generator.clone(),
+                file_name_generator.clone(),
+            ),
+        );
+
         let equality_delete_writer_config =
-            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone(), None, 0)?;
-        let parquet_writer_builder = build_parquet_writer_builder(
-            data_file_prefix.clone(),
-            dir_path.clone(),
-            Arc::new(arrow_schema_to_schema(
-                equality_delete_writer_config.projected_arrow_schema_ref(),
-            )?),
-            file_io.clone(),
-            WriterProperties::default(),
-        )?;
-        let equality_delete_file_writer_builder = EqualityDeleteFileWriterBuilder::new(
-            parquet_writer_builder.clone(),
-            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone(), None, 0)?,
+            EqualityDeleteWriterConfig::new(equality_ids.clone(), self.schema.clone())?;
+        let equality_delete_writer_builder = EqualityDeleteFileWriterBuilder::new(
+            RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(
+                    WriterProperties::default(),
+                    Arc::new(arrow_schema_to_schema(
+                        equality_delete_writer_config.projected_arrow_schema_ref(),
+                    )?),
+                ),
+                file_io,
+                location_generator,
+                file_name_generator,
+            ),
+            equality_delete_writer_config.clone(),
         );
 
-        let iceberg_writer_builder = EqualityDeltaWriterBuilder::new(
+        Ok(EqualityDeltaWriterBuilder::new(
             data_file_writer_builder,
-            position_delete_file_writer_builder,
-            equality_delete_file_writer_builder,
+            position_delete_writer_builder,
+            equality_delete_writer_builder,
             equality_ids,
-        );
-        Ok(iceberg_writer_builder)
+            self.schema.clone(),
+        ))
     }
 
     /// Generates data files with random data, equality deletes, and position deletes
@@ -424,8 +447,10 @@ impl FileGenerator {
 
         let equality_delete_delta_writer_builder =
             self.build_equality_delete_delta_writer_builder()?;
-        let mut equality_delete_delta_writer =
-            equality_delete_delta_writer_builder.clone().build().await?;
+        let mut equality_delete_delta_writer = equality_delete_delta_writer_builder
+            .clone()
+            .build(None)
+            .await?;
 
         let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
             None
@@ -475,8 +500,10 @@ impl FileGenerator {
 
             if data_file_num + num_rows > self.config.data_file_row_count {
                 data_files.extend(equality_delete_delta_writer.close().await?);
-                equality_delete_delta_writer =
-                    equality_delete_delta_writer_builder.clone().build().await?;
+                equality_delete_delta_writer = equality_delete_delta_writer_builder
+                    .clone()
+                    .build(None)
+                    .await?;
                 data_file_num = 0;
             }
             data_file_num += num_rows;

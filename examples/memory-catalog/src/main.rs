@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use iceberg_compaction_core::iceberg::io::FileIOBuilder;
+use iceberg_compaction_core::iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg_compaction_core::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg_compaction_core::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_compaction_core::iceberg_catalog_memory::MemoryCatalog;
+use iceberg_compaction_core::iceberg::{
+    Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
+};
 
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::CompactionConfigBuilder;
@@ -33,8 +34,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
 
     // 2. Create file I/O and memory catalog
-    let file_io = FileIOBuilder::new_fs_io().build()?;
-    let catalog = Arc::new(MemoryCatalog::new(file_io, Some(warehouse_location)));
+    let catalog = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse_location.clone(),
+                )]),
+            )
+            .await?,
+    );
 
     // 3. Create namespace and table
     let namespace_ident = NamespaceIdent::new("my_namespace".into());

@@ -23,7 +23,7 @@ use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterCon
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation, TableIdent,
     spec::{NestedField, PrimitiveType, Schema, Type},
-    transaction::Transaction,
+    transaction::{ApplyTransactionAction, Transaction},
 };
 
 #[tokio::test]
@@ -112,17 +112,10 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
 
     // Commit files to table
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn
-        .fast_append(None, None, vec![])
-        .expect("Failed to create fast append action");
-
-    fast_append_action
-        .add_data_files(commit_data_files)
-        .expect("Failed to add data files");
+    let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
 
     let _table_with_data = fast_append_action
-        .apply()
-        .await
+        .apply(txn)
         .expect("Failed to apply transaction")
         .commit(catalog.as_ref())
         .await
@@ -248,17 +241,10 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // Commit files to table
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn
-        .fast_append(None, None, vec![])
-        .expect("Failed to create fast append action");
-
-    fast_append_action
-        .add_data_files(commit_data_files)
-        .expect("Failed to add data files");
+    let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
 
     let _table_with_data = fast_append_action
-        .apply()
-        .await
+        .apply(txn)
         .expect("Failed to apply transaction")
         .commit(catalog.as_ref())
         .await

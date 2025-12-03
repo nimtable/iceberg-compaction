@@ -20,7 +20,7 @@ use std::sync::Arc;
 use iceberg_compaction_core::iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
-use iceberg_compaction_core::iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg_compaction_core::iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::CompactionConfigBuilder;
@@ -47,15 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // iceberg_configs.insert("oauth2-server-uri".to_owned(), "http://localhost:8080/oauth2".to_owned());
     // iceberg_configs.insert("scope".to_owned(), "your-scope".to_owned());
 
-    let config_builder =
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogConfig::builder()
-            .uri("http://localhost:8080/your/catalog/uri".to_owned())
-            .warehouse("your-warehouse-location".to_owned())
-            .props(iceberg_configs);
-
-    // 2. Create the catalog
     let catalog = Arc::new(
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalog::new(config_builder.build()),
+        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+            .load("rest", iceberg_configs)
+            .await
+            .expect("failed to build rest catalog"),
     );
 
     let namespace_ident = NamespaceIdent::new("my_namespace".into());

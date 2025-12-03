@@ -177,7 +177,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 /// // Create a basic rolling writer (dynamic size estimation disabled by default)
 /// let writer = RollingIcebergWriterBuilder::new(inner_builder)
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
-///     .build()?;
+///     .build(None)?;
 /// ```
 ///
 /// ## With Dynamic Size Estimation
@@ -189,7 +189,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
 ///     .with_dynamic_size_estimation(true)       // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.3) // Adjust smoothing (optional)
-///     .build()?;
+///     .build(None)?;
 /// ```
 ///
 /// ## Custom Configuration
@@ -202,7 +202,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_max_concurrent_closes(8)              // Allow 8 concurrent closes
 ///     .with_dynamic_size_estimation(true)         // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.2) // More stable estimation
-///     .build()?;
+///     .build(None)?;
 /// ```
 pub struct RollingIcebergWriter<B, D> {
     /// Builder for creating new inner writers.
@@ -760,7 +760,7 @@ mod tests {
     impl IcebergWriterBuilder for MockIcebergWriterBuilder {
         type R = MockIcebergWriter;
 
-        async fn build(self) -> Result<Self::R> {
+        async fn build(self, _partition_key: Option<PartitionKey>) -> Result<Self::R> {
             Ok(MockIcebergWriter {
                 written_size: 0,
                 should_flush: self.should_flush,
@@ -814,28 +814,6 @@ mod tests {
         fn current_row_num(&self) -> usize {
             100
         }
-
-        fn current_schema(&self) -> std::sync::Arc<iceberg::spec::Schema> {
-            use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-            use std::sync::Arc;
-            Arc::new(
-                Schema::builder()
-                    .with_fields(vec![
-                        Arc::new(NestedField::required(
-                            1,
-                            "id",
-                            Type::Primitive(PrimitiveType::Long),
-                        )),
-                        Arc::new(NestedField::required(
-                            2,
-                            "name",
-                            Type::Primitive(PrimitiveType::String),
-                        )),
-                    ])
-                    .build()
-                    .unwrap(),
-            )
-        }
     }
 
     // Helper function to create mock DataFile using DataFileBuilder
@@ -887,7 +865,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -930,7 +908,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -958,7 +936,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -1000,7 +978,7 @@ mod tests {
             .with_target_file_size(500) // Small target to trigger multiple files
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.3) // Moderate smoothing
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -1050,7 +1028,7 @@ mod tests {
         let mut rolling_writer = RollingIcebergWriterBuilder::new(mock_builder_no_compression)
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -1068,7 +1046,7 @@ mod tests {
         let mut rolling_writer = RollingIcebergWriterBuilder::new(mock_builder_high_compression)
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
