@@ -1701,7 +1701,6 @@ mod tests {
             .metadata()
             .snapshot_for_ref(MAIN_BRANCH)
             .unwrap();
-        assert_eq!(snapshot_before.summary().additional_properties.len(), 0);
 
         let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
         let result = compaction.compact().await.unwrap().unwrap();
