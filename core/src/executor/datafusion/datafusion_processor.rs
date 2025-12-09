@@ -35,6 +35,7 @@ use iceberg::{
     scan::FileScanTask,
     spec::{NestedField, PrimitiveType, Schema, Type},
 };
+use std::collections::HashSet;
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 
@@ -545,8 +546,6 @@ impl DataFusionTaskContextBuilder {
 
     // build data fusion task context
     pub fn build(mut self) -> Result<DataFusionTaskContext> {
-        use std::collections::HashSet;
-
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
