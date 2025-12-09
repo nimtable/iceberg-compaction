@@ -35,6 +35,7 @@ use iceberg::{
     scan::FileScanTask,
     spec::{NestedField, PrimitiveType, Schema, Type},
 };
+use std::collections::HashSet;
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 
@@ -544,18 +545,28 @@ impl DataFusionTaskContextBuilder {
     }
 
     // build data fusion task context
-    pub fn build(self) -> Result<DataFusionTaskContext> {
+    pub fn build(mut self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
+
+        // Sort equality delete files by equality_ids length (ascending order)
+        // This ensures shorter equality_ids come before longer ones
+        self.equality_delete_files
+            .sort_by(|a, b| a.equality_ids.len().cmp(&b.equality_ids.len()));
+
         // Build schema for equality delete file, equality_ids + seq_num
-        let mut equality_ids: Option<Vec<i32>> = None;
+        let mut last_equality_ids_set: Option<HashSet<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
         for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
-            if equality_ids
+            let current_ids_set: HashSet<i32> = task.equality_ids.iter().copied().collect();
+
+            // Check if this is a new schema (different set of equality IDs)
+            let is_new_schema = last_equality_ids_set
                 .as_ref()
-                .is_none_or(|ids| !ids.eq(&task.equality_ids))
-            {
+                .map_or(true, |last_set| last_set != &current_ids_set);
+
+            if is_new_schema {
                 // If ids are different or not assigned, create a new metadata
                 let equality_delete_schema =
                     self.build_equality_delete_schema(&task.equality_ids, &mut highest_field_id)?;
@@ -565,7 +576,7 @@ impl DataFusionTaskContextBuilder {
                     equality_delete_schema,
                     equality_delete_table_name,
                 ));
-                equality_ids = Some(task.equality_ids.clone());
+                last_equality_ids_set = Some(current_ids_set);
             }
 
             // Add the file scan task to the last metadata
