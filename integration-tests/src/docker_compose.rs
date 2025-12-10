@@ -23,7 +23,8 @@ use std::{
 };
 
 use ctor::dtor;
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
+use iceberg_compaction_core::iceberg::CatalogBuilder;
 use port_scanner::scan_port_addr;
 
 const REST_CATALOG_PORT: u16 = 8181;
@@ -124,11 +125,15 @@ pub async fn get_rest_catalog() -> RestCatalog {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
 
-    let config = RestCatalogConfig::builder()
-        .uri(format!("http://{}", rest_socket_addr))
-        .props(props)
-        .build();
-    RestCatalog::new(config)
+    let mut props = props;
+    props.insert(
+        REST_CATALOG_PROP_URI.to_string(),
+        format!("http://{}", rest_socket_addr),
+    );
+    RestCatalogBuilder::default()
+        .load("rest", props)
+        .await
+        .expect("rest catalog build failed")
 }
 
 struct DockerCompose {
