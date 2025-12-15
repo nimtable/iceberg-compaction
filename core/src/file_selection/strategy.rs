@@ -97,7 +97,7 @@ impl FileGroup {
             .into_values()
             .map(|file| {
                 let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone();
+                file.project_field_ids = file.equality_ids.clone().unwrap_or_default();
                 file
             })
             .collect::<Vec<FileScanTask>>();
@@ -812,9 +812,9 @@ mod tests {
                             deletes: vec![],
                             sequence_number: 1,
                             equality_ids: if delete_type == DataContentType::EqualityDeletes {
-                                vec![1, 2]
+                                Some(vec![1, 2])
                             } else {
-                                vec![]
+                                None
                             },
                             file_size_in_bytes: 1024,
                         })
@@ -836,7 +836,7 @@ mod tests {
                 predicate: None,
                 deletes,
                 sequence_number: 1,
-                equality_ids: vec![],
+                equality_ids: None,
                 file_size_in_bytes: self.size,
             }
         }
@@ -892,7 +892,7 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 1,
-                equality_ids: vec![1, 2],
+                equality_ids: Some(vec![1, 2]),
                 file_size_in_bytes: 1024,
             })
         }
@@ -1678,7 +1678,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 1024,
         });
 
@@ -1694,7 +1694,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![1, 2],
+            equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 2048,
         });
 
@@ -1710,7 +1710,7 @@ mod tests {
             predicate: None,
             deletes: vec![position_delete, equality_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 10 * 1024 * 1024,
         };
 
@@ -1755,7 +1755,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 512,
         });
 
@@ -1771,7 +1771,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_pos_delete.clone()],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
         };
 
@@ -1787,7 +1787,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_pos_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
         };
 
@@ -1835,7 +1835,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![1, 2],
+            equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 1024,
         });
 
@@ -1851,7 +1851,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 512,
         });
 
@@ -1867,7 +1867,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_eq_delete.clone(), pos_delete.clone()],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
         };
 
@@ -1883,7 +1883,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_eq_delete, pos_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
         };
 

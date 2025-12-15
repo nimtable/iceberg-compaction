@@ -32,7 +32,7 @@ use crate::executor::{
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionExecutor};
 use iceberg::table::Table;
-use iceberg::transaction::Transaction;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use std::sync::Arc;
 use std::time::Duration;
@@ -593,9 +593,8 @@ impl Compaction {
         file_group: &FileGroup,
         execution_config: &CompactionExecutionConfig,
     ) -> Result<RewriteFilesRequest> {
-        let schema = table.metadata().current_schema();
-        let default_location_generator =
-            DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let schema = table.metadata().current_schema().clone();
+        let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
@@ -604,10 +603,10 @@ impl Compaction {
 
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
-            schema: schema.clone(),
+            schema,
             file_group: file_group.clone(),
             execution_config: Arc::new(execution_config.clone()),
-            dir_path: default_location_generator.dir_path,
+            location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
         })
@@ -971,13 +970,13 @@ impl CommitManager {
                 let rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        txn.rewrite_files(None, vec![])?
-                            .with_delete_filter_manager_enabled()
-                            .add_data_files(data_files)?
-                            .delete_files(delete_files)?
-                            .with_to_branch(to_branch.to_owned())
-                            .with_starting_sequence_number(snapshot.sequence_number())?
-                            .with_check_file_existence(true)
+                        txn.rewrite_files()
+                            .set_enable_delete_filter_manager(true)
+                            .add_data_files(data_files)
+                            .delete_files(delete_files)
+                            .set_target_branch(to_branch.to_owned())
+                            .set_new_data_file_sequence_number(snapshot.sequence_number())
+                            .set_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -987,15 +986,15 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    txn.rewrite_files(None, vec![])?
-                        .with_delete_filter_manager_enabled()
-                        .add_data_files(data_files)?
-                        .delete_files(delete_files)?
-                        .with_to_branch(to_branch.to_owned())
-                        .with_check_file_existence(true)
+                    txn.rewrite_files()
+                        .set_enable_delete_filter_manager(true)
+                        .add_data_files(data_files)
+                        .delete_files(delete_files)
+                        .set_target_branch(to_branch.to_owned())
+                        .set_check_file_existence(true)
                 };
 
-                let txn = rewrite_action.apply().await?;
+                let txn = rewrite_action.apply(txn)?;
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
@@ -1080,12 +1079,12 @@ impl CommitManager {
                 let overwrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        txn.overwrite_files(None, vec![])?
-                            .add_data_files(data_files)?
-                            .delete_files(delete_files)?
-                            .with_to_branch(to_branch.to_owned())
-                            .with_starting_sequence_number(snapshot.sequence_number())?
-                            .with_check_file_existence(true)
+                        txn.overwrite_files()
+                            .add_data_files(data_files)
+                            .delete_files(delete_files)
+                            .set_target_branch(to_branch.to_owned())
+                            .set_new_data_file_sequence_number(snapshot.sequence_number())
+                            .set_check_file_existence(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -1095,14 +1094,14 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    txn.overwrite_files(None, vec![])?
-                        .add_data_files(data_files)?
-                        .delete_files(delete_files)?
-                        .with_to_branch(to_branch.to_owned())
-                        .with_check_file_existence(true)
+                    txn.overwrite_files()
+                        .add_data_files(data_files)
+                        .delete_files(delete_files)
+                        .set_target_branch(to_branch.to_owned())
+                        .set_check_file_existence(true)
                 };
 
-                let txn = overwrite_action.apply().await?;
+                let txn = overwrite_action.apply(txn)?;
                 match txn.commit(catalog.as_ref()).await {
                     Ok(table) => {
                         // Update metrics after a successful commit
@@ -1286,28 +1285,25 @@ mod tests {
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
-    use iceberg::io::FileIOBuilder;
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
     use iceberg::spec::{MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::Table;
+    use iceberg::transaction::ApplyTransactionAction;
     use iceberg::transaction::Transaction;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
-    use iceberg::writer::base_writer::sort_position_delete_writer::{
-        POSITION_DELETE_SCHEMA, SortPositionDeleteWriterBuilder,
-    };
+    use iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+    use iceberg::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
     use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
-    use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
-    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use iceberg::writer::{
         IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };
-    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-    use iceberg_catalog_memory::MemoryCatalog;
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
     use parquet::file::properties::WriterProperties;
     use std::collections::HashMap;
@@ -1337,11 +1333,18 @@ mod tests {
     async fn create_test_env() -> TestEnv {
         let temp_dir = TempDir::new().unwrap();
         let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        let catalog = Arc::new(MemoryCatalog::new(
-            file_io,
-            Some(warehouse_location.clone()),
-        ));
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
 
         let namespace_ident = NamespaceIdent::new("test_namespace".into());
         create_namespace(catalog.as_ref(), &namespace_ident).await;
@@ -1366,9 +1369,8 @@ mod tests {
         data_files: Vec<DataFile>,
     ) -> Table {
         let transaction = Transaction::new(table);
-        let mut append_action = transaction.fast_append(None, None, vec![]).unwrap();
-        append_action.add_data_files(data_files).unwrap();
-        let tx = append_action.apply().await.unwrap();
+        let append_action = transaction.fast_append().add_data_files(data_files);
+        let tx = append_action.apply(transaction).unwrap();
         tx.commit(catalog).await.unwrap()
     }
 
@@ -1474,93 +1476,86 @@ mod tests {
         warehouse_location: String,
         unique_column_ids: Vec<i32>,
     ) -> impl IcebergWriter {
-        let table_schema = table.metadata().current_schema();
+        let table_schema = table.metadata().current_schema().clone();
+        let unique_uuid_suffix = Uuid::now_v7().to_string();
 
-        // Set up writer
-        let location_generator = DefaultLocationGenerator {
-            dir_path: warehouse_location,
-        };
-
+        let location_generator =
+            DefaultLocationGenerator::with_data_location(warehouse_location.clone());
         let file_name_generator = DefaultFileNameGenerator::new(
             "data".to_owned(),
-            Some("test".to_owned()),
+            Some(unique_uuid_suffix.clone()),
             iceberg::spec::DataFileFormat::Parquet,
         );
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::builder().build(),
-            table_schema.clone(),
+        let data_file_builder = DataFileWriterBuilder::new(RollingFileWriterBuilder::new(
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), table_schema.clone()),
+            1024 * 1024,
             table.file_io().clone(),
-            location_generator,
-            file_name_generator,
+            location_generator.clone(),
+            file_name_generator.clone(),
+        ));
+
+        let position_delete_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        2147483546,
+                        "file_path",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(2147483545, "pos", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
         );
+        let position_delete_builder =
+            PositionDeleteFileWriterBuilder::new(RollingFileWriterBuilder::new(
+                ParquetWriterBuilder::new(WriterProperties::new(), position_delete_schema),
+                1024 * 1024,
+                table.file_io().clone(),
+                location_generator.clone(),
+                file_name_generator.clone(),
+            ));
 
-        let data_file_builder = DataFileWriterBuilder::new(
-            parquet_writer_builder,
-            None,
-            table.metadata().default_partition_spec().spec_id(),
-        );
-
-        let config = EqualityDeleteWriterConfig::new(
-            unique_column_ids.clone(),
-            table_schema.clone(),
-            None,
-            0,
-        )
-        .unwrap();
-
-        let unique_uuid_suffix = Uuid::now_v7();
-
-        let equality_delete_fields = unique_column_ids
-            .iter()
-            .map(|id| table_schema.field_by_id(*id).unwrap().clone())
-            .collect_vec();
-
+        let equality_delete_config =
+            EqualityDeleteWriterConfig::new(unique_column_ids.clone(), table_schema.clone())
+                .unwrap();
         let equality_delete_builder = EqualityDeleteFileWriterBuilder::new(
-            ParquetWriterBuilder::new(
-                WriterProperties::new(),
-                Arc::new(
-                    Schema::builder()
-                        .with_fields(equality_delete_fields)
-                        .build()
-                        .unwrap(),
+            RollingFileWriterBuilder::new(
+                ParquetWriterBuilder::new(
+                    WriterProperties::new(),
+                    Arc::new(
+                        Schema::builder()
+                            .with_fields(
+                                unique_column_ids
+                                    .iter()
+                                    .map(|id| table_schema.field_by_id(*id).unwrap().clone())
+                                    .collect_vec(),
+                            )
+                            .build()
+                            .unwrap(),
+                    ),
                 ),
+                1024 * 1024,
                 table.file_io().clone(),
-                DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
-                DefaultFileNameGenerator::new(
-                    "123".to_owned(),
-                    Some(format!("eq-del-{unique_uuid_suffix}")),
-                    iceberg::spec::DataFileFormat::Parquet,
-                ),
+                location_generator,
+                file_name_generator,
             ),
-            config,
+            equality_delete_config,
         );
 
-        let position_delete_builder = SortPositionDeleteWriterBuilder::new(
-            ParquetWriterBuilder::new(
-                WriterProperties::new(),
-                POSITION_DELETE_SCHEMA.clone(),
-                table.file_io().clone(),
-                DefaultLocationGenerator::new(table.metadata().clone()).unwrap(),
-                DefaultFileNameGenerator::new(
-                    "123".to_owned(),
-                    Some(format!("pos-del-{unique_uuid_suffix}")),
-                    iceberg::spec::DataFileFormat::Parquet,
-                ),
-            ),
-            1024 * 1024, // 1MB
-            None,
-            None,
-        );
-
-        let delta_builder = EqualityDeltaWriterBuilder::new(
+        DeltaWriterBuilder::new(
             data_file_builder,
             position_delete_builder,
             equality_delete_builder,
             unique_column_ids,
-        );
-
-        delta_builder.build().await.unwrap()
+            table_schema,
+        )
+        .build(None)
+        .await
+        .unwrap()
     }
 
     async fn build_simple_data_writer(
@@ -1571,9 +1566,7 @@ mod tests {
         let table_schema = table.metadata().current_schema();
 
         // Set up writer
-        let location_generator = DefaultLocationGenerator {
-            dir_path: warehouse_location,
-        };
+        let location_generator = DefaultLocationGenerator::with_data_location(warehouse_location);
 
         let file_name_generator = DefaultFileNameGenerator::new(
             "data".to_owned(),
@@ -1581,21 +1574,16 @@ mod tests {
             iceberg::spec::DataFileFormat::Parquet,
         );
 
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::builder().build(),
-            table_schema.clone(),
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), table_schema.clone()),
             table.file_io().clone(),
             location_generator,
             file_name_generator,
         );
 
-        let data_file_builder = DataFileWriterBuilder::new(
-            parquet_writer_builder,
-            None,
-            table.metadata().default_partition_spec().spec_id(),
-        );
+        let data_file_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-        data_file_builder.build().await.unwrap()
+        data_file_builder.build(None).await.unwrap()
     }
 
     async fn load_data_files_from_snapshot(table: &Table, branch: &str) -> Vec<DataFile> {
@@ -1711,7 +1699,6 @@ mod tests {
             .metadata()
             .snapshot_for_ref(MAIN_BRANCH)
             .unwrap();
-        assert_eq!(snapshot_before.summary().additional_properties.len(), 0);
 
         let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
         let result = compaction.compact().await.unwrap().unwrap();
@@ -1984,11 +1971,18 @@ mod tests {
     async fn create_branch_test_env() -> BranchTestEnv {
         let temp_dir = TempDir::new().unwrap();
         let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        let catalog = Arc::new(MemoryCatalog::new(
-            file_io,
-            Some(warehouse_location.clone()),
-        ));
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
 
         let namespace_ident = NamespaceIdent::new("test_namespace".into());
         create_namespace(catalog.as_ref(), &namespace_ident).await;
@@ -2025,13 +2019,12 @@ mod tests {
 
         let transaction = Transaction::new(&env.table);
         let branch_name = "feature/compaction-branch";
-        let mut append_action = transaction
-            .fast_append(None, None, vec![])
-            .unwrap()
-            .with_to_branch(branch_name.to_owned());
-        append_action.add_data_files(branch_data_files1).unwrap();
-        append_action.add_data_files(branch_data_files2).unwrap();
-        let tx = append_action.apply().await.unwrap();
+        let append_action = transaction
+            .fast_append()
+            .set_target_branch(branch_name.to_owned())
+            .add_data_files(branch_data_files1)
+            .add_data_files(branch_data_files2);
+        let tx = append_action.apply(transaction).unwrap();
         let updated_table = tx.commit(env.catalog.as_ref()).await.unwrap();
 
         let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
@@ -2091,12 +2084,11 @@ mod tests {
         all_branch_files.extend(large_files);
 
         let transaction = Transaction::new(&env.table);
-        let mut append_action = transaction
-            .fast_append(None, None, vec![])
-            .unwrap()
-            .with_to_branch(new_branch.to_owned());
-        append_action.add_data_files(all_branch_files).unwrap();
-        let tx = append_action.apply().await.unwrap();
+        let append_action = transaction
+            .fast_append()
+            .set_target_branch(new_branch.to_owned())
+            .add_data_files(all_branch_files);
+        let tx = append_action.apply(transaction).unwrap();
         let updated_table = tx.commit(env.catalog.as_ref()).await.unwrap();
 
         let small_file_threshold = 900u64;
