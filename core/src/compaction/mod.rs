@@ -1294,14 +1294,12 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+    use iceberg::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
     use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
-    };
     use iceberg::writer::{
         IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
     };
@@ -1548,7 +1546,7 @@ mod tests {
             equality_delete_config,
         );
 
-        EqualityDeltaWriterBuilder::new(
+        DeltaWriterBuilder::new(
             data_file_builder,
             position_delete_builder,
             equality_delete_builder,
