@@ -14,35 +14,31 @@
 * limitations under the License.
 */
 
-use crate::{
-    config::CompactionExecutionConfig, error::Result,
-    executor::iceberg_writer::rolling_iceberg_writer,
-};
-use async_trait::async_trait;
-use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
-use iceberg::{
-    arrow::RecordBatchPartitionSplitter,
-    io::FileIO,
-    spec::{DataFile, PartitionSpec, Schema},
-    writer::{
-        IcebergWriter, TaskWriter,
-        base_writer::data_file_writer::DataFileWriterBuilder,
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-            rolling_writer::RollingFileWriterBuilder,
-        },
-    },
-};
-use sqlx::types::Uuid;
 use std::sync::Arc;
 use std::time::Instant;
+
+use async_trait::async_trait;
+use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
+use futures::StreamExt;
+use futures::future::try_join_all;
+use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, PartitionSpec, Schema};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, TaskWriter};
+use sqlx::types::Uuid;
 use tokio::task::JoinHandle;
 
-use crate::CompactionError;
-
 use super::{CompactionExecutor, RewriteFilesStat};
+use crate::CompactionError;
+use crate::config::CompactionExecutionConfig;
+use crate::error::Result;
+use crate::executor::iceberg_writer::rolling_iceberg_writer;
 pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
@@ -104,8 +100,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     file_io,
                     partition_spec,
                     execution_config,
-                )
-                .await?;
+                )?;
 
                 // Process each record batch with metrics
                 let mut fetch_batch_start = Instant::now();
@@ -161,7 +156,7 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
-pub async fn build_iceberg_data_file_writer(
+pub fn build_iceberg_data_file_writer(
     data_file_prefix: String,
     location_generator: DefaultLocationGenerator,
     schema: Arc<Schema>,

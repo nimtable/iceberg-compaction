@@ -17,22 +17,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::{
-    io::FileIO, spec::PartitionSpec,
-    writer::file_writer::location_generator::DefaultLocationGenerator,
-};
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, PartitionSpec, Schema};
+use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 
 use crate::common::CompactionMetricsRecorder;
 use crate::config::CompactionExecutionConfig;
 use crate::file_selection::FileGroup;
-use iceberg::spec::{DataFile, Schema};
 
 pub mod mock;
 pub use mock::MockExecutor;
 pub mod datafusion;
 pub mod iceberg_writer;
-use crate::error::Result;
 pub use datafusion::DataFusionExecutor;
+
+use crate::error::Result;
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync + 'static {

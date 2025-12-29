@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use iceberg::{
-    Catalog, NamespaceIdent, TableCreation,
-    spec::{NestedField, PrimitiveType, Schema, Type},
-    transaction::{ApplyTransactionAction, Transaction},
-};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, NamespaceIdent, TableCreation};
 use iceberg_compaction_core::error::Result;
 
 use crate::docker_compose::get_rest_catalog;

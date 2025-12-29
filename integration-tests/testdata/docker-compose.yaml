@@ -31,6 +31,16 @@ services:
       - CATALOG_WAREHOUSE=s3://icebergdata/demo
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
       - CATALOG_S3_ENDPOINT=http://minio:9000
+      # Force path-style access to ensure compatibility with MinIO in docker network
+      # Mapping rule: '_' -> '.', '__' -> '-'  => CATALOG_S3_PATH__STYLE__ACCESS => s3.path-style-access
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      # Avoid proxying internal docker network traffic which causes 502 from proxy
+      - HTTP_PROXY=
+      - http_proxy=
+      - HTTPS_PROXY=
+      - https_proxy=
+      - NO_PROXY=localhost,127.0.0.1,minio,rest,mc,.minio
+      - no_proxy=localhost,127.0.0.1,minio,rest,mc,.minio
     depends_on:
       - minio
     networks:
@@ -43,8 +53,7 @@ services:
     environment:
       - MINIO_ROOT_USER=admin
       - MINIO_ROOT_PASSWORD=password
-      - MINIO_DOMAIN=minio
-    hostname: icebergdata.minio
+    hostname: minio
     networks:
       rest_bridge:
     expose:
@@ -60,6 +69,13 @@ services:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
+      # Avoid proxying internal docker network traffic
+      - HTTP_PROXY=
+      - http_proxy=
+      - HTTPS_PROXY=
+      - https_proxy=
+      - NO_PROXY=localhost,127.0.0.1,minio,rest,mc,.minio
+      - no_proxy=localhost,127.0.0.1,minio,rest,mc,.minio
     entrypoint: >
       /bin/sh -c " until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done; /usr/bin/mc rm -r --force minio/icebergdata; /usr/bin/mc mb minio/icebergdata; /usr/bin/mc policy set public minio/icebergdata; tail -f /dev/null "
     networks:
