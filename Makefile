@@ -12,15 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build check test unit-test integration-test fmt clippy setup clean
+.PHONY: build check check-fmt check-clippy check-toml test unit-test integration-test fmt fix-toml setup clean
 
 # Build the project
 build:
-	cargo build --workspace
+	cargo build --workspace --all-targets
 
-# Run all checks (format, lint, tests)
-check:
-	./scripts/check.sh
+# Run all checks (format, clippy, toml)
+check: check-fmt check-clippy check-toml
+
+# Check code formatting
+check-fmt:
+	cargo fmt --all -- --check
+
+# Run clippy
+check-clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+# Install taplo-cli for TOML formatting
+install-taplo-cli:
+	@which taplo > /dev/null || cargo install taplo-cli
+
+# Check TOML formatting
+check-toml: install-taplo-cli
+	taplo check
+
+# Fix TOML formatting
+fix-toml: install-taplo-cli
+	taplo fmt
 
 # Run all tests
 test: unit-test integration-test
@@ -37,9 +56,8 @@ integration-test:
 fmt:
 	cargo fmt --all
 
-# Run clippy
-clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+# Run clippy (alias for check-clippy)
+clippy: check-clippy
 
 # Setup development environment
 setup:
