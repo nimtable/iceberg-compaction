@@ -16,12 +16,9 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
-use iceberg::spec::PartitionKey;
+use iceberg::spec::{DataFile, PartitionKey};
+use iceberg::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use iceberg::{ErrorKind, Result};
-use iceberg::{
-    spec::DataFile,
-    writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
-};
 use tokio::task::JoinHandle;
 
 use crate::config::{
@@ -834,9 +831,10 @@ mod tests {
     }
 
     fn create_mock_record_batch(memory_size: usize) -> RecordBatch {
+        use std::sync::Arc;
+
         use datafusion::arrow::array::{Int64Array, StringArray};
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc;
 
         let num_rows = std::cmp::max(1, memory_size / 16);
 
@@ -849,10 +847,10 @@ mod tests {
         let name_array =
             StringArray::from_iter_values((0..num_rows).map(|i| format!("name_{}", i)));
 
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
+        RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+        ])
         .unwrap()
     }
 

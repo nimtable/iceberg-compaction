@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-use crate::Result;
 use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
+
+use crate::Result;
 
 pub mod packer;
 pub mod strategy;

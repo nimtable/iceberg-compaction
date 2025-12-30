@@ -14,42 +14,39 @@
  * limitations under the License.
  */
 
-use async_stream::try_stream;
-use iceberg::{
-    arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
-    io::FileIO,
-    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
-    table::Table,
-    writer::{
-        IcebergWriter, IcebergWriterBuilder,
-        base_writer::{
-            data_file_writer::DataFileWriterBuilder,
-            equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
-            position_delete_file_writer::PositionDeleteFileWriterBuilder,
-        },
-        delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP},
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-            rolling_writer::RollingFileWriterBuilder,
-        },
-    },
-};
-use iceberg_compaction_core::{CompactionError, error::Result};
-use parquet::file::properties::WriterProperties;
-use rand::{Rng, distr::Alphanumeric};
 use std::sync::Arc;
 
-use datafusion::arrow::{
-    array::{
-        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
-    },
-    compute::filter,
-    datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+use async_stream::try_stream;
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use datafusion::arrow::compute::filter;
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use futures::StreamExt;
+use iceberg::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
+use iceberg::table::Table;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::equality_delete_writer::{
+    EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+};
+use iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+use iceberg::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg_compaction_core::CompactionError;
+use iceberg_compaction_core::error::Result;
+use parquet::file::properties::WriterProperties;
+use rand::Rng;
+use rand::distr::Alphanumeric;
 
 const DEFAULT_DATA_FILE_ROW_COUNT: usize = 10000;
 const DEFAULT_EQUALITY_DELETE_ROW_COUNT: usize = 200;

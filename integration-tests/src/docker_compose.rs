@@ -16,11 +16,9 @@
 
 // Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 use core::net::{IpAddr, SocketAddr};
-use std::{
-    collections::HashMap,
-    process::Command,
-    sync::{Once, RwLock},
-};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::{Once, RwLock};
 
 use ctor::dtor;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
@@ -127,7 +125,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
 
     let mut props = props;
     props.insert(
-        REST_CATALOG_PROP_URI.to_string(),
+        REST_CATALOG_PROP_URI.to_owned(),
         format!("http://{}", rest_socket_addr),
     );
     RestCatalogBuilder::default()
