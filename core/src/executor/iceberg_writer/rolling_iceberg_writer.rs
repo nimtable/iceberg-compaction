@@ -16,10 +16,8 @@
 
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
-use iceberg::{
-    spec::DataFile,
-    writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder},
-};
+use iceberg::spec::{DataFile, PartitionKey};
+use iceberg::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use iceberg::{ErrorKind, Result};
 use tokio::task::JoinHandle;
 
@@ -176,7 +174,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 /// // Create a basic rolling writer (dynamic size estimation disabled by default)
 /// let writer = RollingIcebergWriterBuilder::new(inner_builder)
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
-///     .build()?;
+///     .build(None)?;
 /// ```
 ///
 /// ## With Dynamic Size Estimation
@@ -188,7 +186,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_target_file_size(1024 * 1024 * 1024) // 1GB
 ///     .with_dynamic_size_estimation(true)       // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.3) // Adjust smoothing (optional)
-///     .build()?;
+///     .build(None)?;
 /// ```
 ///
 /// ## Custom Configuration
@@ -201,7 +199,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 ///     .with_max_concurrent_closes(8)              // Allow 8 concurrent closes
 ///     .with_dynamic_size_estimation(true)         // Enable dynamic size estimation
 ///     .with_size_estimation_smoothing_factor(0.2) // More stable estimation
-///     .build()?;
+///     .build(None)?;
 /// ```
 pub struct RollingIcebergWriter<B, D> {
     /// Builder for creating new inner writers.
@@ -219,6 +217,8 @@ pub struct RollingIcebergWriter<B, D> {
     close_futures: CloseFuture,
     /// Maximum number of concurrent close operations allowed.
     max_concurrent_closes: usize,
+    /// Optional partition key for the writer.
+    partition_key: Option<PartitionKey>,
 }
 
 #[async_trait::async_trait]
@@ -304,7 +304,12 @@ where
 
         // Write the batch to the current writer.
         if self.inner_writer.is_none() {
-            self.inner_writer = Some(self.inner_writer_builder.clone().build().await?);
+            self.inner_writer = Some(
+                self.inner_writer_builder
+                    .clone()
+                    .build(self.partition_key.clone())
+                    .await?,
+            );
         }
         self.inner_writer.as_mut().unwrap().write(input).await?;
 
@@ -428,6 +433,7 @@ pub struct RollingIcebergWriterBuilder<B> {
     max_concurrent_closes: Option<usize>,
     enable_dynamic_size_estimation: Option<bool>,
     size_estimation_smoothing_factor: Option<f64>,
+    partition_key: Option<PartitionKey>,
 }
 
 impl<B> RollingIcebergWriterBuilder<B> {
@@ -438,6 +444,7 @@ impl<B> RollingIcebergWriterBuilder<B> {
             max_concurrent_closes: None,
             enable_dynamic_size_estimation: None,
             size_estimation_smoothing_factor: None,
+            partition_key: None,
         }
     }
 
@@ -463,6 +470,11 @@ impl<B> RollingIcebergWriterBuilder<B> {
         self.size_estimation_smoothing_factor = Some(factor);
         self
     }
+
+    pub fn with_partition_key(mut self, partition_key: PartitionKey) -> Self {
+        self.partition_key = Some(partition_key);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -473,7 +485,7 @@ where
 {
     type R = RollingIcebergWriter<B, B::R>;
 
-    async fn build(self) -> Result<Self::R> {
+    async fn build(self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         let enable_estimation = self
             .enable_dynamic_size_estimation
             .unwrap_or(DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION);
@@ -483,7 +495,7 @@ where
 
         Ok(RollingIcebergWriter {
             inner_writer_builder: self.inner_builder.clone(),
-            inner_writer: Some(self.inner_builder.build().await?),
+            inner_writer: Some(self.inner_builder.build(partition_key.clone()).await?),
             target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
             data_files: Vec::new(),
             size_tracker: SizeEstimationTracker::new(enable_estimation, smoothing_factor),
@@ -491,6 +503,7 @@ where
             max_concurrent_closes: self
                 .max_concurrent_closes
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_CLOSES),
+            partition_key: self.partition_key,
         })
     }
 }
@@ -744,7 +757,7 @@ mod tests {
     impl IcebergWriterBuilder for MockIcebergWriterBuilder {
         type R = MockIcebergWriter;
 
-        async fn build(self) -> Result<Self::R> {
+        async fn build(self, _partition_key: Option<PartitionKey>) -> Result<Self::R> {
             Ok(MockIcebergWriter {
                 written_size: 0,
                 should_flush: self.should_flush,
@@ -798,28 +811,6 @@ mod tests {
         fn current_row_num(&self) -> usize {
             100
         }
-
-        fn current_schema(&self) -> std::sync::Arc<iceberg::spec::Schema> {
-            use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-            use std::sync::Arc;
-            Arc::new(
-                Schema::builder()
-                    .with_fields(vec![
-                        Arc::new(NestedField::required(
-                            1,
-                            "id",
-                            Type::Primitive(PrimitiveType::Long),
-                        )),
-                        Arc::new(NestedField::required(
-                            2,
-                            "name",
-                            Type::Primitive(PrimitiveType::String),
-                        )),
-                    ])
-                    .build()
-                    .unwrap(),
-            )
-        }
     }
 
     // Helper function to create mock DataFile using DataFileBuilder
@@ -840,9 +831,10 @@ mod tests {
     }
 
     fn create_mock_record_batch(memory_size: usize) -> RecordBatch {
+        use std::sync::Arc;
+
         use datafusion::arrow::array::{Int64Array, StringArray};
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc;
 
         let num_rows = std::cmp::max(1, memory_size / 16);
 
@@ -855,10 +847,10 @@ mod tests {
         let name_array =
             StringArray::from_iter_values((0..num_rows).map(|i| format!("name_{}", i)));
 
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
+        RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+        ])
         .unwrap()
     }
 
@@ -871,7 +863,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -914,7 +906,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -942,7 +934,7 @@ mod tests {
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.5)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -984,7 +976,7 @@ mod tests {
             .with_target_file_size(500) // Small target to trigger multiple files
             .with_dynamic_size_estimation(true)
             .with_size_estimation_smoothing_factor(0.3) // Moderate smoothing
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -1034,7 +1026,7 @@ mod tests {
         let mut rolling_writer = RollingIcebergWriterBuilder::new(mock_builder_no_compression)
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
-            .build()
+            .build(None)
             .await
             .unwrap();
 
@@ -1052,7 +1044,7 @@ mod tests {
         let mut rolling_writer = RollingIcebergWriterBuilder::new(mock_builder_high_compression)
             .with_target_file_size(10000)
             .with_dynamic_size_estimation(true)
-            .build()
+            .build(None)
             .await
             .unwrap();
 

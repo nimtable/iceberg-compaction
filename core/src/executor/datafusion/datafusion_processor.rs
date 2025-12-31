@@ -16,27 +16,21 @@
 
 use std::sync::Arc;
 
-use crate::{
-    config::CompactionExecutionConfig,
-    error::{CompactionError, Result},
-    file_selection::FileGroup,
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
 };
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
-    },
-    prelude::{SessionConfig, SessionContext},
-};
-use iceberg::{
-    arrow::schema_to_arrow_schema,
-    io::FileIO,
-    scan::FileScanTask,
-    spec::{NestedField, PrimitiveType, Schema, Type},
-};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::io::FileIO;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
+use crate::config::CompactionExecutionConfig;
+use crate::error::{CompactionError, Result};
+use crate::file_selection::FileGroup;
 
 // System hidden columns used for Iceberg merge-on-read operations
 pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
@@ -502,7 +496,16 @@ impl DataFusionTaskContextBuilder {
     }
 
     pub fn with_input_data_files(mut self, file_group: FileGroup) -> Self {
-        self.data_files = file_group.data_files;
+        self.data_files = file_group
+            .data_files
+            .into_iter()
+            .map(|mut task| {
+                // Prevent ArrowReader from applying deletes; compaction handles them explicitly.
+                task.deletes.clear();
+                task.equality_ids = None;
+                task
+            })
+            .collect();
         self.position_delete_files = file_group.position_delete_files;
         self.equality_delete_files = file_group.equality_delete_files;
         self
@@ -543,29 +546,33 @@ impl DataFusionTaskContextBuilder {
         Ok(position_delete_schema)
     }
 
-    // build data fusion task context
+    // build datafusion task context
     pub fn build(self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
         let position_delete_schema = Self::build_position_schema()?;
         // Build schema for equality delete file, equality_ids + seq_num
-        let mut equality_ids: Option<Vec<i32>> = None;
+        let mut prev_equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
         for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
-            if equality_ids
+            let task_equality_ids = task.equality_ids.as_ref().ok_or_else(|| {
+                CompactionError::Execution("Equality delete file missing equality_ids".to_owned())
+            })?;
+
+            if prev_equality_ids
                 .as_ref()
-                .is_none_or(|ids| !ids.eq(&task.equality_ids))
+                .is_none_or(|ids| ids != task_equality_ids)
             {
                 // If ids are different or not assigned, create a new metadata
                 let equality_delete_schema =
-                    self.build_equality_delete_schema(&task.equality_ids, &mut highest_field_id)?;
+                    self.build_equality_delete_schema(task_equality_ids, &mut highest_field_id)?;
                 let equality_delete_table_name =
                     table_name::build_equality_delete_table_name(&self.table_prefix, table_idx);
                 equality_delete_metadatas.push(EqualityDeleteMetadata::new(
                     equality_delete_schema,
                     equality_delete_table_name,
                 ));
-                equality_ids = Some(task.equality_ids.clone());
+                prev_equality_ids = Some(task_equality_ids.clone());
             }
 
             // Add the file scan task to the last metadata
@@ -784,13 +791,14 @@ mod table_name {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
     use crate::executor::datafusion::datafusion_processor::table_name::{
         DATA_FILE_TABLE, POSITION_DELETE_TABLE,
     };
-
-    use super::*;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use std::sync::Arc;
 
     /// Test building SQL with no delete files
     #[test]
@@ -1103,8 +1111,9 @@ mod tests {
 
     #[test]
     fn test_equality_delete_join_names() {
-        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use std::sync::Arc;
+
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
         // schema
         let fields = vec![
@@ -1313,11 +1322,8 @@ mod tests {
             ("_data_file_table", "select", true, vec![]),
             ("_data_file_table", "join", true, vec![]),
             // Equality delete table with keyword
-            (
-                "_data_file_table",
-                "_position_delete_table",
-                false,
-                vec![EqualityDeleteMetadata::new(
+            ("_data_file_table", "_position_delete_table", false, vec![
+                EqualityDeleteMetadata::new(
                     Schema::builder()
                         .with_fields(vec![Arc::new(NestedField::new(
                             1,
@@ -1328,8 +1334,8 @@ mod tests {
                         .build()
                         .unwrap(),
                     "from".to_owned(), // Equality delete table with keyword
-                )],
-            ),
+                ),
+            ]),
         ];
 
         for (data_table, pos_delete_table, need_file_path_pos, eq_delete_metadatas) in test_cases {

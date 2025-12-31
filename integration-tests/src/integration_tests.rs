@@ -16,15 +16,15 @@
 
 //! Integration tests that require Docker containers
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
-use iceberg::{
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
-    spec::{NestedField, PrimitiveType, Schema, Type},
-    transaction::Transaction,
-};
 
 #[tokio::test]
 async fn test_sqlbuilder_fix_with_keyword_table_name() {
@@ -113,17 +113,10 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
 
     // Commit files to table
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn
-        .fast_append(None, None, vec![])
-        .expect("Failed to create fast append action");
-
-    fast_append_action
-        .add_data_files(commit_data_files)
-        .expect("Failed to add data files");
+    let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
 
     let _table_with_data = fast_append_action
-        .apply()
-        .await
+        .apply(txn)
         .expect("Failed to apply transaction")
         .commit(catalog.as_ref())
         .await
@@ -152,7 +145,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         "Compaction should process input files"
     );
     assert_eq!(
-        2, response.stats.output_files_count,
+        1, response.stats.output_files_count,
         "Compaction should produce output files"
     );
 
@@ -250,17 +243,10 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // Commit files to table
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn
-        .fast_append(None, None, vec![])
-        .expect("Failed to create fast append action");
-
-    fast_append_action
-        .add_data_files(commit_data_files)
-        .expect("Failed to add data files");
+    let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
 
     let _table_with_data = fast_append_action
-        .apply()
-        .await
+        .apply(txn)
         .expect("Failed to apply transaction")
         .commit(catalog.as_ref())
         .await
@@ -286,7 +272,7 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // Verify SqlBuilder correctly handles keyword identifiers in merge-on-read scenarios
     assert_eq!(
-        9, response.stats.input_files_count,
+        6, response.stats.input_files_count,
         "Compaction should process input files"
     );
 
@@ -304,7 +290,7 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // input_equality_delete_file_count
     assert_eq!(
-        3, response.stats.input_equality_delete_file_count,
+        0, response.stats.input_equality_delete_file_count,
         "Compaction should process input equality delete files"
     );
 

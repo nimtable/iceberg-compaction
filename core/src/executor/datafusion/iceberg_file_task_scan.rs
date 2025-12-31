@@ -317,7 +317,6 @@ async fn get_batch_stream(
             let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone()).with_batch_size(max_record_batch_rows);
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
-                .await
                 .map_err(to_datafusion_error)?;
             let mut index_start = 0;
             while let Some(batch) = batch_stream.next().await {
@@ -369,7 +368,7 @@ fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBa
     let mut columns = batch.columns().to_vec();
     columns.push(Arc::new(Int64Array::from(vec![seq_num; batch.num_rows()])));
     RecordBatch::try_new(new_schema, columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Adds a file path and position column to a record batch
@@ -403,7 +402,7 @@ fn add_file_path_pos_into_batch(
         (index_start..(index_start + batch.num_rows() as i64)).collect::<Vec<i64>>(),
     )));
     RecordBatch::try_new(new_schema, columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 impl DisplayAs for IcebergFileTaskScan {
@@ -438,11 +437,13 @@ pub fn get_column_names(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, SchemaBuilder};
     use iceberg::scan::FileScanTask;
     use iceberg::spec::{DataContentType, Schema};
-    use std::sync::Arc;
+
+    use super::*;
 
     fn create_file_scan_task(length: u64, file_id: u64) -> FileScanTask {
         FileScanTask {
@@ -457,7 +458,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 0,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 0,
         }
     }

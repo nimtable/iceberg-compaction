@@ -14,35 +14,31 @@
 * limitations under the License.
 */
 
-use crate::{
-    config::CompactionExecutionConfig, error::Result,
-    executor::iceberg_writer::rolling_iceberg_writer,
-};
-use async_trait::async_trait;
-use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
-use futures::{StreamExt, future::try_join_all};
-use iceberg::{
-    io::FileIO,
-    spec::{DataFile, PartitionSpec, Schema},
-    writer::{
-        IcebergWriter, IcebergWriterBuilder,
-        base_writer::data_file_writer::DataFileWriterBuilder,
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-        },
-        function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder,
-    },
-};
-use parquet::file::properties::WriterProperties;
-use sqlx::types::Uuid;
 use std::sync::Arc;
 use std::time::Instant;
+
+use async_trait::async_trait;
+use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
+use futures::StreamExt;
+use futures::future::try_join_all;
+use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, PartitionSpec, Schema};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, TaskWriter};
+use sqlx::types::Uuid;
 use tokio::task::JoinHandle;
 
-use crate::CompactionError;
-
 use super::{CompactionExecutor, RewriteFilesStat};
+use crate::CompactionError;
+use crate::config::CompactionExecutionConfig;
+use crate::error::Result;
+use crate::executor::iceberg_writer::rolling_iceberg_writer;
 pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
@@ -59,9 +55,9 @@ impl CompactionExecutor for DataFusionExecutor {
             schema,
             file_group,
             execution_config,
-            dir_path,
             partition_spec,
             metrics_recorder,
+            location_generator,
         } = request;
 
         let mut stats = RewriteFilesStat::default();
@@ -87,7 +83,7 @@ impl CompactionExecutor for DataFusionExecutor {
 
         // build iceberg writer for each partition
         for mut batch_stream in batches {
-            let dir_path = dir_path.clone();
+            let location_generator = location_generator.clone();
             let schema = arc_input_schema.clone();
             let execution_config = execution_config.clone();
             let file_io = file_io.clone();
@@ -99,13 +95,12 @@ impl CompactionExecutor for DataFusionExecutor {
             > = tokio::spawn(async move {
                 let mut data_file_writer = build_iceberg_data_file_writer(
                     execution_config.data_file_prefix.clone(),
-                    dir_path,
+                    location_generator,
                     schema,
                     file_io,
                     partition_spec,
                     execution_config,
-                )
-                .await?;
+                )?;
 
                 // Process each record batch with metrics
                 let mut fetch_batch_start = Instant::now();
@@ -161,24 +156,40 @@ impl CompactionExecutor for DataFusionExecutor {
     }
 }
 
-pub async fn build_iceberg_data_file_writer(
+pub fn build_iceberg_data_file_writer(
     data_file_prefix: String,
-    dir_path: String,
+    location_generator: DefaultLocationGenerator,
     schema: Arc<Schema>,
     file_io: FileIO,
     partition_spec: Arc<PartitionSpec>,
     execution_config: Arc<CompactionExecutionConfig>,
 ) -> Result<Box<dyn IcebergWriter>> {
-    let parquet_writer_builder = build_parquet_writer_builder(
-        data_file_prefix,
-        dir_path,
-        schema.clone(),
-        file_io,
-        execution_config.write_parquet_properties.clone(),
-    )?;
-    let data_file_builder =
-        DataFileWriterBuilder::new(parquet_writer_builder, None, partition_spec.spec_id());
-    let data_file_size_writer =
+    let data_file_builder = {
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            execution_config.write_parquet_properties.clone(),
+            schema.clone(),
+        );
+
+        let unique_uuid_suffix = Uuid::now_v7();
+        let file_name_generator = DefaultFileNameGenerator::new(
+            data_file_prefix,
+            Some(unique_uuid_suffix.to_string()),
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        // Noop wrapper for `DataFileWriterBuilder`
+        let rolling_writer_builder = RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            usize::MAX, // No rolling based on row count
+            file_io,
+            location_generator,
+            file_name_generator,
+        );
+
+        DataFileWriterBuilder::new(rolling_writer_builder)
+    };
+
+    let rolling_iceberg_writer_builder =
         rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
             .with_target_file_size(execution_config.target_file_size_bytes)
             .with_max_concurrent_closes(execution_config.max_concurrent_closes)
@@ -187,43 +198,22 @@ pub async fn build_iceberg_data_file_writer(
                 execution_config.size_estimation_smoothing_factor,
             );
 
-    let iceberg_output_writer = if partition_spec.fields().is_empty() {
-        Box::new(data_file_size_writer.build().await?) as Box<dyn IcebergWriter>
+    let partition_splitter = if partition_spec.is_unpartitioned() {
+        None
     } else {
-        Box::new(
-            FanoutPartitionWriterBuilder::new(
-                data_file_size_writer,
-                partition_spec.clone(),
-                schema,
-            )?
-            .build()
-            .await?,
-        ) as Box<dyn IcebergWriter>
+        Some(RecordBatchPartitionSplitter::new_with_computed_values(
+            schema.clone(),
+            partition_spec.clone(),
+        )?)
     };
-    Ok(iceberg_output_writer)
-}
 
-pub fn build_parquet_writer_builder(
-    data_file_prefix: String,
-    dir_path: String,
-    schema: Arc<Schema>,
-    file_io: FileIO,
-    write_parquet_properties: WriterProperties,
-) -> Result<ParquetWriterBuilder<DefaultLocationGenerator, DefaultFileNameGenerator>> {
-    let location_generator = DefaultLocationGenerator { dir_path };
-    let unique_uuid_suffix = Uuid::now_v7();
-    let file_name_generator = DefaultFileNameGenerator::new(
-        data_file_prefix,
-        Some(unique_uuid_suffix.to_string()),
-        iceberg::spec::DataFileFormat::Parquet,
+    let iceberg_task_writer = TaskWriter::new_with_partition_splitter(
+        rolling_iceberg_writer_builder,
+        true,
+        schema,
+        partition_spec,
+        partition_splitter,
     );
 
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        write_parquet_properties,
-        schema.clone(),
-        file_io,
-        location_generator,
-        file_name_generator,
-    );
-    Ok(parquet_writer_builder)
+    Ok(Box::new(iceberg_task_writer))
 }

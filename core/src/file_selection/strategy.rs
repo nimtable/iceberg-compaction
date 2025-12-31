@@ -23,11 +23,11 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use crate::config::{CompactionPlanningConfig, GroupingStrategy};
-use crate::{CompactionError, Result};
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
+use crate::config::{CompactionPlanningConfig, GroupingStrategy};
+use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
 ///
@@ -97,7 +97,7 @@ impl FileGroup {
             .into_values()
             .map(|file| {
                 let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone();
+                file.project_field_ids = file.equality_ids.clone().unwrap_or_default();
                 file
             })
             .collect::<Vec<FileScanTask>>();
@@ -276,9 +276,7 @@ pub enum GroupingStrategyEnum {
 
 impl GroupingStrategyEnum {
     pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
-    where
-        I: Iterator<Item = FileScanTask>,
-    {
+    where I: Iterator<Item = FileScanTask> {
         match self {
             GroupingStrategyEnum::Single(strategy) => strategy.group_files(data_files),
             GroupingStrategyEnum::BinPack(strategy) => strategy.group_files(data_files),
@@ -312,9 +310,7 @@ pub struct SingleGroupingStrategy;
 
 impl SingleGroupingStrategy {
     pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
-    where
-        I: Iterator<Item = FileScanTask>,
-    {
+    where I: Iterator<Item = FileScanTask> {
         let files: Vec<FileScanTask> = data_files.collect();
         if files.is_empty() {
             vec![]
@@ -344,9 +340,7 @@ impl BinPackGroupingStrategy {
     }
 
     pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
-    where
-        I: Iterator<Item = FileScanTask>,
-    {
+    where I: Iterator<Item = FileScanTask> {
         let files: Vec<FileScanTask> = data_files.collect();
 
         if files.is_empty() {
@@ -734,11 +728,11 @@ impl std::fmt::Display for PlanStrategy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::{CompactionPlanningConfig, SmallFilesConfigBuilder};
-
     // Lazy static schema to avoid rebuilding it for every test
     use std::sync::{Arc, OnceLock};
+
+    use super::*;
+    use crate::config::{CompactionPlanningConfig, SmallFilesConfigBuilder};
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
     fn get_test_schema() -> Arc<iceberg::spec::Schema> {
@@ -783,8 +777,9 @@ mod tests {
         }
 
         pub fn build(self) -> FileScanTask {
-            use iceberg::spec::{DataContentType, DataFileFormat};
             use std::sync::Arc;
+
+            use iceberg::spec::{DataContentType, DataFileFormat};
 
             let deletes = if self.has_deletes {
                 self.delete_types
@@ -812,9 +807,9 @@ mod tests {
                             deletes: vec![],
                             sequence_number: 1,
                             equality_ids: if delete_type == DataContentType::EqualityDeletes {
-                                vec![1, 2]
+                                Some(vec![1, 2])
                             } else {
-                                vec![]
+                                None
                             },
                             file_size_in_bytes: 1024,
                         })
@@ -836,7 +831,7 @@ mod tests {
                 predicate: None,
                 deletes,
                 sequence_number: 1,
-                equality_ids: vec![],
+                equality_ids: None,
                 file_size_in_bytes: self.size,
             }
         }
@@ -892,7 +887,7 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 1,
-                equality_ids: vec![1, 2],
+                equality_ids: Some(vec![1, 2]),
                 file_size_in_bytes: 1024,
             })
         }
@@ -1215,10 +1210,11 @@ mod tests {
         assert_eq!(result.len(), 3);
         let mut paths: Vec<_> = result.iter().map(|f| f.data_file_path.as_str()).collect();
         paths.sort();
-        assert_eq!(
-            paths,
-            vec!["small1.parquet", "small2.parquet", "small3.parquet"]
-        );
+        assert_eq!(paths, vec![
+            "small1.parquet",
+            "small2.parquet",
+            "small3.parquet"
+        ]);
 
         let small_file_threshold = match config {
             CompactionPlanningConfig::SmallFiles(sf_config) => sf_config.small_file_threshold_bytes,
@@ -1662,8 +1658,9 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_extraction() {
         // Test that FileGroup correctly extracts and organizes delete files
-        use iceberg::spec::{DataContentType, DataFileFormat};
         use std::sync::Arc;
+
+        use iceberg::spec::{DataContentType, DataFileFormat};
 
         // Create a data file with both position and equality delete files
         let position_delete = Arc::new(FileScanTask {
@@ -1678,7 +1675,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 1024,
         });
 
@@ -1694,7 +1691,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![1, 2],
+            equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 2048,
         });
 
@@ -1710,7 +1707,7 @@ mod tests {
             predicate: None,
             deletes: vec![position_delete, equality_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 10 * 1024 * 1024,
         };
 
@@ -1740,8 +1737,9 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_dedup_and_heuristic_output_parallelism() {
         // Build two data files referencing the same delete file path to ensure dedup
-        use iceberg::spec::{DataContentType, DataFileFormat};
         use std::sync::Arc;
+
+        use iceberg::spec::{DataContentType, DataFileFormat};
 
         let shared_pos_delete = Arc::new(FileScanTask {
             start: 0,
@@ -1755,7 +1753,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 512,
         });
 
@@ -1771,7 +1769,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_pos_delete.clone()],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
         };
 
@@ -1787,7 +1785,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_pos_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
         };
 
@@ -1820,8 +1818,9 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_dedup_mixed_types() {
         // Test deduplication of equality deletes and mixed delete types
-        use iceberg::spec::{DataContentType, DataFileFormat};
         use std::sync::Arc;
+
+        use iceberg::spec::{DataContentType, DataFileFormat};
 
         let shared_eq_delete = Arc::new(FileScanTask {
             start: 0,
@@ -1835,7 +1834,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![1, 2],
+            equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 1024,
         });
 
@@ -1851,7 +1850,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 512,
         });
 
@@ -1867,7 +1866,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_eq_delete.clone(), pos_delete.clone()],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
         };
 
@@ -1883,7 +1882,7 @@ mod tests {
             predicate: None,
             deletes: vec![shared_eq_delete, pos_delete],
             sequence_number: 1,
-            equality_ids: vec![],
+            equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
         };
 

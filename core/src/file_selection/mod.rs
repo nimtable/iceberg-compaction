@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-use crate::Result;
 use futures::stream::TryStreamExt;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
+
+use crate::Result;
 
 pub mod packer;
 pub mod strategy;
@@ -38,11 +39,7 @@ impl FileSelector {
         strategy: PlanStrategy,
         config: &crate::config::CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
-        let scan = table
-            .scan()
-            .snapshot_id(snapshot_id)
-            .with_delete_file_processing_enabled(true)
-            .build()?;
+        let scan = table.scan().snapshot_id(snapshot_id).build()?;
 
         let file_scan_stream = scan.plan_files().await?;
 

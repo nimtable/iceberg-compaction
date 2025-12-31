@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn benchmark_with_config(config: &MockIcebergConfig) -> anyhow::Result<()> {
-    let catalog = Arc::new(config.rest_catalog.load_catalog());
+    let catalog = Arc::new(config.rest_catalog.load_catalog().await);
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(config.rest_catalog.database_name.clone()),
         config.rest_catalog.table_name.clone(),

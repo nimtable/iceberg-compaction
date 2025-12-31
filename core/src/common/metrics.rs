@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use mixtrics::metrics::{BoxedCounterVec, BoxedHistogramVec, BoxedRegistry, Buckets};
-use std::{borrow::Cow, sync::Arc};
 
 use crate::executor::RewriteFilesStat;
 

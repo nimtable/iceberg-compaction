@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::future::try_join_all;
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY},
     spec::{NestedField, PrimitiveType, Schema, Type},
-    transaction::Transaction,
+    transaction::{Transaction, ApplyTransactionAction},
 };
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI};
+use iceberg_catalog_rest::{RestCatalog};
+use iceberg::CatalogBuilder;
 use iceberg_compaction_core::error::Result;
 use serde::{Deserialize, Serialize};
 
@@ -76,19 +79,18 @@ pub struct MockRestCatalogConfig {
 
 impl MockRestCatalogConfig {
     /// Create a `RestCatalog` from the configuration
-    pub fn load_catalog(&self) -> RestCatalog {
+    pub async fn load_catalog(&self) -> RestCatalog {
         let mut props = HashMap::new();
         props.insert(S3_ACCESS_KEY_ID.to_owned(), self.s3_access_key.clone());
         props.insert(S3_SECRET_ACCESS_KEY.to_owned(), self.s3_secret_key.clone());
         props.insert(S3_REGION.to_owned(), self.s3_region.clone());
-
-        let config = RestCatalogConfig::builder()
-            .uri(self.catalog_uri.clone())
-            .warehouse(self.warehouse_path.clone())
-            .props(props)
-            .build();
-
-        RestCatalog::new(config)
+        props.insert(REST_CATALOG_PROP_URI.to_owned(),self.catalog_uri.clone());
+        let catalog = 
+            iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+                .load("rest", props)
+                .await
+                .expect("failed to build rest catalog");
+        catalog
     }
 }
 
@@ -173,7 +175,7 @@ impl MockIcebergConfig {
 pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
     let pk_indices = config.get_pk_field_ids();
     // Get catalog from config
-    let catalog = config.rest_catalog.load_catalog();
+    let catalog = config.rest_catalog.load_catalog().await;
     // Build schema from config
     let (schema, fields_length) = config.build_schema()?;
     // Create namespace
@@ -263,33 +265,53 @@ pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
 
     // Commit data files and position deletes in one transaction
     let txn = Transaction::new(&table);
-    let mut fast_append_action =
-        txn.fast_append(Some(rand::random::<u64>() as i64), None, vec![])?;
-    fast_append_action
-        .add_data_files(data_files)?
-        .add_data_files(position_delete_files)?;
-    let table = fast_append_action.apply().await?.commit(&catalog).await?;
+// <<<<<<< HEAD
+//     let mut fast_append_action =
+//         txn.fast_append(Some(rand::random::<u64>() as i64), None, vec![])?;
+//     fast_append_action
+//         .add_data_files(data_files)?
+//         .add_data_files(position_delete_files)?;
+//     let table = fast_append_action.apply().await?.commit(&catalog).await?;
 
-    // Commit equality deletes in a separate transaction
-    let snapshot = table.metadata().current_snapshot().unwrap();
+//     // Commit equality deletes in a separate transaction
+//     let snapshot = table.metadata().current_snapshot().unwrap();
+//     let txn = Transaction::new(&table);
+//     let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
+//     fast_append_action.add_data_files(equality_delete_files)?;
+//     fast_append_action.apply().await?.commit(&catalog).await?;
+
+//     tracing::info!(
+//         "Successfully created table '{}' in namespace '{}' with {} data files",
+//         config.rest_catalog.table_name,
+//         config.rest_catalog.database_name,
+//         config.writer_config.data_file_num
+//     );
+
+// =======
+    let fast_append_action = txn
+        .fast_append()
+        .add_data_files(data_files)
+        .add_data_files(position_delete_files);
+    let table = fast_append_action
+        .apply(txn)
+        .unwrap()
+        .commit(&catalog)
+        .await?;
+
+    let _snapshot = table.metadata().current_snapshot().unwrap();
     let txn = Transaction::new(&table);
-    let mut fast_append_action = txn.fast_append(Some(snapshot.snapshot_id() + 1), None, vec![])?;
-    fast_append_action.add_data_files(equality_delete_files)?;
-    fast_append_action.apply().await?.commit(&catalog).await?;
-
-    tracing::info!(
-        "Successfully created table '{}' in namespace '{}' with {} data files",
-        config.rest_catalog.table_name,
-        config.rest_catalog.database_name,
-        config.writer_config.data_file_num
-    );
-
+    let fast_append_action = txn.fast_append().add_data_files(equality_delete_files);
+    fast_append_action
+        .apply(txn)
+        .unwrap()
+        .commit(&catalog)
+        .await?;
     Ok(())
 }
 
 /// Delete table defined in YAML configuration (if exists)
 pub async fn delete_table_from_config(config: &MockIcebergConfig) -> Result<()> {
-    let catalog = config.rest_catalog.load_catalog();
+    let catalog = config.rest_catalog.load_catalog().await;
     let namespace_ident = NamespaceIdent::new(config.rest_catalog.database_name.clone());
     let table_ident =
         iceberg::TableIdent::new(namespace_ident, config.rest_catalog.table_name.clone());

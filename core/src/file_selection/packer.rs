@@ -63,9 +63,7 @@ impl ListPacker {
     /// // Result: [[60, 30], [50, 20]] - two bins with good packing
     /// ```
     pub fn pack<T, F>(&self, mut items: Vec<T>, weight_func: F) -> Vec<Vec<T>>
-    where
-        F: Fn(&T) -> u64,
-    {
+    where F: Fn(&T) -> u64 {
         if items.is_empty() {
             return vec![];
         }
@@ -308,10 +306,10 @@ mod tests {
         // - world(5): can't fit bin0 (16+5=21>20), new bin1 -> bin1=[world(5)]
         // - rust(4): can fit bin1 (5+4=9<=20), add to bin1 -> bin1=[world(5), rust(4)]
         assert_eq!(result.len(), 2);
-        assert_eq!(
-            result[0],
-            vec!["programming".to_owned(), "hello".to_owned()]
-        );
+        assert_eq!(result[0], vec![
+            "programming".to_owned(),
+            "hello".to_owned()
+        ]);
         assert_eq!(result[1], vec!["world".to_owned(), "rust".to_owned()]);
     }
 

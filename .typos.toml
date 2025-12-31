@@ -1,0 +1,15 @@
+# Configuration for typos spell checker
+# https://github.com/crate-ci/typos
+
+[files]
+extend-exclude = [
+    "target/",
+    "Cargo.lock",
+]
+
+[default.extend-words]
+# Add project-specific words that should not be flagged as typos
+# Example: ident = "ident"
+
+[default.extend-identifiers]
+# Add identifiers that should not be flagged

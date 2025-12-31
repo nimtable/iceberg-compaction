@@ -17,13 +17,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iceberg_compaction_core::compaction::CompactionBuilder;
+use iceberg_compaction_core::config::CompactionConfigBuilder;
 use iceberg_compaction_core::iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
-use iceberg_compaction_core::iceberg::{Catalog, NamespaceIdent, TableIdent};
-
-use iceberg_compaction_core::compaction::CompactionBuilder;
-use iceberg_compaction_core::config::CompactionConfigBuilder;
+use iceberg_compaction_core::iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,15 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // iceberg_configs.insert("oauth2-server-uri".to_owned(), "http://localhost:8080/oauth2".to_owned());
     // iceberg_configs.insert("scope".to_owned(), "your-scope".to_owned());
 
-    let config_builder =
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogConfig::builder()
-            .uri("http://localhost:8080/your/catalog/uri".to_owned())
-            .warehouse("your-warehouse-location".to_owned())
-            .props(iceberg_configs);
-
-    // 2. Create the catalog
     let catalog = Arc::new(
-        iceberg_compaction_core::iceberg_catalog_rest::RestCatalog::new(config_builder.build()),
+        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+            .load("rest", iceberg_configs)
+            .await
+            .expect("failed to build rest catalog"),
     );
 
     let namespace_ident = NamespaceIdent::new("my_namespace".into());
@@ -70,15 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Perform the compaction
     println!("Starting compaction for table: {}", table_ident);
-    let resp = compaction.compact().await?.unwrap();
-    let stats = &resp.stats;
+    let result = compaction.compact().await?;
 
     // 5. Display compaction results
-    println!("Compaction completed successfully!");
-    println!("  - Input files: {}", stats.input_files_count);
-    println!("  - Output files: {}", stats.output_files_count);
-    println!("  - Input bytes: {}", stats.input_total_bytes);
-    println!("  - Output bytes: {}", stats.output_total_bytes);
+    match result {
+        Some(resp) => {
+            let stats = &resp.stats;
+            println!("Compaction completed successfully!");
+            println!("  - Input files: {}", stats.input_files_count);
+            println!("  - Output files: {}", stats.output_files_count);
+            println!("  - Input bytes: {}", stats.input_total_bytes);
+            println!("  - Output bytes: {}", stats.output_total_bytes);
+        }
+        None => {
+            println!("No compaction needed - table is empty or has no files to compact.");
+        }
+    }
 
     // optional you can check the table after compaction
     let _table = catalog.load_table(&table_ident).await?;
