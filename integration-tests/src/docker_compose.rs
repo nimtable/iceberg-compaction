@@ -242,6 +242,12 @@ impl DockerCompose {
     /// # Panics
     /// Panics if unable to retrieve or parse the IP address
     pub fn get_container_ip(&self, service_name: impl AsRef<str>) -> IpAddr {
+        // On macOS/Windows, Docker runs in a VM so container IPs aren't accessible from host,
+        // so use localhost instead (on Linux, it runs directly).
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            return std::net::Ipv4Addr::LOCALHOST.into();
+        }
+
         let container_name = format!("{}-{}-1", self.project_name, service_name.as_ref());
         let mut cmd = Command::new("docker");
         cmd.arg("inspect")
