@@ -476,15 +476,13 @@ impl FileGenerator {
                 )
             };
 
-            let writer = TaskWriter::new_with_partition_splitter(
+            TaskWriter::new_with_partition_splitter(
                 delta_writer_builder.clone(),
                 true,
                 self.schema.clone(),
                 self.partition_spec.clone(),
                 partition_splitter,
-            );
-
-            writer
+            )
         };
 
         let mut writer = create_new_task_writer();

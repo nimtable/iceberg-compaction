@@ -31,6 +31,8 @@ use iceberg_compaction_core::config::{
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
 
+const MB: u64 = 1024 * 1024;
+
 #[tokio::test]
 async fn test_sqlbuilder_fix_with_keyword_table_name() {
     // This test verifies that the SqlBuilder fix correctly handles SQL keyword table names
@@ -413,13 +415,11 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
     let small_files_config = SmallFilesConfigBuilder::default()
         .group_filters(
             GroupFiltersBuilder::default()
-                .min_group_file_count(2 as usize)
+                .min_group_file_count(2_usize)
                 .build()
                 .expect("Failed to build group filters"),
         )
-        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(
-            1 * 1024 * 2024, // 1 MB
-        )))
+        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
         .build()
         .expect("Failed to build small files config");
 
