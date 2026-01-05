@@ -42,6 +42,10 @@ The example includes:
 
 For more details, see the [rest-catalog example](./examples/rest-catalog/).
 
+### Benchmark Tool
+
+See the [bench binary](./integration-tests/src/bin/README.md) for benchmarking compaction performance with mock data.
+
 ## Development Roadmap
 
 ### Performance 🚀
