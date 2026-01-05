@@ -89,7 +89,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         .expect("Failed to create table with keyword name");
 
     // Generate data files to test SQL keyword handling in compaction scenarios
-    let writer_config = WriterConfig::new(&table);
+    let writer_config = WriterConfig::new(&table, None);
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(5)
         .with_data_file_row_count(300)
@@ -100,6 +100,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         file_generator_config,
         Arc::new(schema.clone()),
         writer_config,
+        vec![],
     )
     .expect("Failed to create file generator");
 
@@ -221,7 +222,7 @@ async fn test_sqlbuilder_with_delete_files() {
         .expect("Failed to create table with keyword name");
 
     // Generate data files with delete files using default parameters
-    let writer_config = WriterConfig::new(&table);
+    let writer_config = WriterConfig::new(&table, None);
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(5)
         .with_data_file_row_count(300);
@@ -231,6 +232,7 @@ async fn test_sqlbuilder_with_delete_files() {
         file_generator_config,
         Arc::new(schema.clone()),
         writer_config,
+        vec![],
     )
     .expect("Failed to create file generator");
 

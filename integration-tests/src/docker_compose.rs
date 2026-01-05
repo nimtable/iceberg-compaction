@@ -34,9 +34,9 @@ const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 const AWS_REGION: &str = "AWS_REGION";
 const MINIO_API_PORT: &str = "MINIO_API_PORT";
 
-const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
-const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
-const S3_REGION: &str = "s3.region";
+pub const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
+pub const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
+pub const S3_REGION: &str = "s3.region";
 const S3_ENDPOINT: &str = "s3.endpoint";
 
 const DEFAULT_ADMIN: &str = "admin";

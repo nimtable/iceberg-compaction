@@ -75,6 +75,7 @@ pub struct RecordBatchGenerator {
     pub num_rows: usize,
     pub batch_size: usize,
     pub schema: ArrowSchema,
+    pub fields_length: Vec<Option<usize>>,
 }
 
 impl RecordBatchGenerator {
@@ -84,11 +85,17 @@ impl RecordBatchGenerator {
     /// * `num_rows` - Total number of rows to generate across all batches
     /// * `batch_size` - Number of rows per batch
     /// * `schema` - Arrow schema defining the structure of the data
-    pub fn new(num_rows: usize, batch_size: usize, schema: ArrowSchema) -> Self {
+    pub fn new(
+        num_rows: usize,
+        batch_size: usize,
+        schema: ArrowSchema,
+        fields_length: Vec<Option<usize>>,
+    ) -> Self {
         Self {
             num_rows,
             batch_size,
             schema,
+            fields_length,
         }
     }
 
@@ -130,7 +137,8 @@ impl RecordBatchGenerator {
             .schema
             .fields()
             .iter()
-            .map(|field| match field.data_type() {
+            .enumerate()
+            .map(|(index, field)| match field.data_type() {
                 datafusion::arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(
                     (0..batch_size)
                         .map(|_| rand::random::<bool>())
@@ -186,11 +194,18 @@ impl RecordBatchGenerator {
                         .map(|_| rand::random::<f64>())
                         .collect::<Vec<f64>>(),
                 )) as ArrayRef,
-                datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(
-                    (0..batch_size)
-                        .map(|_| generate_string(DEFAULT_STRING_LENGTH))
-                        .collect::<Vec<String>>(),
-                )) as ArrayRef,
+                datafusion::arrow::datatypes::DataType::Utf8 => {
+                    let length = self
+                        .fields_length
+                        .get(index)
+                        .and_then(|l| *l)
+                        .unwrap_or(DEFAULT_STRING_LENGTH);
+                    Arc::new(StringArray::from(
+                        (0..batch_size)
+                            .map(|_| generate_string(length))
+                            .collect::<Vec<String>>(),
+                    )) as ArrayRef
+                }
                 _ => unimplemented!("Unsupported data type: {:?}", field.data_type()),
             })
             .collect::<Vec<ArrayRef>>();
@@ -299,12 +314,12 @@ impl WriterConfig {
     ///
     /// # Arguments
     /// * `table` - The Iceberg table to use for configuration
-    pub fn new(table: &Table) -> Self {
+    pub fn new(table: &Table, equality_ids: Option<Vec<i32>>) -> Self {
         Self {
             data_file_prefix: DEFAULT_DATA_FILE_PREFIX.to_owned(),
             file_io: table.file_io().clone(),
             dir_path: format!("{}{}", table.metadata().location(), DEFAULT_DATA_SUBDIR),
-            equality_ids: vec![1],
+            equality_ids: equality_ids.unwrap_or(vec![1]),
         }
     }
 }
@@ -323,12 +338,15 @@ impl FileGenerator {
         config: FileGeneratorConfig,
         schema: Arc<Schema>,
         writer_config: WriterConfig,
+        fields_length: Vec<Option<usize>>,
     ) -> Result<Self> {
         let arrow_schema = schema_to_arrow_schema(&schema)?;
+
         let record_batch_generator = RecordBatchGenerator::new(
             config.data_file_row_count * config.data_file_num,
             config.batch_size,
             arrow_schema,
+            fields_length,
         );
         Ok(Self {
             record_batch_generator,
