@@ -6,6 +6,7 @@ This binary (`bench`) lives under `integration-tests/src/bin/bench.rs`. It can:
 - Delete the table
 
 Default config path: `./testdata/mock_iceberg.yaml` (relative to the `integration-tests/` crate root).
+You need rest catalog if you want to run the tests.
 
 ---
 
