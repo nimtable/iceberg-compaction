@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Ok;
-use iceberg_compaction_core::{
-    CompactionConfig,
-    compaction::CompactionBuilder,
-    config::{CompactionExecutionConfigBuilder, CompactionPlanningConfig},
+use iceberg_compaction_core::CompactionConfig;
+use iceberg_compaction_core::compaction::CompactionBuilder;
+use iceberg_compaction_core::config::{CompactionExecutionConfigBuilder, CompactionPlanningConfig};
+use iceberg_compaction_integration_tests::test_utils::{
+    delete_table_from_config, mock_iceberg_table,
 };
-use iceberg_compaction_integration_tests::{
-    DEFAULT_CONFIG_PATH, MockIcebergConfig,
-    test_utils::{delete_table_from_config, mock_iceberg_table},
-};
+use iceberg_compaction_integration_tests::{DEFAULT_CONFIG_PATH, MockIcebergConfig};
 use tokio::time::Instant;
 
 #[tokio::main]
@@ -31,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let path = args.get(2).map(|s| s.as_str());
     let config =
         iceberg_compaction_integration_tests::test_utils::MockIcebergConfig::from_yaml_file(
-            path.as_deref().unwrap_or(DEFAULT_CONFIG_PATH),
+            path.unwrap_or(DEFAULT_CONFIG_PATH),
         )?;
 
     match cmd {
@@ -48,7 +46,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running mock table creation from config: {:?}", config);
             mock_iceberg_table(&config).await?;
         }
-        "bench" | _ => {
+        "bench" => {
+            println!("Running benchmark with table from config: {:?}", config);
+            mock_iceberg_table(&config).await?;
+            benchmark_with_config(&config).await?;
+        }
+        _ => {
             println!("Running benchmark with table from config: {:?}", config);
             mock_iceberg_table(&config).await?;
             benchmark_with_config(&config).await?;

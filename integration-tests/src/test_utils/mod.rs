@@ -81,11 +81,10 @@ impl MockRestCatalogConfig {
         props.insert(S3_SECRET_ACCESS_KEY.to_owned(), self.s3_secret_key.clone());
         props.insert(S3_REGION.to_owned(), self.s3_region.clone());
         props.insert(REST_CATALOG_PROP_URI.to_owned(), self.catalog_uri.clone());
-        let catalog = iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
+        iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
             .load("rest", props)
             .await
-            .expect("failed to build rest catalog");
-        catalog
+            .expect("failed to build rest catalog")
     }
 }
 
@@ -204,7 +203,7 @@ pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
     let total_files = config.writer_config.data_file_num;
 
     // Calculate files per task
-    let files_per_task = (total_files + concurrency - 1) / concurrency;
+    let files_per_task = total_files.div_ceil(concurrency);
 
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(files_per_task)
