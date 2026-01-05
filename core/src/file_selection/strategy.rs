@@ -326,12 +326,12 @@ impl FileGroup {
         }
     }
 
-    /// Calculates min_file_size from target_file_size using default ratio.
+    /// Calculates `min_file_size` from `target_file_size` using default ratio.
     fn default_min_file_size(target_file_size: u64) -> u64 {
         (target_file_size as f64 * MIN_FILE_SIZE_DEFAULT_RATIO) as u64
     }
 
-    /// Calculates max_file_size from target_file_size using default ratio.
+    /// Calculates `max_file_size` from `target_file_size` using default ratio.
     fn default_max_file_size(target_file_size: u64) -> u64 {
         (target_file_size as f64 * MAX_FILE_SIZE_DEFAULT_RATIO) as u64
     }
