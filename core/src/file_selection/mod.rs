@@ -45,7 +45,8 @@ impl FileSelector {
         config: &crate::config::CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
         let data_files = Self::scan_data_files(table, snapshot_id).await?;
-        strategy.execute(data_files, config)
+        let partition_spec = table.metadata().default_partition_spec();
+        strategy.execute(data_files, config, partition_spec)
     }
 
     /// Scans and collects all data files from a table snapshot.
@@ -69,7 +70,6 @@ impl FileSelector {
             })
             .try_collect()
             .await?;
-
         Ok(data_files)
     }
 
@@ -81,7 +81,8 @@ impl FileSelector {
         tasks: Vec<FileScanTask>,
         strategy: PlanStrategy,
         config: &crate::config::CompactionPlanningConfig,
+        partition_spec: &iceberg::spec::PartitionSpec,
     ) -> Result<Vec<FileGroup>> {
-        strategy.execute(tasks, config)
+        strategy.execute(tasks, config, partition_spec)
     }
 }

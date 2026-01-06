@@ -23,7 +23,10 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
+use std::collections::HashMap;
+
 use iceberg::scan::FileScanTask;
+use iceberg::spec::PartitionSpec;
 
 use super::packer::ListPacker;
 use crate::config::{CompactionPlanningConfig, GroupingStrategy};
@@ -275,7 +278,27 @@ pub enum GroupingStrategyEnum {
 }
 
 impl GroupingStrategyEnum {
-    pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
+    pub fn group_files<I>(&self, data_files: I, partition_spec: &PartitionSpec) -> Vec<FileGroup>
+    where I: Iterator<Item = FileScanTask> {
+        if partition_spec.is_unpartitioned() {
+            self.group_files_single_partition(data_files)
+        } else {
+            self.group_files_by_partition(data_files)
+        }
+    }
+
+    fn group_files_by_partition<I>(&self, data_files: I) -> Vec<FileGroup>
+    where I: Iterator<Item = FileScanTask> {
+        let partitioned_files = group_files_by_partition(data_files);
+        let mut all_files = Vec::new();
+        for (_key, files) in partitioned_files {
+            let partitioned_file_group = self.group_files_single_partition(files.into_iter());
+            all_files.extend(partitioned_file_group);
+        }
+        all_files
+    }
+
+    fn group_files_single_partition<I>(&self, data_files: I) -> Vec<FileGroup>
     where I: Iterator<Item = FileScanTask> {
         match self {
             GroupingStrategyEnum::Single(strategy) => strategy.group_files(data_files),
@@ -525,10 +548,11 @@ impl PlanStrategy {
     }
 
     /// Executes the pipeline:
-    /// 1. Apply each file filter sequentially
-    /// 2. Group files using grouping strategy
-    /// 3. Apply each group filter sequentially
-    /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
+    /// 1. Pre-group files by partition (if the a partition spec is present)
+    /// 2. Apply each file filter sequentially
+    /// 3. Group files using grouping strategy
+    /// 4. Apply each group filter sequentially
+    /// 5. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
     /// # Errors
     /// Propagates errors from parallelism calculation (fails if group has 0 bytes).
@@ -536,13 +560,16 @@ impl PlanStrategy {
         &self,
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
+        partition_spec: &PartitionSpec,
     ) -> Result<Vec<FileGroup>> {
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
         }
 
-        let file_groups = self.grouping.group_files(filtered_files.into_iter());
+        let file_groups = self
+            .grouping
+            .group_files(filtered_files.into_iter(), partition_spec);
 
         let mut file_groups = file_groups;
         for filter in &self.group_filters {
@@ -726,6 +753,42 @@ impl std::fmt::Display for PlanStrategy {
     }
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct PartitionKey(iceberg::spec::Struct);
+
+// Invariant: this function should only be called for partitioned tables
+fn group_files_by_partition<I>(files: I) -> HashMap<PartitionKey, Vec<FileScanTask>>
+where I: Iterator<Item = FileScanTask> {
+    let mut partitioned_groups: HashMap<PartitionKey, Vec<FileScanTask>> = HashMap::new();
+    for file in files {
+        // It is invalid in Iceberg for a partitioned table to have a file without partition data
+        if file.partition.is_none() {
+            tracing::warn!(
+                "File {} is missing partition data in partitioned table, skipping",
+                file.data_file_path
+            );
+            continue;
+        }
+        match file.partition.clone() {
+            Some(partition) => {
+                partitioned_groups
+                    .entry(PartitionKey(partition))
+                    .or_default()
+                    .push(file);
+            }
+            None => {
+                tracing::warn!(
+                    "File {} is missing partition data in partitioned table, skipping",
+                    file.data_file_path
+                );
+                continue;
+            }
+        }
+    }
+
+    partitioned_groups
+}
+
 #[cfg(test)]
 mod tests {
     // Lazy static schema to avoid rebuilding it for every test
@@ -851,11 +914,12 @@ mod tests {
         pub fn execute_strategy_flat(
             strategy: &PlanStrategy,
             data_files: Vec<FileScanTask>,
+            partition_spec: &PartitionSpec,
         ) -> Vec<FileScanTask> {
             let config = CompactionPlanningConfig::default();
 
             strategy
-                .execute(data_files, &config)
+                .execute(data_files, &config, partition_spec)
                 .unwrap()
                 .into_iter()
                 .flat_map(|group| group.into_files())
@@ -1090,7 +1154,10 @@ mod tests {
         ];
 
         let config = TestUtils::create_test_config();
-        let groups = strategy.execute(test_files, &config).unwrap();
+
+        let groups = strategy
+            .execute(test_files, &config, &PartitionSpec::unpartition_spec())
+            .unwrap();
 
         assert_eq!(groups.len(), 2);
         let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
@@ -1113,7 +1180,9 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = strategy.execute(large_files, &config).unwrap();
+        let large_groups = strategy
+            .execute(large_files, &config, &PartitionSpec::unpartition_spec())
+            .unwrap();
         assert_eq!(large_groups.len(), 2);
         assert_eq!(large_groups[0].data_file_count, 1);
         assert_eq!(large_groups[1].data_file_count, 1);
@@ -1165,6 +1234,7 @@ mod tests {
                 .execute(
                     files,
                     &CompactionPlanningConfig::SmallFiles(small_files_config.clone()),
+                    &PartitionSpec::unpartition_spec(),
                 )
                 .unwrap();
             assert_eq!(
@@ -1213,7 +1283,11 @@ mod tests {
                 .build(),
         ];
 
-        let result = TestUtils::execute_strategy_flat(&strategy, test_files);
+        let result = TestUtils::execute_strategy_flat(
+            &strategy,
+            test_files,
+            &PartitionSpec::unpartition_spec(),
+        );
 
         // Now includes small2 with deletes since we removed the NoDeleteFilesStrategy
         assert_eq!(result.len(), 3);
@@ -1253,8 +1327,11 @@ mod tests {
                 .size(10 * 1024 * 1024)
                 .build(),
         ];
-        let insufficient_result =
-            TestUtils::execute_strategy_flat(&min_count_strategy, insufficient_files);
+        let insufficient_result = TestUtils::execute_strategy_flat(
+            &min_count_strategy,
+            insufficient_files,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(insufficient_result.len(), 0);
 
         let sufficient_files = vec![
@@ -1268,8 +1345,11 @@ mod tests {
                 .size(15 * 1024 * 1024)
                 .build(),
         ];
-        let sufficient_result =
-            TestUtils::execute_strategy_flat(&min_count_strategy, sufficient_files);
+        let sufficient_result = TestUtils::execute_strategy_flat(
+            &min_count_strategy,
+            sufficient_files,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(sufficient_result.len(), 3);
 
         let default_small_files_config = SmallFilesConfigBuilder::default()
@@ -1297,7 +1377,11 @@ mod tests {
                 .size(5 * 1024 * 1024)
                 .build(),
         ];
-        let single_result = TestUtils::execute_strategy_flat(&default_strategy, single_file);
+        let single_result = TestUtils::execute_strategy_flat(
+            &default_strategy,
+            single_file,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(single_result.len(), 1);
         TestUtils::assert_paths_eq(&["single.parquet"], &single_result);
 
@@ -1312,7 +1396,11 @@ mod tests {
                 .size(12 * 1024 * 1024)
                 .build(),
         ];
-        let multi_result = TestUtils::execute_strategy_flat(&default_strategy, multiple_files);
+        let multi_result = TestUtils::execute_strategy_flat(
+            &default_strategy,
+            multiple_files,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(multi_result.len(), 3);
         let small_file_threshold_default = match &default_config {
             CompactionPlanningConfig::SmallFiles(config) => config.small_file_threshold_bytes,
@@ -1426,12 +1514,19 @@ mod tests {
         ];
 
         // Strategy with size filter should exclude large files (>100MB)
-        let result_filtered =
-            TestUtils::execute_strategy_flat(&strategy_with_size_filter, test_files.clone());
+        let result_filtered = TestUtils::execute_strategy_flat(
+            &strategy_with_size_filter,
+            test_files.clone(),
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(result_filtered.len(), 3); // small, medium, and with_deletes (all under 100MB)
 
         // Minimal strategy should pass all files
-        let result_minimal = TestUtils::execute_strategy_flat(&strategy_minimal, test_files);
+        let result_minimal = TestUtils::execute_strategy_flat(
+            &strategy_minimal,
+            test_files,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(result_minimal.len(), 4);
     }
 
@@ -1524,7 +1619,9 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = bin_pack_strategy.execute(large_files, &config).unwrap();
+        let large_groups = bin_pack_strategy
+            .execute(large_files, &config, &PartitionSpec::unpartition_spec())
+            .unwrap();
         assert_eq!(
             large_groups.len(),
             4,
@@ -1552,7 +1649,10 @@ mod tests {
 
         // Test Single variant
         let single_enum = GroupingStrategyEnum::Single(SingleGroupingStrategy);
-        let groups = single_enum.group_files(data_files.clone().into_iter());
+        let groups = single_enum.group_files(
+            data_files.clone().into_iter(),
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].data_file_count, 2);
         assert_eq!(single_enum.to_string(), "SingleGrouping");
@@ -1563,20 +1663,23 @@ mod tests {
                 .size(20 * 1024 * 1024)
                 .build(),
         ];
-        let single_file_groups = single_enum.group_files(single.into_iter());
+        let single_file_groups =
+            single_enum.group_files(single.into_iter(), &PartitionSpec::unpartition_spec());
         assert_eq!(single_file_groups.len(), 1);
         assert_eq!(single_file_groups[0].data_file_count, 1);
         TestUtils::assert_paths_eq(&["single.parquet"], &single_file_groups[0].data_files);
 
         // Empty input
         let empty_files: Vec<FileScanTask> = vec![];
-        let single_empty_groups = single_enum.group_files(empty_files.into_iter());
+        let single_empty_groups =
+            single_enum.group_files(empty_files.into_iter(), &PartitionSpec::unpartition_spec());
         assert_eq!(single_empty_groups.len(), 0);
 
         // Test BinPack variant
         let binpack_enum =
             GroupingStrategyEnum::BinPack(BinPackGroupingStrategy::new(20 * 1024 * 1024));
-        let binpack_groups = binpack_enum.group_files(data_files.into_iter());
+        let binpack_groups =
+            binpack_enum.group_files(data_files.into_iter(), &PartitionSpec::unpartition_spec());
         assert!(!binpack_groups.is_empty());
         assert_eq!(binpack_enum.to_string(), "BinPackGrouping[target=20MB]");
     }
@@ -1976,7 +2079,13 @@ mod tests {
                 .build(),
         ];
 
-        let groups = strategy.execute(test_files.clone(), &config).unwrap();
+        let groups = strategy
+            .execute(
+                test_files.clone(),
+                &config,
+                &PartitionSpec::unpartition_spec(),
+            )
+            .unwrap();
 
         assert_eq!(
             groups.len(),
@@ -2140,7 +2249,11 @@ mod tests {
             ),
         ];
 
-        let result = TestUtils::execute_strategy_flat(&strategy, test_files);
+        let result = TestUtils::execute_strategy_flat(
+            &strategy,
+            test_files,
+            &PartitionSpec::unpartition_spec(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].data_file_path, "two_deletes.parquet");
         assert_eq!(result[0].deletes.len(), 2);
@@ -2173,7 +2286,13 @@ mod tests {
                 .build(),
         ];
 
-        let result = strategy.execute(test_files.clone(), &config).unwrap();
+        let result = strategy
+            .execute(
+                test_files.clone(),
+                &config,
+                &PartitionSpec::unpartition_spec(),
+            )
+            .unwrap();
 
         // Full compaction should include ALL files, creating groups but not filtering any
         let total_files_in_groups: usize = result.iter().map(|g| g.data_file_count).sum();
