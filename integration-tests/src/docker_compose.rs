@@ -16,11 +16,9 @@
 
 // Copyright https://github.com/apache/iceberg-rust/crates/test_util. Licensed under Apache-2.0.
 use core::net::{IpAddr, SocketAddr};
-use std::{
-    collections::HashMap,
-    process::Command,
-    sync::{Once, RwLock},
-};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::{Once, RwLock};
 
 use ctor::dtor;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
@@ -36,9 +34,9 @@ const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 const AWS_REGION: &str = "AWS_REGION";
 const MINIO_API_PORT: &str = "MINIO_API_PORT";
 
-const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
-const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
-const S3_REGION: &str = "s3.region";
+pub const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
+pub const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
+pub const S3_REGION: &str = "s3.region";
 const S3_ENDPOINT: &str = "s3.endpoint";
 
 const DEFAULT_ADMIN: &str = "admin";
@@ -127,7 +125,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
 
     let mut props = props;
     props.insert(
-        REST_CATALOG_PROP_URI.to_string(),
+        REST_CATALOG_PROP_URI.to_owned(),
         format!("http://{}", rest_socket_addr),
     );
     RestCatalogBuilder::default()

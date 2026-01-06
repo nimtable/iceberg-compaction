@@ -16,9 +16,11 @@
 
 //! Compaction configuration types and constants.
 
-use crate::common::available_parallelism;
 use derive_builder::Builder;
-use parquet::{basic::Compression, file::properties::WriterProperties};
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+
+use crate::common::available_parallelism;
 
 pub const DEFAULT_PREFIX: &str = "iceberg-compact";
 pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB

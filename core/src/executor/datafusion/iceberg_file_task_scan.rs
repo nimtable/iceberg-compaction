@@ -437,11 +437,13 @@ pub fn get_column_names(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, SchemaBuilder};
     use iceberg::scan::FileScanTask;
     use iceberg::spec::{DataContentType, Schema};
-    use std::sync::Arc;
+
+    use super::*;
 
     fn create_file_scan_task(length: u64, file_id: u64) -> FileScanTask {
         FileScanTask {

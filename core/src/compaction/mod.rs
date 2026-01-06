@@ -14,14 +14,20 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::time::Duration;
+
+use backon::{ExponentialBuilder, Retryable};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
 
-use crate::CompactionError;
-use crate::Result;
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
@@ -30,16 +36,7 @@ use crate::executor::{
     create_compaction_executor,
 };
 use crate::file_selection::{FileGroup, FileSelector};
-use crate::{CompactionConfig, CompactionExecutor};
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
-use std::sync::Arc;
-use std::time::Duration;
-
-use backon::ExponentialBuilder;
-use backon::Retryable;
-use std::borrow::Cow;
+use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
 mod validator;
 
@@ -1277,19 +1274,20 @@ impl CompactionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::compaction::{CompactionBuilder, CompactionPlanner};
-    use crate::config::{
-        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
-        SmallFilesConfigBuilder,
-    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-    use iceberg::spec::{MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::spec::{
+        DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type, UNASSIGNED_SNAPSHOT_ID,
+    };
     use iceberg::table::Table;
-    use iceberg::transaction::ApplyTransactionAction;
-    use iceberg::transaction::Transaction;
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use iceberg::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
@@ -1300,22 +1298,21 @@ mod tests {
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use iceberg::writer::{
-        IcebergWriter, IcebergWriterBuilder, base_writer::data_file_writer::DataFileWriterBuilder,
-    };
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
     use parquet::file::properties::WriterProperties;
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     // Additional imports for new tests
     use crate::compaction::{CommitManagerRetryConfig, CompactionPlan, RewriteResult};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner};
+    use crate::config::{
+        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
+        SmallFilesConfigBuilder,
+    };
     use crate::executor::{ExecutorType, RewriteFilesStat};
-    use iceberg::spec::{DataFile, UNASSIGNED_SNAPSHOT_ID};
-    use std::time::Duration;
 
     // ----------------------
     // Test helpers to reduce duplication
@@ -1338,7 +1335,7 @@ mod tests {
                 .load(
                     "memory",
                     HashMap::from([(
-                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
                         warehouse_location.clone(),
                     )]),
                 )
@@ -1446,14 +1443,11 @@ mod tests {
         // Convert iceberg schema to arrow schema to ensure field ID consistency
         let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
 
-        RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(pos_array),
-            ],
-        )
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(pos_array),
+        ])
         .unwrap()
     }
 
@@ -1464,10 +1458,10 @@ mod tests {
         // Convert iceberg schema to arrow schema to ensure field ID consistency
         let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
 
-        RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+        ])
         .unwrap()
     }
 
@@ -1976,7 +1970,7 @@ mod tests {
                 .load(
                     "memory",
                     HashMap::from([(
-                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
                         warehouse_location.clone(),
                     )]),
                 )

@@ -4,36 +4,45 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Main library
-iceberg-compaction-core = { path = "../core" }
-
-# Docker and test utilities
-ctor = { workspace = true }
-port_scanner = { workspace = true }
-tempfile = { workspace = true }
 
 # Async runtime
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true }
 
+# Docker and test utilities
+ctor = { workspace = true }
+
+# DataFusion and Parquet
+datafusion = { workspace = true }
+futures = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
 # Iceberg and catalog
 iceberg = { workspace = true }
 # iceberg-catalog-memory = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+# Main library
+iceberg-compaction-core = { path = "../core" }
 iceberg-datafusion = { workspace = true }
-
-# DataFusion and Parquet
-datafusion = { workspace = true }
 parquet = { workspace = true }
-
-# Logging
-tracing = { workspace = true }
+port_scanner = { workspace = true }
 
 # Other utilities
 rand = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+# Logging
 uuid = { workspace = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 
 [lints]
 workspace = true

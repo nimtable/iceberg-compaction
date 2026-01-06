@@ -16,27 +16,21 @@
 
 use std::sync::Arc;
 
-use crate::{
-    config::CompactionExecutionConfig,
-    error::{CompactionError, Result},
-    file_selection::FileGroup,
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
 };
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
-        repartition::RepartitionExec,
-    },
-    prelude::{SessionConfig, SessionContext},
-};
-use iceberg::{
-    arrow::schema_to_arrow_schema,
-    io::FileIO,
-    scan::FileScanTask,
-    spec::{NestedField, PrimitiveType, Schema, Type},
-};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::io::FileIO;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
+use crate::config::CompactionExecutionConfig;
+use crate::error::{CompactionError, Result};
+use crate::file_selection::FileGroup;
 
 // System hidden columns used for Iceberg merge-on-read operations
 pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
@@ -797,13 +791,14 @@ mod table_name {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
     use crate::executor::datafusion::datafusion_processor::table_name::{
         DATA_FILE_TABLE, POSITION_DELETE_TABLE,
     };
-
-    use super::*;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use std::sync::Arc;
 
     /// Test building SQL with no delete files
     #[test]
@@ -1116,8 +1111,9 @@ mod tests {
 
     #[test]
     fn test_equality_delete_join_names() {
-        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use std::sync::Arc;
+
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
         // schema
         let fields = vec![
@@ -1326,11 +1322,8 @@ mod tests {
             ("_data_file_table", "select", true, vec![]),
             ("_data_file_table", "join", true, vec![]),
             // Equality delete table with keyword
-            (
-                "_data_file_table",
-                "_position_delete_table",
-                false,
-                vec![EqualityDeleteMetadata::new(
+            ("_data_file_table", "_position_delete_table", false, vec![
+                EqualityDeleteMetadata::new(
                     Schema::builder()
                         .with_fields(vec![Arc::new(NestedField::new(
                             1,
@@ -1341,8 +1334,8 @@ mod tests {
                         .build()
                         .unwrap(),
                     "from".to_owned(), // Equality delete table with keyword
-                )],
-            ),
+                ),
+            ]),
         ];
 
         for (data_table, pos_delete_table, need_file_path_pos, eq_delete_metadatas) in test_cases {

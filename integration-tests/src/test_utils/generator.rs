@@ -14,42 +14,39 @@
  * limitations under the License.
  */
 
-use async_stream::try_stream;
-use iceberg::{
-    arrow::{arrow_schema_to_schema, schema_to_arrow_schema},
-    io::FileIO,
-    spec::{DataFile, NestedField, PrimitiveType, Schema, Type},
-    table::Table,
-    writer::{
-        IcebergWriter, IcebergWriterBuilder,
-        base_writer::{
-            data_file_writer::DataFileWriterBuilder,
-            equality_delete_writer::{EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig},
-            position_delete_file_writer::PositionDeleteFileWriterBuilder,
-        },
-        delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP},
-        file_writer::{
-            ParquetWriterBuilder,
-            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
-            rolling_writer::RollingFileWriterBuilder,
-        },
-    },
-};
-use iceberg_compaction_core::{CompactionError, error::Result};
-use parquet::file::properties::WriterProperties;
-use rand::{Rng, distr::Alphanumeric};
 use std::sync::Arc;
 
-use datafusion::arrow::{
-    array::{
-        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
-    },
-    compute::filter,
-    datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+use async_stream::try_stream;
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use datafusion::arrow::compute::filter;
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use futures::StreamExt;
+use iceberg::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
+use iceberg::table::Table;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::equality_delete_writer::{
+    EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+};
+use iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+use iceberg::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg_compaction_core::CompactionError;
+use iceberg_compaction_core::error::Result;
+use parquet::file::properties::WriterProperties;
+use rand::Rng;
+use rand::distr::Alphanumeric;
 
 const DEFAULT_DATA_FILE_ROW_COUNT: usize = 10000;
 const DEFAULT_EQUALITY_DELETE_ROW_COUNT: usize = 200;
@@ -78,6 +75,7 @@ pub struct RecordBatchGenerator {
     pub num_rows: usize,
     pub batch_size: usize,
     pub schema: ArrowSchema,
+    pub fields_length: Vec<Option<usize>>,
 }
 
 impl RecordBatchGenerator {
@@ -87,11 +85,17 @@ impl RecordBatchGenerator {
     /// * `num_rows` - Total number of rows to generate across all batches
     /// * `batch_size` - Number of rows per batch
     /// * `schema` - Arrow schema defining the structure of the data
-    pub fn new(num_rows: usize, batch_size: usize, schema: ArrowSchema) -> Self {
+    pub fn new(
+        num_rows: usize,
+        batch_size: usize,
+        schema: ArrowSchema,
+        fields_length: Vec<Option<usize>>,
+    ) -> Self {
         Self {
             num_rows,
             batch_size,
             schema,
+            fields_length,
         }
     }
 
@@ -133,7 +137,8 @@ impl RecordBatchGenerator {
             .schema
             .fields()
             .iter()
-            .map(|field| match field.data_type() {
+            .enumerate()
+            .map(|(index, field)| match field.data_type() {
                 datafusion::arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(
                     (0..batch_size)
                         .map(|_| rand::random::<bool>())
@@ -189,11 +194,18 @@ impl RecordBatchGenerator {
                         .map(|_| rand::random::<f64>())
                         .collect::<Vec<f64>>(),
                 )) as ArrayRef,
-                datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(
-                    (0..batch_size)
-                        .map(|_| generate_string(DEFAULT_STRING_LENGTH))
-                        .collect::<Vec<String>>(),
-                )) as ArrayRef,
+                datafusion::arrow::datatypes::DataType::Utf8 => {
+                    let length = self
+                        .fields_length
+                        .get(index)
+                        .and_then(|l| *l)
+                        .unwrap_or(DEFAULT_STRING_LENGTH);
+                    Arc::new(StringArray::from(
+                        (0..batch_size)
+                            .map(|_| generate_string(length))
+                            .collect::<Vec<String>>(),
+                    )) as ArrayRef
+                }
                 _ => unimplemented!("Unsupported data type: {:?}", field.data_type()),
             })
             .collect::<Vec<ArrayRef>>();
@@ -302,12 +314,12 @@ impl WriterConfig {
     ///
     /// # Arguments
     /// * `table` - The Iceberg table to use for configuration
-    pub fn new(table: &Table) -> Self {
+    pub fn new(table: &Table, equality_ids: Option<Vec<i32>>) -> Self {
         Self {
             data_file_prefix: DEFAULT_DATA_FILE_PREFIX.to_owned(),
             file_io: table.file_io().clone(),
             dir_path: format!("{}{}", table.metadata().location(), DEFAULT_DATA_SUBDIR),
-            equality_ids: vec![1],
+            equality_ids: equality_ids.unwrap_or(vec![1]),
         }
     }
 }
@@ -326,12 +338,15 @@ impl FileGenerator {
         config: FileGeneratorConfig,
         schema: Arc<Schema>,
         writer_config: WriterConfig,
+        fields_length: Vec<Option<usize>>,
     ) -> Result<Self> {
         let arrow_schema = schema_to_arrow_schema(&schema)?;
+
         let record_batch_generator = RecordBatchGenerator::new(
             config.data_file_row_count * config.data_file_num,
             config.batch_size,
             arrow_schema,
+            fields_length,
         );
         Ok(Self {
             record_batch_generator,

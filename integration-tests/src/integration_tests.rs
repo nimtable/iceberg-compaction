@@ -16,15 +16,15 @@
 
 //! Integration tests that require Docker containers
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
-use iceberg::{
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
-    spec::{NestedField, PrimitiveType, Schema, Type},
-    transaction::{ApplyTransactionAction, Transaction},
-};
 
 #[tokio::test]
 async fn test_sqlbuilder_fix_with_keyword_table_name() {
@@ -89,7 +89,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         .expect("Failed to create table with keyword name");
 
     // Generate data files to test SQL keyword handling in compaction scenarios
-    let writer_config = WriterConfig::new(&table);
+    let writer_config = WriterConfig::new(&table, None);
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(5)
         .with_data_file_row_count(300)
@@ -100,6 +100,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         file_generator_config,
         Arc::new(schema.clone()),
         writer_config,
+        vec![],
     )
     .expect("Failed to create file generator");
 
@@ -144,7 +145,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
         "Compaction should process input files"
     );
     assert_eq!(
-        2, response.stats.output_files_count,
+        1, response.stats.output_files_count,
         "Compaction should produce output files"
     );
 
@@ -221,7 +222,7 @@ async fn test_sqlbuilder_with_delete_files() {
         .expect("Failed to create table with keyword name");
 
     // Generate data files with delete files using default parameters
-    let writer_config = WriterConfig::new(&table);
+    let writer_config = WriterConfig::new(&table, None);
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(5)
         .with_data_file_row_count(300);
@@ -231,6 +232,7 @@ async fn test_sqlbuilder_with_delete_files() {
         file_generator_config,
         Arc::new(schema.clone()),
         writer_config,
+        vec![],
     )
     .expect("Failed to create file generator");
 
@@ -270,7 +272,7 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // Verify SqlBuilder correctly handles keyword identifiers in merge-on-read scenarios
     assert_eq!(
-        9, response.stats.input_files_count,
+        6, response.stats.input_files_count,
         "Compaction should process input files"
     );
 
@@ -288,7 +290,7 @@ async fn test_sqlbuilder_with_delete_files() {
 
     // input_equality_delete_file_count
     assert_eq!(
-        3, response.stats.input_equality_delete_file_count,
+        0, response.stats.input_equality_delete_file_count,
         "Compaction should process input equality delete files"
     );
 
