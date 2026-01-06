@@ -2890,7 +2890,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=54498bc5189b8d1f68419b53ba2d0288ce375a87#54498bc5189b8d1f68419b53ba2d0288ce375a87"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=4bf15b94052f507c4cf0a820863294a65d8ac1a2#4bf15b94052f507c4cf0a820863294a65d8ac1a2"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=54498bc5189b8d1f68419b53ba2d0288ce375a87#54498bc5189b8d1f68419b53ba2d0288ce375a87"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=4bf15b94052f507c4cf0a820863294a65d8ac1a2#4bf15b94052f507c4cf0a820863294a65d8ac1a2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2963,7 +2963,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=54498bc5189b8d1f68419b53ba2d0288ce375a87#54498bc5189b8d1f68419b53ba2d0288ce375a87"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=4bf15b94052f507c4cf0a820863294a65d8ac1a2#4bf15b94052f507c4cf0a820863294a65d8ac1a2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=54498bc5189b8d1f68419b53ba2d0288ce375a87#54498bc5189b8d1f68419b53ba2d0288ce375a87"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=4bf15b94052f507c4cf0a820863294a65d8ac1a2#4bf15b94052f507c4cf0a820863294a65d8ac1a2"
 dependencies = [
  "anyhow",
  "async-trait",
