@@ -811,6 +811,8 @@ mod tests {
         size: u64,
         has_deletes: bool,
         delete_types: Vec<iceberg::spec::DataContentType>,
+        partition: Option<iceberg::spec::Struct>,
+        schema: Option<Arc<iceberg::spec::Schema>>,
     }
 
     impl TestFileBuilder {
@@ -820,6 +822,8 @@ mod tests {
                 size: 10 * 1024 * 1024, // Default 10MB
                 has_deletes: false,
                 delete_types: vec![],
+                partition: None,
+                schema: None,
             }
         }
 
@@ -837,6 +841,16 @@ mod tests {
 
         pub fn with_deletes(self) -> Self {
             self.with_equality_deletes()
+        }
+
+        pub fn with_partition(mut self, partition: iceberg::spec::Struct) -> Self {
+            self.partition = Some(partition);
+            self
+        }
+
+        pub fn with_schema(mut self, schema: Arc<iceberg::spec::Schema>) -> Self {
+            self.schema = Some(schema);
+            self
         }
 
         pub fn build(self) -> FileScanTask {
@@ -860,7 +874,7 @@ mod tests {
                             ),
                             data_file_content: delete_type,
                             data_file_format: DataFileFormat::Parquet,
-                            schema: get_test_schema(),
+                            schema: self.schema.clone().unwrap_or(get_test_schema()),
                             project_field_ids: if delete_type == DataContentType::EqualityDeletes {
                                 vec![1, 2]
                             } else {
@@ -892,14 +906,14 @@ mod tests {
                 data_file_path: self.path,
                 data_file_content: DataContentType::Data,
                 data_file_format: DataFileFormat::Parquet,
-                schema: get_test_schema(),
+                schema: self.schema.unwrap_or(get_test_schema()),
                 project_field_ids: vec![1, 2],
                 predicate: None,
                 deletes,
                 sequence_number: 1,
                 equality_ids: None,
                 file_size_in_bytes: self.size,
-                partition: None,
+                partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
             }
@@ -2352,5 +2366,434 @@ mod tests {
         assert!(exec_p >= 1);
         assert!(out_p >= 1);
         assert!(exec_p <= config.max_parallelism());
+    }
+
+    // ##############################################################
+    // Tests for Grouping Partitioned Files
+    // ##############################################################
+
+    // NOTE: The unit tests above already cover the case of Tables which do not have a partition
+    // and thus should not be pre-grouped by partition before applying filters.
+
+    static TEST_SCHEMA_WITH_PARTITION: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
+
+    fn get_test_schema_with_partition() -> Arc<iceberg::spec::Schema> {
+        TEST_SCHEMA_WITH_PARTITION
+            .get_or_init(|| {
+                Arc::new(
+                    iceberg::spec::Schema::builder()
+                        .with_fields(vec![Arc::new(iceberg::spec::NestedField::new(
+                            1,
+                            "num",
+                            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                            true,
+                        ))])
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .clone()
+    }
+
+    /// Create a bucket partition value
+    fn create_partition_value(bucket_value: i32) -> iceberg::spec::Struct {
+        let fields: Vec<Option<iceberg::spec::Literal>> = vec![Some(
+            iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(bucket_value)),
+        )];
+        iceberg::spec::Struct::from_iter(fields)
+    }
+
+    /// Helper to create a simple partitioned `PartitionSpec`
+    fn create_test_partition_spec() -> PartitionSpec {
+        use iceberg::spec::{Transform, UnboundPartitionSpec};
+
+        // For unit tests, we just need a non-unpartitioned spec
+        // The actual fields don't matter since we're manufacturing partition values
+        UnboundPartitionSpec::builder()
+            .add_partition_field(
+                1, // field_id
+                "test_bucket",
+                Transform::Bucket(5),
+            )
+            .expect("Failed to add partition field")
+            .build()
+            .bind(get_test_schema_with_partition())
+            .expect("Failed to bind partition spec to test schema")
+    }
+
+    #[test]
+    fn test_single_strategy_groups_by_partition() {
+        // Validates that the Single group strategy (without filters) groups files by partition.
+
+        // 1. Create files in 5 partitions with varying counts.
+        let build_file = |name: &str, partition_num: i32| {
+            TestFileBuilder::new(name)
+                .size(1024 * 1024) // size doesn't matter for this test
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+        let files = vec![
+            // Partition 0
+            build_file("p0_file1.parquet", 0),
+            build_file("p0_file2.parquet", 0),
+            build_file("p0_file3.parquet", 0),
+            // Partition 1
+            build_file("p1_file1.parquet", 1),
+            // Partition 2
+            build_file("p2_file1.parquet", 2),
+            build_file("p2_file2.parquet", 2),
+            build_file("p2_file3.parquet", 2),
+            build_file("p2_file4.parquet", 2),
+            // Partition 3
+            build_file("p3_file1.parquet", 3),
+            build_file("p3_file2.parquet", 3),
+            // Partition 4
+            build_file("p4_file1.parquet", 4),
+        ];
+
+        // 2. Create strategy with Single grouping, and no group filters.
+        let strategy = PlanStrategy::new_custom(
+            None, // no file filters
+            None, // no delete file count filter
+            GroupingStrategy::Single,
+            None, // no group filters
+        );
+        let config = CompactionPlanningConfig::default();
+        let partition_spec = create_test_partition_spec();
+
+        // 3. Execute strategy
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        assert_eq!(
+            groups.len(),
+            5,
+            "Should have 5 groups (one per partition), not 1 combined group"
+        );
+    }
+
+    #[test]
+    fn test_single_group_groups_and_applies_min_file_count_filter_to_partitions() {
+        // Validates that min_group_file_count filter applies to groups created within each partition.
+
+        // 1. Create files in 5 partitions with varying counts.
+        let build_file = |name: &str, partition_num: i32| {
+            TestFileBuilder::new(name)
+                .size(1024 * 1024) // size doesn't matter for this test
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+        let files = vec![
+            // Partition 0
+            build_file("p0_file1.parquet", 0),
+            build_file("p0_file2.parquet", 0),
+            build_file("p0_file3.parquet", 0),
+            // Partition 1
+            build_file("p1_file1.parquet", 1),
+            // Partition 2
+            build_file("p2_file1.parquet", 2),
+            build_file("p2_file2.parquet", 2),
+            build_file("p2_file3.parquet", 2),
+            build_file("p2_file4.parquet", 2),
+            // Partition 3
+            build_file("p3_file1.parquet", 3),
+            build_file("p3_file2.parquet", 3),
+            // Partition 4
+            build_file("p4_file1.parquet", 4),
+        ];
+
+        // 2. Create strategy with Single grouping + min_group_file_count filter
+        let small_files_config = SmallFilesConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(crate::config::GroupFilters {
+                min_group_file_count: Some(2),
+                min_group_size_bytes: None,
+            })
+            .build()
+            .unwrap();
+        let config = CompactionPlanningConfig::SmallFiles(small_files_config.clone());
+        let strategy = PlanStrategy::from_small_files(&small_files_config);
+
+        // 3. Execute strategy
+        let partition_spec = create_test_partition_spec();
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 0, 2, 3)");
+
+        // Collect file counts per group
+        let mut file_counts: Vec<usize> = groups.iter().map(|g| g.data_file_count).collect();
+        file_counts.sort();
+
+        assert_eq!(
+            file_counts,
+            vec![2, 3, 4],
+            "File counts should be [2, 3, 4] for partitions 3, 0, 2 respectively"
+        );
+
+        // Verify total files in output
+        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(
+            total_files, 9,
+            "Should have 9 total files (partitions 1 and 4 filtered out)"
+        );
+    }
+
+    #[test]
+    fn test_binpack_groups_by_partition_does_not_mix_across_partitions() {
+        // Validates that BinPack creates separate groups per partition and doesn't
+        // mix files from different partitions, even when it could optimize packing.
+
+        // 1. Create files in 3 partitions, 2 files each
+        let build_file = |name: &str, partition_num: i32, size_mb: u64| {
+            TestFileBuilder::new(name)
+                .size(size_mb * 1024 * 1024)
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+
+        let files = vec![
+            // Partition 0: 2 files @ 10MB each = 20MB total
+            build_file("p0_file1.parquet", 0, 10),
+            build_file("p0_file2.parquet", 0, 20),
+            // Partition 1: 2 files @ 10MB each = 20MB total
+            build_file("p1_file1.parquet", 1, 10),
+            build_file("p1_file2.parquet", 1, 20),
+            // Partition 2: 2 files @ 10MB each = 20MB total
+            build_file("p2_file1.parquet", 2, 10),
+            build_file("p2_file2.parquet", 2, 20),
+        ];
+
+        // 2. Create strategy with BinPack grouping, and no group filters.
+        // Target size = 50MB. Without partitions, it would optimally pack into 50MB groups.
+        let strategy = PlanStrategy::new_custom(
+            None, // no file filters
+            None, // no delete file count filter
+            GroupingStrategy::BinPack(crate::config::BinPackConfig::new(50 * 1024 * 1024)),
+            None, // no group filters
+        );
+
+        let config = CompactionPlanningConfig::default();
+        let partition_spec = create_test_partition_spec();
+
+        // 3. Execute strategy
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        assert_eq!(
+            groups.len(),
+            3,
+            "Should have 3 groups (one per partition), not 1 combined group"
+        );
+
+        // Verify the groups
+        for group in &groups {
+            assert_eq!(
+                group.data_file_count, 2,
+                "Each partition should have 2 files grouped together"
+            );
+            assert_eq!(
+                group.total_size,
+                30 * 1024 * 1024,
+                "Each group should be 30MB"
+            );
+        }
+
+        // Verify total files
+        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(total_files, 6, "Should have all 6 files in output");
+    }
+
+    #[test]
+    fn test_binpack_optimizes_files_within_partition() {
+        // Validates that BinPacking will optimize file groups by size within a partition.
+
+        // 1. Create files in 3 partitions, 2 files each
+        let build_file = |name: &str, partition_num: i32, size_mb: u64| {
+            TestFileBuilder::new(name)
+                .size(size_mb * 1024 * 1024)
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+
+        let files = vec![
+            // Partition 0: BinPack to [50MB, 5MB]
+            build_file("p0_file1.parquet", 0, 10),
+            build_file("p0_file2.parquet", 0, 20),
+            build_file("p0_file3.parquet", 0, 5),
+            build_file("p0_file4.parquet", 0, 5),
+            build_file("p0_file5.parquet", 0, 15),
+            // Partition 1: BinPack to [40MB, 35MB]
+            build_file("p1_file1.parquet", 1, 10),
+            build_file("p1_file2.parquet", 1, 20),
+            build_file("p1_file3.parquet", 1, 15),
+            build_file("p1_file4.parquet", 1, 5),
+            build_file("p1_file5.parquet", 1, 20),
+            build_file("p1_file6.parquet", 1, 5),
+        ];
+
+        // 2. Create strategy with BinPack grouping, and no group filters. Target size = 50MB.
+        let strategy = PlanStrategy::new_custom(
+            None, // no file filters
+            None, // no delete file count filter
+            GroupingStrategy::BinPack(crate::config::BinPackConfig::new(50 * 1024 * 1024)),
+            None, // no group filters
+        );
+
+        let config = CompactionPlanningConfig::default();
+        let partition_spec = create_test_partition_spec();
+
+        // 3. Execute strategy
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        assert_eq!(groups.len(), 4, "Should have 4 groups (two per partition)");
+
+        // Collect the byte size of each group
+        let mut group_sizes: Vec<u64> = groups.iter().map(|g| g.total_size_mb()).collect();
+        group_sizes.sort();
+
+        assert_eq!(
+            group_sizes,
+            vec![5, 35, 40, 50],
+            "Binpacked group byte sizes should be [5, 35, 40, 50]"
+        );
+    }
+
+    #[test]
+    fn test_binpack_with_min_file_count_filter() {
+        // Validates that BinPacking will optimize file groups by size within a partition, and
+        // then filter groups which do not meet the minimum file count.
+
+        // 1. Create files in 3 partitions, 2 files each
+        let build_file = |name: &str, partition_num: i32, size_mb: u64| {
+            TestFileBuilder::new(name)
+                .size(size_mb * 1024 * 1024)
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+
+        let files = vec![
+            // Partition 0: BinPacks to a group of 4 files (50MB), and 1 file (10MB)
+            build_file("p0_file1.parquet", 0, 10),
+            build_file("p0_file2.parquet", 0, 20),
+            build_file("p0_file3.parquet", 0, 5),
+            build_file("p0_file4.parquet", 0, 5),
+            build_file("p0_file5.parquet", 0, 15),
+            // Partition 1: BinPacks to a group of 3 files (40MB), and 2 files (35MB)
+            build_file("p1_file1.parquet", 1, 10),
+            build_file("p1_file2.parquet", 1, 20),
+            build_file("p1_file3.parquet", 1, 15),
+            build_file("p1_file4.parquet", 1, 5),
+            build_file("p1_file5.parquet", 1, 20),
+            build_file("p1_file6.parquet", 1, 5),
+        ];
+
+        // 2. Create strategy with BinPack grouping, and no group filters. Target size = 50MB.
+        let strategy = PlanStrategy::new_custom(
+            None, // no file filters
+            None, // no delete file count filter
+            GroupingStrategy::BinPack(crate::config::BinPackConfig::new(50 * 1024 * 1024)),
+            Some(crate::config::GroupFilters {
+                min_group_file_count: Some(2), // Requires at least 2 files per group
+                min_group_size_bytes: None,
+            }),
+        );
+
+        let config = CompactionPlanningConfig::default();
+        let partition_spec = create_test_partition_spec();
+
+        // 3. Execute strategy
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        // Verify a 5MB file from Partition 0 was filtered out.
+        assert_eq!(
+            groups.len(),
+            3,
+            "Should have 3 groups (1 for partition 0; 2 for partition 1)"
+        );
+
+        // Collect the byte size of each group
+        let mut group_sizes: Vec<u64> = groups.iter().map(|g| g.total_size_mb()).collect();
+        group_sizes.sort();
+
+        assert_eq!(
+            group_sizes,
+            vec![35, 40, 50],
+            "Binpacked group byte sizes should be [35, 40, 50]"
+        );
+    }
+
+    #[test]
+    fn test_binpack_with_min_file_count_and_min_size_filters() {
+        // Validates that BinPacking will optimize file groups by size within a partition
+        // and can apply filters to the groups
+
+        let target_filters = crate::config::GroupFilters {
+            min_group_file_count: Some(2), // Requires at least 2 files per group
+            min_group_size_bytes: Some(20 * 1024 * 1024), // Requires at least 15MB per group
+        };
+
+        // 1. Create files in 3 partitions, 2 files each
+        let build_file = |name: &str, partition_num: i32, size_mb: u64| {
+            TestFileBuilder::new(name)
+                .size(size_mb * 1024 * 1024)
+                .with_partition(create_partition_value(partition_num))
+                .with_schema(get_test_schema_with_partition())
+                .build()
+        };
+
+        let files = vec![
+            // Partition 0: Enough data, but not enough files
+            build_file("p0_file1.parquet", 0, 30),
+            // Partition 1: Enough files, but not enough data
+            build_file("p1_file1.parquet", 1, 5),
+            build_file("p1_file2.parquet", 1, 5),
+            // Partition 2: Enough data, and enough files
+            build_file("p2_file1.parquet", 2, 10),
+            build_file("p2_file2.parquet", 2, 10),
+            // Partition 3: First group has enough data/files, 2nd group has too little data
+            build_file("p3_file1.parquet", 3, 25),
+            build_file("p3_file2.parquet", 3, 25),
+            build_file("p3_file3.parquet", 3, 5),
+            build_file("p3_file4.parquet", 3, 5),
+            // Partition 4: First group has enough data/files, 2nd group has too few files
+            build_file("p4_file1.parquet", 4, 25),
+            build_file("p4_file2.parquet", 4, 25),
+            build_file("p4_file3.parquet", 4, 30),
+        ];
+
+        // 2. Create strategy with BinPack grouping, and no group filters. Target size = 50MB.
+        let strategy = PlanStrategy::new_custom(
+            None, // no file filters
+            None, // no delete file count filter
+            GroupingStrategy::BinPack(crate::config::BinPackConfig::new(50 * 1024 * 1024)),
+            Some(target_filters),
+        );
+
+        let config = CompactionPlanningConfig::default();
+        let partition_spec = create_test_partition_spec();
+
+        // 3. Execute strategy
+        let groups = strategy.execute(files, &config, &partition_spec).unwrap();
+
+        // 4. Assertions
+        assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 2, 3, 4)");
+
+        // Collect the byte size of each group
+        let mut group_sizes: Vec<u64> = groups.iter().map(|g| g.total_size_mb()).collect();
+        group_sizes.sort();
+
+        assert_eq!(
+            group_sizes,
+            vec![20, 50, 50],
+            "Binpacked group byte sizes should be [20, 50, 50]"
+        );
     }
 }
