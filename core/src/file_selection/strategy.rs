@@ -173,7 +173,7 @@ impl FileGroup {
     /// - Also considers file count constraints: `ceil(files_count / max_file_count_per_partition)`
     /// - Takes the max of size-based and count-based parallelism
     ///
-    /// Both values are capped by `max_parallelism`.
+    /// Input parallelism is capped by `max_input_parallelism`, output parallelism is capped by `max_output_parallelism`.
     ///
     /// # Errors
     /// Returns error if `input_total_bytes()` is 0.
@@ -195,7 +195,7 @@ impl FileGroup {
         // Calculate output parallelism using Iceberg's expectedOutputFiles algorithm
         let output_parallelism =
             Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
-                .min(config.max_parallelism())
+                .min(config.max_output_parallelism())
                 .max(1);
 
         // Apply output parallelism heuristic if enabled
@@ -215,10 +215,10 @@ impl FileGroup {
             .div_ceil(config.max_file_count_per_partition())
             .max(1);
 
-        // Input parallelism is the max of size-based and count-based, capped by max_parallelism
+        // Input parallelism is the max of size-based and count-based, capped by max_input_parallelism
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.max_parallelism());
+            .min(config.max_input_parallelism());
 
         Ok((input_parallelism, output_parallelism))
     }
@@ -1686,7 +1686,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
             .max_file_count_per_partition(5_usize) // 5 files per partition
-            .max_parallelism(8_usize) // Max 8 parallel tasks
+            .max_input_parallelism(8_usize) // Max 8 parallel input tasks
+            .max_output_parallelism(8_usize) // Max 8 parallel output tasks
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -1712,7 +1713,7 @@ mod tests {
         assert!(executor_parallelism >= 1);
         assert!(output_parallelism >= 1);
         assert!(output_parallelism <= executor_parallelism);
-        assert!(executor_parallelism <= config.max_parallelism());
+        assert!(executor_parallelism <= config.max_input_parallelism());
 
         // Test error case - empty group
         let empty_group = FileGroup::empty();
@@ -1744,7 +1745,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64)
             .max_file_count_per_partition(5_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -1909,7 +1911,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2022,7 +2025,8 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
             .min_size_per_partition(20 * 1024 * 1024_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2075,8 +2079,8 @@ mod tests {
                 idx
             );
             assert!(
-                group.executor_parallelism <= config.max_parallelism(),
-                "Group {} should respect max_parallelism",
+                group.executor_parallelism <= config.max_input_parallelism(),
+                "Group {} should respect max_input_parallelism",
                 idx
             );
             assert!(
@@ -2103,7 +2107,7 @@ mod tests {
                 .max(1);
             let expected_exec_p = partition_by_size
                 .max(partition_by_count)
-                .min(config.max_parallelism());
+                .min(config.max_input_parallelism());
 
             assert_eq!(
                 group.executor_parallelism, expected_exec_p,
@@ -2283,7 +2287,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(1000_usize)
+            .max_input_parallelism(1000_usize)
+            .max_output_parallelism(1000_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -2301,6 +2306,6 @@ mod tests {
         let (exec_p, out_p) = result.unwrap();
         assert!(exec_p >= 1);
         assert!(out_p >= 1);
-        assert!(exec_p <= config.max_parallelism());
+        assert!(exec_p <= config.max_input_parallelism());
     }
 }
