@@ -20,12 +20,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, UnboundPartitionSpec};
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::{
-    BinPackConfig, CompactionConfigBuilder, CompactionPlanningConfig, GroupFiltersBuilder,
-    GroupingStrategy, SmallFilesConfigBuilder,
+    BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
+    CompactionPlanningConfig, GroupFiltersBuilder, GroupingStrategy, SmallFilesConfigBuilder,
 };
 
 use crate::docker_compose::get_rest_catalog;
@@ -313,14 +314,16 @@ async fn test_sqlbuilder_with_delete_files() {
     let _ = catalog.drop_namespace(&namespace_ident).await;
 }
 
-#[tokio::test]
-async fn test_min_files_in_group_applies_to_partitioned_table() {
-    // Issue 111: https://github.com/nimtable/iceberg-compaction/issues/111
-    // This test verifies that the min_files_in_group config is applied to partitions, not the whole table.
+// #######################################
+// Tests for Partitioned Tables
+// #######################################
 
-    let catalog = get_rest_catalog().await;
-    let catalog = Arc::new(catalog);
-
+async fn setup_bucket_partitioned_table(
+    catalog: Arc<iceberg_catalog_rest::RestCatalog>,
+    namespace_name: &str,
+    table_name: &str,
+    bucket_number: usize,
+) -> (Table, Schema) {
     // Create a schema with a "num" column which we will partition on
     let schema = Schema::builder()
         .with_fields(vec![
@@ -340,8 +343,7 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         .build()
         .expect("Failed to create schema");
 
-    let namespace_ident = NamespaceIdent::new("test_namespace".to_owned());
-    let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".to_owned());
+    let namespace_ident = NamespaceIdent::new(namespace_name.to_owned());
 
     catalog
         .create_namespace(&namespace_ident, HashMap::default())
@@ -350,12 +352,11 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
 
     // Create a partition spec with a bucket transform. We expect the compaction to produce the
     // same number of files as the number of buckets.
-    let partition_bucket_n: usize = 5;
     let unbound_partition_spec = UnboundPartitionSpec::builder()
         .add_partition_field(
             2,
             "num_bucket",
-            iceberg::spec::Transform::Bucket(partition_bucket_n as u32),
+            iceberg::spec::Transform::Bucket(bucket_number as u32),
         )
         .expect("could not add partition field")
         .build();
@@ -365,7 +366,7 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         .expect("could not bind partition spec to test schema");
 
     let table_creation = TableCreation::builder()
-        .name("test_table".to_owned())
+        .name(table_name.to_owned())
         .schema(schema.clone())
         .partition_spec(partition_spec.clone())
         .build();
@@ -375,17 +376,27 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         .await
         .expect("Failed to create table with keyword name");
 
-    let writer_config = WriterConfig::new(&table, None);
+    (table, schema)
+}
+
+async fn write_data_to_table(
+    catalog: Arc<iceberg_catalog_rest::RestCatalog>,
+    table: &Table,
+    schema: &Schema,
+    data_files: usize,
+    row_count: usize,
+) {
+    let writer_config = WriterConfig::new(table, None);
     let file_generator_config = FileGeneratorConfig::new()
-        .with_data_file_num(10)
-        .with_data_file_row_count(300)
+        .with_data_file_num(data_files)
+        .with_data_file_row_count(row_count)
         .with_equality_delete_row_count(0) // No delete files to avoid data deletion issues
         .with_position_delete_row_count(0);
 
     let mut file_generator = FileGenerator::new(
         file_generator_config,
         Arc::new(schema.clone()),
-        Arc::new(partition_spec.clone()),
+        table.metadata().default_partition_spec().clone(),
         writer_config,
         vec![],
     )
@@ -396,10 +407,8 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         .await
         .expect("Failed to generate test data files");
 
-    println!("commit_data_files len {}", commit_data_files.len());
-
     // Commit files to table
-    let txn = Transaction::new(&table);
+    let txn = Transaction::new(table);
     let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
 
     let _table_with_data = fast_append_action
@@ -408,6 +417,27 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         .commit(catalog.as_ref())
         .await
         .expect("Failed to commit transaction");
+}
+
+#[tokio::test]
+async fn test_min_files_in_group_applies_to_partitioned_table() {
+    // Issue 111: https://github.com/nimtable/iceberg-compaction/issues/111
+    // This test verifies that the min_files_in_group config is applied to partitions, not the whole table.
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    let partition_bucket_n: usize = 5;
+    let (table, schema) = setup_bucket_partitioned_table(
+        catalog.clone(),
+        "partition_namespace_01",
+        "partition_table_01",
+        partition_bucket_n,
+    )
+    .await;
+
+    // Write enough rows that each partition will compact to 4 files apiece.
+    write_data_to_table(catalog.clone(), &table, &schema, 10, 300).await;
 
     // Setup the SmallFiles compaction configuration with BinPacking. The key configuration is
     // to set a min_group_file_count to 2. The expectation is that a partition should have
@@ -431,7 +461,7 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
     let config = Arc::new(config);
 
     // Run compaction once to get our first compacted data.
-    let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone())
+    let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
         .with_config(config.clone())
         .with_catalog_name("test_catalog".to_owned())
         .build();
@@ -451,7 +481,7 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
     );
 
     // Run compaction again to verify we DO NOT comapct the data again.
-    let compaction = CompactionBuilder::new(catalog.clone(), table_ident.clone())
+    let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
         .with_config(config.clone())
         .with_catalog_name("test_catalog".to_owned())
         .build();
@@ -464,6 +494,81 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
     );
 
     // Clean up: try to drop the table and namespace
-    let _ = catalog.drop_table(&table_ident).await;
-    let _ = catalog.drop_namespace(&namespace_ident).await;
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_group() {
+    // https://github.com/nimtable/iceberg-compaction/issues/111
+    // This test verifies that writing multiple output files within a partition does not error/panic.
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    let partition_bucket_n: usize = 5;
+    let (table, schema) = setup_bucket_partitioned_table(
+        catalog.clone(),
+        "partition_namespace_02",
+        "partition_test_02",
+        partition_bucket_n,
+    )
+    .await;
+
+    // Write enough rows that each partition will compact to 4 files apiece.
+    write_data_to_table(catalog.clone(), &table, &schema, 10, 10_000).await;
+
+    // Setup the SmallFiles compaction configuration with BinPacking.
+    let small_files_config = SmallFilesConfigBuilder::default()
+        .group_filters(
+            GroupFiltersBuilder::default()
+                .min_group_file_count(5_usize)
+                .build()
+                .expect("Failed to build group filters"),
+        )
+        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
+        .build()
+        .expect("Failed to build small files config");
+
+    // The key configuration is setting target_file_size_bytes to a value small enough to
+    // trigger rolling the file within each partition.
+    let planning_config = CompactionPlanningConfig::SmallFiles(small_files_config);
+    let config = CompactionConfigBuilder::default()
+        .execution(
+            CompactionExecutionConfigBuilder::default()
+                .target_file_size_bytes(100_000_u64)
+                .build()
+                .expect("Failed to build execution config"),
+        )
+        .planning(planning_config)
+        .build()
+        .expect("Failed to build compaction config");
+    let config = Arc::new(config);
+
+    // Run compaction once to get our first compacted data.
+    let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
+        .with_config(config.clone())
+        .with_catalog_name("test_catalog".to_owned())
+        .build();
+
+    let compaction_result = compaction
+        .compact()
+        .await
+        .expect("The compaction job to not result in an error")
+        .expect("Full compaction SQL generation should succeed");
+
+    assert_eq!(
+        55, compaction_result.stats.input_files_count,
+        "Compaction input should match the expected number of files"
+    );
+
+    assert_eq!(
+        partition_bucket_n * 4,
+        compaction_result.stats.output_files_count,
+        "Compaction should produce 4 files per partition"
+    );
+
+    // Clean up: try to drop the table and namespace
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
 }

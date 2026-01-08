@@ -503,7 +503,7 @@ where
             max_concurrent_closes: self
                 .max_concurrent_closes
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_CLOSES),
-            partition_key: self.partition_key,
+            partition_key,
         })
     }
 }
