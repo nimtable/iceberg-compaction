@@ -20,10 +20,12 @@ use iceberg::table::Table;
 
 use crate::Result;
 
+pub mod analyzer;
 pub mod packer;
 pub mod strategy;
 
 // Re-export commonly used types for convenience
+pub use analyzer::{SnapshotAnalyzer, SnapshotStats};
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy};
 

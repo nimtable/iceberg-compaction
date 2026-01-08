@@ -36,6 +36,10 @@ pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per part
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 
+// Auto compaction defaults
+pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
+pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
+
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
 
@@ -372,5 +376,131 @@ impl Default for CompactionConfig {
         CompactionConfigBuilder::default()
             .build()
             .expect("CompactionConfig default should always build")
+    }
+}
+
+/// Thresholds for auto compaction strategy selection.
+///
+/// Contains only strategy selection judgement conditions.
+#[derive(Debug, Clone)]
+pub struct AutoThresholds {
+    pub min_small_files_count: usize,
+    pub min_files_with_deletes_count: usize,
+}
+
+impl Default for AutoThresholds {
+    fn default() -> Self {
+        Self {
+            min_small_files_count: DEFAULT_MIN_SMALL_FILES_COUNT,
+            min_files_with_deletes_count: DEFAULT_MIN_FILES_WITH_DELETES_COUNT,
+        }
+    }
+}
+
+/// Configuration for automatic compaction strategy selection.
+///
+/// Combines strategy selection thresholds with common planning parameters.
+/// Automatically resolves the best compaction strategy based on snapshot statistics.
+/// Strategy priority: `FilesWithDeletes` → `SmallFiles` → `Full`.
+#[derive(Builder, Debug, Clone)]
+#[builder(setter(into, strip_option))]
+pub struct AutoCompactionConfig {
+    /// Strategy selection thresholds
+    #[builder(default)]
+    pub thresholds: AutoThresholds,
+
+    /// Common planning parameters applied to all selected strategies
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    #[builder(default = "available_parallelism().get()")]
+    pub max_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
+    pub small_file_threshold_bytes: u64,
+
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
+
+    /// Strategy-specific parameter: minimum delete files for `FilesWithDeletes` strategy
+    #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub min_delete_file_count_threshold: usize,
+
+    /// Execution configuration
+    #[builder(default)]
+    pub execution: CompactionExecutionConfig,
+}
+
+impl AutoCompactionConfig {
+    /// Resolves which strategy to use based on snapshot stats.
+    /// Priority order: `FilesWithDeletes` → `SmallFiles` → `Full`.
+    /// Returns a fully configured `CompactionPlanningConfig` using Auto's common parameters.
+    pub fn resolve(
+        &self,
+        stats: &crate::file_selection::analyzer::SnapshotStats,
+    ) -> Option<CompactionPlanningConfig> {
+        // Priority 1: FilesWithDeletes
+        if stats.files_with_deletes_count >= self.thresholds.min_files_with_deletes_count {
+            return Some(CompactionPlanningConfig::FilesWithDeletes(
+                FilesWithDeletesConfig {
+                    target_file_size_bytes: self.target_file_size_bytes,
+                    min_size_per_partition: self.min_size_per_partition,
+                    max_file_count_per_partition: self.max_file_count_per_partition,
+                    max_parallelism: self.max_parallelism,
+                    enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
+                    grouping_strategy: self.grouping_strategy.clone(),
+                    min_delete_file_count_threshold: self.min_delete_file_count_threshold,
+                    group_filters: self.group_filters.clone(),
+                },
+            ));
+        }
+
+        // Priority 2: SmallFiles
+        if stats.small_files_count >= self.thresholds.min_small_files_count {
+            return Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+                target_file_size_bytes: self.target_file_size_bytes,
+                min_size_per_partition: self.min_size_per_partition,
+                max_file_count_per_partition: self.max_file_count_per_partition,
+                max_parallelism: self.max_parallelism,
+                enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
+                small_file_threshold_bytes: self.small_file_threshold_bytes,
+                grouping_strategy: self.grouping_strategy.clone(),
+                group_filters: self.group_filters.clone(),
+            }));
+        }
+
+        // Priority 3: Full (always available if more than 1 file)
+        if stats.total_data_files > 1 {
+            return Some(CompactionPlanningConfig::Full(FullCompactionConfig {
+                target_file_size_bytes: self.target_file_size_bytes,
+                min_size_per_partition: self.min_size_per_partition,
+                max_file_count_per_partition: self.max_file_count_per_partition,
+                max_parallelism: self.max_parallelism,
+                enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
+                grouping_strategy: self.grouping_strategy.clone(),
+            }));
+        }
+
+        None
+    }
+}
+
+impl Default for AutoCompactionConfig {
+    fn default() -> Self {
+        AutoCompactionConfigBuilder::default()
+            .build()
+            .expect("AutoCompactionConfig default should always build")
     }
 }
