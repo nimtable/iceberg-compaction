@@ -17,7 +17,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use iceberg::spec::MAIN_BRANCH;
 use iceberg::{Catalog, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 
@@ -86,11 +85,6 @@ impl AutoCompactionBuilder {
     }
 
     pub fn build(self) -> AutoCompaction {
-        let to_branch = self
-            .to_branch
-            .clone()
-            .unwrap_or_else(|| MAIN_BRANCH.to_owned().into());
-
         let mut inner_builder = CompactionBuilder::new(self.catalog, self.table_ident);
 
         if let Some(name) = self.catalog_name {
@@ -105,12 +99,13 @@ impl AutoCompactionBuilder {
         if let Some(retry) = self.commit_retry_config {
             inner_builder = inner_builder.with_retry_config(retry);
         }
-        inner_builder = inner_builder.with_to_branch(to_branch.clone());
+        if let Some(to_branch) = self.to_branch {
+            inner_builder = inner_builder.with_to_branch(to_branch);
+        }
 
         AutoCompaction {
             inner: inner_builder.build(),
             auto_config: self.auto_config,
-            to_branch,
         }
     }
 }
@@ -118,7 +113,6 @@ impl AutoCompactionBuilder {
 pub struct AutoCompaction {
     inner: Compaction,
     auto_config: AutoCompactionConfig,
-    to_branch: Cow<'static, str>,
 }
 
 impl AutoCompaction {
@@ -130,7 +124,7 @@ impl AutoCompaction {
             .load_table(&self.inner.table_ident)
             .await?;
 
-        let snapshot = match table.metadata().snapshot_for_ref(&self.to_branch) {
+        let snapshot = match table.metadata().snapshot_for_ref(&self.inner.to_branch) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -162,7 +156,7 @@ impl AutoCompaction {
             .load_table(&self.inner.table_ident)
             .await?;
 
-        let snapshot = match table.metadata().snapshot_for_ref(&self.to_branch) {
+        let snapshot = match table.metadata().snapshot_for_ref(&self.inner.to_branch) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -183,7 +177,7 @@ impl AutoCompaction {
         // Generate and execute compaction plans
         let planner = CompactionPlanner::new(planning);
         let plans = planner
-            .plan_compaction_with_branch(&table, &self.to_branch)
+            .plan_compaction_with_branch(&table, &self.inner.to_branch)
             .await?;
 
         if plans.is_empty() {
