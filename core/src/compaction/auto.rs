@@ -122,8 +122,7 @@ pub struct AutoCompaction {
 }
 
 impl AutoCompaction {
-    /// Resolves which compaction strategy to use based on snapshot stats.
-    /// Returns `None` if no strategy matches the current snapshot state.
+    /// Resolves which compaction strategy to use based on snapshot statistics.
     pub async fn resolve(&self) -> Result<Option<CompactionPlanningConfig>> {
         let table = self
             .inner
@@ -146,8 +145,17 @@ impl AutoCompaction {
         Ok(self.auto_config.resolve(&stats))
     }
 
-    /// Runs auto compaction: analyze snapshot, resolve strategy, plan, execute, and commit.
+    /// Runs auto compaction with the same execution semantics as [`Compaction::compact`].
+    ///
+    /// Unlike `Compaction` which uses a pre-configured planning strategy, this method
+    /// auto-resolves the strategy by analyzing snapshot statistics at runtime.
+    /// All other aspects (concurrent execution, single transaction commit, validation)
+    /// remain identical to ensure consistent behavior.
+    ///
+    /// Returns `None` if no strategy matches or no files need compaction.
     pub async fn compact(&self) -> Result<Option<CompactionResult>> {
+        let overall_start_time = std::time::Instant::now();
+
         let table = self
             .inner
             .catalog
@@ -159,6 +167,7 @@ impl AutoCompaction {
             None => return Ok(None),
         };
 
+        // Analyze snapshot and resolve strategy based on current state
         let stats = SnapshotAnalyzer::analyze(
             &table,
             snapshot.snapshot_id(),
@@ -171,6 +180,7 @@ impl AutoCompaction {
             None => return Ok(None),
         };
 
+        // Generate and execute compaction plans
         let planner = CompactionPlanner::new(planning);
         let plans = planner
             .plan_compaction_with_branch(&table, &self.to_branch)
@@ -180,34 +190,35 @@ impl AutoCompaction {
             return Ok(None);
         }
 
-        // Execute plans using compact_with_plan for each plan and merge results
-        let mut merged_result = CompactionResult::default();
-        let mut final_table = None;
+        let rewrite_results = self
+            .inner
+            .concurrent_rewrite_plans(plans, &self.auto_config.execution, &table)
+            .await?;
 
-        for plan in plans {
-            if let Some(result) = self
-                .inner
-                .compact_with_plan(plan, &self.auto_config.execution)
-                .await?
-            {
-                merged_result.data_files.extend(result.data_files);
-                merged_result.stats.input_files_count += result.stats.input_files_count;
-                merged_result.stats.output_files_count += result.stats.output_files_count;
-                merged_result.stats.input_total_bytes += result.stats.input_total_bytes;
-                merged_result.stats.output_total_bytes += result.stats.output_total_bytes;
-                final_table = result.table;
-            }
-        }
-
-        if merged_result.data_files.is_empty() {
+        if rewrite_results.is_empty() {
             return Ok(None);
         }
 
-        merged_result.table = final_table;
-        Ok(Some(merged_result))
-    }
+        // Commit and validate
+        let commit_start_time = std::time::Instant::now();
+        let final_table = self
+            .inner
+            .commit_rewrite_results(rewrite_results.clone())
+            .await?;
 
-    pub fn inner(&self) -> &Compaction {
-        &self.inner
+        if self.auto_config.execution.enable_validate_compaction {
+            self.inner
+                .run_validations(rewrite_results.clone(), &final_table)
+                .await?;
+        }
+
+        self.inner
+            .record_overall_metrics(&rewrite_results, overall_start_time, commit_start_time);
+
+        let merged_result = self
+            .inner
+            .merge_rewrite_results_to_compaction_result(rewrite_results, Some(final_table));
+
+        Ok(Some(merged_result))
     }
 }
