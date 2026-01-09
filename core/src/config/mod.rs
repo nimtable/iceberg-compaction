@@ -20,6 +20,7 @@ use derive_builder::Builder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use crate::SnapshotStats;
 use crate::common::available_parallelism;
 
 pub const DEFAULT_PREFIX: &str = "iceberg-compact";
@@ -450,10 +451,7 @@ pub struct AutoCompactionConfig {
 
 impl AutoCompactionConfig {
     /// Selects strategy based on snapshot statistics.
-    pub fn resolve(
-        &self,
-        stats: &crate::file_selection::analyzer::SnapshotStats,
-    ) -> Option<CompactionPlanningConfig> {
+    pub fn resolve(&self, stats: &SnapshotStats) -> Option<CompactionPlanningConfig> {
         if stats.total_data_files <= 1 {
             return None;
         }
@@ -533,7 +531,6 @@ mod tests {
     ) -> SnapshotStats {
         SnapshotStats {
             total_data_files,
-            total_delete_files: 0,
             small_files_count: small_files,
             files_with_deletes_count: files_with_deletes,
         }

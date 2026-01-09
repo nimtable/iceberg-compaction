@@ -22,7 +22,6 @@ use crate::Result;
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStats {
     pub total_data_files: usize,
-    pub total_delete_files: usize,
     pub small_files_count: usize,
     pub files_with_deletes_count: usize,
 }
@@ -55,9 +54,7 @@ impl SnapshotAnalyzer {
                     }
                 }
                 iceberg::spec::DataContentType::PositionDeletes
-                | iceberg::spec::DataContentType::EqualityDeletes => {
-                    stats.total_delete_files += 1;
-                }
+                | iceberg::spec::DataContentType::EqualityDeletes => {}
             }
         }
 
