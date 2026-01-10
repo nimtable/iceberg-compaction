@@ -218,6 +218,8 @@ impl DatafusionTableRegister {
         need_file_path_and_pos: bool,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
+        // TODO: Make prefetch_enabled configurable. Hardcoded to true for testing.
+        let prefetch_enabled = true;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
             Arc::new(schema),
@@ -226,6 +228,7 @@ impl DatafusionTableRegister {
             need_file_path_and_pos,
             self.executor_parallelism,
             self.max_record_batch_rows,
+            prefetch_enabled,
         );
 
         self.ctx

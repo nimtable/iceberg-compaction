@@ -39,8 +39,12 @@ pub struct IcebergFileScanTaskTableProvider {
     need_file_path_and_pos: bool,
     executor_parallelism: usize,
     max_record_batch_rows: usize,
+    /// When true, files are downloaded entirely into memory before reading.
+    /// This is optimal for compaction where we read 100% of file content.
+    prefetch_enabled: bool,
 }
 impl IcebergFileScanTaskTableProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_scan_tasks: Vec<FileScanTask>,
         schema: ArrowSchemaRef,
@@ -49,6 +53,7 @@ impl IcebergFileScanTaskTableProvider {
         need_file_path_and_pos: bool,
         executor_parallelism: usize,
         max_record_batch_rows: usize,
+        prefetch_enabled: bool,
     ) -> Self {
         Self {
             file_scan_tasks,
@@ -58,6 +63,7 @@ impl IcebergFileScanTaskTableProvider {
             need_file_path_and_pos,
             executor_parallelism,
             max_record_batch_rows,
+            prefetch_enabled,
         }
     }
 }
@@ -96,6 +102,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             self.need_file_path_and_pos,
             self.executor_parallelism,
             self.max_record_batch_rows,
+            self.prefetch_enabled,
         )?))
     }
 

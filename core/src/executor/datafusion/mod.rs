@@ -103,6 +103,7 @@ impl CompactionExecutor for DataFusionExecutor {
                 )?;
 
                 // Process each record batch with metrics
+                let start = Instant::now();
                 let mut fetch_batch_start = Instant::now();
                 while let Some(batch_result) = batch_stream.as_mut().next().await {
                     if let Some(metrics_recorder) = &metrics_recorder {
@@ -133,11 +134,13 @@ impl CompactionExecutor for DataFusionExecutor {
                     fetch_batch_start = Instant::now(); // Reset for next batch
                 }
 
+                println!("Total read time: {}ms", start.elapsed().as_millis());
                 let data_files = data_file_writer.close().await?;
                 Ok(data_files)
             });
             futures.push(future);
         }
+
         // collect all data files from all partitions
         let output_data_files: Vec<DataFile> = try_join_all(futures)
             .await
