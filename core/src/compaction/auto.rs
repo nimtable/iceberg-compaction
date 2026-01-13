@@ -33,8 +33,7 @@ use super::{
 use crate::Result;
 use crate::config::AutoCompactionConfig;
 use crate::executor::ExecutorType;
-use crate::file_selection::analyzer::SnapshotStats;
-use crate::file_selection::{FileSelector, PlanStrategy};
+use crate::file_selection::{FileSelector, PlanStrategy, SnapshotStats};
 
 /// Planner that performs analysis and plan generation in a single scan.
 ///

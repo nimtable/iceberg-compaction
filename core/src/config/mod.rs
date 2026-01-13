@@ -522,7 +522,7 @@ impl Default for AutoCompactionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_selection::analyzer::SnapshotStats;
+    use crate::file_selection::SnapshotStats;
 
     fn create_test_stats(
         total_data_files: usize,

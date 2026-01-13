@@ -20,12 +20,15 @@ use iceberg::table::Table;
 
 use crate::Result;
 
-pub mod analyzer;
 pub mod packer;
 pub mod strategy;
 
-// Re-export commonly used types for convenience
-pub use analyzer::{SnapshotAnalyzer, SnapshotStats};
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotStats {
+    pub total_data_files: usize,
+    pub small_files_count: usize,
+    pub files_with_deletes_count: usize,
+}
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy};
 
