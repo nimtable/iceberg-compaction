@@ -14,21 +14,96 @@
  * limitations under the License.
  */
 
+//! Automatic compaction with runtime strategy selection.
+//!
+//! This module provides [`AutoCompactionPlanner`] for single-scan planning and
+//! [`AutoCompaction`] for end-to-end automatic compaction workflows.
+
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 
 use super::{
-    CommitManagerRetryConfig, Compaction, CompactionBuilder, CompactionPlanner, CompactionResult,
+    CommitManagerRetryConfig, Compaction, CompactionBuilder, CompactionPlan, CompactionResult,
 };
 use crate::Result;
-use crate::config::{AutoCompactionConfig, CompactionPlanningConfig};
+use crate::config::AutoCompactionConfig;
 use crate::executor::ExecutorType;
-use crate::file_selection::analyzer::{SnapshotAnalyzer, SnapshotStats};
+use crate::file_selection::analyzer::SnapshotStats;
+use crate::file_selection::{FileSelector, PlanStrategy};
 
+/// Planner that performs analysis and plan generation in a single scan.
+///
+/// Combines snapshot analysis (stats computation) and file grouping into one
+/// `plan_files()` call, avoiding the redundant IO of separate analyze-then-plan flows.
+pub struct AutoCompactionPlanner {
+    config: AutoCompactionConfig,
+}
+
+impl AutoCompactionPlanner {
+    pub fn new(config: AutoCompactionConfig) -> Self {
+        Self { config }
+    }
+
+    /// Plans compaction for a table branch.
+    ///
+    /// Returns empty vector if no files need compaction.
+    pub async fn plan_compaction_with_branch(
+        &self,
+        table: &Table,
+        to_branch: &str,
+    ) -> Result<Vec<CompactionPlan>> {
+        let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) else {
+            return Ok(vec![]);
+        };
+
+        let snapshot_id = snapshot.snapshot_id();
+
+        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let stats = Self::compute_stats(&tasks, self.config.small_file_threshold_bytes);
+
+        let Some(planning_config) = self.config.resolve(&stats) else {
+            return Ok(vec![]);
+        };
+
+        let strategy = PlanStrategy::from(&planning_config);
+        let file_groups =
+            FileSelector::group_tasks_with_strategy(tasks, strategy, &planning_config)?;
+
+        let plans = file_groups
+            .into_iter()
+            .map(|fg| CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id))
+            .filter(|p| p.has_files())
+            .collect();
+
+        Ok(plans)
+    }
+
+    /// Computes statistics from pre-scanned tasks without additional IO.
+    fn compute_stats(tasks: &[FileScanTask], small_file_threshold_bytes: u64) -> SnapshotStats {
+        let mut stats = SnapshotStats::default();
+
+        for task in tasks {
+            stats.total_data_files += 1;
+
+            if task.length < small_file_threshold_bytes {
+                stats.small_files_count += 1;
+            }
+
+            if !task.deletes.is_empty() {
+                stats.files_with_deletes_count += 1;
+            }
+        }
+
+        stats
+    }
+}
+
+/// Builder for [`AutoCompaction`].
 pub struct AutoCompactionBuilder {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
@@ -111,74 +186,29 @@ impl AutoCompactionBuilder {
     }
 }
 
+/// Automatic compaction with runtime strategy selection.
+///
+/// Selects the appropriate compaction strategy (small files, files with deletes,
+/// or full) based on snapshot statistics and executes the compaction workflow.
 pub struct AutoCompaction {
     inner: Compaction,
     auto_config: AutoCompactionConfig,
 }
 
 impl AutoCompaction {
-    /// Loads the table, resolves the target snapshot, and analyzes it.
+    /// Runs automatic compaction.
     ///
-    /// Returns `Ok(None)` when the target branch has no snapshot.
-    async fn analyze_snapshot(&self) -> Result<Option<(Table, SnapshotStats)>> {
+    /// Returns `None` if no strategy matches or no files need compaction.
+    pub async fn compact(&self) -> Result<Option<CompactionResult>> {
+        let overall_start_time = std::time::Instant::now();
+
         let table = self
             .inner
             .catalog
             .load_table(&self.inner.table_ident)
             .await?;
 
-        let snapshot = match table.metadata().snapshot_for_ref(&self.inner.to_branch) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let stats = SnapshotAnalyzer::analyze(
-            &table,
-            snapshot.snapshot_id(),
-            self.auto_config.small_file_threshold_bytes,
-        )
-        .await?;
-
-        Ok(Some((table, stats)))
-    }
-
-    /// Resolves strategy by analyzing the current snapshot.
-    ///
-    /// Returns the table and the chosen planning config so callers that
-    /// need to proceed with execution can avoid redoing the analysis.
-    async fn resolve_strategy(&self) -> Result<Option<(Table, CompactionPlanningConfig)>> {
-        let Some((table, stats)) = self.analyze_snapshot().await? else {
-            return Ok(None);
-        };
-
-        let Some(planning) = self.auto_config.resolve(&stats) else {
-            return Ok(None);
-        };
-
-        Ok(Some((table, planning)))
-    }
-
-    /// Resolves which compaction strategy to use based on snapshot statistics.
-    pub async fn resolve(&self) -> Result<Option<CompactionPlanningConfig>> {
-        Ok(self
-            .resolve_strategy()
-            .await?
-            .map(|(_table, planning)| planning))
-    }
-
-    /// Runs auto compaction using the same execution path as [`Compaction::compact`].
-    ///
-    /// The planning strategy is chosen at runtime based on the latest snapshot stats.
-    /// Returns `None` when no strategy applies or there is no work to do.
-    pub async fn compact(&self) -> Result<Option<CompactionResult>> {
-        let overall_start_time = std::time::Instant::now();
-
-        let Some((table, planning)) = self.resolve_strategy().await? else {
-            return Ok(None);
-        };
-
-        // Generate and execute compaction plans
-        let planner = CompactionPlanner::new(planning);
+        let planner = AutoCompactionPlanner::new(self.auto_config.clone());
         let plans = planner
             .plan_compaction_with_branch(&table, &self.inner.to_branch)
             .await?;
@@ -196,7 +226,6 @@ impl AutoCompaction {
             return Ok(None);
         }
 
-        // Commit and validate
         let commit_start_time = std::time::Instant::now();
         let final_table = self
             .inner

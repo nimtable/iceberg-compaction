@@ -41,6 +41,15 @@ impl FileSelector {
         strategy: PlanStrategy,
         config: &crate::config::CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
+        let data_files = Self::scan_data_files(table, snapshot_id).await?;
+        strategy.execute(data_files, config)
+    }
+
+    /// Scans and collects all data files from a table snapshot.
+    ///
+    /// Filters out non-data files (delete files). Returns raw `FileScanTask`s
+    /// for downstream processing.
+    pub async fn scan_data_files(table: &Table, snapshot_id: i64) -> Result<Vec<FileScanTask>> {
         let scan = table.scan().snapshot_id(snapshot_id).build()?;
 
         let file_scan_stream = scan.plan_files().await?;
@@ -58,6 +67,18 @@ impl FileSelector {
             .try_collect()
             .await?;
 
-        strategy.execute(data_files, config)
+        Ok(data_files)
+    }
+
+    /// Groups pre-scanned tasks using the given strategy, skipping the scan phase.
+    ///
+    /// Use this when tasks have already been collected (e.g., for stats calculation)
+    /// to avoid redundant `plan_files()` calls.
+    pub fn group_tasks_with_strategy(
+        tasks: Vec<FileScanTask>,
+        strategy: PlanStrategy,
+        config: &crate::config::CompactionPlanningConfig,
+    ) -> Result<Vec<FileGroup>> {
+        strategy.execute(tasks, config)
     }
 }
