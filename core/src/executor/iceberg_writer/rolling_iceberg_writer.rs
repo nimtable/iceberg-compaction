@@ -433,7 +433,6 @@ pub struct RollingIcebergWriterBuilder<B> {
     max_concurrent_closes: Option<usize>,
     enable_dynamic_size_estimation: Option<bool>,
     size_estimation_smoothing_factor: Option<f64>,
-    partition_key: Option<PartitionKey>,
 }
 
 impl<B> RollingIcebergWriterBuilder<B> {
@@ -444,7 +443,6 @@ impl<B> RollingIcebergWriterBuilder<B> {
             max_concurrent_closes: None,
             enable_dynamic_size_estimation: None,
             size_estimation_smoothing_factor: None,
-            partition_key: None,
         }
     }
 
@@ -468,11 +466,6 @@ impl<B> RollingIcebergWriterBuilder<B> {
     /// Higher values make the estimation more responsive but potentially more volatile.
     pub fn with_size_estimation_smoothing_factor(mut self, factor: f64) -> Self {
         self.size_estimation_smoothing_factor = Some(factor);
-        self
-    }
-
-    pub fn with_partition_key(mut self, partition_key: PartitionKey) -> Self {
-        self.partition_key = Some(partition_key);
         self
     }
 }

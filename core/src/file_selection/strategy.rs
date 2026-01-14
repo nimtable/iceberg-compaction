@@ -755,34 +755,28 @@ impl std::fmt::Display for PlanStrategy {
 #[derive(Eq, Hash, PartialEq)]
 struct PartitionKey(iceberg::spec::Struct);
 
-// Invariant: this function should only be called for partitioned tables
+/// Groups files by their partition key, which is based on the values of their
+/// partition fields.
+///
+/// If the table is unpartitioned, all files will be grouped together. It's
+/// possible for data files not have have a partition, such as in the case of a
+/// table created without a partition, but then with one added later. The data
+/// files in the initial version would not have a partition.
 fn group_files_by_partition<I>(files: I) -> HashMap<PartitionKey, Vec<FileScanTask>>
 where I: Iterator<Item = FileScanTask> {
     let mut partitioned_groups: HashMap<PartitionKey, Vec<FileScanTask>> = HashMap::new();
     for file in files {
-        // It is invalid in Iceberg for a partitioned table to have a file without partition data
-        if file.partition.is_none() {
-            tracing::warn!(
-                "File {} is missing partition data in partitioned table, skipping",
-                file.data_file_path
-            );
-            continue;
-        }
-        match file.partition.clone() {
-            Some(partition) => {
-                partitioned_groups
-                    .entry(PartitionKey(partition))
-                    .or_default()
-                    .push(file);
-            }
-            None => {
-                tracing::warn!(
-                    "File {} is missing partition data in partitioned table, skipping",
-                    file.data_file_path
-                );
-                continue;
-            }
-        }
+        let partition_key = match &file.partition {
+            Some(partition) => PartitionKey(partition.clone()),
+            // All FileScanTask files will have a partition value, even if it's empty. None doesn't
+            // seem to be a valid value (although that could change). For now, set it to the default
+            // value for an unpartitioned file, which is an empty Struct.
+            None => PartitionKey(iceberg::spec::Struct::empty()),
+        };
+        partitioned_groups
+            .entry(partition_key)
+            .or_default()
+            .push(file);
     }
 
     partitioned_groups
@@ -2719,6 +2713,144 @@ mod tests {
             group_sizes,
             vec![20, 50, 50],
             "Binpacked group byte sizes should be [20, 50, 50]"
+        );
+    }
+
+    #[test]
+    fn test_single_strategy_with_mixed_unpartitioned_and_partitioned_files() {
+        let build_file = |name: &str, partition: Option<iceberg::spec::Struct>| {
+            TestFileBuilder::new(name)
+                .size(10 * 1024 * 1024)
+                .with_schema(get_test_schema_with_partition())
+                .with_partition(partition.unwrap_or_else(iceberg::spec::Struct::empty))
+                .build()
+        };
+
+        // Create files with empty partition with the standard default value (empty struct)
+        let file_empty_1 = build_file("empty_1.parquet", Some(iceberg::spec::Struct::empty()));
+        let file_empty_2 = build_file("empty_2.parquet", Some(iceberg::spec::Struct::empty()));
+
+        // Create files with a `None` partition value, to validate we handle this edge case
+        let mut file_none_1 = build_file("none_1.parquet", None);
+        file_none_1.partition = None; // Explicitly set to None
+        let mut file_none_2 = build_file("none_2.parquet", None);
+        file_none_2.partition = None;
+
+        // Create files with actual partition values
+        let file_p0 = build_file("partition_0.parquet", Some(create_partition_value(0)));
+        let file_p1 = build_file("partition_1.parquet", Some(create_partition_value(1)));
+
+        let files = vec![
+            file_none_1,
+            file_empty_1,
+            file_p0,
+            file_none_2,
+            file_empty_2,
+            file_p1,
+        ];
+
+        // Create Single grouping strategy
+        let strategy = PlanStrategy::new_custom(None, None, GroupingStrategy::Single, None);
+
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config, true).unwrap();
+
+        // Should have 3 groups:
+        // - Group 1: unpartitioned files (None + empty partition)
+        // - Group 2: partition 0
+        // - Group 3: partition 1
+        assert_eq!(groups.len(), 3, "Should have 3 groups");
+
+        // Find the unpartitioned group (should have 4 files)
+        let unpartitioned_group = groups.iter().find(|g| g.data_file_count == 4);
+        assert!(
+            unpartitioned_group.is_some(),
+            "Should have a group with 4 unpartitioned files"
+        );
+
+        // Verify partition groups each have 1 file
+        let partition_groups: Vec<_> = groups.iter().filter(|g| g.data_file_count == 1).collect();
+        assert_eq!(
+            partition_groups.len(),
+            2,
+            "Should have 2 partition groups with 1 file each"
+        );
+    }
+
+    #[test]
+    fn test_binpack_strategy_with_mixed_unpartitioned_and_partitioned_files() {
+        let build_file = |name: &str, size_mb: u64, partition: Option<iceberg::spec::Struct>| {
+            TestFileBuilder::new(name)
+                .size(size_mb * 1024 * 1024)
+                .with_schema(get_test_schema_with_partition())
+                .with_partition(partition.unwrap_or_else(iceberg::spec::Struct::empty))
+                .build()
+        };
+
+        // Create files with empty partition with the standard default value (empty struct)
+        let file_empty_1 = build_file("empty_1.parquet", 10, Some(iceberg::spec::Struct::empty()));
+        let file_empty_2 = build_file("empty_2.parquet", 25, Some(iceberg::spec::Struct::empty()));
+
+        // Create files with a `None` partition value, to validate we handle this edge case
+        let mut file_none_1 = build_file("none_1.parquet", 15, None);
+        file_none_1.partition = None;
+        let mut file_none_2 = build_file("none_2.parquet", 20, None);
+        file_none_2.partition = None;
+
+        // Create partitioned files
+        let file_p0_1 = build_file("p0_file1.parquet", 15, Some(create_partition_value(0)));
+        let file_p0_2 = build_file("p0_file2.parquet", 20, Some(create_partition_value(0)));
+        let file_p1 = build_file("p1_file1.parquet", 30, Some(create_partition_value(1)));
+
+        let files = vec![
+            file_none_1,  // 15MB
+            file_empty_1, // 10MB
+            file_p0_1,    // 15MB
+            file_none_2,  // 20MB
+            file_empty_2, // 25MB
+            file_p0_2,    // 20MB
+            file_p1,      // 30MB
+        ];
+
+        // Create BinPack strategy with 50MB target
+        let strategy = PlanStrategy::new_custom(
+            None,
+            None,
+            GroupingStrategy::BinPack(crate::config::BinPackConfig::new(50 * 1024 * 1024)),
+            None,
+        );
+
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config, true).unwrap();
+
+        // Verify partitions are kept separate:
+        // - Unpartitioned (None + empty): 70MB total -> should be binpacked into groups
+        // - Partition 0: 35MB total
+        // - Partition 1: 30MB total
+
+        // Total should be at least 3 groups (one per partition type)
+        assert!(groups.len() >= 3, "Should have at least 3 groups");
+
+        // Find groups by checking partition values
+        let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
+        assert_eq!(total_files, 7, "All 7 files should be in groups");
+
+        // Verify unpartitioned files are grouped together
+        let unpartitioned_files_count: usize = groups
+            .iter()
+            .filter(|g| {
+                // Check if any file in the group has None or empty partition
+                g.data_files.iter().any(|f| {
+                    f.partition.is_none()
+                        || f.partition.as_ref().is_some_and(|p| p.fields().is_empty())
+                })
+            })
+            .map(|g| g.data_file_count)
+            .sum();
+
+        assert_eq!(
+            unpartitioned_files_count, 4,
+            "Should have 4 unpartitioned files grouped together"
         );
     }
 }
