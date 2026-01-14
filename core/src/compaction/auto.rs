@@ -70,13 +70,8 @@ impl AutoCompactionPlanner {
         };
 
         let strategy = PlanStrategy::from(&planning_config);
-        let is_partitioned = !table.metadata().default_partition_spec().is_unpartitioned();
-        let file_groups = FileSelector::group_tasks_with_strategy(
-            tasks,
-            strategy,
-            &planning_config,
-            is_partitioned,
-        )?;
+        let file_groups =
+            FileSelector::group_tasks_with_strategy(tasks, strategy, &planning_config)?;
 
         let plans = file_groups
             .into_iter()
