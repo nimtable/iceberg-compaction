@@ -812,6 +812,9 @@ mod tests {
                                 None
                             },
                             file_size_in_bytes: 1024,
+                            partition: None,
+                            partition_spec: None,
+                            name_mapping: None,
                         })
                     })
                     .collect()
@@ -833,6 +836,9 @@ mod tests {
                 sequence_number: 1,
                 equality_ids: None,
                 file_size_in_bytes: self.size,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
             }
         }
     }
@@ -889,6 +895,9 @@ mod tests {
                 sequence_number: 1,
                 equality_ids: Some(vec![1, 2]),
                 file_size_in_bytes: 1024,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
             })
         }
 
@@ -1677,6 +1686,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         });
 
         let equality_delete = Arc::new(FileScanTask {
@@ -1693,6 +1705,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 2048,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         });
 
         let data_file = FileScanTask {
@@ -1709,6 +1724,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 10 * 1024 * 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let group = FileGroup::new(vec![data_file]);
@@ -1755,6 +1773,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 512,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         });
 
         let f1 = FileScanTask {
@@ -1771,6 +1792,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let f2 = FileScanTask {
@@ -1787,6 +1811,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 4 * 1024 * 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
@@ -1836,6 +1863,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: Some(vec![1, 2]),
             file_size_in_bytes: 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         });
 
         let pos_delete = Arc::new(FileScanTask {
@@ -1852,6 +1882,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 512,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         });
 
         let f1 = FileScanTask {
@@ -1868,6 +1901,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let f2 = FileScanTask {
@@ -1884,6 +1920,9 @@ mod tests {
             sequence_number: 1,
             equality_ids: None,
             file_size_in_bytes: 5 * 1024 * 1024,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
