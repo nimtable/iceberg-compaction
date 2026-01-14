@@ -480,7 +480,7 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
         "Compaction should produce the same number of output files as the number of partitioned buckets"
     );
 
-    // Run compaction again to verify we DO NOT comapct the data again.
+    // Run compaction again to verify we DO NOT compact the data again.
     let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
         .with_config(config.clone())
         .with_catalog_name("test_catalog".to_owned())
