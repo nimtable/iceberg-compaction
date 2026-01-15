@@ -39,8 +39,6 @@ pub struct IcebergFileScanTaskTableProvider {
     need_file_path_and_pos: bool,
     executor_parallelism: usize,
     max_record_batch_rows: usize,
-    /// When true, files are downloaded entirely into memory before reading.
-    /// This is optimal for compaction where we read 100% of file content.
     prefetch_enabled: bool,
 }
 impl IcebergFileScanTaskTableProvider {
