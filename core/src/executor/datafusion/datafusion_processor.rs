@@ -63,6 +63,7 @@ impl DatafusionProcessor {
             ctx.clone(),
             executor_parallelism,
             execution_config.max_record_batch_rows,
+            execution_config.enable_prefetch,
         );
 
         Self {
@@ -166,6 +167,7 @@ pub struct DatafusionTableRegister {
 
     executor_parallelism: usize,
     max_record_batch_rows: usize,
+    is_prefetch_enabled: bool,
 }
 
 impl DatafusionTableRegister {
@@ -174,12 +176,14 @@ impl DatafusionTableRegister {
         ctx: Arc<SessionContext>,
         executor_parallelism: usize,
         max_record_batch_rows: usize,
+        is_prefetch_enabled: bool,
     ) -> Self {
         DatafusionTableRegister {
             file_io,
             ctx,
             executor_parallelism,
             max_record_batch_rows,
+            is_prefetch_enabled,
         }
     }
 
@@ -206,6 +210,7 @@ impl DatafusionTableRegister {
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
     ) -> Result<()> {
+        // Allow prefetch here too?
         self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
     }
 
@@ -218,8 +223,6 @@ impl DatafusionTableRegister {
         need_file_path_and_pos: bool,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
-        // TODO: Make prefetch_enabled configurable. Hardcoded to true for testing.
-        let prefetch_enabled = true;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
             Arc::new(schema),
@@ -228,7 +231,7 @@ impl DatafusionTableRegister {
             need_file_path_and_pos,
             self.executor_parallelism,
             self.max_record_batch_rows,
-            prefetch_enabled,
+            self.is_prefetch_enabled,
         );
 
         self.ctx

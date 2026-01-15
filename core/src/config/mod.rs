@@ -36,6 +36,7 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
+pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
 
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
@@ -342,6 +343,23 @@ pub struct CompactionExecutionConfig {
     /// Actual parallelism is typically lower due to per-plan heuristics.
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
+
+    /// Enable feature to prefetch entire data files before compacting them.
+    ///
+    /// This improves performance by reducing the number of total HTTP requests required
+    /// to read data files. Presently, iceberg-rust will sent multiple sequential HTTP
+    /// requests to download the byte ranges of each column from a Parquet file in an object
+    /// store. That is sub-optimal if we know we need the entire file for compacting.
+    /// Instead of making N HTTP requests for N column chunks, we can make 1 HTTP request
+    /// for the entire file.
+    ///
+    /// It will download one file per concurrent file group being processed. For example,
+    /// if 4 parallel executions are running, 4 downloaded files will be held in memory
+    /// at once.
+    ///
+    /// **Note**: This is currently experimental and may not be stable.
+    #[builder(default = "DEFAULT_ENABLE_PREFETCH")]
+    pub enable_prefetch: bool,
 }
 
 impl Default for CompactionExecutionConfig {
