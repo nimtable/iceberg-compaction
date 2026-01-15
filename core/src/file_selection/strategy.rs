@@ -28,7 +28,10 @@ use std::collections::HashMap;
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{CompactionPlanningConfig, GroupingStrategy};
+use crate::config::{
+    CompactionPlanningConfig, GroupingStrategy, MAX_FILE_SIZE_DEFAULT_RATIO,
+    MIN_FILE_SIZE_DEFAULT_RATIO, SPLIT_OVERHEAD,
+};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -159,15 +162,20 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Calculates executor and output parallelism.
+    /// Calculates executor and output parallelism using Iceberg's algorithms.
     ///
-    /// - `partition_by_size` = `ceil(input_total_bytes / min_size_per_partition)`
-    /// - `partition_by_count` = `ceil(input_files_count / max_file_count_per_partition)`
-    /// - `executor_parallelism` = `min(max(partition_by_size, partition_by_count), max_parallelism)`
-    /// - `output_parallelism` = `min(partition_by_size, executor_parallelism, max_parallelism)`
+    /// ## Output Parallelism (from Iceberg's `expectedOutputFiles`)
+    /// - Uses target file size and input size to determine optimal output file count
+    /// - Handles remainder distribution intelligently to avoid tiny files
+    /// - Algorithm considers min/max file size constraints
     ///
-    /// If `enable_heuristic_output_parallelism` is true and total data file size
-    /// is below `target_file_size_bytes`, `output_parallelism` is set to 1.
+    /// ## Input/Executor Parallelism (from Iceberg's `inputSplitSize`)
+    /// - Calculates optimal split size for reading: `input_size / expected_output_files + SPLIT_OVERHEAD`
+    /// - Input parallelism = `ceil(input_total_bytes / input_split_size)`
+    /// - Also considers file count constraints: `ceil(files_count / max_file_count_per_partition)`
+    /// - Takes the max of size-based and count-based parallelism
+    ///
+    /// Input parallelism is capped by `max_input_parallelism`, output parallelism is capped by `max_output_parallelism`.
     ///
     /// # Errors
     /// Returns error if `input_total_bytes()` is 0.
@@ -175,33 +183,44 @@ impl FileGroup {
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
-        let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
-        if total_file_size_for_partitioning == 0 {
+        let input_size = files_to_compact.input_total_bytes();
+        if input_size == 0 {
             return Err(CompactionError::Execution(
                 "No files to calculate task parallelism".to_owned(),
             ));
         }
 
-        let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_size_per_partition())
-            .max(1) as usize;
+        let target_file_size = config.target_file_size_bytes();
+        let min_file_size = Self::default_min_file_size(target_file_size);
+        let max_file_size = Self::default_max_file_size(target_file_size);
 
-        let total_files_count_for_partitioning = files_to_compact.input_files_count();
+        // Calculate output parallelism using Iceberg's expectedOutputFiles algorithm
+        let output_parallelism =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
+                .min(config.max_output_parallelism())
+                .max(1);
 
-        let partition_by_count = total_files_count_for_partitioning
+        // Apply output parallelism heuristic if enabled
+        let output_parallelism =
+            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+
+        // Calculate input split size using Iceberg's inputSplitSize algorithm
+        let split_size =
+            Self::input_split_size(input_size, target_file_size, min_file_size, max_file_size);
+
+        // Input parallelism based on split size
+        let partition_by_size = input_size.div_ceil(split_size).max(1) as usize;
+
+        // Also consider file count constraints
+        let total_files_count = files_to_compact.input_files_count();
+        let partition_by_count = total_files_count
             .div_ceil(config.max_file_count_per_partition())
             .max(1);
 
+        // Input parallelism is the max of size-based and count-based, capped by max_input_parallelism
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.max_parallelism());
-
-        let mut output_parallelism = partition_by_size
-            .min(input_parallelism)
-            .min(config.max_parallelism());
-
-        output_parallelism =
-            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+            .min(config.max_input_parallelism());
 
         Ok((input_parallelism, output_parallelism))
     }
@@ -228,6 +247,95 @@ impl FileGroup {
         } else {
             current_output_parallelism
         }
+    }
+
+    /// Calculates the write maximum file size.
+    ///
+    /// This is the target file size plus half the difference between max and target,
+    /// used to avoid creating tiny remainder files. From Iceberg's `writeMaxFileSize()`.
+    ///
+    /// Formula: `target_file_size + 0.5 * (max_file_size - target_file_size)`
+    fn write_max_file_size(target_file_size: u64, max_file_size: u64) -> u64 {
+        let diff = max_file_size.saturating_sub(target_file_size);
+        target_file_size + diff / 2
+    }
+
+    /// Calculates the expected number of output files for the given input size.
+    ///
+    /// 1. If input size < target file size, return 1
+    /// 2. Calculate files with and without remainder
+    /// 3. If remainder > min file size, round up
+    /// 4. Otherwise, if average file size without remainder is acceptable, round down
+    /// 5. Otherwise, round up
+    fn expected_output_files(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> usize {
+        if input_size < target_file_size {
+            return 1;
+        }
+
+        let num_files_with_remainder = input_size.div_ceil(target_file_size);
+        let num_files_without_remainder = input_size / target_file_size;
+
+        if num_files_without_remainder == 0 {
+            return 1;
+        }
+
+        let remainder = input_size % target_file_size;
+        let avg_file_size_without_remainder = input_size / num_files_without_remainder;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        // If remainder is larger than minimum file size, we should round up
+        if remainder > min_file_size {
+            num_files_with_remainder as usize
+        } else if avg_file_size_without_remainder
+            <= ((target_file_size as f64 * 1.1) as u64).min(write_max)
+        {
+            // If the average file size without remainder is acceptable (< 1.1 * target or < writeMax),
+            // we can round down and distribute the remainder
+            num_files_without_remainder as usize
+        } else {
+            // Otherwise, round up
+            num_files_with_remainder as usize
+        }
+    }
+
+    /// Calculates the input split size for reading files.
+    ///
+    /// From Iceberg's `inputSplitSize()`. This determines how to partition input
+    /// for parallel reading.
+    ///
+    /// Formula: `max(target_file_size, min(estimated_split_size, write_max_file_size))`
+    /// where `estimated_split_size = (input_size / expected_output_files) + SPLIT_OVERHEAD`
+    fn input_split_size(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> u64 {
+        let expected_files =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size);
+        let estimated_split_size = (input_size / expected_files.max(1) as u64) + SPLIT_OVERHEAD;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if estimated_split_size < target_file_size {
+            target_file_size
+        } else {
+            estimated_split_size.min(write_max)
+        }
+    }
+
+    /// Calculates `min_file_size` from `target_file_size` using default ratio.
+    fn default_min_file_size(target_file_size: u64) -> u64 {
+        (target_file_size as f64 * MIN_FILE_SIZE_DEFAULT_RATIO) as u64
+    }
+
+    /// Calculates `max_file_size` from `target_file_size` using default ratio.
+    fn default_max_file_size(target_file_size: u64) -> u64 {
+        (target_file_size as f64 * MAX_FILE_SIZE_DEFAULT_RATIO) as u64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1640,7 +1748,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
             .max_file_count_per_partition(5_usize) // 5 files per partition
-            .max_parallelism(8_usize) // Max 8 parallel tasks
+            .max_input_parallelism(8_usize) // Max 8 parallel input tasks
+            .max_output_parallelism(8_usize) // Max 8 parallel output tasks
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -1666,7 +1775,7 @@ mod tests {
         assert!(executor_parallelism >= 1);
         assert!(output_parallelism >= 1);
         assert!(output_parallelism <= executor_parallelism);
-        assert!(executor_parallelism <= config.max_parallelism());
+        assert!(executor_parallelism <= config.max_input_parallelism());
 
         // Test error case - empty group
         let empty_group = FileGroup::empty();
@@ -1698,7 +1807,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64)
             .max_file_count_per_partition(5_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -1881,7 +1991,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2006,7 +2117,8 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
             .min_size_per_partition(20 * 1024 * 1024_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2059,8 +2171,8 @@ mod tests {
                 idx
             );
             assert!(
-                group.executor_parallelism <= config.max_parallelism(),
-                "Group {} should respect max_parallelism",
+                group.executor_parallelism <= config.max_input_parallelism(),
+                "Group {} should respect max_input_parallelism",
                 idx
             );
             assert!(
@@ -2087,7 +2199,7 @@ mod tests {
                 .max(1);
             let expected_exec_p = partition_by_size
                 .max(partition_by_count)
-                .min(config.max_parallelism());
+                .min(config.max_input_parallelism());
 
             assert_eq!(
                 group.executor_parallelism, expected_exec_p,
@@ -2267,7 +2379,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(1000_usize)
+            .max_input_parallelism(1000_usize)
+            .max_output_parallelism(1000_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -2285,7 +2398,7 @@ mod tests {
         let (exec_p, out_p) = result.unwrap();
         assert!(exec_p >= 1);
         assert!(out_p >= 1);
-        assert!(exec_p <= config.max_parallelism());
+        assert!(exec_p <= config.max_input_parallelism());
     }
 
     // ##############################################################

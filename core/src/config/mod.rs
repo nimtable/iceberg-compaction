@@ -44,6 +44,14 @@ pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
 
+// Iceberg file size ratio constants (from SizeBasedFileRewritePlanner)
+/// Default ratio for calculating minimum file size: minFileSize = targetFileSize * 0.75
+pub const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
+/// Default ratio for calculating maximum file size: maxFileSize = targetFileSize * 1.80
+pub const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
+/// Overhead added to split size for bin-packing (5MB, same as Iceberg)
+pub const SPLIT_OVERHEAD: u64 = 5 * 1024 * 1024;
+
 /// Configuration for bin-packing grouping strategy.
 ///
 /// This struct wraps bin-packing parameters to allow future extensibility
@@ -118,8 +126,15 @@ pub struct SmallFilesConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -164,8 +179,15 @@ pub struct FullCompactionConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -202,8 +224,15 @@ pub struct FilesWithDeletesConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -277,12 +306,21 @@ impl CompactionPlanningConfig {
         }
     }
 
-    /// Returns maximum parallelism for the strategy.
-    pub fn max_parallelism(&self) -> usize {
+    /// Returns maximum parallelism for input (reading) operations.
+    pub fn max_input_parallelism(&self) -> usize {
         match self {
-            Self::SmallFiles(c) => c.max_parallelism,
-            Self::Full(c) => c.max_parallelism,
-            Self::FilesWithDeletes(c) => c.max_parallelism,
+            Self::SmallFiles(c) => c.max_input_parallelism,
+            Self::Full(c) => c.max_input_parallelism,
+            Self::FilesWithDeletes(c) => c.max_input_parallelism,
+        }
+    }
+
+    /// Returns maximum parallelism for output (writing) operations.
+    pub fn max_output_parallelism(&self) -> usize {
+        match self {
+            Self::SmallFiles(c) => c.max_output_parallelism,
+            Self::Full(c) => c.max_output_parallelism,
+            Self::FilesWithDeletes(c) => c.max_output_parallelism,
         }
     }
 
