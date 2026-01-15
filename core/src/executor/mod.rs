@@ -46,6 +46,7 @@ pub struct RewriteFilesRequest {
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
     pub location_generator: DefaultLocationGenerator,
+    pub format_version: u8,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -482,6 +482,7 @@ pub struct DataFusionTaskContextBuilder {
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
     table_prefix: String,
+    use_reader_delete_filter: bool,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -495,14 +496,21 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
+    pub fn with_reader_delete_filter(mut self, use_reader_delete_filter: bool) -> Self {
+        self.use_reader_delete_filter = use_reader_delete_filter;
+        self
+    }
+
     pub fn with_input_data_files(mut self, file_group: FileGroup) -> Self {
         self.data_files = file_group
             .data_files
             .into_iter()
             .map(|mut task| {
-                // Prevent ArrowReader from applying deletes; compaction handles them explicitly.
-                task.deletes.clear();
-                task.equality_ids = None;
+                if !self.use_reader_delete_filter {
+                    // Prevent ArrowReader from applying deletes; compaction handles them explicitly.
+                    task.deletes.clear();
+                    task.equality_ids = None;
+                }
                 task
             })
             .collect();
@@ -550,39 +558,48 @@ impl DataFusionTaskContextBuilder {
     pub fn build(self) -> Result<DataFusionTaskContext> {
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
-        let position_delete_schema = Self::build_position_schema()?;
+        let position_delete_schema = if self.use_reader_delete_filter {
+            None
+        } else {
+            Some(Self::build_position_schema()?)
+        };
         // Build schema for equality delete file, equality_ids + seq_num
         let mut prev_equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
-        for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
-            let task_equality_ids = task.equality_ids.as_ref().ok_or_else(|| {
-                CompactionError::Execution("Equality delete file missing equality_ids".to_owned())
-            })?;
+        if !self.use_reader_delete_filter {
+            for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
+                let task_equality_ids = task.equality_ids.as_ref().ok_or_else(|| {
+                    CompactionError::Execution(
+                        "Equality delete file missing equality_ids".to_owned(),
+                    )
+                })?;
 
-            if prev_equality_ids
-                .as_ref()
-                .is_none_or(|ids| ids != task_equality_ids)
-            {
-                // If ids are different or not assigned, create a new metadata
-                let equality_delete_schema =
-                    self.build_equality_delete_schema(task_equality_ids, &mut highest_field_id)?;
-                let equality_delete_table_name =
-                    table_name::build_equality_delete_table_name(&self.table_prefix, table_idx);
-                equality_delete_metadatas.push(EqualityDeleteMetadata::new(
-                    equality_delete_schema,
-                    equality_delete_table_name,
-                ));
-                prev_equality_ids = Some(task_equality_ids.clone());
-            }
+                if prev_equality_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids != task_equality_ids)
+                {
+                    // If ids are different or not assigned, create a new metadata
+                    let equality_delete_schema = self
+                        .build_equality_delete_schema(task_equality_ids, &mut highest_field_id)?;
+                    let equality_delete_table_name =
+                        table_name::build_equality_delete_table_name(&self.table_prefix, table_idx);
+                    equality_delete_metadatas.push(EqualityDeleteMetadata::new(
+                        equality_delete_schema,
+                        equality_delete_table_name,
+                    ));
+                    prev_equality_ids = Some(task_equality_ids.clone());
+                }
 
-            // Add the file scan task to the last metadata
-            if let Some(last_metadata) = equality_delete_metadatas.last_mut() {
-                last_metadata.add_file_scan_task(task.clone());
+                // Add the file scan task to the last metadata
+                if let Some(last_metadata) = equality_delete_metadatas.last_mut() {
+                    last_metadata.add_file_scan_task(task.clone());
+                }
             }
         }
 
-        let need_file_path_and_pos = !self.position_delete_files.is_empty();
-        let need_seq_num = !equality_delete_metadatas.is_empty();
+        let need_file_path_and_pos =
+            !self.use_reader_delete_filter && !self.position_delete_files.is_empty();
+        let need_seq_num = !self.use_reader_delete_filter && !equality_delete_metadatas.is_empty();
 
         // Build schema for data file, old schema + seq_num + file_path + pos
         let project_names: Vec<_> = self
@@ -631,9 +648,13 @@ impl DataFusionTaskContextBuilder {
 
         let sql_builder = SqlBuilder::new(
             &project_names,
-            Some(table_name::build_position_delete_table_name(
-                &self.table_prefix,
-            )),
+            if need_file_path_and_pos {
+                Some(table_name::build_position_delete_table_name(
+                    &self.table_prefix,
+                ))
+            } else {
+                None
+            },
             Some(table_name::build_data_file_table_name(&self.table_prefix)),
             &equality_delete_metadatas,
             need_file_path_and_pos,
@@ -656,7 +677,7 @@ impl DataFusionTaskContextBuilder {
                 None
             },
             position_delete_schema: if need_file_path_and_pos {
-                Some(position_delete_schema)
+                position_delete_schema
             } else {
                 None
             },
@@ -707,6 +728,7 @@ impl DataFusionTaskContext {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
+            use_reader_delete_filter: false,
         })
     }
 
@@ -1092,6 +1114,7 @@ mod tests {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
+            use_reader_delete_filter: false,
         };
 
         let equality_ids = vec![1, 2];
