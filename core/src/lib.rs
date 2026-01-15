@@ -21,9 +21,11 @@ pub mod error;
 pub mod executor;
 pub mod file_selection;
 
-pub use config::CompactionConfig;
+pub use compaction::{AutoCompaction, AutoCompactionBuilder};
+pub use config::{AutoCompactionConfig, AutoThresholds, CompactionConfig};
 pub use error::{CompactionError, Result};
 pub use executor::CompactionExecutor;
+pub use file_selection::SnapshotStats;
 // Re-export iceberg related crates
 pub use iceberg;
 // pub use iceberg_catalog_memory;
