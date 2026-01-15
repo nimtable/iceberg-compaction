@@ -26,10 +26,13 @@ use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use futures::StreamExt;
-use iceberg::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+use iceberg::arrow::{
+    RecordBatchPartitionSplitter, arrow_schema_to_schema, schema_to_arrow_schema,
+};
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{DataFile, NestedField, PartitionSpec, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
+use iceberg::writer::TaskWriter;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
     EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -41,7 +44,6 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg_compaction_core::CompactionError;
 use iceberg_compaction_core::error::Result;
 use parquet::file::properties::WriterProperties;
@@ -298,6 +300,7 @@ pub struct FileGenerator {
     pub record_batch_generator: RecordBatchGenerator,
     pub config: FileGeneratorConfig,
     pub schema: Arc<Schema>,
+    pub partition_spec: Arc<PartitionSpec>,
     pub writer_config: WriterConfig,
 }
 
@@ -337,6 +340,7 @@ impl FileGenerator {
     pub fn new(
         config: FileGeneratorConfig,
         schema: Arc<Schema>,
+        partition_spec: Arc<PartitionSpec>,
         writer_config: WriterConfig,
         fields_length: Vec<Option<usize>>,
     ) -> Result<Self> {
@@ -352,6 +356,7 @@ impl FileGenerator {
             record_batch_generator,
             config,
             schema,
+            partition_spec,
             writer_config,
         })
     }
@@ -457,7 +462,30 @@ impl FileGenerator {
         let mut data_files = Vec::new();
 
         let delta_writer_builder = self.build_delta_writer_builder()?;
-        let mut delta_writer = delta_writer_builder.clone().build(None).await?;
+
+        let create_new_task_writer = || {
+            let partition_splitter = if self.partition_spec.is_unpartitioned() {
+                None
+            } else {
+                Some(
+                    RecordBatchPartitionSplitter::new_with_computed_values(
+                        self.schema.clone(),
+                        self.partition_spec.clone(),
+                    )
+                    .expect("Failed to create partition splitter"),
+                )
+            };
+
+            TaskWriter::new_with_partition_splitter(
+                delta_writer_builder.clone(),
+                true,
+                self.schema.clone(),
+                self.partition_spec.clone(),
+                partition_splitter,
+            )
+        };
+
+        let mut writer = create_new_task_writer();
 
         let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
             None
@@ -506,8 +534,8 @@ impl FileGenerator {
             let num_rows = batch.num_rows();
 
             if data_file_num + num_rows > self.config.data_file_row_count {
-                data_files.extend(delta_writer.close().await?);
-                delta_writer = delta_writer_builder.clone().build(None).await?;
+                data_files.extend(writer.close().await?);
+                writer = create_new_task_writer();
                 data_file_num = 0;
             }
             data_file_num += num_rows;
@@ -515,7 +543,7 @@ impl FileGenerator {
             // 1. add equality delete
             if let Some(delete_rate) = equality_delete_rate {
                 let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
-                delta_writer.write(delete_batch).await?;
+                writer.write(delete_batch).await?;
             }
 
             // 2. add data file
@@ -523,15 +551,15 @@ impl FileGenerator {
             columns.push(Arc::new(Int32Array::from(vec![INSERT_OP; num_rows])) as ArrayRef);
             let batch_with_op = RecordBatch::try_new(schema_with_extra_op_column.clone(), columns)
                 .map_err(|e| CompactionError::Test(e.to_string()))?;
-            delta_writer.write(batch_with_op).await?;
+            writer.write(batch_with_op).await?;
 
             // 3. add position delete
             if let Some(delete_rate) = position_delete_rate {
                 let delete_batch = build_delete_batch(&batch, delete_rate, num_rows)?;
-                delta_writer.write(delete_batch).await?;
+                writer.write(delete_batch).await?;
             }
         }
-        data_files.extend(delta_writer.close().await?);
+        data_files.extend(writer.close().await?);
         Ok(data_files)
     }
 }

@@ -194,6 +194,7 @@ pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
     let table = catalog
         .create_table(&namespace_ident, table_creation)
         .await?;
+    let partition_spec = table.metadata().default_partition_spec().clone();
 
     // Generate files
     let writer_config = WriterConfig::new(&table, Some(pk_indices));
@@ -219,10 +220,12 @@ pub async fn mock_iceberg_table(config: &MockIcebergConfig) -> Result<()> {
         let writer_config = writer_config.clone();
         let fields_length = fields_length.clone();
 
+        let partition_spec_to_move = partition_spec.clone();
         let task: tokio::task::JoinHandle<Result<_>> = tokio::spawn(async move {
             let mut file_generator = FileGenerator::new(
                 file_generator_config,
                 Arc::new(schema),
+                partition_spec_to_move,
                 writer_config,
                 fields_length,
             )?;

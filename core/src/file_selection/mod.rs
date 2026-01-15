@@ -69,7 +69,6 @@ impl FileSelector {
             })
             .try_collect()
             .await?;
-
         Ok(data_files)
     }
 
