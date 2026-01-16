@@ -16,13 +16,12 @@
 
 //! Integration tests that require Docker containers
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, UnboundPartitionSpec};
+use iceberg::Catalog;
+use iceberg::spec::{PrimitiveType, Schema, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::{
     BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
@@ -44,58 +43,25 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
     let catalog = Arc::new(catalog);
 
     // Create a schema with SQL keyword column names to test the fix
-    let schema = Schema::builder()
-        .with_fields(vec![
-            Arc::new(NestedField::new(
-                1,
-                "select", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Int),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                2,
-                "from", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::String),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                3,
-                "where", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Double),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                4,
-                "order", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Long),
-                false,
-            )),
-        ])
-        .build()
-        .expect("Failed to create schema");
+    let schema = TestSchemaBuilder::new()
+        .add_field("select", PrimitiveType::Int) // SQL keyword
+        .add_field("from", PrimitiveType::String) // SQL keyword
+        .add_field("where", PrimitiveType::Double) // SQL keyword
+        .add_field("order", PrimitiveType::Long) // SQL keyword
+        .build();
 
     // Use SQL keywords as table and namespace names to test the fix
     let keyword_namespace = "join"; // SQL keyword
     let keyword_table_name = "group"; // SQL keyword
 
-    let namespace_ident = NamespaceIdent::new(keyword_namespace.to_owned());
-    let table_ident = TableIdent::new(namespace_ident.clone(), keyword_table_name.to_owned());
-
-    // Create namespace and table with keyword names
-    catalog
-        .create_namespace(&namespace_ident, HashMap::default())
-        .await
-        .expect("Failed to create namespace with keyword name");
-
-    let table_creation = TableCreation::builder()
-        .name(keyword_table_name.to_owned())
-        .schema(schema.clone())
-        .build();
-
-    let table = catalog
-        .create_table(&namespace_ident, table_creation)
-        .await
-        .expect("Failed to create table with keyword name");
+    let table = setup_table(
+        catalog.clone(),
+        keyword_namespace,
+        keyword_table_name,
+        &schema,
+        None,
+    )
+    .await;
 
     // Generate data files to test SQL keyword handling in compaction scenarios
     let writer_config = WriterConfig::new(&table, None);
@@ -139,7 +105,7 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
 
     let compaction = iceberg_compaction_core::compaction::CompactionBuilder::new(
         catalog.clone(),
-        table_ident.clone(),
+        table.identifier().clone(),
     )
     .with_config(Arc::new(config))
     .with_catalog_name("test_catalog".to_owned())
@@ -165,8 +131,8 @@ async fn test_sqlbuilder_fix_with_keyword_table_name() {
     // - Full compaction SQL generation with proper identifier quoting
 
     // Clean up: try to drop the table and namespace
-    let _ = catalog.drop_table(&table_ident).await;
-    let _ = catalog.drop_namespace(&namespace_ident).await;
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
 }
 
 #[tokio::test]
@@ -178,58 +144,25 @@ async fn test_sqlbuilder_with_delete_files() {
     let catalog = Arc::new(catalog);
 
     // Create a schema with SQL keyword column names to test the fix
-    let schema = Schema::builder()
-        .with_fields(vec![
-            Arc::new(NestedField::new(
-                1,
-                "select", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Int),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                2,
-                "from", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::String),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                3,
-                "where", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Double),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                4,
-                "order", // SQL keyword as column name
-                Type::Primitive(PrimitiveType::Long),
-                false,
-            )),
-        ])
-        .build()
-        .expect("Failed to create schema");
+    let schema = TestSchemaBuilder::new()
+        .add_field("select", PrimitiveType::Int) // SQL Keyword
+        .add_field("from", PrimitiveType::String) // SQL Keyword
+        .add_field("where", PrimitiveType::Double) // SQL Keyword
+        .add_field("order", PrimitiveType::Long) // SQL Keyword
+        .build();
 
     // Use SQL keywords as table and namespace names to test the fix
     let keyword_namespace = "union"; // SQL keyword
     let keyword_table_name = "having"; // SQL keyword
 
-    let namespace_ident = NamespaceIdent::new(keyword_namespace.to_owned());
-    let table_ident = TableIdent::new(namespace_ident.clone(), keyword_table_name.to_owned());
-
-    // Create namespace and table with keyword names
-    catalog
-        .create_namespace(&namespace_ident, HashMap::default())
-        .await
-        .expect("Failed to create namespace with keyword name");
-
-    let table_creation = TableCreation::builder()
-        .name(keyword_table_name.to_owned())
-        .schema(schema.clone())
-        .build();
-
-    let table = catalog
-        .create_table(&namespace_ident, table_creation)
-        .await
-        .expect("Failed to create table with keyword name");
+    let table = setup_table(
+        catalog.clone(),
+        keyword_namespace,
+        keyword_table_name,
+        &schema,
+        None,
+    )
+    .await;
 
     // Generate data files with delete files using default parameters
     let writer_config = WriterConfig::new(&table, None);
@@ -270,7 +203,7 @@ async fn test_sqlbuilder_with_delete_files() {
 
     let compaction = iceberg_compaction_core::compaction::CompactionBuilder::new(
         catalog.clone(),
-        table_ident.clone(),
+        table.identifier().clone(),
     )
     .with_config(Arc::new(config))
     .with_catalog_name("test_catalog_with_deletes".to_owned())
@@ -311,8 +244,8 @@ async fn test_sqlbuilder_with_delete_files() {
     // - Full compaction SQL generation with delete files and proper identifier quoting
 
     // Clean up: try to drop the table and namespace
-    let _ = catalog.drop_table(&table_ident).await;
-    let _ = catalog.drop_namespace(&namespace_ident).await;
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
 }
 
 #[tokio::test]
