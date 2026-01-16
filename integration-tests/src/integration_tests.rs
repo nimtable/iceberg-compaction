@@ -31,6 +31,7 @@ use iceberg_compaction_core::config::{
 
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
+use crate::test_utils::{TestSchemaBuilder, setup_table};
 
 const MB: u64 = 1024 * 1024;
 
@@ -314,6 +315,80 @@ async fn test_sqlbuilder_with_delete_files() {
     let _ = catalog.drop_namespace(&namespace_ident).await;
 }
 
+#[tokio::test]
+async fn test_compaction_with_prefetching_enabled() {
+    // Basic test that enabling prefetching does not cause any issues
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Prefetching typically benefits files with more columns, so add more here.
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Int)
+        .add_field("num", PrimitiveType::Long)
+        .add_field("bool", PrimitiveType::Boolean)
+        .add_field("str1", PrimitiveType::String)
+        .add_field("float", PrimitiveType::Float)
+        .add_field("double", PrimitiveType::Double)
+        .add_field("str2", PrimitiveType::String)
+        .add_field("str3", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "prefetch_tests",
+        "basic_prefetch_test",
+        &schema,
+        None,
+    )
+    .await;
+
+    write_data_to_table(catalog.clone(), &table, &schema, 10, 1_000).await;
+
+    // The Planning configuration isn't important for this test
+    let small_files_config = SmallFilesConfigBuilder::default()
+        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
+        .build()
+        .expect("Failed to build small files config");
+
+    let planning_config = CompactionPlanningConfig::SmallFiles(small_files_config);
+    let config = CompactionConfigBuilder::default()
+        .execution(
+            CompactionExecutionConfigBuilder::default()
+                .enable_prefetch(true) // <-- KEY CONFIG FOR TEST: Enable prefetching
+                .build()
+                .expect("Failed to build execution config"),
+        )
+        .planning(planning_config)
+        .build()
+        .expect("Failed to build compaction config");
+    let config = Arc::new(config);
+
+    // Run compaction once to get our first compacted data.
+    let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
+        .with_config(config.clone())
+        .with_catalog_name("test_catalog".to_owned())
+        .build();
+
+    let compaction_result = compaction.compact().await.unwrap();
+
+    let response = compaction_result.expect("Full compaction SQL generation should succeed");
+
+    assert_eq!(
+        19, response.stats.input_files_count,
+        "Compaction should process input files"
+    );
+
+    assert_eq!(
+        1, response.stats.output_files_count,
+        "Compaction should process output files"
+    );
+
+    // Clean up: try to drop the table and namespace
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
 // #######################################
 // Tests for Partitioned Tables
 // #######################################
@@ -325,30 +400,10 @@ async fn setup_bucket_partitioned_table(
     bucket_number: usize,
 ) -> (Table, Schema) {
     // Create a schema with a "num" column which we will partition on
-    let schema = Schema::builder()
-        .with_fields(vec![
-            Arc::new(NestedField::new(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-                false,
-            )),
-            Arc::new(NestedField::new(
-                2,
-                "num",
-                Type::Primitive(PrimitiveType::Long),
-                false,
-            )),
-        ])
-        .build()
-        .expect("Failed to create schema");
-
-    let namespace_ident = NamespaceIdent::new(namespace_name.to_owned());
-
-    catalog
-        .create_namespace(&namespace_ident, HashMap::default())
-        .await
-        .expect("Failed to create namespace with keyword name");
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Int)
+        .add_field("num", PrimitiveType::Long)
+        .build();
 
     // Create a partition spec with a bucket transform. We expect the compaction to produce the
     // same number of files as the number of buckets.
@@ -361,20 +416,14 @@ async fn setup_bucket_partitioned_table(
         .expect("could not add partition field")
         .build();
 
-    let partition_spec = unbound_partition_spec
-        .bind(schema.clone())
-        .expect("could not bind partition spec to test schema");
-
-    let table_creation = TableCreation::builder()
-        .name(table_name.to_owned())
-        .schema(schema.clone())
-        .partition_spec(partition_spec.clone())
-        .build();
-
-    let table = catalog
-        .create_table(&namespace_ident, table_creation)
-        .await
-        .expect("Failed to create table with keyword name");
+    let table = setup_table(
+        catalog.clone(),
+        namespace_name,
+        table_name,
+        &schema,
+        Some(unbound_partition_spec),
+    )
+    .await;
 
     (table, schema)
 }
