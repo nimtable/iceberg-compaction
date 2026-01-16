@@ -210,7 +210,6 @@ impl DatafusionTableRegister {
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
     ) -> Result<()> {
-        // Allow prefetch here too?
         self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
     }
 

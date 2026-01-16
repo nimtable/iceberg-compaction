@@ -357,7 +357,7 @@ async fn get_batch_stream(
                         if need_seq_num {
                             batch = add_seq_num_into_batch(batch, file_context.sequence_number)?;
                         }
-                        // add file path and position if needed - use ORIGINAL path!
+                        // add file path and position if needed (for prefetching: use original path, not memory path)
                         if need_file_path_and_pos {
                             batch = add_file_path_pos_into_batch(batch, &file_context.original_path, index_start)?;
                             index_start += batch.num_rows() as i64;
