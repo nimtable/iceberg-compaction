@@ -58,7 +58,7 @@ impl SizeEstimationTracker {
             return;
         }
 
-        let physical_growth = new_physical_size - self.last_physical_size;
+        let physical_growth = new_physical_size.saturating_sub(self.last_physical_size);
 
         if self.enabled && self.current_memory_size > 0 {
             let calculated_ratio = physical_growth as f64 / self.current_memory_size as f64;

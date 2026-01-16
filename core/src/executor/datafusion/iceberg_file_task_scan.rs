@@ -34,8 +34,9 @@ use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
-use iceberg::io::FileIO;
+use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::scan::FileScanTask;
+use iceberg::spec::DataContentType;
 use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
 
@@ -108,6 +109,7 @@ pub(crate) struct IcebergFileTaskScan {
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
+    prefetch_enabled: bool,
 }
 
 impl IcebergFileTaskScan {
@@ -122,6 +124,7 @@ impl IcebergFileTaskScan {
         need_file_path_and_pos: bool,
         executor_parallelism: usize,
         max_record_batch_rows: usize,
+        prefetch_enabled: bool,
     ) -> Result<Self, DataFusionError> {
         let output_schema = match projection {
             None => schema.clone(),
@@ -166,6 +169,7 @@ impl IcebergFileTaskScan {
             need_seq_num,
             need_file_path_and_pos,
             max_record_batch_rows,
+            prefetch_enabled,
         })
     }
 
@@ -288,6 +292,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
             self.need_seq_num,
             self.need_file_path_and_pos,
             self.max_record_batch_rows,
+            self.prefetch_enabled,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -298,7 +303,14 @@ impl ExecutionPlan for IcebergFileTaskScan {
     }
 }
 
-/// Gets a stream of record batches from a list of file scan tasks
+/// Gets a stream of record batches from a list of file scan tasks.
+///
+/// If `is_prefetch_enabled` is true, it will download the entire file into memory before
+/// reading into a batch stream. Instead of making N HTTP requests for N column chunks,
+/// we make 1 HTTP request per file.
+///
+/// For now, only one file is processed at a time. Subsequent calls to the stream will
+/// eventually trigger more I/O reads.
 #[allow(clippy::unused_async)]
 async fn get_batch_stream(
     file_io: FileIO,
@@ -306,51 +318,165 @@ async fn get_batch_stream(
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
+    is_prefetch_enabled: bool,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let optional_prefetch: Option<Prefetcher> = if is_prefetch_enabled {
+        Some(Prefetcher::new()?)
+    } else {
+        None
+    };
+
     let stream = try_stream! {
         let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+
         for task in file_scan_tasks {
-            let file_path = task.data_file_path.clone();
-            let data_file_content = task.data_file_content;
-            let sequence_number = task.sequence_number;
+            let mut file_context = FileTaskContext::from_task(&task);
+
+            let (file_io, task) = match &optional_prefetch {
+                Some(prefetcher) => {
+                    // We prefetch the file into memory, and return a MemoryFileIO to give to
+                    // the ArrowReaderBuilder instead of the original file IO.
+                    let in_memory_task = prefetcher.prefetch_file_into_memory(&task, &mut file_context, &file_io).await?;
+                    (prefetcher.memory_file_io(), in_memory_task)
+                },
+                None => (file_io.clone(), task)
+            };
+
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(file_io.clone()).with_batch_size(max_record_batch_rows);
+            let arrow_reader_builder = ArrowReaderBuilder::new(file_io).with_batch_size(max_record_batch_rows);
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
                 .map_err(to_datafusion_error)?;
+
             let mut index_start = 0;
             while let Some(batch) = batch_stream.next().await {
                 let mut batch = batch.map_err(to_datafusion_error)?;
-                let batch = match data_file_content {
-                    iceberg::spec::DataContentType::Data => {
+                let batch = match file_context.data_file_content {
+                    DataContentType::Data => {
                         // add sequence number if needed
                         if need_seq_num {
-                            batch = add_seq_num_into_batch(batch, sequence_number)?;
+                            batch = add_seq_num_into_batch(batch, file_context.sequence_number)?;
                         }
-                        // add file path and position if needed
+                        // add file path and position if needed (for prefetching: use original path, not memory path)
                         if need_file_path_and_pos {
-                            batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
+                            batch = add_file_path_pos_into_batch(batch, &file_context.original_path, index_start)?;
                             index_start += batch.num_rows() as i64;
                         }
                         batch
                     }
-                    iceberg::spec::DataContentType::PositionDeletes => {
+                    DataContentType::PositionDeletes => {
                         batch
                     },
-                    iceberg::spec::DataContentType::EqualityDeletes => {
-                        add_seq_num_into_batch(batch, sequence_number)?
+                    DataContentType::EqualityDeletes => {
+                        add_seq_num_into_batch(batch, file_context.sequence_number)?
                     },
                 };
                 if let Some(batch) = record_batch_buffer.add(batch)? {
                     yield batch;
                 }
             }
+
+            // 3. Clean up any memory file to avoid accmulating too much memory; ignore errors as cleanup is best-effort
+            if let Some(prefetcher) = &optional_prefetch {
+                let _ = prefetcher.clear_file(&file_context).await;
+            }
         }
+
         if let Some(batch) = record_batch_buffer.finish()? {
             yield batch;
         }
     };
+
     Ok(Box::pin(stream))
+}
+
+/// Holds metadata about a file scan task that needs to be preserved
+/// when using memory-backed file reading for prefetch optimization.
+struct FileTaskContext {
+    original_path: String,
+    data_file_content: DataContentType,
+    sequence_number: i64,
+    memory_path: Option<String>,
+}
+
+impl FileTaskContext {
+    fn from_task(task: &FileScanTask) -> Self {
+        Self {
+            original_path: task.data_file_path.clone(),
+            data_file_content: task.data_file_content,
+            sequence_number: task.sequence_number,
+            memory_path: None,
+        }
+    }
+
+    fn set_memory_path(&mut self, memory_path: String) {
+        self.memory_path = Some(memory_path);
+    }
+}
+
+struct Prefetcher {
+    memory_file_io: FileIO,
+}
+
+/// Internal type for prefetching file scan tasks into memory. This allows us to
+/// only setup the memory file IO when prefetch is enabled.
+impl Prefetcher {
+    fn new() -> DFResult<Self> {
+        Ok(Self {
+            memory_file_io: FileIOBuilder::new("memory")
+                .build()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        })
+    }
+
+    pub fn memory_file_io(&self) -> FileIO {
+        self.memory_file_io.clone()
+    }
+
+    pub async fn prefetch_file_into_memory(
+        &self,
+        task: &FileScanTask,
+        file_context: &mut FileTaskContext,
+        file_io: &FileIO,
+    ) -> DFResult<FileScanTask> {
+        // 1. Download file from source storage (single HTTP request)
+        let file_bytes = file_io
+            .new_input(&file_context.original_path)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .read()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // 2. Write to memory storage
+        let memory_path = generate_memory_path(&file_context.original_path);
+        self.memory_file_io
+            .new_output(&memory_path)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .write(file_bytes)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // 3. Create modified task with memory path
+        let mut memory_task = task.clone();
+        memory_task.data_file_path = memory_path.clone();
+        file_context.set_memory_path(memory_path);
+        Ok(memory_task)
+    }
+
+    pub async fn clear_file(&self, file_context: &FileTaskContext) -> DFResult<()> {
+        // swallow errors: this is best effort cleanup
+        if let Some(memory_path) = &file_context.memory_path {
+            let _ = self.memory_file_io.delete(memory_path).await;
+        }
+        Ok(())
+    }
+}
+
+/// Generate a memory path from an original storage path. This does not impact the final
+/// compaction output. It simply allows the `ArrowReaderBuilder` to read file data from memory.
+/// Ex: `s3://bucket/path/to/file.parquet` -> `memory:/bucket/path/to/file.parquet`
+fn generate_memory_path(original_path: &str) -> String {
+    format!("memory:/{}", original_path.replace("://", "/"))
 }
 
 /// Adds a sequence number column to a record batch
