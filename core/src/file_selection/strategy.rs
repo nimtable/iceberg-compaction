@@ -26,10 +26,7 @@
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{
-    CompactionPlanningConfig, GroupingStrategy, MAX_FILE_SIZE_DEFAULT_RATIO,
-    MIN_FILE_SIZE_DEFAULT_RATIO, SPLIT_OVERHEAD,
-};
+use crate::config::{CompactionPlanningConfig, GroupingStrategy, SPLIT_OVERHEAD};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -290,7 +287,7 @@ impl FileGroup {
         if remainder > min_file_size {
             num_files_with_remainder as usize
         } else if avg_file_size_without_remainder
-            <= ((target_file_size as f64 * 1.1) as u64).min(write_max)
+            <= (target_file_size + target_file_size / 10).min(write_max)
         {
             // If the average file size without remainder is acceptable (< 1.1 * target or < writeMax),
             // we can round down and distribute the remainder
@@ -327,13 +324,15 @@ impl FileGroup {
     }
 
     /// Calculates `min_file_size` from `target_file_size` using default ratio.
+    /// Uses integer arithmetic: target_file_size * 3 / 4 for 0.75 ratio to avoid floating-point precision loss.
     fn default_min_file_size(target_file_size: u64) -> u64 {
-        (target_file_size as f64 * MIN_FILE_SIZE_DEFAULT_RATIO) as u64
+        target_file_size * 3 / 4 // 0.75 = 3/4
     }
 
     /// Calculates `max_file_size` from `target_file_size` using default ratio.
+    /// Uses integer arithmetic: target_file_size * 9 / 5 for 1.80 ratio to avoid floating-point precision loss.
     fn default_max_file_size(target_file_size: u64) -> u64 {
-        (target_file_size as f64 * MAX_FILE_SIZE_DEFAULT_RATIO) as u64
+        target_file_size * 9 / 5 // 1.80 = 9/5
     }
 
     pub fn is_empty(&self) -> bool {
