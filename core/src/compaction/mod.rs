@@ -38,7 +38,10 @@ use crate::executor::{
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
+pub mod auto;
 mod validator;
+
+pub use auto::{AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner};
 
 /// Validates that all rewrite results target the same snapshot and branch.
 ///
@@ -296,7 +299,7 @@ impl Compaction {
     }
 
     /// Records metrics for overall compaction duration and statistics.
-    fn record_overall_metrics(
+    pub(crate) fn record_overall_metrics(
         &self,
         rewrite_results: &[RewriteResult],
         overall_start_time: std::time::Instant,
@@ -326,7 +329,10 @@ impl Compaction {
     }
 
     /// Merges statistics from multiple rewrite results into a single aggregate.
-    fn merge_rewrite_stats(&self, rewrite_results: &[RewriteResult]) -> RewriteFilesStat {
+    pub(crate) fn merge_rewrite_stats(
+        &self,
+        rewrite_results: &[RewriteResult],
+    ) -> RewriteFilesStat {
         let mut merged_stats = RewriteFilesStat::default();
 
         for result in rewrite_results {
@@ -510,7 +516,7 @@ impl Compaction {
     /// # Performance
     ///
     /// Uses buffered stream for concurrent execution.
-    async fn concurrent_rewrite_plans(
+    pub(crate) async fn concurrent_rewrite_plans(
         &self,
         plans: Vec<CompactionPlan>,
         execution_config: &CompactionExecutionConfig,
@@ -530,7 +536,7 @@ impl Compaction {
     }
 
     /// Runs `CompactionValidator` for each result if validation info is present.
-    async fn run_validations(
+    pub(crate) async fn run_validations(
         &self,
         rewrite_results: Vec<RewriteResult>,
         committed_table: &Table,
@@ -560,7 +566,7 @@ impl Compaction {
     }
 
     /// Merges multiple rewrite results into a single `CompactionResult`.
-    fn merge_rewrite_results_to_compaction_result(
+    pub(crate) fn merge_rewrite_results_to_compaction_result(
         &self,
         results: Vec<RewriteResult>,
         table: Option<Table>,
