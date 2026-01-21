@@ -324,13 +324,13 @@ impl FileGroup {
     }
 
     /// Calculates `min_file_size` from `target_file_size` using default ratio.
-    /// Uses integer arithmetic: target_file_size * 3 / 4 for 0.75 ratio to avoid floating-point precision loss.
+    /// Uses integer arithmetic: `target_file_size` * 3 / 4 for 0.75 ratio to avoid floating-point precision loss.
     fn default_min_file_size(target_file_size: u64) -> u64 {
         target_file_size * 3 / 4 // 0.75 = 3/4
     }
 
     /// Calculates `max_file_size` from `target_file_size` using default ratio.
-    /// Uses integer arithmetic: target_file_size * 9 / 5 for 1.80 ratio to avoid floating-point precision loss.
+    /// Uses integer arithmetic: `target_file_size` * 9 / 5 for 1.80 ratio to avoid floating-point precision loss.
     fn default_max_file_size(target_file_size: u64) -> u64 {
         target_file_size * 9 / 5 // 1.80 = 9/5
     }
@@ -2096,21 +2096,18 @@ mod tests {
         assert!(!parallelisms.is_empty());
 
         for (idx, group) in groups.iter().enumerate() {
-            let partition_by_size = (group
-                .input_total_bytes()
-                .div_ceil(config.min_size_per_partition()))
-            .max(1) as usize;
-            let partition_by_count = group
-                .input_files_count()
-                .div_ceil(config.max_file_count_per_partition())
-                .max(1);
-            let expected_exec_p = partition_by_size
-                .max(partition_by_count)
-                .min(config.max_input_parallelism());
+            // Use the new parallelism calculation method instead of manual calculation
+            let (expected_exec_p, expected_output_p) =
+                FileGroup::calculate_parallelism(group, &config).unwrap();
 
             assert_eq!(
                 group.executor_parallelism, expected_exec_p,
-                "Group {}: parallelism mismatch",
+                "Group {}: executor parallelism mismatch",
+                idx
+            );
+            assert_eq!(
+                group.output_parallelism, expected_output_p,
+                "Group {}: output parallelism mismatch",
                 idx
             );
             assert!(group.output_parallelism <= group.executor_parallelism);
