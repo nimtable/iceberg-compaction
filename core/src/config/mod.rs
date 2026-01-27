@@ -352,6 +352,15 @@ impl Default for CompactionExecutionConfig {
     }
 }
 
+impl CompactionExecutionConfig {
+    /// Allows user to configure compression algorithm
+    pub fn with_compression(compression: Compression) -> WriterProperties {
+        WriterProperties::builder()
+            .set_compression(compression)
+            .build()
+    }
+}
+
 /// Combined planning and execution configuration for compaction.
 #[derive(Builder, Debug, Clone)]
 #[builder(pattern = "owned")]
