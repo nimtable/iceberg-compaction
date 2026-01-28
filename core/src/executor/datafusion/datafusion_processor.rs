@@ -25,7 +25,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataContentType, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{DataContentType, FormatVersion, NestedField, PrimitiveType, Schema, Type};
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use crate::config::CompactionExecutionConfig;
@@ -482,7 +482,7 @@ pub struct DataFusionTaskContextBuilder {
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
     table_prefix: String,
-    use_reader_position_delete: bool,
+    format_version: FormatVersion,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -496,8 +496,8 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_reader_position_delete(mut self, use_reader_position_delete: bool) -> Self {
-        self.use_reader_position_delete = use_reader_position_delete;
+    pub fn with_format_version(mut self, format_version: FormatVersion) -> Self {
+        self.format_version = format_version;
         self
     }
 
@@ -506,7 +506,7 @@ impl DataFusionTaskContextBuilder {
             .data_files
             .into_iter()
             .map(|mut task| {
-                if self.use_reader_position_delete {
+                if self.ge_v3_format() {
                     // Keep position deletes for reader-side filtering; drop equality deletes for joins.
                     task.deletes.retain(|delete| {
                         delete.data_file_content == DataContentType::PositionDeletes
@@ -561,9 +561,10 @@ impl DataFusionTaskContextBuilder {
 
     // build datafusion task context
     pub fn build(self) -> Result<DataFusionTaskContext> {
+        let ge_v3_format = self.ge_v3_format();
         let mut highest_field_id = self.schema.highest_field_id();
         // Build schema for position delete file, file_path + pos
-        let position_delete_schema = if self.use_reader_position_delete {
+        let position_delete_schema = if ge_v3_format {
             None
         } else {
             Some(Self::build_position_schema()?)
@@ -598,8 +599,7 @@ impl DataFusionTaskContextBuilder {
             }
         }
 
-        let need_file_path_and_pos =
-            !self.use_reader_position_delete && !self.position_delete_files.is_empty();
+        let need_file_path_and_pos = !ge_v3_format && !self.position_delete_files.is_empty();
         let need_seq_num = !equality_delete_metadatas.is_empty();
 
         // Build schema for data file, old schema + seq_num + file_path + pos
@@ -692,6 +692,10 @@ impl DataFusionTaskContextBuilder {
         })
     }
 
+    fn ge_v3_format(&self) -> bool {
+        self.format_version >= FormatVersion::V3
+    }
+
     /// Builds an equality delete schema based on the given `equality_ids`
     fn build_equality_delete_schema(
         &self,
@@ -729,7 +733,7 @@ impl DataFusionTaskContext {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
-            use_reader_position_delete: false,
+            format_version: FormatVersion::V2,
         })
     }
 
@@ -1115,7 +1119,7 @@ mod tests {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
-            use_reader_position_delete: false,
+            format_version: FormatVersion::V2,
         };
 
         let equality_ids = vec![1, 2];

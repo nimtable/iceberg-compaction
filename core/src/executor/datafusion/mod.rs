@@ -70,7 +70,7 @@ impl CompactionExecutor for DataFusionExecutor {
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
-            .with_reader_position_delete(format_version >= 3)
+            .with_format_version(format_version)
             .with_input_data_files(file_group)
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
