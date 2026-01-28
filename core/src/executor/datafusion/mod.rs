@@ -140,6 +140,7 @@ impl CompactionExecutor for DataFusionExecutor {
             });
             futures.push(future);
         }
+
         // collect all data files from all partitions
         let output_data_files: Vec<DataFile> = try_join_all(futures)
             .await

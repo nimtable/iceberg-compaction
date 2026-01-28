@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use futures::future::try_join_all;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type, UnboundPartitionSpec};
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog};
@@ -297,4 +298,69 @@ pub async fn delete_table_from_config(config: &MockIcebergConfig) -> Result<()> 
             format!("Failed to drop table: {}", e),
         )),
     }
+}
+
+pub struct TestSchemaBuilder {
+    curr_id: i32,
+    fields: Vec<Arc<NestedField>>,
+}
+
+impl TestSchemaBuilder {
+    pub fn new() -> Self {
+        Self {
+            curr_id: 1,
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn add_field(mut self, name: &str, primitive_type: PrimitiveType) -> Self {
+        self.fields.push(Arc::new(NestedField::new(
+            self.curr_id,
+            name,
+            Type::Primitive(primitive_type),
+            false,
+        )));
+        self.curr_id += 1;
+        self
+    }
+
+    pub fn build(&self) -> Schema {
+        Schema::builder()
+            .with_fields(self.fields.clone())
+            .build()
+            .expect("Failed to build schema")
+    }
+}
+
+pub async fn setup_table(
+    catalog: Arc<iceberg_catalog_rest::RestCatalog>,
+    namespace_name: &str,
+    table_name: &str,
+    schema: &Schema,
+    unbound_partition_spec: Option<UnboundPartitionSpec>,
+) -> Table {
+    // 1) Setup namespace
+    let namespace_ident = NamespaceIdent::new(namespace_name.to_owned());
+    catalog
+        .create_namespace(&namespace_ident, HashMap::default())
+        .await
+        .expect("Failed to create namespace with keyword name");
+
+    let table_builder = TableCreation::builder()
+        .name(table_name.to_owned())
+        .schema(schema.clone());
+
+    let table_creation = if let Some(unbound_partition_spec) = unbound_partition_spec {
+        let partition_spec = unbound_partition_spec
+            .bind(schema.clone())
+            .expect("could not bind partition spec to test schema");
+        table_builder.partition_spec(partition_spec).build()
+    } else {
+        table_builder.build()
+    };
+
+    catalog
+        .create_table(&namespace_ident, table_creation)
+        .await
+        .expect("Failed to create table with keyword name")
 }

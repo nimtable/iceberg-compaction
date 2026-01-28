@@ -63,6 +63,7 @@ impl DatafusionProcessor {
             ctx.clone(),
             executor_parallelism,
             execution_config.max_record_batch_rows,
+            execution_config.enable_prefetch,
         );
 
         Self {
@@ -166,6 +167,7 @@ pub struct DatafusionTableRegister {
 
     executor_parallelism: usize,
     max_record_batch_rows: usize,
+    is_prefetch_enabled: bool,
 }
 
 impl DatafusionTableRegister {
@@ -174,12 +176,14 @@ impl DatafusionTableRegister {
         ctx: Arc<SessionContext>,
         executor_parallelism: usize,
         max_record_batch_rows: usize,
+        is_prefetch_enabled: bool,
     ) -> Self {
         DatafusionTableRegister {
             file_io,
             ctx,
             executor_parallelism,
             max_record_batch_rows,
+            is_prefetch_enabled,
         }
     }
 
@@ -226,6 +230,7 @@ impl DatafusionTableRegister {
             need_file_path_and_pos,
             self.executor_parallelism,
             self.max_record_batch_rows,
+            self.is_prefetch_enabled,
         );
 
         self.ctx
