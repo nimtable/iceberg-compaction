@@ -16,8 +16,13 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::compute::SortOptions;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, execute_stream_partitioned,
 };
@@ -25,7 +30,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, SortOrderRef, Type};
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use crate::config::CompactionExecutionConfig;
@@ -138,6 +143,7 @@ impl DatafusionProcessor {
             .ok_or_else(|| CompactionError::Unexpected("Input schema is not set".to_owned()))?;
         let exec_sql = datafusion_task_ctx.exec_sql.clone();
 
+        let sort_order = datafusion_task_ctx.sort_order.clone();
         self.register_tables(datafusion_task_ctx)?;
 
         let df = self.ctx.sql(&exec_sql).await?;
@@ -153,6 +159,54 @@ impl DatafusionProcessor {
             } else {
                 physical_plan
             };
+
+        let schema = plan_to_execute.schema().clone();
+
+        // Create sort expressions based on the Iceberg sort order if available
+        let sort_exprs = if let Some((_, sort_order)) = sort_order {
+            // Use Iceberg sort order to create physical sort expressions
+            let mut exprs = Vec::new();
+            for sort_field in &sort_order.fields {
+                // Find the column name from the field id
+                if let Some(field) = input_schema.field_by_id(sort_field.source_id) {
+                    // Find the column index in the physical schema
+                    if let Ok(column_index) = schema.index_of(&field.name) {
+                        let sort_options = SortOptions {
+                            descending: matches!(
+                                sort_field.direction,
+                                iceberg::spec::SortDirection::Descending
+                            ),
+                            nulls_first: matches!(
+                                sort_field.null_order,
+                                iceberg::spec::NullOrder::First
+                            ),
+                        };
+
+                        exprs.push(PhysicalSortExpr {
+                            expr: Arc::new(Column::new(&field.name, column_index)),
+                            options: sort_options,
+                        });
+                    }
+                }
+            }
+            Some(exprs)
+        } else {
+            None
+        };
+
+        let plan_to_execute = match sort_exprs {
+            Some(exprs) if !exprs.is_empty() => {
+                if let Some(lex_ordering) = LexOrdering::new(exprs) {
+                    Arc::new(
+                        SortExec::new(lex_ordering, plan_to_execute)
+                            .with_preserve_partitioning(true),
+                    )
+                } else {
+                    plan_to_execute
+                }
+            }
+            _ => plan_to_execute,
+        };
 
         // Use execute_stream_partitioned to execute all partitions at once
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
@@ -474,6 +528,7 @@ pub struct DataFusionTaskContext {
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
     pub(crate) exec_sql: String,
     pub(crate) table_prefix: String,
+    pub(crate) sort_order: Option<(i64, SortOrderRef)>,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -482,6 +537,7 @@ pub struct DataFusionTaskContextBuilder {
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
     table_prefix: String,
+    sort_order: Option<(i64, SortOrderRef)>,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -492,6 +548,11 @@ impl DataFusionTaskContextBuilder {
 
     pub fn with_table_prefix(mut self, table_prefix: String) -> Self {
         self.table_prefix = table_prefix;
+        self
+    }
+
+    pub fn with_sort_order(mut self, sort_order: Option<(i64, SortOrderRef)>) -> Self {
+        self.sort_order = sort_order;
         self
     }
 
@@ -667,6 +728,7 @@ impl DataFusionTaskContextBuilder {
             },
             exec_sql,
             table_prefix: self.table_prefix,
+            sort_order: self.sort_order,
         })
     }
 
@@ -707,6 +769,7 @@ impl DataFusionTaskContext {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
+            sort_order: None,
         })
     }
 
@@ -1092,6 +1155,7 @@ mod tests {
             position_delete_files: vec![],
             equality_delete_files: vec![],
             table_prefix: "".to_owned(),
+            sort_order: None,
         };
 
         let equality_ids = vec![1, 2];

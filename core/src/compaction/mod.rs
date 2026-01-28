@@ -612,6 +612,14 @@ impl Compaction {
             location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
+            sort_order: {
+                let default_sort_order = table.metadata().default_sort_order_id();
+                table
+                    .metadata()
+                    .sort_order_by_id(default_sort_order)
+                    .cloned()
+                    .map(|so| (default_sort_order, so))
+            },
         })
     }
 
@@ -1841,6 +1849,108 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    /// Test compaction with sort order to verify data is sorted correctly
+    #[tokio::test]
+    async fn test_compaction_with_sort_order() {
+        let env = create_test_env().await;
+        let namespace_ident = NamespaceIdent::new("test_namespace2".into());
+        create_namespace(env.catalog.as_ref(), &namespace_ident).await;
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table_order".into());
+
+        let sort_order = iceberg::spec::SortOrder::builder()
+            .with_sort_field(iceberg::spec::SortField {
+                source_id: 1,
+                transform: iceberg::spec::Transform::Identity,
+                direction: iceberg::spec::SortDirection::Ascending,
+                null_order: iceberg::spec::NullOrder::First,
+            })
+            .build(&simple_table_schema())
+            .unwrap();
+        let _ = env
+            .catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .sort_order(sort_order)
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = env.catalog.load_table(&table_ident).await.unwrap();
+
+        let data_files = write_simple_files(&env.table, &env.warehouse_location, "test", 3).await;
+        let _updated_table = append_and_commit(&table, env.catalog.as_ref(), data_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), table_ident.clone());
+        let result = compaction.compact().await.unwrap().unwrap();
+
+        assert_eq!(result.data_files.len(), 1);
+        assert_eq!(result.data_files[0].sort_order_id(), Some(1));
+
+        // Scan and print the table data after compaction
+        let final_table = env.catalog.load_table(&table_ident).await.unwrap();
+        let snapshot = final_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+        let scan = final_table
+            .scan()
+            .snapshot_id(snapshot.snapshot_id())
+            .build()
+            .unwrap();
+
+        // Collect file scan tasks from the stream
+        use futures::StreamExt;
+        let mut file_scan_tasks = vec![];
+        let mut task_stream = scan.plan_files().await.unwrap();
+        while let Some(task) = task_stream.next().await {
+            file_scan_tasks.push(task.unwrap());
+        }
+
+        // Use DataFusion to read the data
+        use datafusion::prelude::SessionContext;
+        use iceberg::arrow::schema_to_arrow_schema;
+
+        use crate::executor::datafusion::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
+
+        let ctx = SessionContext::new();
+        let schema = schema_to_arrow_schema(final_table.metadata().current_schema()).unwrap();
+        let provider = IcebergFileScanTaskTableProvider::new(
+            file_scan_tasks,
+            Arc::new(schema),
+            final_table.file_io().clone(),
+            false,
+            false,
+            1,
+            8192,
+        );
+
+        ctx.register_table("compacted_table", Arc::new(provider))
+            .unwrap();
+        let df = ctx
+            .sql("SELECT * FROM compacted_table ORDER BY id")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let target_id = vec![1, 1, 1, 2, 2, 2, 3, 3, 3];
+        for (_, batch) in batches.iter().enumerate() {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .for_each(|(i, value)| {
+                    assert_eq!(value.unwrap(), target_id[i]);
+                });
+        }
     }
 
     /// Test the `plan_compaction` functionality
