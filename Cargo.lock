@@ -1295,9 +1295,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a97769d94ddab943e4510d138150169a2758b5ef3eb191a9ee688de3e23ef7b3"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
 ]
@@ -2916,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b68266f5cefa66a4b9fa2a605c691c2172122ca7#b68266f5cefa66a4b9fa2a605c691c2172122ca7"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=0d0539d3ef464439cb6f41dab731e3c0dfe92b28#0d0539d3ef464439cb6f41dab731e3c0dfe92b28"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2937,6 +2937,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "derive_builder",
  "expect-test",
  "flate2",
@@ -2974,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b68266f5cefa66a4b9fa2a605c691c2172122ca7#b68266f5cefa66a4b9fa2a605c691c2172122ca7"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=0d0539d3ef464439cb6f41dab731e3c0dfe92b28#0d0539d3ef464439cb6f41dab731e3c0dfe92b28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2989,7 +2990,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b68266f5cefa66a4b9fa2a605c691c2172122ca7#b68266f5cefa66a4b9fa2a605c691c2172122ca7"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=0d0539d3ef464439cb6f41dab731e3c0dfe92b28#0d0539d3ef464439cb6f41dab731e3c0dfe92b28"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3076,7 +3077,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.7.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=b68266f5cefa66a4b9fa2a605c691c2172122ca7#b68266f5cefa66a4b9fa2a605c691c2172122ca7"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=0d0539d3ef464439cb6f41dab731e3c0dfe92b28#0d0539d3ef464439cb6f41dab731e3c0dfe92b28"
 dependencies = [
  "anyhow",
  "async-trait",

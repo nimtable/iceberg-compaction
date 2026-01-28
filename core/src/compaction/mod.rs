@@ -612,6 +612,7 @@ impl Compaction {
             location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
+            format_version: table.metadata().format_version(),
         })
     }
 
