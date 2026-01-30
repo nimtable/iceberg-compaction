@@ -60,8 +60,6 @@ impl CompactionExecutor for DataFusionExecutor {
             location_generator,
             sort_order,
         } = request;
-        println!("Starting rewrite_files with {:?} input files", sort_order);
-
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
         let sort_order_id = sort_order.clone().map(|(id, _)| id as i32);
