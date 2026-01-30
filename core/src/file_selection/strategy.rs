@@ -515,6 +515,18 @@ pub struct PlanStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
     grouping: GroupingStrategyEnum,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    full_filtered: Option<FullFilteredConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct FullFilteredConfig {
+    target_file_size_bytes: u64,
+    min_rewrite_input_bytes: u64,
+    allow_underfilled_with_deletes: bool,
+    min_delete_file_count_threshold: usize,
+    top_up_to_target: bool,
+    top_up_max_good_bytes: u64,
+    top_up_max_good_files: Option<usize>,
 }
 
 impl PlanStrategy {
@@ -527,6 +539,16 @@ impl PlanStrategy {
             file_filters,
             grouping,
             group_filters,
+            full_filtered: None,
+        }
+    }
+
+    fn new_full_filtered(grouping: GroupingStrategyEnum, config: FullFilteredConfig) -> Self {
+        Self {
+            file_filters: vec![],
+            grouping,
+            group_filters: vec![],
+            full_filtered: Some(config),
         }
     }
 
@@ -544,6 +566,10 @@ impl PlanStrategy {
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
+        if let Some(full_config) = &self.full_filtered {
+            return self.execute_full_filtered(data_files, config, full_config);
+        }
+
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
@@ -557,6 +583,105 @@ impl PlanStrategy {
         }
 
         file_groups
+            .into_iter()
+            .map(|group| group.with_calculated_parallelism(config))
+            .collect()
+    }
+
+    fn execute_full_filtered(
+        &self,
+        data_files: Vec<FileScanTask>,
+        config: &CompactionPlanningConfig,
+        full_config: &FullFilteredConfig,
+    ) -> Result<Vec<FileGroup>> {
+        let partitioned = group_files_by_partition(data_files.into_iter());
+        let mut planned_groups = Vec::new();
+
+        for (_partition, files) in partitioned {
+            let mut bad_files = Vec::new();
+            let mut good_files = Vec::new();
+            let mut has_delete_pressure = false;
+
+            for file in files {
+                let delete_pressure = full_config.min_delete_file_count_threshold > 0
+                    && file.deletes.len() >= full_config.min_delete_file_count_threshold;
+                if delete_pressure {
+                    has_delete_pressure = true;
+                }
+
+                let is_bad =
+                    delete_pressure || file.file_size_in_bytes < full_config.target_file_size_bytes;
+
+                if is_bad {
+                    bad_files.push(file);
+                } else {
+                    good_files.push(file);
+                }
+            }
+
+            if bad_files.is_empty() {
+                continue;
+            }
+
+            let mut selected_files = bad_files;
+            let mut selected_bytes: u64 = selected_files.iter().map(|f| f.file_size_in_bytes).sum();
+
+            if selected_bytes < full_config.min_rewrite_input_bytes && full_config.top_up_to_target
+            {
+                good_files.sort_by_key(|f| f.file_size_in_bytes);
+
+                let mut added_bytes = 0_u64;
+                let mut added_files = 0_usize;
+                let max_files = full_config.top_up_max_good_files.unwrap_or(usize::MAX);
+
+                for file in good_files {
+                    if added_bytes >= full_config.top_up_max_good_bytes || added_files >= max_files
+                    {
+                        break;
+                    }
+
+                    if added_bytes + file.file_size_in_bytes > full_config.top_up_max_good_bytes {
+                        continue;
+                    }
+
+                    added_bytes += file.file_size_in_bytes;
+                    added_files += 1;
+                    selected_files.push(file);
+
+                    if selected_bytes + added_bytes >= full_config.target_file_size_bytes {
+                        break;
+                    }
+                }
+
+                selected_bytes += added_bytes;
+            }
+
+            if selected_bytes < full_config.min_rewrite_input_bytes
+                && !(full_config.allow_underfilled_with_deletes && has_delete_pressure)
+            {
+                continue;
+            }
+
+            let mut groups = self.grouping.group_files(selected_files.into_iter());
+
+            groups.retain(|group| {
+                let group_bytes: u64 = group.data_files.iter().map(|f| f.file_size_in_bytes).sum();
+
+                if group_bytes >= full_config.min_rewrite_input_bytes {
+                    return true;
+                }
+
+                if full_config.allow_underfilled_with_deletes {
+                    has_delete_pressure
+                } else {
+                    false
+                }
+            });
+
+            planned_groups.extend(groups);
+        }
+
+        planned_groups
             .into_iter()
             .map(|group| group.with_calculated_parallelism(config))
             .collect()
@@ -626,13 +751,32 @@ impl PlanStrategy {
     ///
     /// No file filters. No group filters (full compaction processes all groups).
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
         // Full compaction never uses group filters
         let (grouping, group_filters) =
             Self::build_grouping_and_filters(&config.grouping_strategy, None);
 
-        Self::new(file_filters, grouping, group_filters)
+        if !config.enable_filtered_full {
+            return Self::new(vec![], grouping, group_filters);
+        }
+
+        let min_rewrite_input_bytes = config
+            .min_rewrite_input_bytes
+            .unwrap_or(config.target_file_size_bytes);
+        let top_up_max_good_bytes = config
+            .top_up_max_good_bytes
+            .unwrap_or(config.target_file_size_bytes);
+
+        let full_filtered = FullFilteredConfig {
+            target_file_size_bytes: config.target_file_size_bytes,
+            min_rewrite_input_bytes,
+            allow_underfilled_with_deletes: config.allow_underfilled_with_deletes,
+            min_delete_file_count_threshold: config.min_delete_file_count_threshold,
+            top_up_to_target: config.top_up_to_target,
+            top_up_max_good_bytes,
+            top_up_max_good_files: config.top_up_max_good_files,
+        };
+
+        Self::new_full_filtered(grouping, full_filtered)
     }
 
     /// Constructs strategy for files with delete files.
@@ -1632,6 +1776,108 @@ mod tests {
         let binpack_groups = binpack_enum.group_files(data_files.into_iter());
         assert!(!binpack_groups.is_empty());
         assert_eq!(binpack_enum.to_string(), "BinPackGrouping[target=20MB]");
+    }
+
+    #[test]
+    fn test_full_filtered_skips_underfilled_without_deletes() {
+        let target = 100 * 1024 * 1024_u64;
+        let full_config = crate::config::FullCompactionConfigBuilder::default()
+            .target_file_size_bytes(target)
+            .grouping_strategy(GroupingStrategy::Single)
+            .enable_filtered_full(true)
+            .top_up_to_target(true)
+            .build()
+            .unwrap();
+
+        let strategy = PlanStrategy::from_full(&full_config);
+
+        let files = vec![
+            TestFileBuilder::new("small1.parquet")
+                .size(30 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("small2.parquet")
+                .size(20 * 1024 * 1024)
+                .build(),
+        ];
+
+        let result = strategy
+            .execute(files, &CompactionPlanningConfig::Full(full_config))
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Underfilled without deletes should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_full_filtered_allows_underfilled_with_deletes() {
+        let target = 100 * 1024 * 1024_u64;
+        let full_config = crate::config::FullCompactionConfigBuilder::default()
+            .target_file_size_bytes(target)
+            .grouping_strategy(GroupingStrategy::Single)
+            .enable_filtered_full(true)
+            .allow_underfilled_with_deletes(true)
+            .min_delete_file_count_threshold(1_usize)
+            .top_up_to_target(true)
+            .build()
+            .unwrap();
+
+        let strategy = PlanStrategy::from_full(&full_config);
+
+        let files = vec![
+            TestFileBuilder::new("small_with_deletes.parquet")
+                .size(30 * 1024 * 1024)
+                .with_deletes()
+                .build(),
+            TestFileBuilder::new("small2.parquet")
+                .size(20 * 1024 * 1024)
+                .build(),
+        ];
+
+        let result = strategy
+            .execute(files, &CompactionPlanningConfig::Full(full_config))
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_count, 2);
+    }
+
+    #[test]
+    fn test_full_filtered_top_up_to_target() {
+        let target = 100 * 1024 * 1024_u64;
+        let full_config = crate::config::FullCompactionConfigBuilder::default()
+            .target_file_size_bytes(target)
+            .grouping_strategy(GroupingStrategy::Single)
+            .enable_filtered_full(true)
+            .min_delete_file_count_threshold(1_usize)
+            .top_up_to_target(true)
+            .top_up_max_good_bytes(target)
+            .build()
+            .unwrap();
+
+        let strategy = PlanStrategy::from_full(&full_config);
+
+        let files = vec![
+            TestFileBuilder::new("small.parquet")
+                .size(40 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("good.parquet").size(target).build(),
+        ];
+
+        let result = strategy
+            .execute(files, &CompactionPlanningConfig::Full(full_config))
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_count, 2);
+        let paths: Vec<_> = result[0]
+            .data_files
+            .iter()
+            .map(|f| f.data_file_path.as_str())
+            .collect();
+        assert!(paths.contains(&"small.parquet"));
+        assert!(paths.contains(&"good.parquet"));
     }
 
     #[test]

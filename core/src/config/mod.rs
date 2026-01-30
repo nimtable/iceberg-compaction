@@ -36,6 +36,8 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
+pub const DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD: usize =
+    DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD * 2; // 2x for full fallback delete gating
 pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
 
 // Auto compaction defaults
@@ -152,7 +154,8 @@ impl Default for SmallFilesConfig {
 ///
 /// This strategy performs full compaction of all files in a partition.
 /// Group filters are NOT supported because "full" compaction means processing
-/// ALL files without filtering.
+/// ALL files without filtering. Filtered full (when enabled) applies simple
+/// gating and top-up rules before grouping.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FullCompactionConfig {
@@ -177,6 +180,37 @@ pub struct FullCompactionConfig {
     /// All groups will be compacted regardless of size or file count.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
+
+    /// Enable filtered full planning (skip underfilled groups and allow top-up).
+    #[builder(default = "false")]
+    pub enable_filtered_full: bool,
+
+    /// Minimum total input bytes required to run compaction for a group.
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub min_rewrite_input_bytes: Option<u64>,
+
+    /// Allow compaction even when underfilled if deletes are present.
+    #[builder(default = "true")]
+    pub allow_underfilled_with_deletes: bool,
+
+    /// Minimum delete file count per data file to treat deletes as "bad".
+    /// Defaults to 2x the FilesWithDeletes threshold for stronger gating.
+    #[builder(default = "DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub min_delete_file_count_threshold: usize,
+
+    /// Top-up underfilled groups by adding good files until target size.
+    #[builder(default = "false")]
+    pub top_up_to_target: bool,
+
+    /// Maximum bytes of good files to add during top-up.
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub top_up_max_good_bytes: Option<u64>,
+
+    /// Maximum number of good files to add during top-up. None = unlimited.
+    #[builder(default, setter(strip_option))]
+    pub top_up_max_good_files: Option<usize>,
 }
 
 impl Default for FullCompactionConfig {
@@ -463,6 +497,36 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
+    /// Full fallback delete gating threshold (per data file).
+    #[builder(default = "DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub full_min_delete_file_count_threshold: usize,
+
+    /// Enable filtered full behavior for fallback.
+    #[builder(default = "true")]
+    pub full_enable_filtered: bool,
+
+    /// Minimum input bytes to trigger full compaction when filtered full is enabled.
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub full_min_rewrite_input_bytes: Option<u64>,
+
+    /// Allow underfilled groups when deletes are present (filtered full only).
+    #[builder(default = "true")]
+    pub full_allow_underfilled_with_deletes: bool,
+
+    /// Top-up underfilled groups to target size (filtered full only).
+    #[builder(default = "true")]
+    pub full_top_up_to_target: bool,
+
+    /// Maximum bytes of good files to add during top-up (filtered full only).
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub full_top_up_max_good_bytes: Option<u64>,
+
+    /// Maximum number of good files to add during top-up (filtered full only).
+    #[builder(default, setter(strip_option))]
+    pub full_top_up_max_good_files: Option<usize>,
+
     #[builder(default)]
     pub execution: CompactionExecutionConfig,
 }
@@ -522,6 +586,13 @@ impl AutoCompactionConfig {
                 max_parallelism: self.max_parallelism,
                 enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                 grouping_strategy: self.grouping_strategy.clone(),
+                enable_filtered_full: self.full_enable_filtered,
+                min_rewrite_input_bytes: self.full_min_rewrite_input_bytes,
+                allow_underfilled_with_deletes: self.full_allow_underfilled_with_deletes,
+                min_delete_file_count_threshold: self.full_min_delete_file_count_threshold,
+                top_up_to_target: self.full_top_up_to_target,
+                top_up_max_good_bytes: self.full_top_up_max_good_bytes,
+                top_up_max_good_files: self.full_top_up_max_good_files,
             }));
         }
 
@@ -625,6 +696,29 @@ mod tests {
             .build()
             .unwrap();
         assert!(config.resolve(&stats).is_none());
+    }
+
+    #[test]
+    fn test_resolve_full_filtered_defaults() {
+        let stats = create_test_stats(10, 2, 0);
+
+        let config = AutoCompactionConfigBuilder::default().build().unwrap();
+        let CompactionPlanningConfig::Full(cfg) = config.resolve(&stats).unwrap() else {
+            panic!("Expected Full fallback");
+        };
+
+        assert!(cfg.enable_filtered_full);
+        assert!(cfg.top_up_to_target);
+        assert!(cfg.allow_underfilled_with_deletes);
+        assert_eq!(
+            cfg.min_delete_file_count_threshold,
+            config.full_min_delete_file_count_threshold
+        );
+        assert_eq!(
+            cfg.min_rewrite_input_bytes,
+            config.full_min_rewrite_input_bytes
+        );
+        assert_eq!(cfg.top_up_max_good_bytes, config.full_top_up_max_good_bytes);
     }
 
     #[test]
