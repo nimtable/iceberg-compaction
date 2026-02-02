@@ -36,8 +36,6 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
-pub const DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD: usize =
-    DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD * 2; // 2x for full fallback delete gating
 pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
 
 // Auto compaction defaults
@@ -154,8 +152,7 @@ impl Default for SmallFilesConfig {
 ///
 /// This strategy performs full compaction of all files in a partition.
 /// Group filters are NOT supported because "full" compaction means processing
-/// ALL files without filtering. Filtered full (when enabled) applies simple
-/// gating and top-up rules before grouping.
+/// ALL files without filtering.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FullCompactionConfig {
@@ -180,37 +177,6 @@ pub struct FullCompactionConfig {
     /// All groups will be compacted regardless of size or file count.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
-
-    /// Enable filtered full planning (skip underfilled groups and allow top-up).
-    #[builder(default = "false")]
-    pub enable_filtered_full: bool,
-
-    /// Minimum total input bytes required to run compaction for a group.
-    /// If not set, defaults to `target_file_size_bytes`.
-    #[builder(default, setter(strip_option))]
-    pub min_rewrite_input_bytes: Option<u64>,
-
-    /// Allow compaction even when underfilled if deletes are present.
-    #[builder(default = "true")]
-    pub allow_underfilled_with_deletes: bool,
-
-    /// Minimum delete file count per data file to treat deletes as "bad".
-    /// Defaults to 2x the FilesWithDeletes threshold for stronger gating.
-    #[builder(default = "DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD")]
-    pub min_delete_file_count_threshold: usize,
-
-    /// Top-up underfilled groups by adding good files until target size.
-    #[builder(default = "false")]
-    pub top_up_to_target: bool,
-
-    /// Maximum bytes of good files to add during top-up.
-    /// If not set, defaults to `target_file_size_bytes`.
-    #[builder(default, setter(strip_option))]
-    pub top_up_max_good_bytes: Option<u64>,
-
-    /// Maximum number of good files to add during top-up. None = unlimited.
-    #[builder(default, setter(strip_option))]
-    pub top_up_max_good_files: Option<usize>,
 }
 
 impl Default for FullCompactionConfig {
@@ -266,6 +232,52 @@ impl Default for FilesWithDeletesConfig {
     }
 }
 
+/// Configuration for maintenance compaction strategy.
+///
+/// This strategy is intended as a safe, write-amplification-aware fallback for
+/// automatic compaction. It targets only undersized data files and applies a
+/// minimum input gating threshold to avoid frequent small rewrites.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct MaintenanceCompactionConfig {
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    #[builder(default = "available_parallelism().get()")]
+    pub max_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    /// How to group files before compaction.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Upper bound for undersized-file selection (exclusive).
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub undersized_threshold_bytes: Option<u64>,
+
+    /// Minimum total input bytes required to run compaction for a group.
+    /// If not set, defaults to `target_file_size_bytes`.
+    #[builder(default, setter(strip_option))]
+    pub min_rewrite_input_bytes: Option<u64>,
+}
+
+impl Default for MaintenanceCompactionConfig {
+    fn default() -> Self {
+        MaintenanceCompactionConfigBuilder::default()
+            .build()
+            .expect("MaintenanceCompactionConfig default should always build")
+    }
+}
+
 /// Helper for default `WriterProperties` (SNAPPY compression).
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
@@ -282,6 +294,7 @@ pub enum CompactionPlanningConfig {
     SmallFiles(SmallFilesConfig),
     Full(FullCompactionConfig),
     FilesWithDeletes(FilesWithDeletesConfig),
+    Maintenance(MaintenanceCompactionConfig),
 }
 
 impl CompactionPlanningConfig {
@@ -291,6 +304,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.target_file_size_bytes,
             Self::Full(c) => c.target_file_size_bytes,
             Self::FilesWithDeletes(c) => c.target_file_size_bytes,
+            Self::Maintenance(c) => c.target_file_size_bytes,
         }
     }
 
@@ -300,6 +314,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.min_size_per_partition,
             Self::Full(c) => c.min_size_per_partition,
             Self::FilesWithDeletes(c) => c.min_size_per_partition,
+            Self::Maintenance(c) => c.min_size_per_partition,
         }
     }
 
@@ -309,6 +324,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_file_count_per_partition,
             Self::Full(c) => c.max_file_count_per_partition,
             Self::FilesWithDeletes(c) => c.max_file_count_per_partition,
+            Self::Maintenance(c) => c.max_file_count_per_partition,
         }
     }
 
@@ -318,6 +334,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_parallelism,
             Self::Full(c) => c.max_parallelism,
             Self::FilesWithDeletes(c) => c.max_parallelism,
+            Self::Maintenance(c) => c.max_parallelism,
         }
     }
 
@@ -327,6 +344,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
             Self::Full(c) => c.enable_heuristic_output_parallelism,
             Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
+            Self::Maintenance(c) => c.enable_heuristic_output_parallelism,
         }
     }
 }
@@ -437,8 +455,8 @@ impl Default for CompactionConfig {
 pub struct AutoThresholds {
     /// Minimum small file count to trigger `SmallFiles` strategy.
     pub min_small_files_count: usize,
-    /// Minimum delete file count to trigger `FilesWithDeletes` strategy.
-    pub min_files_with_deletes_count: usize,
+    /// Minimum delete-heavy data file count to trigger `FilesWithDeletes` strategy.
+    pub min_delete_heavy_files_count: usize,
     /// Minimum impact ratio (fraction of total files). None = disabled.
     pub min_impact_ratio: Option<f64>,
 }
@@ -447,7 +465,7 @@ impl Default for AutoThresholds {
     fn default() -> Self {
         Self {
             min_small_files_count: DEFAULT_MIN_SMALL_FILES_COUNT,
-            min_files_with_deletes_count: DEFAULT_MIN_FILES_WITH_DELETES_COUNT,
+            min_delete_heavy_files_count: DEFAULT_MIN_FILES_WITH_DELETES_COUNT,
             min_impact_ratio: None,
         }
     }
@@ -457,7 +475,7 @@ impl Default for AutoThresholds {
 
 /// Automatic strategy selection based on snapshot statistics.
 ///
-/// Priority: `FilesWithDeletes` → `SmallFiles` → `Full` (if enabled).
+/// Priority: `FilesWithDeletes` → `SmallFiles` → `Maintenance` (if enabled).
 #[derive(Builder, Debug, Clone)]
 #[builder(setter(into, strip_option))]
 pub struct AutoCompactionConfig {
@@ -465,9 +483,9 @@ pub struct AutoCompactionConfig {
     #[builder(default)]
     pub thresholds: AutoThresholds,
 
-    /// Fallback to Full when no specialized strategy matches.
+    /// Fallback to maintenance compaction when no specialized strategy matches.
     #[builder(default = "true")]
-    pub enable_full_fallback: bool,
+    pub enable_maintenance_fallback: bool,
 
     /// Common planning parameters applied to all selected strategies
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
@@ -497,35 +515,15 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
-    /// Full fallback delete gating threshold (per data file).
-    #[builder(default = "DEFAULT_FULL_MIN_DELETE_FILE_COUNT_THRESHOLD")]
-    pub full_min_delete_file_count_threshold: usize,
-
-    /// Enable filtered full behavior for fallback.
-    #[builder(default = "true")]
-    pub full_enable_filtered: bool,
-
-    /// Minimum input bytes to trigger full compaction when filtered full is enabled.
+    /// Minimum input bytes to trigger maintenance compaction.
     /// If not set, defaults to `target_file_size_bytes`.
     #[builder(default, setter(strip_option))]
-    pub full_min_rewrite_input_bytes: Option<u64>,
+    pub maintenance_min_rewrite_input_bytes: Option<u64>,
 
-    /// Allow underfilled groups when deletes are present (filtered full only).
-    #[builder(default = "true")]
-    pub full_allow_underfilled_with_deletes: bool,
-
-    /// Top-up underfilled groups to target size (filtered full only).
-    #[builder(default = "true")]
-    pub full_top_up_to_target: bool,
-
-    /// Maximum bytes of good files to add during top-up (filtered full only).
+    /// Upper bound for undersized-file selection (exclusive) for maintenance fallback.
     /// If not set, defaults to `target_file_size_bytes`.
     #[builder(default, setter(strip_option))]
-    pub full_top_up_max_good_bytes: Option<u64>,
-
-    /// Maximum number of good files to add during top-up (filtered full only).
-    #[builder(default, setter(strip_option))]
-    pub full_top_up_max_good_files: Option<usize>,
+    pub maintenance_undersized_threshold_bytes: Option<u64>,
 
     #[builder(default)]
     pub execution: CompactionExecutionConfig,
@@ -540,11 +538,11 @@ impl AutoCompactionConfig {
 
         let total = stats.total_data_files as f64;
 
-        if stats.files_with_deletes_count >= self.thresholds.min_files_with_deletes_count
+        if stats.delete_heavy_files_count >= self.thresholds.min_delete_heavy_files_count
             && self
                 .thresholds
                 .min_impact_ratio
-                .is_none_or(|min| stats.files_with_deletes_count as f64 / total >= min)
+                .is_none_or(|min| stats.delete_heavy_files_count as f64 / total >= min)
         {
             return Some(CompactionPlanningConfig::FilesWithDeletes(
                 FilesWithDeletesConfig {
@@ -578,22 +576,19 @@ impl AutoCompactionConfig {
             }));
         }
 
-        if self.enable_full_fallback {
-            return Some(CompactionPlanningConfig::Full(FullCompactionConfig {
-                target_file_size_bytes: self.target_file_size_bytes,
-                min_size_per_partition: self.min_size_per_partition,
-                max_file_count_per_partition: self.max_file_count_per_partition,
-                max_parallelism: self.max_parallelism,
-                enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
-                grouping_strategy: self.grouping_strategy.clone(),
-                enable_filtered_full: self.full_enable_filtered,
-                min_rewrite_input_bytes: self.full_min_rewrite_input_bytes,
-                allow_underfilled_with_deletes: self.full_allow_underfilled_with_deletes,
-                min_delete_file_count_threshold: self.full_min_delete_file_count_threshold,
-                top_up_to_target: self.full_top_up_to_target,
-                top_up_max_good_bytes: self.full_top_up_max_good_bytes,
-                top_up_max_good_files: self.full_top_up_max_good_files,
-            }));
+        if self.enable_maintenance_fallback {
+            return Some(CompactionPlanningConfig::Maintenance(
+                MaintenanceCompactionConfig {
+                    target_file_size_bytes: self.target_file_size_bytes,
+                    min_size_per_partition: self.min_size_per_partition,
+                    max_file_count_per_partition: self.max_file_count_per_partition,
+                    max_parallelism: self.max_parallelism,
+                    enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
+                    grouping_strategy: self.grouping_strategy.clone(),
+                    undersized_threshold_bytes: self.maintenance_undersized_threshold_bytes,
+                    min_rewrite_input_bytes: self.maintenance_min_rewrite_input_bytes,
+                },
+            ));
         }
 
         None
@@ -616,12 +611,13 @@ mod tests {
     fn create_test_stats(
         total_data_files: usize,
         small_files: usize,
-        files_with_deletes: usize,
+        delete_heavy_files: usize,
     ) -> SnapshotStats {
         SnapshotStats {
             total_data_files,
             small_files_count: small_files,
-            files_with_deletes_count: files_with_deletes,
+            delete_heavy_files_count: delete_heavy_files,
+            undersized_files_count: 0,
         }
     }
 
@@ -629,7 +625,7 @@ mod tests {
     fn test_resolve_strategy_priority() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 3,
+                min_delete_heavy_files_count: 3,
                 min_small_files_count: 5,
                 min_impact_ratio: None,
             })
@@ -654,14 +650,14 @@ mod tests {
         let stats = create_test_stats(10, 2, 1);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
+            CompactionPlanningConfig::Maintenance(_)
         ));
     }
 
     #[test]
     fn test_resolve_returns_none() {
         let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(false)
+            .enable_maintenance_fallback(false)
             .build()
             .unwrap();
 
@@ -680,64 +676,60 @@ mod tests {
         // Use stats that don't meet default thresholds
         let stats = create_test_stats(10, 2, 0);
 
-        // Fallback enabled -> Full
+        // Fallback enabled -> Maintenance
         let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(true)
+            .enable_maintenance_fallback(true)
             .build()
             .unwrap();
         assert!(matches!(
             config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
+            CompactionPlanningConfig::Maintenance(_)
         ));
 
         // Fallback disabled -> None
         let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(false)
+            .enable_maintenance_fallback(false)
             .build()
             .unwrap();
         assert!(config.resolve(&stats).is_none());
     }
 
     #[test]
-    fn test_resolve_full_filtered_defaults() {
+    fn test_resolve_maintenance_defaults() {
         let stats = create_test_stats(10, 2, 0);
 
         let config = AutoCompactionConfigBuilder::default().build().unwrap();
-        let CompactionPlanningConfig::Full(cfg) = config.resolve(&stats).unwrap() else {
-            panic!("Expected Full fallback");
+        let CompactionPlanningConfig::Maintenance(cfg) = config.resolve(&stats).unwrap() else {
+            panic!("Expected Maintenance fallback");
         };
 
-        assert!(cfg.enable_filtered_full);
-        assert!(cfg.top_up_to_target);
-        assert!(cfg.allow_underfilled_with_deletes);
-        assert_eq!(
-            cfg.min_delete_file_count_threshold,
-            config.full_min_delete_file_count_threshold
-        );
         assert_eq!(
             cfg.min_rewrite_input_bytes,
-            config.full_min_rewrite_input_bytes
+            config.maintenance_min_rewrite_input_bytes
         );
-        assert_eq!(cfg.top_up_max_good_bytes, config.full_top_up_max_good_bytes);
+        assert_eq!(
+            cfg.undersized_threshold_bytes,
+            config.maintenance_undersized_threshold_bytes
+        );
     }
 
     #[test]
     fn test_resolve_impact_ratio() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 5,
+                min_delete_heavy_files_count: 5,
                 min_small_files_count: 5,
                 min_impact_ratio: Some(0.10),
             })
-            .enable_full_fallback(true)
+            .enable_maintenance_fallback(true)
             .build()
             .unwrap();
 
-        // Low impact (0.5%) -> fallback to Full
+        // Low impact (0.5%) -> fallback to Maintenance
         let stats = create_test_stats(10000, 100, 50);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
+            CompactionPlanningConfig::Maintenance(_)
         ));
 
         // High impact (80%) -> use specialized strategy
@@ -754,11 +746,11 @@ mod tests {
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
-        // Below boundary (9%) -> fallback to Full
+        // Below boundary (9%) -> fallback to Maintenance
         let stats = create_test_stats(100, 5, 9);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
+            CompactionPlanningConfig::Maintenance(_)
         ));
     }
 
@@ -766,7 +758,7 @@ mod tests {
     fn test_resolve_threshold_boundaries() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 3,
+                min_delete_heavy_files_count: 3,
                 min_small_files_count: 5,
                 min_impact_ratio: None,
             })
@@ -791,7 +783,7 @@ mod tests {
         let stats = create_test_stats(10, 2, 1);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
+            CompactionPlanningConfig::Maintenance(_)
         ));
     }
 
@@ -801,7 +793,7 @@ mod tests {
             .target_file_size_bytes(1_000_000_u64)
             .max_parallelism(8_usize)
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 2,
+                min_delete_heavy_files_count: 2,
                 min_small_files_count: 10,
                 min_impact_ratio: None,
             })

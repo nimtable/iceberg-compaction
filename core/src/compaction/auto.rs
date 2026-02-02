@@ -63,7 +63,17 @@ impl AutoCompactionPlanner {
         let snapshot_id = snapshot.snapshot_id();
 
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
-        let stats = Self::compute_stats(&tasks, self.config.small_file_threshold_bytes);
+        let undersized_threshold_bytes = self
+            .config
+            .maintenance_undersized_threshold_bytes
+            .unwrap_or(self.config.target_file_size_bytes);
+
+        let stats = Self::compute_stats(
+            &tasks,
+            self.config.small_file_threshold_bytes,
+            self.config.min_delete_file_count_threshold,
+            undersized_threshold_bytes,
+        );
 
         let Some(planning_config) = self.config.resolve(&stats) else {
             return Ok(vec![]);
@@ -83,7 +93,12 @@ impl AutoCompactionPlanner {
     }
 
     /// Computes statistics from pre-scanned tasks without additional IO.
-    fn compute_stats(tasks: &[FileScanTask], small_file_threshold_bytes: u64) -> SnapshotStats {
+    fn compute_stats(
+        tasks: &[FileScanTask],
+        small_file_threshold_bytes: u64,
+        min_delete_file_count_threshold: usize,
+        undersized_threshold_bytes: u64,
+    ) -> SnapshotStats {
         let mut stats = SnapshotStats::default();
 
         for task in tasks {
@@ -93,8 +108,14 @@ impl AutoCompactionPlanner {
                 stats.small_files_count += 1;
             }
 
-            if !task.deletes.is_empty() {
-                stats.files_with_deletes_count += 1;
+            if min_delete_file_count_threshold > 0
+                && task.deletes.len() >= min_delete_file_count_threshold
+            {
+                stats.delete_heavy_files_count += 1;
+            }
+
+            if task.length < undersized_threshold_bytes {
+                stats.undersized_files_count += 1;
             }
         }
 
