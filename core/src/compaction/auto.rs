@@ -75,21 +75,28 @@ impl AutoCompactionPlanner {
             undersized_threshold_bytes,
         );
 
-        let Some(planning_config) = self.config.resolve(&stats) else {
+        let planning_configs = self.config.resolve_candidates(&stats);
+        if planning_configs.is_empty() {
             return Ok(vec![]);
-        };
+        }
 
-        let strategy = PlanStrategy::from(&planning_config);
-        let file_groups =
-            FileSelector::group_tasks_with_strategy(tasks, strategy, &planning_config)?;
+        for planning_config in planning_configs {
+            let strategy = PlanStrategy::from(&planning_config);
+            let file_groups =
+                FileSelector::group_tasks_with_strategy(tasks.clone(), strategy, &planning_config)?;
 
-        let plans = file_groups
-            .into_iter()
-            .map(|fg| CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id))
-            .filter(|p| p.has_files())
-            .collect();
+            let plans: Vec<CompactionPlan> = file_groups
+                .into_iter()
+                .map(|fg| CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id))
+                .filter(|p| p.has_files())
+                .collect();
 
-        Ok(plans)
+            if !plans.is_empty() {
+                return Ok(plans);
+            }
+        }
+
+        Ok(vec![])
     }
 
     /// Computes statistics from pre-scanned tasks without additional IO.

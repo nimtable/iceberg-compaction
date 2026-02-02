@@ -532,11 +532,20 @@ pub struct AutoCompactionConfig {
 impl AutoCompactionConfig {
     /// Selects strategy based on snapshot statistics.
     pub fn resolve(&self, stats: &SnapshotStats) -> Option<CompactionPlanningConfig> {
+        self.resolve_candidates(stats).into_iter().next()
+    }
+
+    /// Returns candidate strategies in priority order.
+    ///
+    /// Intended for planners that want an anti-starvation fallback: try each candidate
+    /// until a non-empty plan is produced.
+    pub fn resolve_candidates(&self, stats: &SnapshotStats) -> Vec<CompactionPlanningConfig> {
         if stats.total_data_files <= 1 {
-            return None;
+            return vec![];
         }
 
         let total = stats.total_data_files as f64;
+        let mut candidates = Vec::new();
 
         if stats.delete_heavy_files_count >= self.thresholds.min_delete_heavy_files_count
             && self
@@ -544,7 +553,15 @@ impl AutoCompactionConfig {
                 .min_impact_ratio
                 .is_none_or(|min| stats.delete_heavy_files_count as f64 / total >= min)
         {
-            return Some(CompactionPlanningConfig::FilesWithDeletes(
+            let group_filters = self.group_filters.clone().map(|mut gf| {
+                // Auto `FilesWithDeletes` is intended to prioritize timely delete cleanup.
+                // Size-based gating (`min_group_size_bytes`) can starve this strategy on low-volume
+                // or highly partitioned tables, so Auto drops it while still honoring count gating.
+                gf.min_group_size_bytes = None;
+                gf
+            });
+
+            candidates.push(CompactionPlanningConfig::FilesWithDeletes(
                 FilesWithDeletesConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
@@ -553,7 +570,7 @@ impl AutoCompactionConfig {
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
-                    group_filters: self.group_filters.clone(),
+                    group_filters,
                 },
             ));
         }
@@ -564,7 +581,7 @@ impl AutoCompactionConfig {
                 .min_impact_ratio
                 .is_none_or(|min| stats.small_files_count as f64 / total >= min)
         {
-            return Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+            candidates.push(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
                 min_size_per_partition: self.min_size_per_partition,
                 max_file_count_per_partition: self.max_file_count_per_partition,
@@ -577,7 +594,7 @@ impl AutoCompactionConfig {
         }
 
         if self.enable_maintenance_fallback {
-            return Some(CompactionPlanningConfig::Maintenance(
+            candidates.push(CompactionPlanningConfig::Maintenance(
                 MaintenanceCompactionConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
@@ -591,7 +608,7 @@ impl AutoCompactionConfig {
             ));
         }
 
-        None
+        candidates
     }
 }
 
@@ -808,5 +825,33 @@ mod tests {
 
         assert_eq!(cfg.target_file_size_bytes, 1_000_000);
         assert_eq!(cfg.max_parallelism, 8);
+    }
+
+    #[test]
+    fn test_resolve_auto_files_with_deletes_drops_size_gating() {
+        let config = AutoCompactionConfigBuilder::default()
+            .group_filters(GroupFilters {
+                min_group_size_bytes: Some(123_u64),
+                min_group_file_count: Some(7_usize),
+            })
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: usize::MAX,
+                min_impact_ratio: None,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 1);
+        let CompactionPlanningConfig::FilesWithDeletes(cfg) = config.resolve(&stats).unwrap()
+        else {
+            panic!("Expected FilesWithDeletes");
+        };
+
+        let gf = cfg
+            .group_filters
+            .expect("Auto should propagate group filters");
+        assert_eq!(gf.min_group_size_bytes, None);
+        assert_eq!(gf.min_group_file_count, Some(7_usize));
     }
 }
