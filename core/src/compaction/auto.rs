@@ -31,9 +31,72 @@ use super::{
     CommitManagerRetryConfig, Compaction, CompactionBuilder, CompactionPlan, CompactionResult,
 };
 use crate::Result;
-use crate::config::AutoCompactionConfig;
+use crate::config::{AutoCompactionConfig, DEFAULT_MAX_DELETE_HEAVY_IMPACT_RATIO};
 use crate::executor::ExecutorType;
 use crate::file_selection::{FileSelector, PlanStrategy, SnapshotStats};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSelectedStrategy {
+    FilesWithDeletes,
+    SmallFiles,
+    Maintenance,
+}
+
+impl AutoSelectedStrategy {
+    fn from_planning_config(config: &crate::config::CompactionPlanningConfig) -> Option<Self> {
+        match config {
+            crate::config::CompactionPlanningConfig::FilesWithDeletes(_) => {
+                Some(AutoSelectedStrategy::FilesWithDeletes)
+            }
+            crate::config::CompactionPlanningConfig::SmallFiles(_) => {
+                Some(AutoSelectedStrategy::SmallFiles)
+            }
+            crate::config::CompactionPlanningConfig::Maintenance(_) => {
+                Some(AutoSelectedStrategy::Maintenance)
+            }
+            crate::config::CompactionPlanningConfig::Full(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoPlanReason {
+    Recommended,
+    NoSnapshot,
+    NoCandidate,
+    NoPlansProduced,
+    NotRecommendedFullLikeDeletes,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoPlanReport {
+    pub selected_strategy: Option<AutoSelectedStrategy>,
+    pub plans: Vec<CompactionPlan>,
+    /// Total input bytes for selected plans: data + delete files.
+    pub planned_input_bytes: u64,
+    /// Total input file count for selected plans: data + delete files.
+    pub planned_input_files: usize,
+    /// `planned_data_bytes / total_data_bytes` (0 if total is 0).
+    pub rewrite_ratio: f64,
+    pub reason: AutoPlanReason,
+}
+
+impl AutoPlanReport {
+    fn empty(reason: AutoPlanReason) -> Self {
+        Self {
+            selected_strategy: None,
+            plans: vec![],
+            planned_input_bytes: 0,
+            planned_input_files: 0,
+            rewrite_ratio: 0.0,
+            reason,
+        }
+    }
+}
+
+fn compute_total_data_bytes(tasks: &[FileScanTask]) -> u64 {
+    tasks.iter().map(|t| t.length).sum()
+}
 
 /// Planner that performs analysis and plan generation in a single scan.
 ///
@@ -56,13 +119,27 @@ impl AutoCompactionPlanner {
         table: &Table,
         to_branch: &str,
     ) -> Result<Vec<CompactionPlan>> {
+        let report = self
+            .plan_compaction_report_with_branch(table, to_branch)
+            .await?;
+
+        Ok(report.plans)
+    }
+
+    /// Plans compaction for a table branch and returns a report including cost and reason.
+    pub async fn plan_compaction_report_with_branch(
+        &self,
+        table: &Table,
+        to_branch: &str,
+    ) -> Result<AutoPlanReport> {
         let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) else {
-            return Ok(vec![]);
+            return Ok(AutoPlanReport::empty(AutoPlanReason::NoSnapshot));
         };
 
         let snapshot_id = snapshot.snapshot_id();
 
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let total_data_bytes = compute_total_data_bytes(&tasks);
         let undersized_threshold_bytes = self
             .config
             .maintenance_undersized_threshold_bytes
@@ -77,26 +154,60 @@ impl AutoCompactionPlanner {
 
         let planning_configs = self.config.resolve_candidates(&stats);
         if planning_configs.is_empty() {
-            return Ok(vec![]);
+            return Ok(AutoPlanReport::empty(AutoPlanReason::NoCandidate));
         }
 
+        let delete_heavy_ratio = if stats.total_data_files == 0 {
+            0.0
+        } else {
+            stats.delete_heavy_files_count as f64 / stats.total_data_files as f64
+        };
+        let is_full_like_deletes = delete_heavy_ratio > DEFAULT_MAX_DELETE_HEAVY_IMPACT_RATIO;
+
         for planning_config in planning_configs {
+            let selected_strategy = AutoSelectedStrategy::from_planning_config(&planning_config);
+
             let strategy = PlanStrategy::from(&planning_config);
             let file_groups =
                 FileSelector::group_tasks_with_strategy(tasks.clone(), strategy, &planning_config)?;
 
+            let planned_data_bytes = file_groups.iter().map(|g| g.total_size).sum::<u64>();
             let plans: Vec<CompactionPlan> = file_groups
                 .into_iter()
                 .map(|fg| CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id))
                 .filter(|p| p.has_files())
                 .collect();
 
-            if !plans.is_empty() {
-                return Ok(plans);
+            if plans.is_empty() {
+                continue;
             }
+
+            let planned_input_bytes = plans.iter().map(CompactionPlan::total_bytes).sum();
+            let planned_input_files = plans.iter().map(CompactionPlan::file_count).sum();
+            let rewrite_ratio = if total_data_bytes == 0 {
+                0.0
+            } else {
+                planned_data_bytes as f64 / total_data_bytes as f64
+            };
+
+            let reason = match selected_strategy {
+                Some(AutoSelectedStrategy::FilesWithDeletes) if is_full_like_deletes => {
+                    AutoPlanReason::NotRecommendedFullLikeDeletes
+                }
+                _ => AutoPlanReason::Recommended,
+            };
+
+            return Ok(AutoPlanReport {
+                selected_strategy,
+                planned_input_bytes,
+                planned_input_files,
+                rewrite_ratio,
+                plans,
+                reason,
+            });
         }
 
-        Ok(vec![])
+        Ok(AutoPlanReport::empty(AutoPlanReason::NoPlansProduced))
     }
 
     /// Computes statistics from pre-scanned tasks without additional IO.
@@ -111,22 +222,58 @@ impl AutoCompactionPlanner {
         for task in tasks {
             stats.total_data_files += 1;
 
-            if task.length < small_file_threshold_bytes {
+            let is_small = task.length < small_file_threshold_bytes;
+            if is_small {
                 stats.small_files_count += 1;
             }
 
-            if min_delete_file_count_threshold > 0
-                && task.deletes.len() >= min_delete_file_count_threshold
-            {
+            let is_delete_heavy = min_delete_file_count_threshold > 0
+                && task.deletes.len() >= min_delete_file_count_threshold;
+            if is_delete_heavy {
                 stats.delete_heavy_files_count += 1;
             }
 
-            if task.length < undersized_threshold_bytes {
+            let is_undersized = task.length < undersized_threshold_bytes;
+            if is_undersized {
                 stats.undersized_files_count += 1;
             }
         }
 
         stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_total_data_bytes() {
+        use iceberg::spec::{DataContentType, DataFileFormat, Schema};
+
+        fn make_task(length: u64, path: &str) -> FileScanTask {
+            FileScanTask {
+                start: 0,
+                length,
+                record_count: Some(1),
+                data_file_path: path.to_owned(),
+                data_file_content: DataContentType::Data,
+                data_file_format: DataFileFormat::Parquet,
+                schema: std::sync::Arc::new(Schema::builder().build().unwrap()),
+                project_field_ids: vec![],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: None,
+                file_size_in_bytes: length,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+            }
+        }
+
+        let tasks = vec![make_task(10, "a.parquet"), make_task(20, "b.parquet")];
+        assert_eq!(compute_total_data_bytes(&tasks), 30);
     }
 }
 

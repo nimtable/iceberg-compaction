@@ -41,6 +41,7 @@ pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetch
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
 pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
+pub const DEFAULT_MAX_DELETE_HEAVY_IMPACT_RATIO: f64 = 0.5;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
@@ -545,23 +546,16 @@ impl AutoCompactionConfig {
         }
 
         let total = stats.total_data_files as f64;
-        let mut candidates = Vec::new();
+        let delete_heavy_ratio = stats.delete_heavy_files_count as f64 / total;
 
-        if stats.delete_heavy_files_count >= self.thresholds.min_delete_heavy_files_count
+        let deletes_candidate = if stats.delete_heavy_files_count
+            >= self.thresholds.min_delete_heavy_files_count
             && self
                 .thresholds
                 .min_impact_ratio
-                .is_none_or(|min| stats.delete_heavy_files_count as f64 / total >= min)
+                .is_none_or(|min| delete_heavy_ratio >= min)
         {
-            let group_filters = self.group_filters.clone().map(|mut gf| {
-                // Auto `FilesWithDeletes` is intended to prioritize timely delete cleanup.
-                // Size-based gating (`min_group_size_bytes`) can starve this strategy on low-volume
-                // or highly partitioned tables, so Auto drops it while still honoring count gating.
-                gf.min_group_size_bytes = None;
-                gf
-            });
-
-            candidates.push(CompactionPlanningConfig::FilesWithDeletes(
+            Some(CompactionPlanningConfig::FilesWithDeletes(
                 FilesWithDeletesConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
@@ -570,18 +564,27 @@ impl AutoCompactionConfig {
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
-                    group_filters,
+                    group_filters: self.group_filters.clone().map(|mut gf| {
+                        // Auto `FilesWithDeletes` is intended to prioritize timely delete cleanup.
+                        // Size-based gating (`min_group_size_bytes`) can starve this strategy on
+                        // low-volume or highly partitioned tables, so Auto drops it while still
+                        // honoring count gating.
+                        gf.min_group_size_bytes = None;
+                        gf
+                    }),
                 },
-            ));
-        }
+            ))
+        } else {
+            None
+        };
 
-        if stats.small_files_count >= self.thresholds.min_small_files_count
+        let small_candidate = if stats.small_files_count >= self.thresholds.min_small_files_count
             && self
                 .thresholds
                 .min_impact_ratio
                 .is_none_or(|min| stats.small_files_count as f64 / total >= min)
         {
-            candidates.push(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+            Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
                 min_size_per_partition: self.min_size_per_partition,
                 max_file_count_per_partition: self.max_file_count_per_partition,
@@ -590,11 +593,13 @@ impl AutoCompactionConfig {
                 small_file_threshold_bytes: self.small_file_threshold_bytes,
                 grouping_strategy: self.grouping_strategy.clone(),
                 group_filters: self.group_filters.clone(),
-            }));
-        }
+            }))
+        } else {
+            None
+        };
 
-        if self.enable_maintenance_fallback {
-            candidates.push(CompactionPlanningConfig::Maintenance(
+        let maintenance_candidate = if self.enable_maintenance_fallback {
+            Some(CompactionPlanningConfig::Maintenance(
                 MaintenanceCompactionConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
@@ -605,7 +610,34 @@ impl AutoCompactionConfig {
                     undersized_threshold_bytes: self.maintenance_undersized_threshold_bytes,
                     min_rewrite_input_bytes: self.maintenance_min_rewrite_input_bytes,
                 },
-            ));
+            ))
+        } else {
+            None
+        };
+
+        let mut candidates = Vec::new();
+
+        let is_full_like_deletes = delete_heavy_ratio > DEFAULT_MAX_DELETE_HEAVY_IMPACT_RATIO;
+        if is_full_like_deletes {
+            if let Some(small) = small_candidate {
+                candidates.push(small);
+            }
+            if let Some(maintenance) = maintenance_candidate {
+                candidates.push(maintenance);
+            }
+            if let Some(deletes) = deletes_candidate {
+                candidates.push(deletes);
+            }
+        } else {
+            if let Some(deletes) = deletes_candidate {
+                candidates.push(deletes);
+            }
+            if let Some(small) = small_candidate {
+                candidates.push(small);
+            }
+            if let Some(maintenance) = maintenance_candidate {
+                candidates.push(maintenance);
+            }
         }
 
         candidates
@@ -750,21 +782,22 @@ mod tests {
         ));
 
         // High impact (80%) -> use specialized strategy
-        let stats = create_test_stats(1000, 100, 800);
+        // Keep delete-heavy ratio below "full-like" threshold so deletes remains prioritized.
+        let stats = create_test_stats(1000, 0, 400);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
         // At boundary (10%) -> use specialized strategy
-        let stats = create_test_stats(100, 5, 10);
+        let stats = create_test_stats(100, 0, 10);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
         // Below boundary (9%) -> fallback to Maintenance
-        let stats = create_test_stats(100, 5, 9);
+        let stats = create_test_stats(100, 0, 9);
         assert!(matches!(
             config.resolve(&stats).unwrap(),
             CompactionPlanningConfig::Maintenance(_)
@@ -853,5 +886,29 @@ mod tests {
             .expect("Auto should propagate group filters");
         assert_eq!(gf.min_group_size_bytes, None);
         assert_eq!(gf.min_group_file_count, Some(7_usize));
+    }
+
+    #[test]
+    fn test_resolve_candidates_full_like_defers_deletes() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: 1,
+                min_impact_ratio: None,
+            })
+            .build()
+            .unwrap();
+
+        // Full-like: 6/10 delete-heavy (R=0.6) -> try low-WA candidates first.
+        let stats = create_test_stats(10, 9, 6);
+        let candidates = config.resolve_candidates(&stats);
+        assert!(matches!(
+            candidates[0],
+            CompactionPlanningConfig::SmallFiles(_)
+        ));
+        assert!(matches!(
+            candidates[candidates.len() - 1],
+            CompactionPlanningConfig::FilesWithDeletes(_)
+        ));
     }
 }
