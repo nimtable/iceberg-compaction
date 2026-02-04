@@ -199,10 +199,10 @@ impl AutoCompactionPlanner {
 
             return Ok(AutoPlanReport {
                 selected_strategy,
+                plans,
                 planned_input_bytes,
                 planned_input_files,
                 rewrite_ratio,
-                plans,
                 reason,
             });
         }
@@ -240,40 +240,6 @@ impl AutoCompactionPlanner {
         }
 
         stats
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_compute_total_data_bytes() {
-        use iceberg::spec::{DataContentType, DataFileFormat, Schema};
-
-        fn make_task(length: u64, path: &str) -> FileScanTask {
-            FileScanTask {
-                start: 0,
-                length,
-                record_count: Some(1),
-                data_file_path: path.to_owned(),
-                data_file_content: DataContentType::Data,
-                data_file_format: DataFileFormat::Parquet,
-                schema: std::sync::Arc::new(Schema::builder().build().unwrap()),
-                project_field_ids: vec![],
-                predicate: None,
-                deletes: vec![],
-                sequence_number: 1,
-                equality_ids: None,
-                file_size_in_bytes: length,
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-            }
-        }
-
-        let tasks = vec![make_task(10, "a.parquet"), make_task(20, "b.parquet")];
-        assert_eq!(compute_total_data_bytes(&tasks), 30);
     }
 }
 
@@ -420,5 +386,39 @@ impl AutoCompaction {
             .merge_rewrite_results_to_compaction_result(rewrite_results, Some(final_table));
 
         Ok(Some(merged_result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_total_data_bytes() {
+        use iceberg::spec::{DataContentType, DataFileFormat, Schema};
+
+        fn make_task(length: u64, path: &str) -> FileScanTask {
+            FileScanTask {
+                start: 0,
+                length,
+                record_count: Some(1),
+                data_file_path: path.to_owned(),
+                data_file_content: DataContentType::Data,
+                data_file_format: DataFileFormat::Parquet,
+                schema: std::sync::Arc::new(Schema::builder().build().unwrap()),
+                project_field_ids: vec![],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: None,
+                file_size_in_bytes: length,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+            }
+        }
+
+        let tasks = vec![make_task(10, "a.parquet"), make_task(20, "b.parquet")];
+        assert_eq!(compute_total_data_bytes(&tasks), 30);
     }
 }
