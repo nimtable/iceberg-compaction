@@ -27,7 +27,8 @@ pub mod strategy;
 pub struct SnapshotStats {
     pub total_data_files: usize,
     pub small_files_count: usize,
-    pub files_with_deletes_count: usize,
+    pub delete_heavy_files_count: usize,
+    pub undersized_files_count: usize,
 }
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy};

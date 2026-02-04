@@ -376,7 +376,12 @@ impl std::fmt::Display for BinPackGroupingStrategy {
 
 /// File filter by size threshold.
 ///
-/// Filters by `task.length`. Bounds are inclusive. If both `None`, passes all files.
+/// Filters by `task.length`.
+///
+/// - `min_size` is inclusive (`>=`)
+/// - `max_size` is exclusive (`<`)
+///
+/// If both `None`, passes all files.
 #[derive(Debug)]
 pub struct SizeFilterStrategy {
     pub min_size: Option<u64>,
@@ -390,9 +395,9 @@ impl FileFilterStrategy for SizeFilterStrategy {
             .filter(|task| {
                 let file_size = task.length;
                 match (self.min_size, self.max_size) {
-                    (Some(min), Some(max)) => file_size >= min && file_size <= max,
+                    (Some(min), Some(max)) => file_size >= min && file_size < max,
                     (Some(min), None) => file_size >= min,
-                    (None, Some(max)) => file_size <= max,
+                    (None, Some(max)) => file_size < max,
                     (None, None) => true,
                 }
             })
@@ -605,34 +610,67 @@ impl PlanStrategy {
         (grouping, group_filter_strategies)
     }
 
+    fn build(
+        file_filters: Vec<Box<dyn FileFilterStrategy>>,
+        grouping_strategy: &GroupingStrategy,
+        group_filters: Option<&crate::config::GroupFilters>,
+    ) -> Self {
+        let (grouping, group_filters) =
+            Self::build_grouping_and_filters(grouping_strategy, group_filters);
+        Self::new(file_filters, grouping, group_filters)
+    }
+
     /// Constructs strategy for small files compaction.
     ///
-    /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
+    /// Selects small files where `size < small_file_threshold_bytes`.
     pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
         let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
             min_size: None,
             max_size: Some(config.small_file_threshold_bytes),
         })];
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
+        Self::build(
+            file_filters,
             &config.grouping_strategy,
             config.group_filters.as_ref(),
-        );
+        )
+    }
 
-        Self::new(file_filters, grouping, group_filters)
+    /// Constructs strategy for maintenance compaction.
+    ///
+    /// Targets only undersized data files (`size < undersized_threshold_bytes`) and applies
+    /// a minimum group input gating threshold via `min_rewrite_input_bytes`.
+    pub fn from_maintenance(config: &crate::config::MaintenanceCompactionConfig) -> Self {
+        let undersized_threshold_bytes = config
+            .undersized_threshold_bytes
+            .unwrap_or(config.target_file_size_bytes);
+        let min_rewrite_input_bytes = config
+            .min_rewrite_input_bytes
+            .unwrap_or(config.target_file_size_bytes);
+
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(undersized_threshold_bytes),
+        })];
+
+        let group_filters = crate::config::GroupFilters {
+            min_group_size_bytes: Some(min_rewrite_input_bytes),
+            min_group_file_count: None,
+        };
+
+        Self::build(
+            file_filters,
+            &config.grouping_strategy,
+            Some(&group_filters),
+        )
     }
 
     /// Constructs strategy for full compaction.
     ///
     /// No file filters. No group filters (full compaction processes all groups).
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
-        // Full compaction never uses group filters
-        let (grouping, group_filters) =
-            Self::build_grouping_and_filters(&config.grouping_strategy, None);
-
-        Self::new(file_filters, grouping, group_filters)
+        // Full compaction never uses group filters.
+        Self::build(vec![], &config.grouping_strategy, None)
     }
 
     /// Constructs strategy for files with delete files.
@@ -647,12 +685,11 @@ impl PlanStrategy {
             )));
         }
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
+        Self::build(
+            file_filters,
             &config.grouping_strategy,
             config.group_filters.as_ref(),
-        );
-
-        Self::new(file_filters, grouping, group_filters)
+        )
     }
 
     /// Test-only builder accepting raw filter parameters.
@@ -681,10 +718,7 @@ impl PlanStrategy {
             )));
         }
 
-        let (grouping, group_filter_strategies) =
-            Self::build_grouping_and_filters(&grouping_strategy, group_filters.as_ref());
-
-        Self::new(file_filters, grouping, group_filter_strategies)
+        Self::build(file_filters, &grouping_strategy, group_filters.as_ref())
     }
 }
 
@@ -698,6 +732,9 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
 
             CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
                 PlanStrategy::from_files_with_deletes(deletes_config)
+            }
+            CompactionPlanningConfig::Maintenance(maintenance_config) => {
+                PlanStrategy::from_maintenance(maintenance_config)
             }
         }
     }
@@ -1023,22 +1060,51 @@ mod tests {
         ];
 
         let result: Vec<FileScanTask> = strategy.filter(test_files);
-        assert_eq!(result.len(), 4);
+        assert_eq!(result.len(), 3);
         TestUtils::assert_paths_eq(
-            &[
-                "min_edge.parquet",
-                "medium1.parquet",
-                "medium2.parquet",
-                "max_edge.parquet",
-            ],
+            &["min_edge.parquet", "medium1.parquet", "medium2.parquet"],
             &result,
         );
 
         for file in &result {
-            assert!(file.length >= 5 * 1024 * 1024 && file.length <= 50 * 1024 * 1024);
+            assert!(file.length >= 5 * 1024 * 1024 && file.length < 50 * 1024 * 1024);
         }
 
-        // Test min = max (exact match only)
+        // Test max-only (exclusive)
+        let max_only_strategy = SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(50 * 1024 * 1024),
+        };
+        let test_files = vec![
+            TestFileBuilder::new("below.parquet")
+                .size(49 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("at_max.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+        ];
+        let result = max_only_strategy.filter(test_files);
+        assert_eq!(result.len(), 1);
+        TestUtils::assert_paths_eq(&["below.parquet"], &result);
+
+        // Test min-only (inclusive)
+        let min_only_strategy = SizeFilterStrategy {
+            min_size: Some(50 * 1024 * 1024),
+            max_size: None,
+        };
+        let test_files = vec![
+            TestFileBuilder::new("below.parquet")
+                .size(49 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("at_min.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+        ];
+        let result = min_only_strategy.filter(test_files);
+        assert_eq!(result.len(), 1);
+        TestUtils::assert_paths_eq(&["at_min.parquet"], &result);
+
+        // Test min = max (empty range)
         let exact_strategy = SizeFilterStrategy {
             min_size: Some(10 * 1024 * 1024),
             max_size: Some(10 * 1024 * 1024),
@@ -1055,8 +1121,7 @@ mod tests {
                 .build(),
         ];
         let result = exact_strategy.filter(test_files);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].data_file_path, "exact.parquet");
+        assert_eq!(result.len(), 0);
 
         // Test min > max (invalid range - should return empty)
         let invalid_strategy = SizeFilterStrategy {
@@ -1260,6 +1325,10 @@ mod tests {
             TestFileBuilder::new("small3.parquet")
                 .size(10 * 1024 * 1024)
                 .build(),
+            // Upper bound is exclusive (`size < threshold`), so exact-threshold file is excluded.
+            TestFileBuilder::new("exact_threshold.parquet")
+                .size(20 * 1024 * 1024)
+                .build(),
             TestFileBuilder::new("large.parquet")
                 .size(25 * 1024 * 1024)
                 .build(),
@@ -1282,7 +1351,7 @@ mod tests {
             _ => panic!("Expected small files config"),
         };
         for file in &result {
-            assert!(file.length <= small_file_threshold);
+            assert!(file.length < small_file_threshold);
         }
 
         let min_count_small_files_config = SmallFilesConfigBuilder::default()
@@ -1371,7 +1440,7 @@ mod tests {
             _ => panic!("Expected small files config"),
         };
         for file in &multi_result {
-            assert!(file.length <= small_file_threshold_default);
+            assert!(file.length < small_file_threshold_default);
             assert!(file.deletes.is_empty());
         }
     }
@@ -1468,6 +1537,10 @@ mod tests {
             TestFileBuilder::new("medium.parquet")
                 .size(50 * 1024 * 1024)
                 .build(),
+            // Upper bound is exclusive (`size < max`), so exact-max file is excluded.
+            TestFileBuilder::new("exact_max.parquet")
+                .size(100 * 1024 * 1024)
+                .build(),
             TestFileBuilder::new("large.parquet")
                 .size(200 * 1024 * 1024)
                 .build(),
@@ -1477,7 +1550,7 @@ mod tests {
                 .build(),
         ];
 
-        // Strategy with size filter should exclude large files (>100MB)
+        // Strategy with size filter should exclude large files (>= 100MB, max is exclusive)
         let result_filtered =
             TestUtils::execute_strategy_flat(&strategy_with_size_filter, test_files.clone());
         assert_eq!(result_filtered.len(), 3); // small, medium, and with_deletes (all under 100MB)
@@ -1485,7 +1558,7 @@ mod tests {
         // Minimal strategy should pass all files
         let result_minimal =
             TestUtils::execute_strategy_flat(&strategy_minimal, test_files.clone());
-        assert_eq!(result_minimal.len(), 4);
+        assert_eq!(result_minimal.len(), 5);
     }
 
     #[test]
@@ -1632,6 +1705,73 @@ mod tests {
         let binpack_groups = binpack_enum.group_files(data_files.into_iter());
         assert!(!binpack_groups.is_empty());
         assert_eq!(binpack_enum.to_string(), "BinPackGrouping[target=20MB]");
+    }
+
+    #[test]
+    fn test_maintenance_skips_underfilled_groups() {
+        let target = 100 * 1024 * 1024_u64;
+        let maintenance_config = crate::config::MaintenanceCompactionConfigBuilder::default()
+            .target_file_size_bytes(target)
+            .grouping_strategy(GroupingStrategy::Single)
+            .min_rewrite_input_bytes(target)
+            .build()
+            .unwrap();
+
+        let strategy = PlanStrategy::from_maintenance(&maintenance_config);
+
+        let files = vec![
+            TestFileBuilder::new("small1.parquet")
+                .size(30 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("small2.parquet")
+                .size(20 * 1024 * 1024)
+                .build(),
+        ];
+
+        let result = strategy
+            .execute(
+                files,
+                &CompactionPlanningConfig::Maintenance(maintenance_config),
+            )
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Underfilled maintenance group should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_selects_only_undersized_exclusive() {
+        let target = 100 * 1024 * 1024_u64;
+        let maintenance_config = crate::config::MaintenanceCompactionConfigBuilder::default()
+            .target_file_size_bytes(target)
+            .grouping_strategy(GroupingStrategy::Single)
+            .min_rewrite_input_bytes(1_u64)
+            .build()
+            .unwrap();
+
+        let strategy = PlanStrategy::from_maintenance(&maintenance_config);
+
+        let files = vec![
+            TestFileBuilder::new("undersized.parquet")
+                .size(40 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("exact_target.parquet")
+                .size(target)
+                .build(),
+        ];
+
+        let result = strategy
+            .execute(
+                files,
+                &CompactionPlanningConfig::Maintenance(maintenance_config),
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_count, 1);
+        TestUtils::assert_paths_eq(&["undersized.parquet"], &result[0].data_files);
     }
 
     #[test]
