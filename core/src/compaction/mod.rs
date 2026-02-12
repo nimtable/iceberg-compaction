@@ -1029,6 +1029,7 @@ impl CommitManager {
             .when(|e| {
                 matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
                     || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+                    || matches!(e.kind(), iceberg::ErrorKind::CatalogCommitConflicts)
             })
             .notify(|e, d| {
                 // Notify the user about the error
@@ -1136,6 +1137,7 @@ impl CommitManager {
             .when(|e| {
                 matches!(e.kind(), iceberg::ErrorKind::DataInvalid)
                     || matches!(e.kind(), iceberg::ErrorKind::Unexpected)
+                    || matches!(e.kind(), iceberg::ErrorKind::CatalogCommitConflicts)
             })
             .notify(|e, d| {
                 // Notify the user about the error
