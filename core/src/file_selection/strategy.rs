@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{CompactionPlanningConfig, GroupingStrategy};
+use crate::config::{CompactionPlanningConfig, GroupingStrategy, SPLIT_OVERHEAD};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -159,15 +159,20 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Calculates executor and output parallelism.
+    /// Calculates executor and output parallelism using Iceberg's algorithms.
     ///
-    /// - `partition_by_size` = `ceil(input_total_bytes / min_size_per_partition)`
-    /// - `partition_by_count` = `ceil(input_files_count / max_file_count_per_partition)`
-    /// - `executor_parallelism` = `min(max(partition_by_size, partition_by_count), max_parallelism)`
-    /// - `output_parallelism` = `min(partition_by_size, executor_parallelism, max_parallelism)`
+    /// ## Output Parallelism (from Iceberg's `expectedOutputFiles`)
+    /// - Uses target file size and input size to determine optimal output file count
+    /// - Handles remainder distribution intelligently to avoid tiny files
+    /// - Algorithm considers min/max file size constraints
     ///
-    /// If `enable_heuristic_output_parallelism` is true and total data file size
-    /// is below `target_file_size_bytes`, `output_parallelism` is set to 1.
+    /// ## Input/Executor Parallelism (from Iceberg's `inputSplitSize`)
+    /// - Calculates optimal split size for reading: `input_size / expected_output_files + SPLIT_OVERHEAD`
+    /// - Input parallelism = `ceil(input_total_bytes / input_split_size)`
+    /// - Also considers file count constraints: `ceil(files_count / max_file_count_per_partition)`
+    /// - Takes the max of size-based and count-based parallelism
+    ///
+    /// Input parallelism is capped by `max_input_parallelism`, output parallelism is capped by `max_output_parallelism`.
     ///
     /// # Errors
     /// Returns error if `input_total_bytes()` is 0.
@@ -175,33 +180,44 @@ impl FileGroup {
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
-        let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
-        if total_file_size_for_partitioning == 0 {
+        let input_size = files_to_compact.input_total_bytes();
+        if input_size == 0 {
             return Err(CompactionError::Execution(
                 "No files to calculate task parallelism".to_owned(),
             ));
         }
 
-        let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_size_per_partition())
-            .max(1) as usize;
+        let target_file_size = config.target_file_size_bytes();
+        let min_file_size = Self::default_min_file_size(target_file_size);
+        let max_file_size = Self::default_max_file_size(target_file_size);
 
-        let total_files_count_for_partitioning = files_to_compact.input_files_count();
+        // Calculate output parallelism using Iceberg's expectedOutputFiles algorithm
+        let output_parallelism =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
+                .min(config.max_output_parallelism())
+                .max(1);
 
-        let partition_by_count = total_files_count_for_partitioning
+        // Apply output parallelism heuristic if enabled
+        let output_parallelism =
+            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+
+        // Calculate input split size using Iceberg's inputSplitSize algorithm
+        let split_size =
+            Self::input_split_size(input_size, target_file_size, min_file_size, max_file_size);
+
+        // Input parallelism based on split size
+        let partition_by_size = input_size.div_ceil(split_size).max(1) as usize;
+
+        // Also consider file count constraints
+        let total_files_count = files_to_compact.input_files_count();
+        let partition_by_count = total_files_count
             .div_ceil(config.max_file_count_per_partition())
             .max(1);
 
+        // Input parallelism is the max of size-based and count-based, capped by max_input_parallelism
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.max_parallelism());
-
-        let mut output_parallelism = partition_by_size
-            .min(input_parallelism)
-            .min(config.max_parallelism());
-
-        output_parallelism =
-            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+            .min(config.max_input_parallelism());
 
         Ok((input_parallelism, output_parallelism))
     }
@@ -228,6 +244,97 @@ impl FileGroup {
         } else {
             current_output_parallelism
         }
+    }
+
+    /// Calculates the write maximum file size.
+    ///
+    /// This is the target file size plus half the difference between max and target,
+    /// used to avoid creating tiny remainder files. From Iceberg's `writeMaxFileSize()`.
+    ///
+    /// Formula: `target_file_size + 0.5 * (max_file_size - target_file_size)`
+    fn write_max_file_size(target_file_size: u64, max_file_size: u64) -> u64 {
+        let diff = max_file_size.saturating_sub(target_file_size);
+        target_file_size + diff / 2
+    }
+
+    /// Calculates the expected number of output files for the given input size.
+    ///
+    /// 1. If input size < target file size, return 1
+    /// 2. Calculate files with and without remainder
+    /// 3. If remainder > min file size, round up
+    /// 4. Otherwise, if average file size without remainder is acceptable, round down
+    /// 5. Otherwise, round up
+    fn expected_output_files(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> usize {
+        if input_size < target_file_size {
+            return 1;
+        }
+
+        let num_files_with_remainder = input_size.div_ceil(target_file_size);
+        let num_files_without_remainder = input_size / target_file_size;
+
+        if num_files_without_remainder == 0 {
+            return 1;
+        }
+
+        let remainder = input_size % target_file_size;
+        let avg_file_size_without_remainder = input_size / num_files_without_remainder;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        // If remainder is larger than minimum file size, we should round up
+        if remainder > min_file_size {
+            num_files_with_remainder as usize
+        } else if avg_file_size_without_remainder
+            <= (target_file_size + target_file_size / 10).min(write_max)
+        {
+            // If the average file size without remainder is acceptable (< 1.1 * target or < writeMax),
+            // we can round down and distribute the remainder
+            num_files_without_remainder as usize
+        } else {
+            // Otherwise, round up
+            num_files_with_remainder as usize
+        }
+    }
+
+    /// Calculates the input split size for reading files.
+    ///
+    /// From Iceberg's `inputSplitSize()`. This determines how to partition input
+    /// for parallel reading.
+    ///
+    /// Formula: `max(target_file_size, min(estimated_split_size, write_max_file_size))`
+    /// where `estimated_split_size = (input_size / expected_output_files) + SPLIT_OVERHEAD`
+    fn input_split_size(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> u64 {
+        let expected_files =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size);
+        let estimated_split_size = (input_size / expected_files.max(1) as u64) + SPLIT_OVERHEAD;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if estimated_split_size < target_file_size {
+            target_file_size
+        } else {
+            estimated_split_size.min(write_max)
+        }
+    }
+
+    /// Calculates `min_file_size` from `target_file_size` using default ratio.
+    /// Uses integer arithmetic: `target_file_size` * 3 / 4 for 0.75 ratio to avoid floating-point precision loss.
+    fn default_min_file_size(target_file_size: u64) -> u64 {
+        target_file_size * 3 / 4 // 0.75 = 3/4
+    }
+
+    /// Calculates `max_file_size` from `target_file_size` using default ratio.
+    /// Uses integer arithmetic: `target_file_size` * 9 / 5 for 1.80 ratio to avoid floating-point precision loss.
+    fn default_max_file_size(target_file_size: u64) -> u64 {
+        target_file_size * 9 / 5 // 1.80 = 9/5
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1640,7 +1747,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
             .max_file_count_per_partition(5_usize) // 5 files per partition
-            .max_parallelism(8_usize) // Max 8 parallel tasks
+            .max_input_parallelism(8_usize) // Max 8 parallel input tasks
+            .max_output_parallelism(8_usize) // Max 8 parallel output tasks
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -1666,7 +1774,7 @@ mod tests {
         assert!(executor_parallelism >= 1);
         assert!(output_parallelism >= 1);
         assert!(output_parallelism <= executor_parallelism);
-        assert!(executor_parallelism <= config.max_parallelism());
+        assert!(executor_parallelism <= config.max_input_parallelism());
 
         // Test error case - empty group
         let empty_group = FileGroup::empty();
@@ -1698,7 +1806,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(10 * 1024 * 1024_u64)
             .max_file_count_per_partition(5_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -1881,7 +1990,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2006,7 +2116,8 @@ mod tests {
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
             .min_size_per_partition(20 * 1024 * 1024_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
@@ -2059,8 +2170,8 @@ mod tests {
                 idx
             );
             assert!(
-                group.executor_parallelism <= config.max_parallelism(),
-                "Group {} should respect max_parallelism",
+                group.executor_parallelism <= config.max_input_parallelism(),
+                "Group {} should respect max_input_parallelism",
                 idx
             );
             assert!(
@@ -2077,21 +2188,18 @@ mod tests {
         assert!(!parallelisms.is_empty());
 
         for (idx, group) in groups.iter().enumerate() {
-            let partition_by_size = (group
-                .input_total_bytes()
-                .div_ceil(config.min_size_per_partition()))
-            .max(1) as usize;
-            let partition_by_count = group
-                .input_files_count()
-                .div_ceil(config.max_file_count_per_partition())
-                .max(1);
-            let expected_exec_p = partition_by_size
-                .max(partition_by_count)
-                .min(config.max_parallelism());
+            // Use the new parallelism calculation method instead of manual calculation
+            let (expected_exec_p, expected_output_p) =
+                FileGroup::calculate_parallelism(group, &config).unwrap();
 
             assert_eq!(
                 group.executor_parallelism, expected_exec_p,
-                "Group {}: parallelism mismatch",
+                "Group {}: executor parallelism mismatch",
+                idx
+            );
+            assert_eq!(
+                group.output_parallelism, expected_output_p,
+                "Group {}: output parallelism mismatch",
                 idx
             );
             assert!(group.output_parallelism <= group.executor_parallelism);
@@ -2267,7 +2375,8 @@ mod tests {
         let small_files_config = SmallFilesConfigBuilder::default()
             .min_size_per_partition(1_u64)
             .max_file_count_per_partition(1_usize)
-            .max_parallelism(1000_usize)
+            .max_input_parallelism(1000_usize)
+            .max_output_parallelism(1000_usize)
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
@@ -2285,7 +2394,262 @@ mod tests {
         let (exec_p, out_p) = result.unwrap();
         assert!(exec_p >= 1);
         assert!(out_p >= 1);
-        assert!(exec_p <= config.max_parallelism());
+        assert!(exec_p <= config.max_input_parallelism());
+    }
+
+    // Test 1: Output parallelism limiting small files
+    #[test]
+    fn test_output_parallelism_prevents_small_files() {
+        let config = SmallFilesConfigBuilder::default()
+            .target_file_size_bytes(1024 * 1024 * 1024_u64) // 1GB target
+            .max_input_parallelism(32_usize)
+            .max_output_parallelism(4_usize) // Limit to 4 output files
+            .enable_heuristic_output_parallelism(false)
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::SmallFiles(config);
+
+        // Case 1: Many tiny files - should consolidate efficiently
+        // 1000 files * 1MB = 1GB total
+        // Despite having many files, total size is small (< target)
+        // Expected: Should produce 1 output file (consolidate all tiny files)
+        let tiny_files: Vec<FileScanTask> = (0..1000)
+            .map(|i| {
+                TestFileBuilder::new(&format!("tiny{}.parquet", i))
+                    .size(1024 * 1024) // 1MB each - very small files
+                    .build()
+            })
+            .collect();
+
+        let tiny_group = FileGroup::new(tiny_files);
+        let (_, tiny_output_p) =
+            FileGroup::calculate_parallelism(&tiny_group, &planning_config).unwrap();
+
+        assert_eq!(
+            tiny_output_p, 1,
+            "1000 tiny files (1GB total < 1GB target) should consolidate into 1 output file"
+        );
+
+        // Verify total size is reasonable for consolidation
+        let tiny_total_size = tiny_group.input_total_bytes();
+        assert_eq!(
+            tiny_total_size,
+            1000 * 1024 * 1024,
+            "Total size should be 1000MB"
+        );
+        assert!(
+            tiny_total_size < planning_config.target_file_size_bytes(),
+            "Total size should be less than target, justifying single output file"
+        );
+
+        // Case 2: Large input that would naturally produce many files
+        // 100 files * 100MB = 10GB total
+        // Without cap: would produce ~10 output files
+        // With cap: should produce exactly 4 output files
+        // Result: 10GB / 4 = 2.5GB per file (no small files!)
+        let files: Vec<FileScanTask> = (0..100)
+            .map(|i| {
+                TestFileBuilder::new(&format!("file{}.parquet", i))
+                    .size(100 * 1024 * 1024) // 100MB each
+                    .build()
+            })
+            .collect();
+
+        let group = FileGroup::new(files);
+        let (_, output_parallelism) =
+            FileGroup::calculate_parallelism(&group, &planning_config).unwrap();
+
+        assert_eq!(
+            output_parallelism, 4,
+            "Output parallelism should be capped to prevent creating ~10 files"
+        );
+
+        // Verify each output file would be >= target size
+        let avg_output_size = group.input_total_bytes() / output_parallelism as u64;
+        assert!(
+            avg_output_size >= planning_config.target_file_size_bytes(),
+            "Each output file should be >= target ({}GB >= 1GB)",
+            avg_output_size / 1024 / 1024 / 1024
+        );
+
+        // Case 2: Very small input should produce only 1 output file
+        let small_files = vec![
+            TestFileBuilder::new("small.parquet")
+                .size(100 * 1024 * 1024) // 100MB (< 1GB target)
+                .build(),
+        ];
+
+        let small_group = FileGroup::new(small_files);
+        let (_, small_output_p) =
+            FileGroup::calculate_parallelism(&small_group, &planning_config).unwrap();
+
+        assert_eq!(
+            small_output_p, 1,
+            "Small input (<target) should produce 1 output file"
+        );
+
+        // Case 3: Input at exact target boundary
+        let exact_files: Vec<FileScanTask> = (0..4)
+            .map(|i| {
+                TestFileBuilder::new(&format!("exact{}.parquet", i))
+                    .size(1024 * 1024 * 1024) // Exactly 1GB each
+                    .build()
+            })
+            .collect();
+
+        let exact_group = FileGroup::new(exact_files);
+        let (_, exact_output_p) =
+            FileGroup::calculate_parallelism(&exact_group, &planning_config).unwrap();
+
+        assert_eq!(
+            exact_output_p, 4,
+            "4GB input with 1GB target and max=4 should produce 4 files"
+        );
+
+        // Case 4: Small remainder that should be absorbed
+        // 10.1GB total (10GB + 100MB small remainder)
+        // The small 100MB remainder should be absorbed into existing files
+        // rather than creating a tiny output file
+        let files_small_remainder = vec![
+            TestFileBuilder::new("base1.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(), // 1GB
+            TestFileBuilder::new("base2.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(), // 1GB
+            TestFileBuilder::new("base3.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(), // 1GB
+            TestFileBuilder::new("tiny_remainder.parquet")
+                .size(100 * 1024 * 1024)
+                .build(), // 100MB tiny remainder
+        ];
+
+        let small_remainder_group = FileGroup::new(files_small_remainder);
+        let (_, small_remainder_output_p) =
+            FileGroup::calculate_parallelism(&small_remainder_group, &planning_config).unwrap();
+
+        // Should still be capped at 4, and the small remainder should be absorbed
+        assert_eq!(
+            small_remainder_output_p, 3,
+            "10.1GB input with tiny remainder should still produce 4 files, absorbing the small remainder"
+        );
+
+        let total_with_small_remainder = small_remainder_group.input_total_bytes();
+        let avg_with_small_remainder = total_with_small_remainder / small_remainder_output_p as u64;
+
+        // Each file should be > 1GB (since we're distributing 10.1GB across 4 files)
+        assert!(
+            avg_with_small_remainder > planning_config.target_file_size_bytes(),
+            "Small remainder should be absorbed, making each file > target size"
+        );
+    }
+
+    /// Test 2: Input parallelism is constrained by multiple factors
+    #[test]
+    fn test_input_parallelism_multiple_constraints() {
+        let config = SmallFilesConfigBuilder::default()
+            .target_file_size_bytes(1024 * 1024 * 1024_u64) // 1GB target
+            .min_size_per_partition(200 * 1024 * 1024_u64) // 200MB per partition
+            .max_file_count_per_partition(10_usize) // Max 10 files per partition
+            .max_input_parallelism(8_usize) // Cap at 8
+            .max_output_parallelism(4_usize)
+            .enable_heuristic_output_parallelism(false)
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::SmallFiles(config);
+
+        // Case 1: Count constraint dominates and hits cap
+        // 100 files * 10MB = 1GB total
+        // Count-based: ceil(100 / 10) = 10 partitions needed
+        // Cap: 8
+        // Expected: 8 (count-based capped by max_input_parallelism)
+        let many_small_files: Vec<FileScanTask> = (0..100)
+            .map(|i| {
+                TestFileBuilder::new(&format!("small{}.parquet", i))
+                    .size(10 * 1024 * 1024) // 10MB each
+                    .build()
+            })
+            .collect();
+
+        let group1 = FileGroup::new(many_small_files);
+        let (input_p1, _) = FileGroup::calculate_parallelism(&group1, &planning_config).unwrap();
+
+        assert_eq!(
+            input_p1, 8,
+            "100 files (count needs 10 partitions) should be capped at max_input_parallelism=8"
+        );
+
+        // Case 2: Count constraint without hitting cap
+        // 20 files * 50MB = 1GB total
+        // Count-based: ceil(20 / 10) = 2 partitions
+        // Expected: >= 2 (respects count constraint, under cap)
+        let medium_count_files: Vec<FileScanTask> = (0..20)
+            .map(|i| {
+                TestFileBuilder::new(&format!("medium{}.parquet", i))
+                    .size(50 * 1024 * 1024) // 50MB each
+                    .build()
+            })
+            .collect();
+
+        let group2 = FileGroup::new(medium_count_files);
+        let (input_p2, _) = FileGroup::calculate_parallelism(&group2, &planning_config).unwrap();
+
+        assert!(
+            input_p2 >= 2,
+            "20 files should yield at least ceil(20/10)=2 parallelism, got {}",
+            input_p2
+        );
+        assert!(input_p2 <= 8, "Should not exceed max_input_parallelism");
+
+        // Case 3: Few files, small total size
+        // 5 files * 100MB = 500MB total
+        // Count-based: ceil(5 / 10) = 1 partition
+        // Size-based: also small
+        // Expected: 1-2 (minimal parallelism needed)
+        let few_files: Vec<FileScanTask> = (0..5)
+            .map(|i| {
+                TestFileBuilder::new(&format!("few{}.parquet", i))
+                    .size(100 * 1024 * 1024) // 100MB each
+                    .build()
+            })
+            .collect();
+
+        let group3 = FileGroup::new(few_files);
+        let (input_p3, _) = FileGroup::calculate_parallelism(&group3, &planning_config).unwrap();
+
+        assert!(input_p3 >= 1, "Should have at least 1 parallelism");
+        assert!(
+            input_p3 < 8,
+            "Small input shouldn't need to hit the cap, got {}",
+            input_p3
+        );
+
+        // Case 4: Large files (size constraint dominates)
+        // 50 files * 500MB = 25GB total
+        // Size-based: 25GB is large, will compute high parallelism
+        // Expected: hits cap at 8
+        let large_files: Vec<FileScanTask> = (0..50)
+            .map(|i| {
+                TestFileBuilder::new(&format!("large{}.parquet", i))
+                    .size(500 * 1024 * 1024) // 500MB each
+                    .build()
+            })
+            .collect();
+
+        let group4 = FileGroup::new(large_files);
+        let (input_p4, _) = FileGroup::calculate_parallelism(&group4, &planning_config).unwrap();
+
+        assert_eq!(
+            input_p4, 8,
+            "25GB input should hit max_input_parallelism cap"
+        );
+
+        // Summary verification: all parallelism values respect the cap
+        assert!(
+            input_p1 <= 8 && input_p2 <= 8 && input_p3 <= 8 && input_p4 <= 8,
+            "All cases must respect max_input_parallelism"
+        );
     }
 
     // ##############################################################
