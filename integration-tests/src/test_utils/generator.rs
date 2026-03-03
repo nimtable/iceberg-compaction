@@ -446,6 +446,25 @@ impl FileGenerator {
         ))
     }
 
+    fn create_task_writer(&self) -> Result<TaskWriter<DeltaWriterBuilderType>> {
+        let partition_splitter = if self.partition_spec.is_unpartitioned() {
+            None
+        } else {
+            Some(RecordBatchPartitionSplitter::try_new_with_computed_values(
+                self.schema.clone(),
+                self.partition_spec.clone(),
+            )?)
+        };
+
+        Ok(TaskWriter::new_with_partition_splitter(
+            self.build_delta_writer_builder()?,
+            true,
+            self.schema.clone(),
+            self.partition_spec.clone(),
+            partition_splitter,
+        ))
+    }
+
     /// Generates data files with random data, equality deletes, and position deletes
     ///
     /// This method orchestrates the generation of:
@@ -461,31 +480,7 @@ impl FileGenerator {
     pub async fn generate(&mut self) -> Result<Vec<DataFile>> {
         let mut data_files = Vec::new();
 
-        let delta_writer_builder = self.build_delta_writer_builder()?;
-
-        let create_new_task_writer = || {
-            let partition_splitter = if self.partition_spec.is_unpartitioned() {
-                None
-            } else {
-                Some(
-                    RecordBatchPartitionSplitter::new_with_computed_values(
-                        self.schema.clone(),
-                        self.partition_spec.clone(),
-                    )
-                    .expect("Failed to create partition splitter"),
-                )
-            };
-
-            TaskWriter::new_with_partition_splitter(
-                delta_writer_builder.clone(),
-                true,
-                self.schema.clone(),
-                self.partition_spec.clone(),
-                partition_splitter,
-            )
-        };
-
-        let mut writer = create_new_task_writer();
+        let mut writer = self.create_task_writer()?;
 
         let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
             None
@@ -535,7 +530,7 @@ impl FileGenerator {
 
             if data_file_num + num_rows > self.config.data_file_row_count {
                 data_files.extend(writer.close().await?);
-                writer = create_new_task_writer();
+                writer = self.create_task_writer()?;
                 data_file_num = 0;
             }
             data_file_num += num_rows;

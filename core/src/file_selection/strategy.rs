@@ -866,6 +866,7 @@ mod tests {
                             partition: None,
                             partition_spec: None,
                             name_mapping: None,
+                            case_sensitive: true,
                         })
                     })
                     .collect()
@@ -890,6 +891,7 @@ mod tests {
                 partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
+                case_sensitive: true,
             }
         }
     }
@@ -949,6 +951,7 @@ mod tests {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                case_sensitive: true,
             })
         }
 
@@ -1742,6 +1745,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let equality_delete = Arc::new(FileScanTask {
@@ -1761,6 +1765,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let data_file = FileScanTask {
@@ -1780,6 +1785,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![data_file]);
@@ -1829,6 +1835,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let f1 = FileScanTask {
@@ -1848,6 +1855,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let f2 = FileScanTask {
@@ -1867,6 +1875,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
@@ -1919,6 +1928,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let pos_delete = Arc::new(FileScanTask {
@@ -1938,6 +1948,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let f1 = FileScanTask {
@@ -1957,6 +1968,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let f2 = FileScanTask {
@@ -1976,6 +1988,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
