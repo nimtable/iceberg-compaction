@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use datafusion::arrow::array::RecordBatch;
 use futures::future;
 use iceberg::spec::{DataFile, PartitionKey};
@@ -203,7 +205,7 @@ type CloseFuture = Vec<JoinHandle<Result<(Vec<DataFile>, Option<(u64, u64)>)>>>;
 /// ```
 pub struct RollingIcebergWriter<B, D> {
     /// Builder for creating new inner writers.
-    inner_writer_builder: B,
+    inner_writer_builder: Arc<B>,
     /// The current active writer.
     inner_writer: Option<D>,
     /// Target file size in bytes. When exceeded, a new file is started.
@@ -306,7 +308,6 @@ where
         if self.inner_writer.is_none() {
             self.inner_writer = Some(
                 self.inner_writer_builder
-                    .clone()
                     .build(self.partition_key.clone())
                     .await?,
             );
@@ -428,7 +429,7 @@ pub fn need_build_new_file(
 
 #[derive(Clone)]
 pub struct RollingIcebergWriterBuilder<B> {
-    inner_builder: B,
+    inner_builder: Arc<B>,
     target_file_size: Option<u64>,
     max_concurrent_closes: Option<usize>,
     enable_dynamic_size_estimation: Option<bool>,
@@ -438,7 +439,7 @@ pub struct RollingIcebergWriterBuilder<B> {
 impl<B> RollingIcebergWriterBuilder<B> {
     pub fn new(inner_builder: B) -> Self {
         Self {
-            inner_builder,
+            inner_builder: Arc::new(inner_builder),
             target_file_size: None,
             max_concurrent_closes: None,
             enable_dynamic_size_estimation: None,
@@ -478,7 +479,7 @@ where
 {
     type R = RollingIcebergWriter<B, B::R>;
 
-    async fn build(self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
+    async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         let enable_estimation = self
             .enable_dynamic_size_estimation
             .unwrap_or(DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION);
@@ -487,7 +488,7 @@ where
             .unwrap_or(DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR);
 
         Ok(RollingIcebergWriter {
-            inner_writer_builder: self.inner_builder.clone(),
+            inner_writer_builder: Arc::clone(&self.inner_builder),
             inner_writer: Some(self.inner_builder.build(partition_key.clone()).await?),
             target_file_size: self.target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
             data_files: Vec::new(),
@@ -750,7 +751,7 @@ mod tests {
     impl IcebergWriterBuilder for MockIcebergWriterBuilder {
         type R = MockIcebergWriter;
 
-        async fn build(self, _partition_key: Option<PartitionKey>) -> Result<Self::R> {
+        async fn build(&self, _partition_key: Option<PartitionKey>) -> Result<Self::R> {
             Ok(MockIcebergWriter {
                 written_size: 0,
                 should_flush: self.should_flush,
