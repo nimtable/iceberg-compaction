@@ -44,12 +44,7 @@ pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
 
-// Iceberg file size ratio constants (from SizeBasedFileRewritePlanner)
-/// Default ratio for calculating minimum file size: minFileSize = targetFileSize * 0.75
-pub const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
-/// Default ratio for calculating maximum file size: maxFileSize = targetFileSize * 1.80
-pub const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
-/// Overhead added to split size for bin-packing (5MB, same as Iceberg)
+/// Overhead added to split size for bin-packing
 pub const SPLIT_OVERHEAD: u64 = 5 * 1024 * 1024;
 
 /// Configuration for bin-packing grouping strategy.

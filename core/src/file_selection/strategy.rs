@@ -270,7 +270,7 @@ impl FileGroup {
         min_file_size: u64,
         max_file_size: u64,
     ) -> usize {
-        if input_size < target_file_size {
+        if target_file_size == 0 || input_size < target_file_size {
             return 1;
         }
 
@@ -313,6 +313,10 @@ impl FileGroup {
         min_file_size: u64,
         max_file_size: u64,
     ) -> u64 {
+        if target_file_size == 0 {
+            return input_size.saturating_add(SPLIT_OVERHEAD);
+        }
+
         let expected_files =
             Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size);
         let estimated_split_size = (input_size / expected_files.max(1) as u64) + SPLIT_OVERHEAD;
@@ -2507,7 +2511,7 @@ mod tests {
         );
 
         // Case 4: Small remainder that should be absorbed
-        // 10.1GB total (10GB + 100MB small remainder)
+        // 3.1GB total (3GB + 100MB small remainder)
         // The small 100MB remainder should be absorbed into existing files
         // rather than creating a tiny output file
         let files_small_remainder = vec![
@@ -3189,5 +3193,28 @@ mod tests {
             unpartitioned_files_count, 4,
             "Should have 4 unpartitioned files grouped together"
         );
+    }
+
+    /// `target_file_size = 0` must not panic in `expected_output_files` or
+    /// `input_split_size`.
+    #[test]
+    fn test_target_file_size_zero_does_not_panic() {
+        // expected_output_files returns 1 when target is 0.
+        assert_eq!(
+            FileGroup::expected_output_files(1024, 0, 0, 0),
+            1,
+            "expected_output_files should return 1 when target_file_size is 0"
+        );
+
+        // input_split_size returns input_size + SPLIT_OVERHEAD when target is 0.
+        assert_eq!(
+            FileGroup::input_split_size(1024, 0, 0, 0),
+            1024 + SPLIT_OVERHEAD,
+            "input_split_size should return input_size + SPLIT_OVERHEAD when target_file_size is 0"
+        );
+
+        // default_min/max return 0, which is safe.
+        assert_eq!(FileGroup::default_min_file_size(0), 0);
+        assert_eq!(FileGroup::default_max_file_size(0), 0);
     }
 }
