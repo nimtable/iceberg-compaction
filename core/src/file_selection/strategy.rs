@@ -332,13 +332,13 @@ impl FileGroup {
     /// Calculates `min_file_size` from `target_file_size` using default ratio.
     /// Uses integer arithmetic: `target_file_size` * 3 / 4 for 0.75 ratio to avoid floating-point precision loss.
     fn default_min_file_size(target_file_size: u64) -> u64 {
-        target_file_size * 3 / 4 // 0.75 = 3/4
+        target_file_size.saturating_mul(3) / 4 // 0.75 = 3/4
     }
 
     /// Calculates `max_file_size` from `target_file_size` using default ratio.
     /// Uses integer arithmetic: `target_file_size` * 9 / 5 for 1.80 ratio to avoid floating-point precision loss.
     fn default_max_file_size(target_file_size: u64) -> u64 {
-        target_file_size * 9 / 5 // 1.80 = 9/5
+        target_file_size.saturating_mul(9) / 5 // 1.80 = 9/5
     }
 
     pub fn is_empty(&self) -> bool {
@@ -3216,5 +3216,10 @@ mod tests {
         // default_min/max return 0, which is safe.
         assert_eq!(FileGroup::default_min_file_size(0), 0);
         assert_eq!(FileGroup::default_max_file_size(0), 0);
+
+        // Saturating arithmetic prevents overflow for very large target sizes.
+        // saturating_mul(3) and saturating_mul(9) clamp to u64::MAX before dividing.
+        assert_eq!(FileGroup::default_min_file_size(u64::MAX), u64::MAX / 4);
+        assert_eq!(FileGroup::default_max_file_size(u64::MAX), u64::MAX / 5);
     }
 }
