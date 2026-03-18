@@ -39,10 +39,8 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 
 - Intended use: timely cleanup of delete-heavy files
 - Candidate set: `deletes.len() >= min_delete_file_count_threshold`
-- Under `Auto`, `min_group_file_count` gating is recommended
-- Under `Auto`, `min_group_size_bytes` is ignored by default
-- Rationale: avoid long-term starvation of delete cleanup due to size gating
-- If `min_group_file_count` is configured, `Auto` preserves it
+- May use `group_filters` for group gating
+- `Auto` does not rewrite or override caller-provided group gating for this strategy
 - Must be fixed-point: rewritten delete-heavy input files should leave the candidate set in the newly committed snapshot
 
 ## `Auto` Planner
@@ -76,7 +74,7 @@ For that reason, `Auto` does not introduce a full-like special case and does not
 
 ## Planner Budget
 
-`max_auto_plans_per_run` is planner-level configuration, not external invocation policy.
+`max_auto_plans_per_run` is planner-level configuration, not external invocation policy. Its default is unlimited.
 
 Rationale:
 

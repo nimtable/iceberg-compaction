@@ -41,7 +41,7 @@ pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetch
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
 pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
-pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: usize = 1;
+pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: usize = usize::MAX;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
@@ -454,6 +454,7 @@ pub struct AutoCompactionConfig {
     pub min_delete_file_count_threshold: usize,
 
     /// Maximum number of compaction plans to execute per auto-compaction run.
+    /// Defaults to unlimited.
     #[builder(default = "DEFAULT_MAX_AUTO_PLANS_PER_RUN")]
     pub max_auto_plans_per_run: usize,
 
@@ -480,14 +481,7 @@ impl AutoCompactionConfig {
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
-                    group_filters: self.group_filters.clone().map(|mut gf| {
-                        // Auto `FilesWithDeletes` is intended to prioritize timely delete cleanup.
-                        // Size-based gating (`min_group_size_bytes`) can starve this strategy on
-                        // low-volume or highly partitioned tables, so Auto drops it while still
-                        // honoring count gating.
-                        gf.min_group_size_bytes = None;
-                        gf
-                    }),
+                    group_filters: self.group_filters.clone(),
                 },
             ))
         } else {
@@ -597,6 +591,12 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_default_budget_is_unbounded() {
+        let config = AutoCompactionConfig::default();
+        assert_eq!(config.max_auto_plans_per_run, usize::MAX);
+    }
+
+    #[test]
     fn test_candidates_ignore_table_wide_ratio() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_auto_files_with_deletes_drops_size_gating() {
+    fn test_files_with_deletes_candidate_preserves_group_filters() {
         let config = AutoCompactionConfigBuilder::default()
             .group_filters(GroupFilters {
                 min_group_size_bytes: Some(123_u64),
@@ -712,7 +712,7 @@ mod tests {
         let gf = cfg
             .group_filters
             .expect("Auto should propagate group filters");
-        assert_eq!(gf.min_group_size_bytes, None);
+        assert_eq!(gf.min_group_size_bytes, Some(123_u64));
         assert_eq!(gf.min_group_file_count, Some(7_usize));
     }
 }
