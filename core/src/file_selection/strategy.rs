@@ -31,6 +31,9 @@ use super::packer::ListPacker;
 use crate::config::{CompactionPlanningConfig, GroupingStrategy};
 use crate::{CompactionError, Result};
 
+/// Overhead added to input split size when estimating read-side partitioning.
+const SPLIT_OVERHEAD: u64 = 5 * 1024 * 1024;
+
 /// Bundle of data files and associated delete files for compaction.
 ///
 /// Delete files are deduplicated by path during construction. Position deletes
@@ -159,15 +162,14 @@ impl FileGroup {
         Ok(self)
     }
 
-    /// Calculates executor and output parallelism.
+    /// Calculates executor and output parallelism using target-size-based heuristics.
     ///
-    /// - `partition_by_size` = `ceil(input_total_bytes / min_size_per_partition)`
-    /// - `partition_by_count` = `ceil(input_files_count / max_file_count_per_partition)`
-    /// - `executor_parallelism` = `min(max(partition_by_size, partition_by_count), max_parallelism)`
-    /// - `output_parallelism` = `min(partition_by_size, executor_parallelism, max_parallelism)`
+    /// Output parallelism is estimated from target file size and remainder handling,
+    /// while executor parallelism is derived from input split size and file count.
+    /// Both are capped by `max_parallelism`.
     ///
-    /// If `enable_heuristic_output_parallelism` is true and total data file size
-    /// is below `target_file_size_bytes`, `output_parallelism` is set to 1.
+    /// If `enable_heuristic_output_parallelism` is true and total data file size is
+    /// below `target_file_size_bytes`, `output_parallelism` is set to 1.
     ///
     /// # Errors
     /// Returns error if `input_total_bytes()` is 0.
@@ -175,16 +177,29 @@ impl FileGroup {
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
-        let total_file_size_for_partitioning = files_to_compact.input_total_bytes();
-        if total_file_size_for_partitioning == 0 {
+        let input_size = files_to_compact.input_total_bytes();
+        if input_size == 0 {
             return Err(CompactionError::Execution(
                 "No files to calculate task parallelism".to_owned(),
             ));
         }
 
-        let partition_by_size = total_file_size_for_partitioning
-            .div_ceil(config.min_size_per_partition())
-            .max(1) as usize;
+        let target_file_size = config.target_file_size_bytes();
+        let min_file_size = Self::default_min_file_size(target_file_size);
+        let max_file_size = Self::default_max_file_size(target_file_size);
+
+        let output_parallelism =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
+                .min(config.max_parallelism())
+                .max(1);
+
+        let output_parallelism =
+            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+
+        let split_size =
+            Self::input_split_size(input_size, target_file_size, min_file_size, max_file_size);
+
+        let partition_by_size = input_size.div_ceil(split_size).max(1) as usize;
 
         let total_files_count_for_partitioning = files_to_compact.input_files_count();
 
@@ -195,13 +210,6 @@ impl FileGroup {
         let input_parallelism = partition_by_size
             .max(partition_by_count)
             .min(config.max_parallelism());
-
-        let mut output_parallelism = partition_by_size
-            .min(input_parallelism)
-            .min(config.max_parallelism());
-
-        output_parallelism =
-            Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
 
         Ok((input_parallelism, output_parallelism))
     }
@@ -228,6 +236,73 @@ impl FileGroup {
         } else {
             current_output_parallelism
         }
+    }
+
+    fn write_max_file_size(target_file_size: u64, max_file_size: u64) -> u64 {
+        let diff = max_file_size.saturating_sub(target_file_size);
+        target_file_size + diff / 2
+    }
+
+    fn expected_output_files(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> usize {
+        if target_file_size == 0 || input_size < target_file_size {
+            return 1;
+        }
+
+        let num_files_with_remainder = input_size.div_ceil(target_file_size);
+        let num_files_without_remainder = input_size / target_file_size;
+
+        if num_files_without_remainder == 0 {
+            return 1;
+        }
+
+        let remainder = input_size % target_file_size;
+        let avg_file_size_without_remainder = input_size / num_files_without_remainder;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if remainder > min_file_size {
+            num_files_with_remainder as usize
+        } else if avg_file_size_without_remainder
+            <= (target_file_size + target_file_size / 10).min(write_max)
+        {
+            num_files_without_remainder as usize
+        } else {
+            num_files_with_remainder as usize
+        }
+    }
+
+    fn input_split_size(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> u64 {
+        if target_file_size == 0 {
+            return input_size.saturating_add(SPLIT_OVERHEAD);
+        }
+
+        let expected_files =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size);
+        let estimated_split_size = (input_size / expected_files.max(1) as u64) + SPLIT_OVERHEAD;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if estimated_split_size < target_file_size {
+            target_file_size
+        } else {
+            estimated_split_size.min(write_max)
+        }
+    }
+
+    fn default_min_file_size(target_file_size: u64) -> u64 {
+        target_file_size.saturating_mul(3) / 4
+    }
+
+    fn default_max_file_size(target_file_size: u64) -> u64 {
+        target_file_size.saturating_mul(9) / 5
     }
 
     pub fn is_empty(&self) -> bool {
@@ -871,6 +946,7 @@ mod tests {
                             partition: None,
                             partition_spec: None,
                             name_mapping: None,
+                            case_sensitive: true,
                         })
                     })
                     .collect()
@@ -895,6 +971,7 @@ mod tests {
                 partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
+                case_sensitive: true,
             }
         }
     }
@@ -954,6 +1031,7 @@ mod tests {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                case_sensitive: true,
             })
         }
 
@@ -1721,6 +1799,28 @@ mod tests {
             }
             _ => panic!("Expected CompactionError::Execution"),
         }
+
+        let default_config = CompactionPlanningConfig::SmallFiles(
+            SmallFilesConfigBuilder::default().build().unwrap(),
+        );
+        let files = vec![
+            TestFileBuilder::new("a.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("b.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(),
+            TestFileBuilder::new("c.parquet")
+                .size(1024 * 1024 * 1024)
+                .build(),
+        ];
+        let group = FileGroup::new(files);
+        let (_, output_parallelism) =
+            FileGroup::calculate_parallelism(&group, &default_config).unwrap();
+        assert_eq!(
+            output_parallelism, 3,
+            "output parallelism should track target file size rather than min_size_per_partition"
+        );
     }
 
     #[test]
@@ -1783,6 +1883,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let equality_delete = Arc::new(FileScanTask {
@@ -1802,6 +1903,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let data_file = FileScanTask {
@@ -1821,6 +1923,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![data_file]);
@@ -1870,6 +1973,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let f1 = FileScanTask {
@@ -1889,6 +1993,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let f2 = FileScanTask {
@@ -1908,6 +2013,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
@@ -1960,6 +2066,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let pos_delete = Arc::new(FileScanTask {
@@ -1979,6 +2086,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         });
 
         let f1 = FileScanTask {
@@ -1998,6 +2106,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let f2 = FileScanTask {
@@ -2017,6 +2126,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            case_sensitive: true,
         };
 
         let group = FileGroup::new(vec![f1, f2]);
@@ -2118,24 +2228,19 @@ mod tests {
         assert!(!parallelisms.is_empty());
 
         for (idx, group) in groups.iter().enumerate() {
-            let partition_by_size = (group
-                .input_total_bytes()
-                .div_ceil(config.min_size_per_partition()))
-            .max(1) as usize;
-            let partition_by_count = group
-                .input_files_count()
-                .div_ceil(config.max_file_count_per_partition())
-                .max(1);
-            let expected_exec_p = partition_by_size
-                .max(partition_by_count)
-                .min(config.max_parallelism());
+            let (expected_exec_p, expected_output_p) =
+                FileGroup::calculate_parallelism(group, &config).unwrap();
 
             assert_eq!(
                 group.executor_parallelism, expected_exec_p,
-                "Group {}: parallelism mismatch",
+                "Group {}: executor parallelism mismatch",
                 idx
             );
-            assert!(group.output_parallelism <= group.executor_parallelism);
+            assert_eq!(
+                group.output_parallelism, expected_output_p,
+                "Group {}: output parallelism mismatch",
+                idx
+            );
         }
 
         let has_parallelism = parallelisms.iter().any(|(exec_p, _)| *exec_p > 1);

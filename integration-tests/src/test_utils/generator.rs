@@ -30,9 +30,10 @@ use iceberg::arrow::{
     RecordBatchPartitionSplitter, arrow_schema_to_schema, schema_to_arrow_schema,
 };
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, NestedField, PartitionSpec, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    DataFile, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema, Type,
+};
 use iceberg::table::Table;
-use iceberg::writer::TaskWriter;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
     EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -44,6 +45,7 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriterBuilder, TaskWriter};
 use iceberg_compaction_core::CompactionError;
 use iceberg_compaction_core::error::Result;
 use parquet::file::properties::WriterProperties;
@@ -72,6 +74,39 @@ pub type DeltaWriterBuilderType = DeltaWriterBuilder<
         DefaultFileNameGenerator,
     >,
 >;
+
+struct SharedIcebergWriterBuilder<B> {
+    inner: Arc<B>,
+}
+
+impl<B> Clone for SharedIcebergWriterBuilder<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<B> SharedIcebergWriterBuilder<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<B, I, O> IcebergWriterBuilder<I, O> for SharedIcebergWriterBuilder<B>
+where B: IcebergWriterBuilder<I, O>
+{
+    type R = B::R;
+
+    async fn build(&self, partition_key: Option<PartitionKey>) -> iceberg::Result<Self::R> {
+        self.inner.build(partition_key).await
+    }
+}
+
+type SharedDeltaWriterBuilderType = SharedIcebergWriterBuilder<DeltaWriterBuilderType>;
 
 pub struct RecordBatchGenerator {
     pub num_rows: usize,
@@ -446,6 +481,28 @@ impl FileGenerator {
         ))
     }
 
+    fn create_task_writer(
+        &self,
+        writer_builder: SharedDeltaWriterBuilderType,
+    ) -> Result<TaskWriter<SharedDeltaWriterBuilderType>> {
+        let partition_splitter = if self.partition_spec.is_unpartitioned() {
+            None
+        } else {
+            Some(RecordBatchPartitionSplitter::try_new_with_computed_values(
+                self.schema.clone(),
+                self.partition_spec.clone(),
+            )?)
+        };
+
+        Ok(TaskWriter::new_with_partition_splitter(
+            writer_builder,
+            true,
+            self.schema.clone(),
+            self.partition_spec.clone(),
+            partition_splitter,
+        ))
+    }
+
     /// Generates data files with random data, equality deletes, and position deletes
     ///
     /// This method orchestrates the generation of:
@@ -461,31 +518,8 @@ impl FileGenerator {
     pub async fn generate(&mut self) -> Result<Vec<DataFile>> {
         let mut data_files = Vec::new();
 
-        let delta_writer_builder = self.build_delta_writer_builder()?;
-
-        let create_new_task_writer = || {
-            let partition_splitter = if self.partition_spec.is_unpartitioned() {
-                None
-            } else {
-                Some(
-                    RecordBatchPartitionSplitter::new_with_computed_values(
-                        self.schema.clone(),
-                        self.partition_spec.clone(),
-                    )
-                    .expect("Failed to create partition splitter"),
-                )
-            };
-
-            TaskWriter::new_with_partition_splitter(
-                delta_writer_builder.clone(),
-                true,
-                self.schema.clone(),
-                self.partition_spec.clone(),
-                partition_splitter,
-            )
-        };
-
-        let mut writer = create_new_task_writer();
+        let writer_builder = SharedIcebergWriterBuilder::new(self.build_delta_writer_builder()?);
+        let mut writer = self.create_task_writer(writer_builder.clone())?;
 
         let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
             None
@@ -535,7 +569,7 @@ impl FileGenerator {
 
             if data_file_num + num_rows > self.config.data_file_row_count {
                 data_files.extend(writer.close().await?);
-                writer = create_new_task_writer();
+                writer = self.create_task_writer(writer_builder.clone())?;
                 data_file_num = 0;
             }
             data_file_num += num_rows;
