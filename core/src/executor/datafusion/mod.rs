@@ -204,7 +204,7 @@ pub fn build_iceberg_data_file_writer(
     let partition_splitter = if partition_spec.is_unpartitioned() {
         None
     } else {
-        Some(RecordBatchPartitionSplitter::try_new_with_computed_values(
+        Some(RecordBatchPartitionSplitter::new_with_computed_values(
             schema.clone(),
             partition_spec.clone(),
         )?)

@@ -14,23 +14,23 @@ async-trait = "0.1.89"
 
 # Data processing and storage
 ctor = "0.2.8"
-datafusion = "52.2"
+datafusion = "50"
 
 # Local workspace members
 futures = "0.3.17"
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "96a69c09dbc410358ed44a9e789c4ffa0b2d2871", features = [
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4d5f635572a8e90c77a3c56c12aa40d5362f0d68", features = [
     "storage-s3",
     "storage-gcs",
     "storage-azblob",
     "storage-azdls",
 ] }
-iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "96a69c09dbc410358ed44a9e789c4ffa0b2d2871" }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "96a69c09dbc410358ed44a9e789c4ffa0b2d2871" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "96a69c09dbc410358ed44a9e789c4ffa0b2d2871" }
+iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4d5f635572a8e90c77a3c56c12aa40d5362f0d68" }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4d5f635572a8e90c77a3c56c12aa40d5362f0d68" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4d5f635572a8e90c77a3c56c12aa40d5362f0d68" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "96a69c09dbc410358ed44a9e789c4ffa0b2d2871" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "4d5f635572a8e90c77a3c56c12aa40d5362f0d68" }
 
-parquet = { version = "57.1", features = ["async"] }
+parquet = { version = "56.2", features = ["async"] }
 port_scanner = "0.1.5"
 rand = "0.9.0"
 
