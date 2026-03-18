@@ -1474,6 +1474,23 @@ mod tests {
         .unwrap()
     }
 
+    /// Creates a large record batch (1000 rows) for tests that need files
+    /// significantly larger than the small test files (~1.3 KB).
+    fn create_test_record_batch_large(iceberg_schema: &Schema) -> RecordBatch {
+        let ids: Vec<i32> = (0..1000).collect();
+        let names: Vec<String> = (0..1000).map(|i| format!("name_{i:0>100}")).collect();
+        let id_array = Int32Array::from(ids);
+        let name_array = StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+        ])
+        .unwrap()
+    }
+
     async fn build_equality_delta_writer(
         table: &Table,
         warehouse_location: String,
@@ -2074,12 +2091,11 @@ mod tests {
         small_writer1.write(batch.clone()).await.unwrap();
         let small_files1 = small_writer1.close().await.unwrap();
 
+        let large_batch = create_test_record_batch_large(&simple_table_schema());
         let mut large_writer =
             build_simple_data_writer(&env.table, env.warehouse_location.clone(), "large-branch")
                 .await;
-        for _ in 0..10 {
-            large_writer.write(batch.clone()).await.unwrap();
-        }
+        large_writer.write(large_batch).await.unwrap();
         let large_files = large_writer.close().await.unwrap();
 
         let mut all_branch_files = Vec::new();
@@ -2094,7 +2110,7 @@ mod tests {
         let tx = append_action.apply(transaction).unwrap();
         let updated_table = tx.commit(env.catalog.as_ref()).await.unwrap();
 
-        let small_file_threshold = 900u64;
+        let small_file_threshold = 10_000u64;
         let planning_config = CompactionPlanningConfig::SmallFiles(
             SmallFilesConfigBuilder::default()
                 .small_file_threshold_bytes(small_file_threshold)
