@@ -13,7 +13,7 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 ## Terms
 
 - `data file`: a `FileScanTask` where `data_file_content == Data`
-- `delete-heavy`: `deletes.len() >= min_delete_file_count_threshold`
+- `delete-heavy`: when `min_delete_file_count_threshold > 0`, `deletes.len() >= min_delete_file_count_threshold`
 - `candidate set`: the set of data files that a strategy is allowed to include in compaction
 - `group gating`: group-level thresholds used to avoid frequent small rewrites
 - `plan budget`: the maximum number of plans that `Auto` is allowed to execute in a single run
@@ -41,11 +41,14 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - Candidate set: `deletes.len() >= min_delete_file_count_threshold`
 - May use `group_filters` for group gating
 - `Auto` does not rewrite or override caller-provided group gating for this strategy
+- Under `Auto`, `min_delete_file_count_threshold == 0` disables delete-heavy detection and therefore disables this candidate
 - Must be fixed-point: rewritten delete-heavy input files should leave the candidate set in the newly committed snapshot
 
 ## `Auto` Planner
 
 `Auto` only chooses between two localized rewrite strategies: `FilesWithDeletes` and `SmallFiles`.
+
+Zero-valued auto thresholds are treated as disabled for the corresponding candidate.
 
 Within a single scan, `Auto` produces two candidate plan sets:
 

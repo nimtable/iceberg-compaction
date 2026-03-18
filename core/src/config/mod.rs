@@ -509,6 +509,12 @@ impl AutoCompactionConfig {
             return None;
         }
 
+        if self.min_delete_file_count_threshold == 0
+            || self.thresholds.min_delete_heavy_files_count == 0
+        {
+            return None;
+        }
+
         if stats.delete_heavy_files_count >= self.thresholds.min_delete_heavy_files_count {
             Some(CompactionPlanningConfig::FilesWithDeletes(
                 FilesWithDeletesConfig {
@@ -580,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_files_with_deletes_candidate_priority() {
+    fn test_files_with_deletes_candidate_threshold() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
                 min_delete_heavy_files_count: 3,
@@ -589,7 +595,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // Priority 1: FilesWithDeletes wins when both thresholds met
+        // Threshold met -> delete candidate is available.
         let stats = create_test_stats(10, 6, 4);
         assert!(matches!(
             config.files_with_deletes_candidate(&stats).unwrap(),
@@ -756,5 +762,34 @@ mod tests {
             .expect("Auto should propagate group filters");
         assert_eq!(gf.min_group_size_bytes, Some(123_u64));
         assert_eq!(gf.min_group_file_count, Some(7_usize));
+    }
+
+    #[test]
+    fn test_files_with_deletes_candidate_is_disabled_when_delete_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .min_delete_file_count_threshold(0_usize)
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: usize::MAX,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 10);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_files_with_deletes_candidate_is_disabled_when_auto_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 0,
+                min_small_files_count: usize::MAX,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 10);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
     }
 }

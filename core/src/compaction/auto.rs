@@ -149,21 +149,30 @@ impl AutoCompactionPlanner {
         }
 
         let delete_report = if let Some(planning_config) = delete_candidate {
-            Some(Self::build_report(
+            let report = Self::build_report(
                 tasks.clone(),
                 planning_config,
                 to_branch,
                 snapshot_id,
                 total_data_bytes,
                 AutoPlanReason::Recommended,
-            )?)
+            )?;
+            if report.plans.is_empty() {
+                Some(report)
+            } else {
+                return Ok(Self::cap_report_plans(
+                    report,
+                    total_data_bytes,
+                    self.config.max_auto_plans_per_run,
+                ));
+            }
         } else {
             None
         };
 
         let small_report = if let Some(planning_config) = small_candidate {
             Some(Self::build_report(
-                tasks.clone(),
+                tasks,
                 planning_config,
                 to_branch,
                 snapshot_id,
