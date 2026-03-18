@@ -542,6 +542,10 @@ impl AutoCompactionConfig {
             return None;
         }
 
+        if self.thresholds.min_small_files_count == 0 {
+            return None;
+        }
+
         if stats.small_files_count >= self.thresholds.min_small_files_count {
             Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
@@ -791,5 +795,19 @@ mod tests {
 
         let stats = create_test_stats(10, 0, 10);
         assert!(config.files_with_deletes_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_small_files_candidate_is_disabled_when_auto_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: usize::MAX,
+                min_small_files_count: 0,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 10, 0);
+        assert!(config.small_files_candidate(&stats).is_none());
     }
 }

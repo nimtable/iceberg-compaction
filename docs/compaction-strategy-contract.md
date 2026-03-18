@@ -89,16 +89,17 @@ The current budget unit is `plan count`, not input bytes. This assumes grouping 
 
 ## Return Semantics
 
-### Executable Results
+### Non-Empty Results
 
 - `Recommended`: safe to execute by default
-- `BudgetCapped`: a candidate strategy was selected, but only the subset of plans within the configured budget is returned
+- `BudgetCapped`: a candidate strategy was selected, and the returned plans are the subset that fit within the configured budget
 
 ### Empty Results
 
 - `NoCandidate`: no strategy threshold was met
 - `NoPlansProduced`: a strategy threshold was met, but all plans were filtered out by group gating
 - `NoSnapshot`: the target branch does not have an associated snapshot
+- `BudgetCapped`: budget capping may also return an empty result when `max_auto_plans_per_run == 0`
 
 ### Report Path
 

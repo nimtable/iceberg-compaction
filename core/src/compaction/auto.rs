@@ -109,7 +109,11 @@ impl AutoCompactionPlanner {
 
     /// Plans compaction for a table branch.
     ///
-    /// Returns empty vector if no files need compaction.
+    /// Returns an empty vector when the planner does not return executable plans.
+    ///
+    /// Use [`plan_compaction_report_with_branch`](Self::plan_compaction_report_with_branch)
+    /// when callers need to distinguish between `NoSnapshot`, `NoCandidate`,
+    /// `NoPlansProduced`, and budget-capped empty results.
     pub async fn plan_compaction_with_branch(
         &self,
         table: &Table,
@@ -134,10 +138,10 @@ impl AutoCompactionPlanner {
 
         let snapshot_id = snapshot.snapshot_id();
 
-        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
-        let total_data_bytes = compute_total_data_bytes(&tasks);
+        let mut tasks = Some(FileSelector::scan_data_files(table, snapshot_id).await?);
+        let total_data_bytes = compute_total_data_bytes(tasks.as_ref().unwrap());
         let stats = Self::compute_stats(
-            &tasks,
+            tasks.as_ref().unwrap(),
             self.config.small_file_threshold_bytes,
             self.config.min_delete_file_count_threshold,
         );
@@ -149,8 +153,13 @@ impl AutoCompactionPlanner {
         }
 
         let delete_report = if let Some(planning_config) = delete_candidate {
+            let delete_tasks = if small_candidate.is_some() {
+                tasks.as_ref().unwrap().clone()
+            } else {
+                tasks.take().unwrap()
+            };
             let report = Self::build_report(
-                tasks.clone(),
+                delete_tasks,
                 planning_config,
                 to_branch,
                 snapshot_id,
@@ -172,7 +181,7 @@ impl AutoCompactionPlanner {
 
         let small_report = if let Some(planning_config) = small_candidate {
             Some(Self::build_report(
-                tasks,
+                tasks.take().unwrap(),
                 planning_config,
                 to_branch,
                 snapshot_id,
