@@ -1515,14 +1515,11 @@ mod tests {
         // Convert iceberg schema to arrow schema to ensure field ID consistency
         let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
 
-        RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(pos_array),
-            ],
-        )
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(pos_array),
+        ])
         .unwrap()
     }
 
@@ -1533,10 +1530,10 @@ mod tests {
         // Convert iceberg schema to arrow schema to ensure field ID consistency
         let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
 
-        RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+        ])
         .unwrap()
     }
 
@@ -2541,8 +2538,9 @@ mod tests {
     /// Verifies that `custom_snapshot_properties` correctly filters known keys.
     #[test]
     fn test_custom_snapshot_properties_filters_known_keys() {
-        use super::{KNOWN_SNAPSHOT_SUMMARY_KEYS, custom_snapshot_properties};
         use iceberg::spec::{Operation, Snapshot, Summary};
+
+        use super::{KNOWN_SNAPSHOT_SUMMARY_KEYS, custom_snapshot_properties};
 
         let mut all_properties = HashMap::new();
 
