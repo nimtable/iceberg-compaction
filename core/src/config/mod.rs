@@ -16,6 +16,8 @@
 
 //! Compaction configuration types and constants.
 
+use std::num::NonZeroUsize;
+
 use derive_builder::Builder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -41,7 +43,7 @@ pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetch
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
 pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
-pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: usize = usize::MAX;
+pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: NonZeroUsize = NonZeroUsize::MAX;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
@@ -494,7 +496,7 @@ pub struct AutoCompactionConfig {
     /// Maximum number of compaction plans to execute per auto-compaction run.
     /// Defaults to unlimited.
     #[builder(default = "DEFAULT_MAX_AUTO_PLANS_PER_RUN")]
-    pub max_auto_plans_per_run: usize,
+    pub max_auto_plans_per_run: NonZeroUsize,
 
     #[builder(default)]
     pub execution: CompactionExecutionConfig,
@@ -643,7 +645,7 @@ mod tests {
     #[test]
     fn test_auto_default_budget_is_unbounded() {
         let config = AutoCompactionConfig::default();
-        assert_eq!(config.max_auto_plans_per_run, usize::MAX);
+        assert_eq!(config.max_auto_plans_per_run, NonZeroUsize::MAX);
     }
 
     #[test]

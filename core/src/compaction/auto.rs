@@ -20,6 +20,7 @@
 //! [`AutoCompaction`] for end-to-end automatic compaction workflows.
 
 use std::borrow::Cow;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use iceberg::scan::FileScanTask;
@@ -229,7 +230,7 @@ impl AutoCompactionPlanner {
     fn cap_report_plans(
         report: AutoPlanReport,
         total_data_bytes: u64,
-        max_plans: usize,
+        max_plans: NonZeroUsize,
     ) -> AutoPlanReport {
         if report.plans.is_empty() {
             return AutoPlanReport {
@@ -238,22 +239,11 @@ impl AutoCompactionPlanner {
             };
         }
 
-        if max_plans == 0 {
-            return AutoPlanReport {
-                selected_strategy: report.selected_strategy,
-                plans: vec![],
-                planned_input_bytes: 0,
-                planned_input_files: 0,
-                rewrite_ratio: 0.0,
-                reason: AutoPlanReason::BudgetCapped,
-            };
-        }
-
-        if report.plans.len() <= max_plans {
+        if report.plans.len() <= max_plans.get() {
             return report;
         }
 
-        let plans: Vec<CompactionPlan> = report.plans.into_iter().take(max_plans).collect();
+        let plans: Vec<CompactionPlan> = report.plans.into_iter().take(max_plans.get()).collect();
         Self::report_from_plans(
             report.selected_strategy,
             plans,
@@ -266,7 +256,7 @@ impl AutoCompactionPlanner {
         delete_report: Option<AutoPlanReport>,
         small_report: Option<AutoPlanReport>,
         total_data_bytes: u64,
-        max_plans: usize,
+        max_plans: NonZeroUsize,
     ) -> AutoPlanReport {
         if let Some(report) = delete_report.filter(|report| !report.plans.is_empty()) {
             return Self::cap_report_plans(report, total_data_bytes, max_plans);
@@ -416,8 +406,8 @@ impl AutoCompactionBuilder {
 
 /// Automatic compaction with runtime strategy selection.
 ///
-/// Selects the appropriate compaction strategy (small files, files with deletes,
-/// or full) based on snapshot statistics and executes the compaction workflow.
+/// Selects between localized `FilesWithDeletes` and `SmallFiles` plans based on
+/// snapshot statistics and executes the compaction workflow.
 pub struct AutoCompaction {
     inner: Compaction,
     auto_config: AutoCompactionConfig,
@@ -426,7 +416,8 @@ pub struct AutoCompaction {
 impl AutoCompaction {
     /// Runs automatic compaction.
     ///
-    /// Returns `None` if no strategy matches or no files need compaction.
+    /// Returns `None` when `Auto` does not produce executable plans or when no
+    /// rewrite results are produced.
     pub async fn compact(&self) -> Result<Option<CompactionResult>> {
         let overall_start_time = std::time::Instant::now();
 
@@ -573,7 +564,8 @@ mod tests {
             reason: AutoPlanReason::Recommended,
         };
 
-        let capped = AutoCompactionPlanner::cap_report_plans(report, 100, 2);
+        let capped =
+            AutoCompactionPlanner::cap_report_plans(report, 100, NonZeroUsize::new(2).unwrap());
         assert_eq!(capped.reason, AutoPlanReason::BudgetCapped);
         assert_eq!(capped.plans.len(), 2);
         assert_eq!(capped.planned_input_bytes, 30);
@@ -592,22 +584,12 @@ mod tests {
             reason: AutoPlanReason::Recommended,
         };
 
-        let capped = AutoCompactionPlanner::cap_report_plans(report, 100, 1);
+        let capped =
+            AutoCompactionPlanner::cap_report_plans(report, 100, NonZeroUsize::new(1).unwrap());
         assert_eq!(capped.reason, AutoPlanReason::Recommended);
         assert_eq!(capped.plans.len(), 1);
         assert_eq!(capped.planned_input_bytes, 10);
         assert_eq!(capped.planned_input_files, 1);
-    }
-
-    #[test]
-    fn test_cap_report_plans_returns_empty_when_budget_is_zero() {
-        let report = make_report(AutoSelectedStrategy::FilesWithDeletes, &[10], 100);
-
-        let capped = AutoCompactionPlanner::cap_report_plans(report, 100, 0);
-        assert_eq!(capped.reason, AutoPlanReason::BudgetCapped);
-        assert!(capped.plans.is_empty());
-        assert_eq!(capped.planned_input_bytes, 0);
-        assert_eq!(capped.planned_input_files, 0);
     }
 
     #[test]
@@ -619,7 +601,12 @@ mod tests {
         ));
         let small_report = Some(make_report(AutoSelectedStrategy::SmallFiles, &[20], 100));
 
-        let selected = AutoCompactionPlanner::select_report(delete_report, small_report, 100, 10);
+        let selected = AutoCompactionPlanner::select_report(
+            delete_report,
+            small_report,
+            100,
+            NonZeroUsize::new(10).unwrap(),
+        );
         assert_eq!(
             selected.selected_strategy,
             Some(AutoSelectedStrategy::FilesWithDeletes)
@@ -633,7 +620,12 @@ mod tests {
         let delete_report = Some(AutoPlanReport::empty(AutoPlanReason::NoPlansProduced));
         let small_report = Some(make_report(AutoSelectedStrategy::SmallFiles, &[20], 100));
 
-        let selected = AutoCompactionPlanner::select_report(delete_report, small_report, 100, 10);
+        let selected = AutoCompactionPlanner::select_report(
+            delete_report,
+            small_report,
+            100,
+            NonZeroUsize::new(10).unwrap(),
+        );
         assert_eq!(
             selected.selected_strategy,
             Some(AutoSelectedStrategy::SmallFiles)
@@ -648,7 +640,7 @@ mod tests {
             Some(AutoPlanReport::empty(AutoPlanReason::NoPlansProduced)),
             Some(AutoPlanReport::empty(AutoPlanReason::NoPlansProduced)),
             100,
-            10,
+            NonZeroUsize::new(10).unwrap(),
         );
 
         assert!(selected.plans.is_empty());

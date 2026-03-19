@@ -78,6 +78,7 @@ For that reason, `Auto` does not introduce a full-like special case and does not
 ## Planner Budget
 
 `max_auto_plans_per_run` is planner-level configuration, not external invocation policy. Its default is unlimited.
+It is represented as a positive integer budget; zero is not a valid configuration value.
 
 Rationale:
 
@@ -99,7 +100,6 @@ The current budget unit is `plan count`, not input bytes. This assumes grouping 
 - `NoCandidate`: no strategy threshold was met
 - `NoPlansProduced`: a strategy threshold was met, but all plans were filtered out by group gating
 - `NoSnapshot`: the target branch does not have an associated snapshot
-- `BudgetCapped`: budget capping may also return an empty result when `max_auto_plans_per_run == 0`
 
 ### Report Path
 
