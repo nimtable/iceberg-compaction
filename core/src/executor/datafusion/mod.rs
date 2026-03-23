@@ -23,7 +23,7 @@ use futures::StreamExt;
 use futures::future::try_join_all;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, PartitionSpec, Schema};
+use iceberg::spec::{DataFile, DataFileBuilder, PartitionSpec, Schema};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -59,6 +59,7 @@ impl CompactionExecutor for DataFusionExecutor {
             metrics_recorder,
             location_generator,
             sort_order,
+            format_version,
         } = request;
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
@@ -70,6 +71,7 @@ impl CompactionExecutor for DataFusionExecutor {
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
+            .with_format_version(format_version)
             .with_input_data_files(file_group)
             .with_sort_order(sort_order.clone())
             .build()?;
@@ -102,7 +104,6 @@ impl CompactionExecutor for DataFusionExecutor {
                     file_io,
                     partition_spec,
                     execution_config,
-                    sort_order_id,
                 )?;
 
                 // Process each record batch with metrics
@@ -136,11 +137,13 @@ impl CompactionExecutor for DataFusionExecutor {
                     fetch_batch_start = Instant::now(); // Reset for next batch
                 }
 
-                let data_files = data_file_writer.close().await?;
+                let data_files =
+                    with_sort_order_id(data_file_writer.close().await?, sort_order_id)?;
                 Ok(data_files)
             });
             futures.push(future);
         }
+
         // collect all data files from all partitions
         let output_data_files: Vec<DataFile> = try_join_all(futures)
             .await
@@ -166,7 +169,6 @@ pub fn build_iceberg_data_file_writer(
     file_io: FileIO,
     partition_spec: Arc<PartitionSpec>,
     execution_config: Arc<CompactionExecutionConfig>,
-    sort_order_id: Option<i32>,
 ) -> Result<Box<dyn IcebergWriter>> {
     let data_file_builder = {
         let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -190,9 +192,7 @@ pub fn build_iceberg_data_file_writer(
             file_name_generator,
         );
 
-        let builder =
-            DataFileWriterBuilder::new(rolling_writer_builder).sort_order_id(sort_order_id);
-        builder
+        DataFileWriterBuilder::new(rolling_writer_builder)
     };
 
     let rolling_iceberg_writer_builder =
@@ -207,7 +207,7 @@ pub fn build_iceberg_data_file_writer(
     let partition_splitter = if partition_spec.is_unpartitioned() {
         None
     } else {
-        Some(RecordBatchPartitionSplitter::new_with_computed_values(
+        Some(RecordBatchPartitionSplitter::try_new_with_computed_values(
             schema.clone(),
             partition_spec.clone(),
         )?)
@@ -222,4 +222,52 @@ pub fn build_iceberg_data_file_writer(
     );
 
     Ok(Box::new(iceberg_task_writer))
+}
+
+fn with_sort_order_id(
+    data_files: Vec<DataFile>,
+    sort_order_id: Option<i32>,
+) -> Result<Vec<DataFile>> {
+    match sort_order_id {
+        Some(sort_order_id) => data_files
+            .into_iter()
+            .map(|data_file| rebuild_data_file_with_sort_order_id(data_file, sort_order_id))
+            .collect(),
+        None => Ok(data_files),
+    }
+}
+
+fn rebuild_data_file_with_sort_order_id(
+    data_file: DataFile,
+    sort_order_id: i32,
+) -> Result<DataFile> {
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(data_file.content_type())
+        .file_path(data_file.file_path().to_owned())
+        .file_format(data_file.file_format())
+        .partition(data_file.partition().clone())
+        .record_count(data_file.record_count())
+        .file_size_in_bytes(data_file.file_size_in_bytes())
+        .column_sizes(data_file.column_sizes().clone())
+        .value_counts(data_file.value_counts().clone())
+        .null_value_counts(data_file.null_value_counts().clone())
+        .nan_value_counts(data_file.nan_value_counts().clone())
+        .lower_bounds(data_file.lower_bounds().clone())
+        .upper_bounds(data_file.upper_bounds().clone())
+        .key_metadata(data_file.key_metadata().map(|metadata| metadata.to_vec()))
+        .split_offsets(data_file.split_offsets().map(|offsets| offsets.to_vec()))
+        .equality_ids(data_file.equality_ids())
+        .sort_order_id(sort_order_id)
+        .first_row_id(data_file.first_row_id())
+        .partition_spec_id(data_file.partition_spec_id())
+        .referenced_data_file(data_file.referenced_data_file())
+        .content_offset(data_file.content_offset())
+        .content_size_in_bytes(data_file.content_size_in_bytes());
+
+    builder.build().map_err(|error| {
+        CompactionError::Execution(format!(
+            "failed to rebuild data file with sort order id {sort_order_id}: {error}"
+        ))
+    })
 }

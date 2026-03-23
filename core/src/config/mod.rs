@@ -36,6 +36,7 @@ pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per
 pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
+pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
 
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
@@ -43,6 +44,9 @@ pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
+
+/// Overhead added to split size for bin-packing
+pub const SPLIT_OVERHEAD: u64 = 5 * 1024 * 1024;
 
 /// Configuration for bin-packing grouping strategy.
 ///
@@ -118,8 +122,15 @@ pub struct SmallFilesConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -164,8 +175,15 @@ pub struct FullCompactionConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -202,8 +220,15 @@ pub struct FilesWithDeletesConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -277,12 +302,21 @@ impl CompactionPlanningConfig {
         }
     }
 
-    /// Returns maximum parallelism for the strategy.
-    pub fn max_parallelism(&self) -> usize {
+    /// Returns maximum parallelism for input (reading) operations.
+    pub fn max_input_parallelism(&self) -> usize {
         match self {
-            Self::SmallFiles(c) => c.max_parallelism,
-            Self::Full(c) => c.max_parallelism,
-            Self::FilesWithDeletes(c) => c.max_parallelism,
+            Self::SmallFiles(c) => c.max_input_parallelism,
+            Self::Full(c) => c.max_input_parallelism,
+            Self::FilesWithDeletes(c) => c.max_input_parallelism,
+        }
+    }
+
+    /// Returns maximum parallelism for output (writing) operations.
+    pub fn max_output_parallelism(&self) -> usize {
+        match self {
+            Self::SmallFiles(c) => c.max_output_parallelism,
+            Self::Full(c) => c.max_output_parallelism,
+            Self::FilesWithDeletes(c) => c.max_output_parallelism,
         }
     }
 
@@ -342,6 +376,23 @@ pub struct CompactionExecutionConfig {
     /// Actual parallelism is typically lower due to per-plan heuristics.
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
+
+    /// Enable feature to prefetch entire data files before compacting them.
+    ///
+    /// This improves performance by reducing the number of total HTTP requests required
+    /// to read data files. Presently, iceberg-rust will sent multiple sequential HTTP
+    /// requests to download the byte ranges of each column from a Parquet file in an object
+    /// store. That is sub-optimal if we know we need the entire file for compacting.
+    /// Instead of making N HTTP requests for N column chunks, we can make 1 HTTP request
+    /// for the entire file.
+    ///
+    /// It will download one file per concurrent file group being processed. For example,
+    /// if 4 parallel executions are running, 4 downloaded files will be held in memory
+    /// at once.
+    ///
+    /// **Note**: This is currently experimental and may not be stable.
+    #[builder(default = "DEFAULT_ENABLE_PREFETCH")]
+    pub enable_prefetch: bool,
 }
 
 impl Default for CompactionExecutionConfig {
@@ -427,8 +478,13 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
     pub max_file_count_per_partition: usize,
 
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
     #[builder(default = "available_parallelism().get()")]
-    pub max_parallelism: usize,
+    pub max_output_parallelism: usize,
 
     #[builder(default = "true")]
     pub enable_heuristic_output_parallelism: bool,
@@ -469,11 +525,12 @@ impl AutoCompactionConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
                     max_file_count_per_partition: self.max_file_count_per_partition,
-                    max_parallelism: self.max_parallelism,
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
                     group_filters: self.group_filters.clone(),
+                    max_input_parallelism: self.max_input_parallelism,
+                    max_output_parallelism: self.max_output_parallelism,
                 },
             ));
         }
@@ -488,7 +545,8 @@ impl AutoCompactionConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
                 min_size_per_partition: self.min_size_per_partition,
                 max_file_count_per_partition: self.max_file_count_per_partition,
-                max_parallelism: self.max_parallelism,
+                max_input_parallelism: self.max_input_parallelism,
+                max_output_parallelism: self.max_output_parallelism,
                 enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                 small_file_threshold_bytes: self.small_file_threshold_bytes,
                 grouping_strategy: self.grouping_strategy.clone(),
@@ -501,7 +559,8 @@ impl AutoCompactionConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
                 min_size_per_partition: self.min_size_per_partition,
                 max_file_count_per_partition: self.max_file_count_per_partition,
-                max_parallelism: self.max_parallelism,
+                max_input_parallelism: self.max_input_parallelism,
+                max_output_parallelism: self.max_output_parallelism,
                 enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                 grouping_strategy: self.grouping_strategy.clone(),
             }));
@@ -687,7 +746,7 @@ mod tests {
     fn test_resolve_propagates_config() {
         let config = AutoCompactionConfigBuilder::default()
             .target_file_size_bytes(1_000_000_u64)
-            .max_parallelism(8_usize)
+            .max_input_parallelism(8_usize)
             .thresholds(AutoThresholds {
                 min_files_with_deletes_count: 2,
                 min_small_files_count: 10,
@@ -703,6 +762,6 @@ mod tests {
         };
 
         assert_eq!(cfg.target_file_size_bytes, 1_000_000);
-        assert_eq!(cfg.max_parallelism, 8);
+        assert_eq!(cfg.max_input_parallelism, 8);
     }
 }

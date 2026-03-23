@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, PartitionSpec, Schema, SortOrderRef};
+use iceberg::spec::{DataFile, FormatVersion, PartitionSpec, Schema, SortOrderRef};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 
 use crate::common::CompactionMetricsRecorder;
@@ -47,6 +47,7 @@ pub struct RewriteFilesRequest {
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
     pub location_generator: DefaultLocationGenerator,
     pub sort_order: Option<(i64, SortOrderRef)>,
+    pub format_version: FormatVersion,
 }
 
 #[derive(Debug, Clone, Default)]
