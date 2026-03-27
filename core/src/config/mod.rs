@@ -360,10 +360,32 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
 
+    /// Deprecated: this setting is no longer used after switching to the upstream
+    /// `RollingFileWriter`.
+    ///
+    /// It remains temporarily for backward compatibility and will be removed in a
+    /// future change.
+    #[deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
+    )]
     #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
+    #[builder_setter_attr(deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
+    ))]
     pub enable_dynamic_size_estimation: bool,
 
+    /// Deprecated: this setting is no longer used after switching to the upstream
+    /// `RollingFileWriter`.
+    ///
+    /// It remains temporarily for backward compatibility and will be removed in a
+    /// future change.
+    #[deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
+    )]
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
+    #[builder_setter_attr(deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
+    ))]
     pub size_estimation_smoothing_factor: f64,
 
     /// Maximum concurrent compaction plans in `compact()` method.
