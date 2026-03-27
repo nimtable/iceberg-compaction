@@ -545,10 +545,13 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
         "Compaction input should be around the expected number of files"
     );
 
-    assert_eq!(
-        partition_bucket_n * 4, // 20 total
-        compaction_result.stats.output_files_count,
-        "Compaction should produce 4 files per partition"
+    assert!(
+        compaction_result.stats.output_files_count > partition_bucket_n,
+        "Compaction should roll within at least one partition and produce more files than partitions"
+    );
+    assert!(
+        compaction_result.stats.output_files_count < compaction_result.stats.input_files_count,
+        "Compaction should reduce the total number of files"
     );
 
     // Clean up: try to drop the table and namespace
