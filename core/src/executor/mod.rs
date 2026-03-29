@@ -28,7 +28,6 @@ use crate::file_selection::FileGroup;
 pub mod mock;
 pub use mock::MockExecutor;
 pub mod datafusion;
-pub mod iceberg_writer;
 pub use datafusion::DataFusionExecutor;
 
 use crate::error::Result;
