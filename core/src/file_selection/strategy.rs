@@ -487,7 +487,10 @@ impl std::fmt::Display for BinPackGroupingStrategy {
 
 /// File filter by size threshold.
 ///
-/// Filters by `task.length`. Bounds are inclusive. If both `None`, passes all files.
+/// Filters by `task.length`.
+///
+/// `min_size` is inclusive and `max_size` is exclusive. If both are `None`,
+/// passes all files.
 #[derive(Debug)]
 pub struct SizeFilterStrategy {
     pub min_size: Option<u64>,
@@ -501,9 +504,9 @@ impl FileFilterStrategy for SizeFilterStrategy {
             .filter(|task| {
                 let file_size = task.length;
                 match (self.min_size, self.max_size) {
-                    (Some(min), Some(max)) => file_size >= min && file_size <= max,
+                    (Some(min), Some(max)) => file_size >= min && file_size < max,
                     (Some(min), None) => file_size >= min,
-                    (None, Some(max)) => file_size <= max,
+                    (None, Some(max)) => file_size < max,
                     (None, None) => true,
                 }
             })
@@ -1109,7 +1112,7 @@ mod tests {
             assert_eq!(strategy.to_string(), expected_desc);
         }
 
-        // Test normal range filtering (5-50MB)
+        // Test normal range filtering [5MB, 50MB)
         let strategy = SizeFilterStrategy {
             min_size: Some(5 * 1024 * 1024),
             max_size: Some(50 * 1024 * 1024),
@@ -1137,22 +1140,17 @@ mod tests {
         ];
 
         let result: Vec<FileScanTask> = strategy.filter(test_files);
-        assert_eq!(result.len(), 4);
+        assert_eq!(result.len(), 3);
         TestUtils::assert_paths_eq(
-            &[
-                "min_edge.parquet",
-                "medium1.parquet",
-                "medium2.parquet",
-                "max_edge.parquet",
-            ],
+            &["min_edge.parquet", "medium1.parquet", "medium2.parquet"],
             &result,
         );
 
         for file in &result {
-            assert!(file.length >= 5 * 1024 * 1024 && file.length <= 50 * 1024 * 1024);
+            assert!(file.length >= 5 * 1024 * 1024 && file.length < 50 * 1024 * 1024);
         }
 
-        // Test min = max (exact match only)
+        // Test min = max (empty range because max is exclusive)
         let exact_strategy = SizeFilterStrategy {
             min_size: Some(10 * 1024 * 1024),
             max_size: Some(10 * 1024 * 1024),
@@ -1169,8 +1167,7 @@ mod tests {
                 .build(),
         ];
         let result = exact_strategy.filter(test_files);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].data_file_path, "exact.parquet");
+        assert_eq!(result.len(), 0);
 
         // Test min > max (invalid range - should return empty)
         let invalid_strategy = SizeFilterStrategy {

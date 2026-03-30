@@ -42,7 +42,10 @@ use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 pub mod auto;
 mod validator;
 
-pub use auto::{AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner};
+pub use auto::{
+    AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner, AutoPlanReason, AutoPlanReport,
+    AutoSelectedStrategy,
+};
 
 /// Validates that all rewrite results target the same snapshot and branch.
 ///
