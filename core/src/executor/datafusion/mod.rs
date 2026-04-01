@@ -31,8 +31,8 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, TaskWriter};
-use sqlx::types::Uuid;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
 use crate::CompactionError;
