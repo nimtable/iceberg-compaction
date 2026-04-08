@@ -38,6 +38,12 @@ pub trait CompactionExecutor: Send + Sync + 'static {
     async fn rewrite_files(&self, request: RewriteFilesRequest) -> Result<RewriteFilesResponse>;
 }
 
+#[derive(Debug, Clone)]
+pub struct TableSortOrder {
+    pub id: i64,
+    pub order: SortOrderRef,
+}
+
 pub struct RewriteFilesRequest {
     pub file_io: FileIO,
     pub schema: Arc<Schema>,
@@ -46,7 +52,7 @@ pub struct RewriteFilesRequest {
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,
     pub location_generator: DefaultLocationGenerator,
-    pub sort_order: Option<(i64, SortOrderRef)>,
+    pub sort_order: Option<TableSortOrder>,
     pub format_version: FormatVersion,
 }
 

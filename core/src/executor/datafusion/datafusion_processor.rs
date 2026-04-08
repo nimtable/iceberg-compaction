@@ -31,12 +31,14 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataContentType, FormatVersion, NestedField, PrimitiveType, Schema, SortOrderRef, Type,
+    DataContentType, FormatVersion, NestedField, PrimitiveType, Schema, SortOrderRef, Transform,
+    Type,
 };
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use crate::config::CompactionExecutionConfig;
 use crate::error::{CompactionError, Result};
+use crate::executor::TableSortOrder;
 use crate::file_selection::FileGroup;
 
 // System hidden columns used for Iceberg merge-on-read operations
@@ -165,42 +167,18 @@ impl DatafusionProcessor {
 
         let schema = plan_to_execute.schema().clone();
 
-        // Create sort expressions based on the Iceberg sort order if available
-        let sort_exprs = if let Some((_, sort_order)) = sort_order {
-            // Use Iceberg sort order to create physical sort expressions
-            let mut exprs = Vec::new();
-            for sort_field in &sort_order.fields {
-                // Find the column name from the field id
-                if let Some(field) = input_schema.field_by_id(sort_field.source_id) {
-                    // Find the column index in the physical schema
-                    if let Ok(column_index) = schema.index_of(&field.name) {
-                        let sort_options = SortOptions {
-                            descending: matches!(
-                                sort_field.direction,
-                                iceberg::spec::SortDirection::Descending
-                            ),
-                            nulls_first: matches!(
-                                sort_field.null_order,
-                                iceberg::spec::NullOrder::First
-                            ),
-                        };
-
-                        exprs.push(PhysicalSortExpr {
-                            expr: Arc::new(Column::new(&field.name, column_index)),
-                            options: sort_options,
-                        });
-                    }
-                }
-            }
-            Some(exprs)
-        } else {
-            None
-        };
+        let sort_exprs = sort_order
+            .as_ref()
+            .map(|sort_order| build_physical_sort_exprs(&input_schema, &schema, &sort_order.order))
+            .transpose()?;
 
         let plan_to_execute = match sort_exprs {
             Some(exprs) if !exprs.is_empty() => {
                 if let Some(lex_ordering) = LexOrdering::new(exprs) {
                     Arc::new(
+                        // Preserve output partitioning so each writer task keeps its own sorted
+                        // stream. The sort order metadata is per output file; we do not require
+                        // a single globally sorted stream across all output partitions.
                         SortExec::new(lex_ordering, plan_to_execute)
                             .with_preserve_partitioning(true),
                     )
@@ -215,6 +193,44 @@ impl DatafusionProcessor {
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
         Ok((batches, input_schema))
     }
+}
+
+fn build_physical_sort_exprs(
+    input_schema: &Schema,
+    physical_schema: &datafusion::arrow::datatypes::SchemaRef,
+    sort_order: &SortOrderRef,
+) -> Result<Vec<PhysicalSortExpr>> {
+    let mut exprs = Vec::new();
+
+    for sort_field in &sort_order.fields {
+        if sort_field.transform != Transform::Identity {
+            return Err(CompactionError::Execution(format!(
+                "unsupported Iceberg sort transform {:?} for field id {}; only identity sort transforms are supported",
+                sort_field.transform, sort_field.source_id
+            )));
+        }
+
+        // Find the column name from the field id.
+        if let Some(field) = input_schema.field_by_id(sort_field.source_id) {
+            // Find the column index in the physical schema.
+            if let Ok(column_index) = physical_schema.index_of(&field.name) {
+                let sort_options = SortOptions {
+                    descending: matches!(
+                        sort_field.direction,
+                        iceberg::spec::SortDirection::Descending
+                    ),
+                    nulls_first: matches!(sort_field.null_order, iceberg::spec::NullOrder::First),
+                };
+
+                exprs.push(PhysicalSortExpr {
+                    expr: Arc::new(Column::new(&field.name, column_index)),
+                    options: sort_options,
+                });
+            }
+        }
+    }
+
+    Ok(exprs)
 }
 
 pub struct DatafusionTableRegister {
@@ -535,7 +551,7 @@ pub struct DataFusionTaskContext {
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
     pub(crate) exec_sql: String,
     pub(crate) table_prefix: String,
-    pub(crate) sort_order: Option<(i64, SortOrderRef)>,
+    pub(crate) sort_order: Option<TableSortOrder>,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -544,7 +560,7 @@ pub struct DataFusionTaskContextBuilder {
     position_delete_files: Vec<FileScanTask>,
     equality_delete_files: Vec<FileScanTask>,
     table_prefix: String,
-    sort_order: Option<(i64, SortOrderRef)>,
+    sort_order: Option<TableSortOrder>,
     format_version: FormatVersion,
 }
 
@@ -559,7 +575,7 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_sort_order(mut self, sort_order: Option<(i64, SortOrderRef)>) -> Self {
+    pub fn with_sort_order(mut self, sort_order: Option<TableSortOrder>) -> Self {
         self.sort_order = sort_order;
         self
     }
@@ -1206,6 +1222,41 @@ mod tests {
             "sys_hidden_seq_num"
         );
         assert_eq!(highest_field_id, 3);
+    }
+
+    #[test]
+    fn test_build_physical_sort_exprs_rejects_non_identity_transform() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::new(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+                true,
+            ))])
+            .build()
+            .unwrap();
+        let physical_schema = schema_to_arrow_schema(&schema).unwrap();
+        let sort_order = Arc::new(
+            iceberg::spec::SortOrder::builder()
+                .with_sort_field(iceberg::spec::SortField {
+                    source_id: 1,
+                    transform: Transform::Bucket(8),
+                    direction: iceberg::spec::SortDirection::Ascending,
+                    null_order: iceberg::spec::NullOrder::First,
+                })
+                .build(&schema)
+                .unwrap(),
+        );
+
+        let error = build_physical_sort_exprs(&schema, &Arc::new(physical_schema), &sort_order)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("only identity sort transforms are supported"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

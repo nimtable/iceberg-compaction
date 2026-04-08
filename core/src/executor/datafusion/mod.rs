@@ -63,7 +63,7 @@ impl CompactionExecutor for DataFusionExecutor {
         } = request;
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
-        let sort_order_id = sort_order.clone().map(|(id, _)| id as i32);
+        let sort_order_id = sort_order.clone().map(|sort_order| sort_order.id as i32);
 
         // Extract parallelism before file_group is moved
         let executor_parallelism = file_group.executor_parallelism;

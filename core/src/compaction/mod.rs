@@ -33,7 +33,7 @@ use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
-    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
+    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
 };
 use crate::file_selection::{FileGroup, FileSelector};
@@ -614,12 +614,15 @@ impl Compaction {
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
             sort_order: {
-                let default_sort_order = table.metadata().default_sort_order_id();
+                let default_sort_order_id = table.metadata().default_sort_order_id();
                 table
                     .metadata()
-                    .sort_order_by_id(default_sort_order)
+                    .sort_order_by_id(default_sort_order_id)
                     .cloned()
-                    .map(|so| (default_sort_order, so))
+                    .map(|order| TableSortOrder {
+                        id: default_sort_order_id,
+                        order,
+                    })
             },
             format_version: table.metadata().format_version(),
         })
@@ -1381,6 +1384,7 @@ mod tests {
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1975,52 +1979,16 @@ mod tests {
         assert_eq!(result.data_files.len(), 1);
         assert_eq!(result.data_files[0].sort_order_id(), Some(1));
 
-        // Scan and print the table data after compaction
-        let final_table = env.catalog.load_table(&table_ident).await.unwrap();
-        let snapshot = final_table
-            .metadata()
-            .snapshot_for_ref(MAIN_BRANCH)
-            .unwrap();
-        let scan = final_table
-            .scan()
-            .snapshot_id(snapshot.snapshot_id())
+        // Read the compacted Parquet file directly so the assertion validates the
+        // physical row order produced by compaction rather than a query-side ORDER BY.
+        let output_file = &result.data_files[0];
+        let input_file = table.file_io().new_input(output_file.file_path()).unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(input_content)
+            .unwrap()
             .build()
             .unwrap();
-
-        // Collect file scan tasks from the stream
-        use futures::StreamExt;
-        let mut file_scan_tasks = vec![];
-        let mut task_stream = scan.plan_files().await.unwrap();
-        while let Some(task) = task_stream.next().await {
-            file_scan_tasks.push(task.unwrap());
-        }
-
-        // Use DataFusion to read the data
-        use datafusion::prelude::SessionContext;
-        use iceberg::arrow::schema_to_arrow_schema;
-
-        use crate::executor::datafusion::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
-
-        let ctx = SessionContext::new();
-        let schema = schema_to_arrow_schema(final_table.metadata().current_schema()).unwrap();
-        let provider = IcebergFileScanTaskTableProvider::new(
-            file_scan_tasks,
-            Arc::new(schema),
-            final_table.file_io().clone(),
-            false,
-            false,
-            1,
-            8192,
-            false,
-        );
-
-        ctx.register_table("compacted_table", Arc::new(provider))
-            .unwrap();
-        let df = ctx
-            .sql("SELECT * FROM compacted_table ORDER BY id")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
 
         let target_ids = [1, 1, 1, 2, 2, 2, 3, 3, 3];
         let actual_ids: Vec<_> = batches
