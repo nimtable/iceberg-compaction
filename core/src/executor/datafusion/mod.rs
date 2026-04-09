@@ -57,11 +57,12 @@ impl CompactionExecutor for DataFusionExecutor {
             partition_spec,
             metrics_recorder,
             location_generator,
+            sort_order,
             format_version,
         } = request;
-
         let mut stats = RewriteFilesStat::default();
         stats.record_input(&file_group);
+        let sort_order_id = sort_order.clone().map(|sort_order| sort_order.id as i32);
 
         // Extract parallelism before file_group is moved
         let executor_parallelism = file_group.executor_parallelism;
@@ -71,6 +72,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_schema(schema.clone())
             .with_format_version(format_version)
             .with_input_data_files(file_group)
+            .with_sort_order(sort_order.clone())
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),
@@ -100,6 +102,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     schema,
                     file_io,
                     partition_spec,
+                    sort_order_id,
                     execution_config,
                 )?;
 
@@ -134,8 +137,7 @@ impl CompactionExecutor for DataFusionExecutor {
                     fetch_batch_start = Instant::now(); // Reset for next batch
                 }
 
-                let data_files = data_file_writer.close().await?;
-                Ok(data_files)
+                Ok(data_file_writer.close().await?)
             });
             futures.push(future);
         }
@@ -164,6 +166,7 @@ pub fn build_iceberg_data_file_writer(
     schema: Arc<Schema>,
     file_io: FileIO,
     partition_spec: Arc<PartitionSpec>,
+    sort_order_id: Option<i32>,
     execution_config: Arc<CompactionExecutionConfig>,
 ) -> Result<Box<dyn IcebergWriter>> {
     let target_file_size =
@@ -196,7 +199,7 @@ pub fn build_iceberg_data_file_writer(
         )
         .with_max_concurrent_closes(execution_config.max_concurrent_closes);
 
-        DataFileWriterBuilder::new(rolling_writer_builder)
+        DataFileWriterBuilder::new(rolling_writer_builder).sort_order_id(sort_order_id)
     };
 
     let partition_splitter = if partition_spec.is_unpartitioned() {

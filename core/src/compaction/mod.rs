@@ -33,7 +33,7 @@ use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
-    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat,
+    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
 };
 use crate::file_selection::{FileGroup, FileSelector};
@@ -616,6 +616,17 @@ impl Compaction {
             location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
             metrics_recorder: Some(metrics_recorder),
+            sort_order: {
+                let default_sort_order_id = table.metadata().default_sort_order_id();
+                table
+                    .metadata()
+                    .sort_order_by_id(default_sort_order_id)
+                    .cloned()
+                    .map(|order| TableSortOrder {
+                        id: default_sort_order_id,
+                        order,
+                    })
+            },
             format_version: table.metadata().format_version(),
         })
     }
@@ -1376,6 +1387,7 @@ mod tests {
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1927,6 +1939,74 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    /// Test compaction with sort order to verify data is sorted correctly
+    #[tokio::test]
+    async fn test_compaction_with_sort_order() {
+        let env = create_test_env().await;
+        let namespace_ident = NamespaceIdent::new("test_namespace2".into());
+        create_namespace(env.catalog.as_ref(), &namespace_ident).await;
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table_order".into());
+
+        let sort_order = iceberg::spec::SortOrder::builder()
+            .with_sort_field(iceberg::spec::SortField {
+                source_id: 1,
+                transform: iceberg::spec::Transform::Identity,
+                direction: iceberg::spec::SortDirection::Ascending,
+                null_order: iceberg::spec::NullOrder::First,
+            })
+            .build(&simple_table_schema())
+            .unwrap();
+        let _ = env
+            .catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .sort_order(sort_order)
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = env.catalog.load_table(&table_ident).await.unwrap();
+
+        let data_files = write_simple_files(&env.table, &env.warehouse_location, "test", 3).await;
+        let _updated_table = append_and_commit(&table, env.catalog.as_ref(), data_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), table_ident.clone());
+        let result = compaction.compact().await.unwrap().unwrap();
+
+        assert_eq!(result.data_files.len(), 1);
+        assert_eq!(result.data_files[0].sort_order_id(), Some(1));
+
+        // Read the compacted Parquet file directly so the assertion validates the
+        // physical row order produced by compaction rather than a query-side ORDER BY.
+        let output_file = &result.data_files[0];
+        let input_file = table.file_io().new_input(output_file.file_path()).unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(input_content)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+
+        let target_ids = [1, 1, 1, 2, 2, 2, 3, 3, 3];
+        let actual_ids: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.unwrap())
+            })
+            .collect();
+        assert_eq!(actual_ids, target_ids);
     }
 
     /// Test the `plan_compaction` functionality
