@@ -21,18 +21,6 @@ mixtrics = "0.2.0"
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 rand = { workspace = true }
-sqlx = { version = "0.8.2", default-features = false, features = [
-	"bigdecimal",
-	"chrono",
-	"json",
-	"mysql",
-	"postgres",
-	"runtime-tokio-native-tls",
-	"rust_decimal",
-	"sqlite",
-	"time",
-	"uuid",
-] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

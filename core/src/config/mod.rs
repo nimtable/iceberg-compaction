@@ -16,6 +16,8 @@
 
 //! Compaction configuration types and constants.
 
+use std::num::NonZeroUsize;
+
 use derive_builder::Builder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -41,6 +43,7 @@ pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetch
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
 pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
+pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: NonZeroUsize = NonZeroUsize::MAX;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
@@ -360,10 +363,32 @@ pub struct CompactionExecutionConfig {
     #[builder(default = "DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS")]
     pub enable_normalized_column_identifiers: bool,
 
+    /// Deprecated: this setting is no longer used after switching to the upstream
+    /// `RollingFileWriter`.
+    ///
+    /// It remains temporarily for backward compatibility and will be removed in a
+    /// future change.
+    #[deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
+    )]
     #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
+    #[builder_setter_attr(deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
+    ))]
     pub enable_dynamic_size_estimation: bool,
 
+    /// Deprecated: this setting is no longer used after switching to the upstream
+    /// `RollingFileWriter`.
+    ///
+    /// It remains temporarily for backward compatibility and will be removed in a
+    /// future change.
+    #[deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
+    )]
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
+    #[builder_setter_attr(deprecated(
+        note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
+    ))]
     pub size_estimation_smoothing_factor: f64,
 
     /// Maximum concurrent compaction plans in `compact()` method.
@@ -372,7 +397,7 @@ pub struct CompactionExecutionConfig {
     /// (`plan_compaction()` → `rewrite_plan()` → `commit_rewrite_results()`) manages
     /// concurrency externally.
     ///
-    /// Theoretical max parallelism = `max_parallelism` × `max_concurrent_compaction_plans`.
+    /// Theoretical max read parallelism = `max_input_parallelism` × `max_concurrent_compaction_plans`.
     /// Actual parallelism is typically lower due to per-plan heuristics.
     #[builder(default = "DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS")]
     pub max_concurrent_compaction_plans: usize,
@@ -436,37 +461,26 @@ impl Default for CompactionConfig {
 pub struct AutoThresholds {
     /// Minimum small file count to trigger `SmallFiles` strategy.
     pub min_small_files_count: usize,
-    /// Minimum delete file count to trigger `FilesWithDeletes` strategy.
-    pub min_files_with_deletes_count: usize,
-    /// Minimum impact ratio (fraction of total files). None = disabled.
-    pub min_impact_ratio: Option<f64>,
+    /// Minimum delete-heavy data file count to trigger `FilesWithDeletes` strategy.
+    pub min_delete_heavy_files_count: usize,
 }
 
 impl Default for AutoThresholds {
     fn default() -> Self {
         Self {
             min_small_files_count: DEFAULT_MIN_SMALL_FILES_COUNT,
-            min_files_with_deletes_count: DEFAULT_MIN_FILES_WITH_DELETES_COUNT,
-            min_impact_ratio: None,
+            min_delete_heavy_files_count: DEFAULT_MIN_FILES_WITH_DELETES_COUNT,
         }
     }
 }
 
-// TODO: Consider supporting custom strategy order in the future.
-
 /// Automatic strategy selection based on snapshot statistics.
-///
-/// Priority: `FilesWithDeletes` → `SmallFiles` → `Full` (if enabled).
 #[derive(Builder, Debug, Clone)]
 #[builder(setter(into, strip_option))]
 pub struct AutoCompactionConfig {
     /// Strategy selection thresholds.
     #[builder(default)]
     pub thresholds: AutoThresholds,
-
-    /// Fallback to Full when no specialized strategy matches.
-    #[builder(default = "true")]
-    pub enable_full_fallback: bool,
 
     /// Common planning parameters applied to all selected strategies
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
@@ -501,47 +515,63 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
+    /// Maximum number of compaction plans to execute per auto-compaction run.
+    /// Defaults to unlimited.
+    #[builder(default = "DEFAULT_MAX_AUTO_PLANS_PER_RUN")]
+    pub max_auto_plans_per_run: NonZeroUsize,
+
     #[builder(default)]
     pub execution: CompactionExecutionConfig,
 }
 
 impl AutoCompactionConfig {
-    /// Selects strategy based on snapshot statistics.
-    pub fn resolve(&self, stats: &SnapshotStats) -> Option<CompactionPlanningConfig> {
+    pub(crate) fn files_with_deletes_candidate(
+        &self,
+        stats: &SnapshotStats,
+    ) -> Option<CompactionPlanningConfig> {
         if stats.total_data_files <= 1 {
             return None;
         }
 
-        let total = stats.total_data_files as f64;
-
-        if stats.files_with_deletes_count >= self.thresholds.min_files_with_deletes_count
-            && self
-                .thresholds
-                .min_impact_ratio
-                .is_none_or(|min| stats.files_with_deletes_count as f64 / total >= min)
+        if self.min_delete_file_count_threshold == 0
+            || self.thresholds.min_delete_heavy_files_count == 0
         {
-            return Some(CompactionPlanningConfig::FilesWithDeletes(
+            return None;
+        }
+
+        if stats.delete_heavy_files_count >= self.thresholds.min_delete_heavy_files_count {
+            Some(CompactionPlanningConfig::FilesWithDeletes(
                 FilesWithDeletesConfig {
                     target_file_size_bytes: self.target_file_size_bytes,
                     min_size_per_partition: self.min_size_per_partition,
                     max_file_count_per_partition: self.max_file_count_per_partition,
+                    max_input_parallelism: self.max_input_parallelism,
+                    max_output_parallelism: self.max_output_parallelism,
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
                     group_filters: self.group_filters.clone(),
-                    max_input_parallelism: self.max_input_parallelism,
-                    max_output_parallelism: self.max_output_parallelism,
                 },
-            ));
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn small_files_candidate(
+        &self,
+        stats: &SnapshotStats,
+    ) -> Option<CompactionPlanningConfig> {
+        if stats.total_data_files <= 1 {
+            return None;
         }
 
-        if stats.small_files_count >= self.thresholds.min_small_files_count
-            && self
-                .thresholds
-                .min_impact_ratio
-                .is_none_or(|min| stats.small_files_count as f64 / total >= min)
-        {
-            return Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+        if self.thresholds.min_small_files_count == 0 {
+            return None;
+        }
+
+        if stats.small_files_count >= self.thresholds.min_small_files_count {
+            Some(CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
                 target_file_size_bytes: self.target_file_size_bytes,
                 min_size_per_partition: self.min_size_per_partition,
                 max_file_count_per_partition: self.max_file_count_per_partition,
@@ -551,22 +581,10 @@ impl AutoCompactionConfig {
                 small_file_threshold_bytes: self.small_file_threshold_bytes,
                 grouping_strategy: self.grouping_strategy.clone(),
                 group_filters: self.group_filters.clone(),
-            }));
+            }))
+        } else {
+            None
         }
-
-        if self.enable_full_fallback {
-            return Some(CompactionPlanningConfig::Full(FullCompactionConfig {
-                target_file_size_bytes: self.target_file_size_bytes,
-                min_size_per_partition: self.min_size_per_partition,
-                max_file_count_per_partition: self.max_file_count_per_partition,
-                max_input_parallelism: self.max_input_parallelism,
-                max_output_parallelism: self.max_output_parallelism,
-                enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
-                grouping_strategy: self.grouping_strategy.clone(),
-            }));
-        }
-
-        None
     }
 }
 
@@ -586,136 +604,118 @@ mod tests {
     fn create_test_stats(
         total_data_files: usize,
         small_files: usize,
-        files_with_deletes: usize,
+        delete_heavy_files: usize,
     ) -> SnapshotStats {
         SnapshotStats {
             total_data_files,
             small_files_count: small_files,
-            files_with_deletes_count: files_with_deletes,
+            delete_heavy_files_count: delete_heavy_files,
         }
     }
 
     #[test]
-    fn test_resolve_strategy_priority() {
+    fn test_files_with_deletes_candidate_threshold() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 3,
+                min_delete_heavy_files_count: 3,
                 min_small_files_count: 5,
-                min_impact_ratio: None,
             })
             .build()
             .unwrap();
 
-        // Priority 1: FilesWithDeletes wins when both thresholds met
+        // Threshold met -> delete candidate is available.
         let stats = create_test_stats(10, 6, 4);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.files_with_deletes_candidate(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
-        // Priority 2: SmallFiles when only it meets threshold
+        // Below delete threshold -> no delete candidate
         let stats = create_test_stats(10, 6, 2);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_candidates_return_none_for_small_tables() {
+        let config = AutoCompactionConfigBuilder::default().build().unwrap();
+
+        // Empty table
+        assert!(
+            config
+                .files_with_deletes_candidate(&create_test_stats(0, 0, 0))
+                .is_none()
+        );
+        assert!(
+            config
+                .small_files_candidate(&create_test_stats(0, 0, 0))
+                .is_none()
+        );
+
+        // Single file
+        assert!(
+            config
+                .files_with_deletes_candidate(&create_test_stats(1, 0, 0))
+                .is_none()
+        );
+        assert!(
+            config
+                .small_files_candidate(&create_test_stats(1, 0, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_auto_default_budget_is_unbounded() {
+        let config = AutoCompactionConfig::default();
+        assert_eq!(config.max_auto_plans_per_run, NonZeroUsize::MAX);
+    }
+
+    #[test]
+    fn test_candidates_ignore_table_wide_ratio() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 5,
+                min_small_files_count: 5,
+            })
+            .build()
+            .unwrap();
+
+        // Low table-wide ratio still qualifies once absolute threshold is met.
+        let stats = create_test_stats(10000, 100, 50);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.files_with_deletes_candidate(&stats).unwrap(),
+            CompactionPlanningConfig::FilesWithDeletes(_)
+        ));
+        assert!(matches!(
+            config.small_files_candidate(&stats).unwrap(),
             CompactionPlanningConfig::SmallFiles(_)
         ));
 
-        // Priority 3: Full when no threshold met but fallback enabled
-        let stats = create_test_stats(10, 2, 1);
+        // Larger counts continue to qualify.
+        let stats = create_test_stats(1000, 0, 400);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
-        ));
-    }
-
-    #[test]
-    fn test_resolve_returns_none() {
-        let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(false)
-            .build()
-            .unwrap();
-
-        // Empty table
-        assert!(config.resolve(&create_test_stats(0, 0, 0)).is_none());
-
-        // Single file
-        assert!(config.resolve(&create_test_stats(1, 0, 0)).is_none());
-
-        // Multiple files but no threshold met and fallback disabled
-        assert!(config.resolve(&create_test_stats(5, 2, 0)).is_none());
-    }
-
-    #[test]
-    fn test_resolve_fallback_behavior() {
-        // Use stats that don't meet default thresholds
-        let stats = create_test_stats(10, 2, 0);
-
-        // Fallback enabled -> Full
-        let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(true)
-            .build()
-            .unwrap();
-        assert!(matches!(
-            config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
-        ));
-
-        // Fallback disabled -> None
-        let config = AutoCompactionConfigBuilder::default()
-            .enable_full_fallback(false)
-            .build()
-            .unwrap();
-        assert!(config.resolve(&stats).is_none());
-    }
-
-    #[test]
-    fn test_resolve_impact_ratio() {
-        let config = AutoCompactionConfigBuilder::default()
-            .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 5,
-                min_small_files_count: 5,
-                min_impact_ratio: Some(0.10),
-            })
-            .enable_full_fallback(true)
-            .build()
-            .unwrap();
-
-        // Low impact (0.5%) -> fallback to Full
-        let stats = create_test_stats(10000, 100, 50);
-        assert!(matches!(
-            config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
-        ));
-
-        // High impact (80%) -> use specialized strategy
-        let stats = create_test_stats(1000, 100, 800);
-        assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.files_with_deletes_candidate(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
-        // At boundary (10%) -> use specialized strategy
-        let stats = create_test_stats(100, 5, 10);
+        // Absolute threshold still controls eligibility.
+        let stats = create_test_stats(100, 0, 10);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.files_with_deletes_candidate(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
-        // Below boundary (9%) -> fallback to Full
-        let stats = create_test_stats(100, 5, 9);
-        assert!(matches!(
-            config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
-        ));
+        // Below threshold -> no candidate
+        let stats = create_test_stats(100, 0, 4);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
     }
 
     #[test]
-    fn test_resolve_threshold_boundaries() {
+    fn test_small_files_candidate_threshold_boundaries() {
         let config = AutoCompactionConfigBuilder::default()
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 3,
+                min_delete_heavy_files_count: 3,
                 min_small_files_count: 5,
-                min_impact_ratio: None,
             })
             .build()
             .unwrap();
@@ -723,45 +723,115 @@ mod tests {
         // At delete threshold (exactly 3)
         let stats = create_test_stats(10, 0, 3);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.files_with_deletes_candidate(&stats).unwrap(),
             CompactionPlanningConfig::FilesWithDeletes(_)
         ));
 
         // At small files threshold (exactly 5)
         let stats = create_test_stats(10, 5, 2);
         assert!(matches!(
-            config.resolve(&stats).unwrap(),
+            config.small_files_candidate(&stats).unwrap(),
             CompactionPlanningConfig::SmallFiles(_)
         ));
 
-        // Below both thresholds
+        // Below small-files threshold
         let stats = create_test_stats(10, 2, 1);
-        assert!(matches!(
-            config.resolve(&stats).unwrap(),
-            CompactionPlanningConfig::Full(_)
-        ));
+        assert!(config.small_files_candidate(&stats).is_none());
     }
 
     #[test]
-    fn test_resolve_propagates_config() {
+    fn test_delete_candidate_propagates_config() {
         let config = AutoCompactionConfigBuilder::default()
             .target_file_size_bytes(1_000_000_u64)
             .max_input_parallelism(8_usize)
+            .max_output_parallelism(6_usize)
             .thresholds(AutoThresholds {
-                min_files_with_deletes_count: 2,
+                min_delete_heavy_files_count: 2,
                 min_small_files_count: 10,
-                min_impact_ratio: None,
             })
             .build()
             .unwrap();
 
         let stats = create_test_stats(10, 1, 3);
-        let CompactionPlanningConfig::FilesWithDeletes(cfg) = config.resolve(&stats).unwrap()
+        let CompactionPlanningConfig::FilesWithDeletes(cfg) =
+            config.files_with_deletes_candidate(&stats).unwrap()
         else {
             panic!("Expected FilesWithDeletes");
         };
 
         assert_eq!(cfg.target_file_size_bytes, 1_000_000);
         assert_eq!(cfg.max_input_parallelism, 8);
+        assert_eq!(cfg.max_output_parallelism, 6);
+    }
+
+    #[test]
+    fn test_files_with_deletes_candidate_preserves_group_filters() {
+        let config = AutoCompactionConfigBuilder::default()
+            .group_filters(GroupFilters {
+                min_group_size_bytes: Some(123_u64),
+                min_group_file_count: Some(7_usize),
+            })
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: usize::MAX,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 1);
+        let CompactionPlanningConfig::FilesWithDeletes(cfg) =
+            config.files_with_deletes_candidate(&stats).unwrap()
+        else {
+            panic!("Expected FilesWithDeletes");
+        };
+
+        let gf = cfg
+            .group_filters
+            .expect("Auto should propagate group filters");
+        assert_eq!(gf.min_group_size_bytes, Some(123_u64));
+        assert_eq!(gf.min_group_file_count, Some(7_usize));
+    }
+
+    #[test]
+    fn test_files_with_deletes_candidate_is_disabled_when_delete_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .min_delete_file_count_threshold(0_usize)
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: usize::MAX,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 10);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_files_with_deletes_candidate_is_disabled_when_auto_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 0,
+                min_small_files_count: usize::MAX,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 0, 10);
+        assert!(config.files_with_deletes_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_small_files_candidate_is_disabled_when_auto_threshold_is_zero() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: usize::MAX,
+                min_small_files_count: 0,
+            })
+            .build()
+            .unwrap();
+
+        let stats = create_test_stats(10, 10, 0);
+        assert!(config.small_files_candidate(&stats).is_none());
     }
 }

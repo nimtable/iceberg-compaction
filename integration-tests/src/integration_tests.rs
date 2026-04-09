@@ -16,10 +16,11 @@
 
 //! Integration tests that require Docker containers
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use iceberg::spec::{PrimitiveType, Schema, UnboundPartitionSpec};
+use iceberg::spec::{PrimitiveLiteral, PrimitiveType, Schema, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg_compaction_core::compaction::CompactionBuilder;
@@ -545,10 +546,31 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
         "Compaction input should be around the expected number of files"
     );
 
+    let mut output_files_per_partition = BTreeMap::new();
+    for data_file in &compaction_result.data_files {
+        let partition_value = data_file.partition().fields()[0]
+            .as_ref()
+            .expect("partition value should not be null")
+            .as_primitive_literal()
+            .expect("expected primitive partition literal");
+
+        let bucket = match partition_value {
+            PrimitiveLiteral::Int(value) => value as i64,
+            PrimitiveLiteral::Long(value) => value,
+            other => panic!("expected bucket partition value, got {other:?}"),
+        };
+
+        *output_files_per_partition.entry(bucket).or_insert(0_usize) += 1;
+    }
+
     assert_eq!(
-        partition_bucket_n * 4, // 20 total
-        compaction_result.stats.output_files_count,
-        "Compaction should produce 4 files per partition"
+        partition_bucket_n,
+        output_files_per_partition.len(),
+        "Compaction should produce files for every partition bucket"
+    );
+    assert!(
+        output_files_per_partition.values().all(|count| *count == 3),
+        "Compaction should produce exactly 3 files per partition with upstream rolling: {output_files_per_partition:?}"
     );
 
     // Clean up: try to drop the table and namespace

@@ -31,14 +31,13 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, TaskWriter};
-use sqlx::types::Uuid;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
 use crate::CompactionError;
 use crate::config::CompactionExecutionConfig;
 use crate::error::Result;
-use crate::executor::iceberg_writer::rolling_iceberg_writer;
 pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
@@ -170,6 +169,14 @@ pub fn build_iceberg_data_file_writer(
     sort_order_id: Option<i32>,
     execution_config: Arc<CompactionExecutionConfig>,
 ) -> Result<Box<dyn IcebergWriter>> {
+    let target_file_size =
+        usize::try_from(execution_config.target_file_size_bytes).map_err(|_| {
+            CompactionError::Config(format!(
+                "target_file_size_bytes {} exceeds platform usize",
+                execution_config.target_file_size_bytes
+            ))
+        })?;
+
     let data_file_builder = {
         let parquet_writer_builder = ParquetWriterBuilder::new(
             execution_config.write_parquet_properties.clone(),
@@ -183,26 +190,17 @@ pub fn build_iceberg_data_file_writer(
             iceberg::spec::DataFileFormat::Parquet,
         );
 
-        // Noop wrapper for `DataFileWriterBuilder`
         let rolling_writer_builder = RollingFileWriterBuilder::new(
             parquet_writer_builder,
-            usize::MAX, // No rolling based on row count
+            target_file_size,
             file_io,
             location_generator,
             file_name_generator,
-        );
+        )
+        .with_max_concurrent_closes(execution_config.max_concurrent_closes);
 
         DataFileWriterBuilder::new(rolling_writer_builder).sort_order_id(sort_order_id)
     };
-
-    let rolling_iceberg_writer_builder =
-        rolling_iceberg_writer::RollingIcebergWriterBuilder::new(data_file_builder)
-            .with_target_file_size(execution_config.target_file_size_bytes)
-            .with_max_concurrent_closes(execution_config.max_concurrent_closes)
-            .with_dynamic_size_estimation(execution_config.enable_dynamic_size_estimation)
-            .with_size_estimation_smoothing_factor(
-                execution_config.size_estimation_smoothing_factor,
-            );
 
     let partition_splitter = if partition_spec.is_unpartitioned() {
         None
@@ -214,7 +212,7 @@ pub fn build_iceberg_data_file_writer(
     };
 
     let iceberg_task_writer = TaskWriter::new_with_partition_splitter(
-        rolling_iceberg_writer_builder,
+        data_file_builder,
         true,
         schema,
         partition_spec,
