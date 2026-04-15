@@ -102,7 +102,7 @@ impl RecordBatchBuffer {
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
     file_scan_tasks_group: Vec<Vec<FileScanTask>>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
     file_io: FileIO,
@@ -174,16 +174,16 @@ impl IcebergFileTaskScan {
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef, partitioning_size: usize) -> PlanProperties {
+    fn compute_properties(schema: ArrowSchemaRef, partitioning_size: usize) -> Arc<PlanProperties> {
         // TODO:
         // This is more or less a placeholder, to be replaced
         // once we support output-partitioning
-        PlanProperties::new(
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(partitioning_size),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        )
+        ))
     }
 }
 
@@ -277,7 +277,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
