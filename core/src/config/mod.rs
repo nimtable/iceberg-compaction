@@ -82,9 +82,10 @@ impl Default for BinPackConfig {
 ///
 /// This determines the grouping algorithm only. Group filtering is handled
 /// separately by [`GroupFilters`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum GroupingStrategy {
     /// Put all files into a single group.
+    #[default]
     Single,
     /// Group files using bin-packing algorithm to target a specific group size.
     BinPack(BinPackConfig),
@@ -101,12 +102,6 @@ pub struct GroupFilters {
     pub min_group_size_bytes: Option<u64>,
     /// Minimum number of files for a group to be included.
     pub min_group_file_count: Option<usize>,
-}
-
-impl Default for GroupingStrategy {
-    fn default() -> Self {
-        Self::Single
-    }
 }
 
 /// Configuration for small files compaction strategy.
