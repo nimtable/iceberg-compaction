@@ -30,6 +30,9 @@ pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
 pub const DEFAULT_VALIDATE_COMPACTION: bool = false;
 pub const DEFAULT_MAX_RECORD_BATCH_ROWS: usize = 1024;
 pub const DEFAULT_MAX_CONCURRENT_CLOSES: usize = 4;
+// Match Iceberg's default parquet row-group size:
+// https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/TableProperties.java
+pub const DEFAULT_MAX_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 pub const DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS: bool = true;
 pub const DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION: bool = false;
 pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
@@ -254,10 +257,11 @@ impl Default for FilesWithDeletesConfig {
     }
 }
 
-/// Helper for default `WriterProperties` (SNAPPY compression).
+/// Helper for default `WriterProperties` (ZSTD compression).
 fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_bytes(Some(DEFAULT_MAX_ROW_GROUP_BYTES))
         .set_created_by(
             concat!("iceberg-compaction version ", env!("CARGO_PKG_VERSION")).to_owned(),
         )
@@ -593,6 +597,8 @@ impl Default for AutoCompactionConfig {
 
 #[cfg(test)]
 mod tests {
+    use parquet::schema::types::ColumnPath;
+
     use super::*;
     use crate::file_selection::SnapshotStats;
 
@@ -663,6 +669,21 @@ mod tests {
     fn test_auto_default_budget_is_unbounded() {
         let config = AutoCompactionConfig::default();
         assert_eq!(config.max_auto_plans_per_run, NonZeroUsize::MAX);
+    }
+
+    #[test]
+    fn test_execution_default_sets_max_row_group_bytes() {
+        let config = CompactionExecutionConfig::default();
+        assert_eq!(
+            config.write_parquet_properties.max_row_group_bytes(),
+            Some(DEFAULT_MAX_ROW_GROUP_BYTES)
+        );
+        assert_eq!(
+            config
+                .write_parquet_properties
+                .compression(&ColumnPath::new(vec![])),
+            Compression::ZSTD(Default::default())
+        );
     }
 
     #[test]
