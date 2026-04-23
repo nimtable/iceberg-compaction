@@ -97,7 +97,9 @@ impl<B> SharedIcebergWriterBuilder<B> {
 
 #[async_trait::async_trait]
 impl<B, I, O> IcebergWriterBuilder<I, O> for SharedIcebergWriterBuilder<B>
-where B: IcebergWriterBuilder<I, O>
+where
+    B: IcebergWriterBuilder<I, O>,
+    I: Send + 'static,
 {
     type R = B::R;
 
