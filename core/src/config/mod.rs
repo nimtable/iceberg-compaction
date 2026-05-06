@@ -417,6 +417,25 @@ pub struct CompactionExecutionConfig {
     /// **Note**: This is currently experimental and may not be stable.
     #[builder(default = "DEFAULT_ENABLE_PREFETCH")]
     pub enable_prefetch: bool,
+
+    /// Optional bound on `DataFusion`'s session memory pool, in bytes.
+    ///
+    /// When `Some(bytes)`, the [`SessionContext`](datafusion::prelude::SessionContext)
+    /// is constructed with a [`FairSpillPool`](datafusion::execution::memory_pool::FairSpillPool)
+    /// of `bytes` capacity, so high-cardinality compactions spill to disk
+    /// instead of consuming unbounded heap. This is the recommended setting
+    /// when running compaction inside a memory-constrained container — pair
+    /// it with the operator's cgroup memory limit (typical: 0.75 × limit).
+    ///
+    /// When `None` (default), the upstream behavior is preserved:
+    /// `DataFusion` allocates without a pool ceiling and relies on the OS
+    /// / cgroup to reap the process on memory exhaustion.
+    ///
+    /// Spill files are written under [`std::env::temp_dir`] by
+    /// `DataFusion`'s default `DiskManager`; ensure the runtime has enough
+    /// ephemeral storage for the working set.
+    #[builder(default)]
+    pub memory_pool_bytes: Option<u64>,
 }
 
 impl Default for CompactionExecutionConfig {
