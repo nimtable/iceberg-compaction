@@ -78,7 +78,7 @@ impl CompactionExecutor for DataFusionExecutor {
             execution_config.clone(),
             executor_parallelism,
             file_io.clone(),
-        )
+        )?
         .execute(datafusion_task_ctx, output_parallelism)
         .await?;
         let arc_input_schema = Arc::new(input_schema);
