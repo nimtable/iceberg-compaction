@@ -1,0 +1,23 @@
+core/src/compaction/mod.rs
+  8f9963abe0a142ec 739,744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "895a5752b751de8d549319ea45f3c60c57f7457b",
+  "prompts": {
+    "8f9963abe0a142ec": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1b3da15d3ffe59zKa6kd1hPxax",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "volodymyr",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 6,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  }
+}
