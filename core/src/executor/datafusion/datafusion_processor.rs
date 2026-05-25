@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
@@ -58,7 +60,7 @@ impl DatafusionProcessor {
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
-    ) -> Self {
+    ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
             .with_batch_size(execution_config.max_record_batch_rows)
@@ -66,7 +68,29 @@ impl DatafusionProcessor {
                 "datafusion.sql_parser.enable_ident_normalization",
                 execution_config.enable_normalized_column_identifiers,
             );
-        let ctx = Arc::new(SessionContext::new_with_config(session_config));
+        // When the operator caps DataFusion's session memory pool, install a
+        // `FairSpillPool` with that capacity so spillable operators (sort,
+        // hash aggregation, repartition) bound peak heap use and spill to
+        // `std::env::temp_dir` instead of OOMing the process. Without a pool
+        // configured, DataFusion runs unbounded and relies on the OS / cgroup
+        // reaper, which is exactly the failure mode this knob exists to avoid.
+        let ctx = if let Some(pool_bytes) = execution_config.memory_pool_bytes {
+            let pool = Arc::new(FairSpillPool::new(pool_bytes as usize));
+            let runtime_env = RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .build_arc()
+                .map_err(|e| {
+                    CompactionError::Config(format!(
+                        "failed to build datafusion runtime env with memory_pool_bytes={pool_bytes}: {e}"
+                    ))
+                })?;
+            Arc::new(SessionContext::new_with_config_rt(
+                session_config,
+                runtime_env,
+            ))
+        } else {
+            Arc::new(SessionContext::new_with_config(session_config))
+        };
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
@@ -75,10 +99,10 @@ impl DatafusionProcessor {
             execution_config.enable_prefetch,
         );
 
-        Self {
+        Ok(Self {
             table_register,
             ctx,
-        }
+        })
     }
 
     /// Registers all necessary tables (data files, position deletes, equality deletes) with `DataFusion`
@@ -909,6 +933,7 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
+    use crate::config::CompactionExecutionConfigBuilder;
     use crate::executor::datafusion::datafusion_processor::table_name::{
         DATA_FILE_TABLE, POSITION_DELETE_TABLE,
     };
@@ -1869,5 +1894,55 @@ mod tests {
             let result = quote_identifier(input);
             assert_eq!(result, expected);
         }
+    }
+
+    /// `memory_pool_bytes = None` keeps upstream behavior — the
+    /// `SessionContext` is constructed without a configured pool and
+    /// `DatafusionProcessor::new` returns `Ok`.
+    #[test]
+    fn test_datafusion_processor_default_pool_none() {
+        let cfg = Arc::new(CompactionExecutionConfig::default());
+        let file_io = iceberg::io::FileIOBuilder::new("memory")
+            .build()
+            .expect("memory FileIO must build");
+        let processor = DatafusionProcessor::new(cfg, 1, file_io);
+        assert!(processor.is_ok(), "default config should build cleanly");
+    }
+
+    /// `memory_pool_bytes = Some(N)` plumbs through to a `FairSpillPool`
+    /// of capacity `N`. We assert via `runtime_env().memory_pool().pool_size()`,
+    /// which `FairSpillPool` reports as the configured cap.
+    #[test]
+    fn test_datafusion_processor_memory_pool_bytes_plumbs_through() {
+        const POOL_BYTES: u64 = 64 * 1024 * 1024;
+        let cfg = Arc::new(
+            CompactionExecutionConfigBuilder::default()
+                .memory_pool_bytes(Some(POOL_BYTES))
+                .build()
+                .expect("config builds"),
+        );
+        let file_io = iceberg::io::FileIOBuilder::new("memory")
+            .build()
+            .expect("memory FileIO must build");
+        let processor = DatafusionProcessor::new(cfg, 1, file_io)
+            .expect("memory_pool_bytes path must construct cleanly");
+        let pool = processor.ctx.runtime_env().memory_pool.clone();
+        // `MemoryPool::reserved()` is 0 on a fresh pool but `pool_size()` is
+        // not on the trait. Reserve the full cap and verify the limit holds:
+        // a bytes+1 reservation past the cap must error.
+        let consumer =
+            datafusion::execution::memory_pool::MemoryConsumer::new("test").register(&pool);
+        let _ = consumer; // hold the consumer so reservations are tracked
+        let mut reservation =
+            datafusion::execution::memory_pool::MemoryConsumer::new("test_res").register(&pool);
+        // try_grow takes &mut self; keeping the binding mutable.
+        let _ = &mut reservation;
+        reservation
+            .try_grow(POOL_BYTES as usize)
+            .expect("grow up to cap succeeds");
+        assert!(
+            reservation.try_grow(1).is_err(),
+            "growing past pool cap must error — confirms FairSpillPool with the configured size"
+        );
     }
 }
