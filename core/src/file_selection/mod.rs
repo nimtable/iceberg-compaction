@@ -30,7 +30,7 @@ pub struct SnapshotStats {
     pub delete_heavy_files_count: usize,
 }
 pub use packer::ListPacker;
-pub use strategy::{FileGroup, PlanStrategy};
+pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
