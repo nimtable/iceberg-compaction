@@ -736,15 +736,12 @@ async fn get_all_files_from_snapshot(
     file_io: &FileIO,
     table_metadata: &iceberg::spec::TableMetadata,
 ) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, table_metadata)
-        .await
-        .unwrap();
+    let manifest_list = snapshot.load_manifest_list(file_io, table_metadata).await?;
 
     let mut data_file = vec![];
     let mut delete_file = vec![];
     for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(file_io).await.unwrap();
+        let a = manifest_file.load_manifest(file_io).await?;
         let (entry, _) = a.into_parts();
         for i in entry {
             match i.content_type() {
