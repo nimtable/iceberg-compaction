@@ -18,7 +18,8 @@
 //!
 //! Implements a three-stage pipeline:
 //! 1. File filters: Exclude files by size, delete count, or minimum file threshold
-//! 2. Grouping: Combine files using Single (all-in-one) or `BinPack` (First-Fit Decreasing)
+//! 2. Grouping: Choose a file-group scope, then combine files using Single
+//!    (all-in-one) or `BinPack` (First-Fit Decreasing)
 //! 3. Group filters: Remove groups below size/count thresholds
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{CompactionPlanningConfig, GroupingStrategy, SPLIT_OVERHEAD};
+use crate::config::{CompactionPlanningConfig, FileGroupScope, GroupingStrategy, SPLIT_OVERHEAD};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -388,16 +389,26 @@ pub enum GroupingStrategyEnum {
 }
 
 impl GroupingStrategyEnum {
+    /// Groups files independently within each Iceberg partition.
+    ///
+    /// This preserves the historical public API behavior. Use [`PlanStrategy`]
+    /// with [`FileGroupScope::Table`] when the grouping strategy should see
+    /// all selected files together.
     pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
-    where I: Iterator<Item = FileScanTask> {
-        // Note that if the table is unpartitioned, the hash map will have a single entry.
-        group_files_by_partition(data_files)
-            .into_iter()
-            .flat_map(|(_partition_key, files)| match self {
-                GroupingStrategyEnum::Single(strategy) => strategy.group_files(files.into_iter()),
-                GroupingStrategyEnum::BinPack(strategy) => strategy.group_files(files.into_iter()),
-            })
+    where I: IntoIterator<Item = FileScanTask> {
+        group_files_by_partition(data_files.into_iter())
+            .into_values()
+            .flat_map(|files| self.group_files_without_partitioning(files))
             .collect()
+    }
+
+    fn group_files_without_partitioning<I>(&self, data_files: I) -> Vec<FileGroup>
+    where I: IntoIterator<Item = FileScanTask> {
+        let data_files = data_files.into_iter();
+        match self {
+            GroupingStrategyEnum::Single(strategy) => strategy.group_files(data_files),
+            GroupingStrategyEnum::BinPack(strategy) => strategy.group_files(data_files),
+        }
     }
 }
 
@@ -621,17 +632,25 @@ impl std::fmt::Display for MinGroupFileCountStrategy {
     }
 }
 
-/// Three-stage pipeline: file filters → grouping → group filters → parallelism calculation.
+/// Options for constructing a [`PlanStrategy`].
 ///
-/// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
+/// The default file group scope is [`FileGroupScope::Partition`], matching the
+/// historical behavior of [`PlanStrategy::new`].
 #[derive(Debug)]
-pub struct PlanStrategy {
+pub struct PlanStrategyOptions {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
     grouping: GroupingStrategyEnum,
+    file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
 }
 
-impl PlanStrategy {
+impl PlanStrategyOptions {
+    /// Creates options from the explicit file-selection pipeline stages.
+    ///
+    /// The file group scope defaults to [`FileGroupScope::Partition`]. Use
+    /// [`with_file_group_scope`](Self::with_file_group_scope) to opt into
+    /// table-scoped grouping.
+    #[must_use]
     pub fn new(
         file_filters: Vec<Box<dyn FileFilterStrategy>>,
         grouping: GroupingStrategyEnum,
@@ -640,16 +659,65 @@ impl PlanStrategy {
         Self {
             file_filters,
             grouping,
+            file_group_scope: FileGroupScope::Partition,
             group_filters,
         }
     }
 
+    /// Sets the scope used before the grouping strategy runs.
+    #[must_use]
+    pub fn with_file_group_scope(mut self, file_group_scope: FileGroupScope) -> Self {
+        self.file_group_scope = file_group_scope;
+        self
+    }
+}
+
+/// Three-stage pipeline: file filters → grouping → group filters → parallelism calculation.
+///
+/// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
+#[derive(Debug)]
+pub struct PlanStrategy {
+    file_filters: Vec<Box<dyn FileFilterStrategy>>,
+    grouping: GroupingStrategyEnum,
+    file_group_scope: FileGroupScope,
+    group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+}
+
+impl PlanStrategy {
+    /// Creates a plan strategy with partition-scoped grouping.
+    ///
+    /// This preserves the historical public constructor behavior. Use
+    /// [`new_with_options`](Self::new_with_options) when non-default strategy
+    /// options are needed.
+    #[must_use]
+    pub fn new(
+        file_filters: Vec<Box<dyn FileFilterStrategy>>,
+        grouping: GroupingStrategyEnum,
+        group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    ) -> Self {
+        Self::new_with_options(PlanStrategyOptions::new(
+            file_filters,
+            grouping,
+            group_filters,
+        ))
+    }
+
+    /// Creates a plan strategy from explicit construction options.
+    #[must_use]
+    pub fn new_with_options(options: PlanStrategyOptions) -> Self {
+        Self {
+            file_filters: options.file_filters,
+            grouping: options.grouping,
+            file_group_scope: options.file_group_scope,
+            group_filters: options.group_filters,
+        }
+    }
+
     /// Executes the pipeline:
-    /// 1. Pre-group files by partition (if the a partition spec is present)
-    /// 2. Apply each file filter sequentially
-    /// 3. Group files using grouping strategy
-    /// 4. Apply each group filter sequentially
-    /// 5. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
+    /// 1. Apply each file filter sequentially
+    /// 2. Group files using the configured file-group scope and grouping strategy
+    /// 3. Apply each group filter sequentially
+    /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
     /// # Errors
     /// Propagates errors from parallelism calculation (fails if group has 0 bytes).
@@ -663,7 +731,7 @@ impl PlanStrategy {
             filtered_files = filter.filter(filtered_files);
         }
 
-        let file_groups = self.grouping.group_files(filtered_files.into_iter());
+        let file_groups = self.group_files(filtered_files);
 
         let mut file_groups = file_groups;
         for filter in &self.group_filters {
@@ -674,6 +742,13 @@ impl PlanStrategy {
             .into_iter()
             .map(|group| group.with_calculated_parallelism(config))
             .collect()
+    }
+
+    fn group_files(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
+        match self.file_group_scope {
+            FileGroupScope::Table => self.grouping.group_files_without_partitioning(data_files),
+            FileGroupScope::Partition => self.grouping.group_files(data_files),
+        }
     }
 
     /// Constructs grouping enum and group filters from config.
@@ -733,7 +808,10 @@ impl PlanStrategy {
             config.group_filters.as_ref(),
         );
 
-        Self::new(file_filters, grouping, group_filters)
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
     }
 
     /// Constructs strategy for full compaction.
@@ -746,7 +824,10 @@ impl PlanStrategy {
         let (grouping, group_filters) =
             Self::build_grouping_and_filters(&config.grouping_strategy, None);
 
-        Self::new(file_filters, grouping, group_filters)
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
     }
 
     /// Constructs strategy for files with delete files.
@@ -766,7 +847,10 @@ impl PlanStrategy {
             config.group_filters.as_ref(),
         );
 
-        Self::new(file_filters, grouping, group_filters)
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
     }
 
     /// Test-only builder accepting raw filter parameters.
@@ -839,11 +923,20 @@ impl std::fmt::Display for PlanStrategy {
                 .join(" -> ")
         };
 
-        write!(
-            f,
-            "{} -> {} -> {}",
-            file_filter_desc, self.grouping, group_filter_desc
-        )
+        match self.file_group_scope {
+            FileGroupScope::Partition => {
+                write!(
+                    f,
+                    "{} -> {} -> {}",
+                    file_filter_desc, self.grouping, group_filter_desc
+                )
+            }
+            FileGroupScope::Table => write!(
+                f,
+                "{} -> {:?} -> {} -> {}",
+                file_filter_desc, self.file_group_scope, self.grouping, group_filter_desc
+            ),
+        }
     }
 }
 
@@ -883,7 +976,10 @@ mod tests {
     use std::sync::{Arc, OnceLock};
 
     use super::*;
-    use crate::config::{CompactionPlanningConfig, SmallFilesConfigBuilder};
+    use crate::config::{
+        CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfigBuilder,
+        SmallFilesConfigBuilder,
+    };
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
     fn get_test_schema() -> Arc<iceberg::spec::Schema> {
@@ -1716,7 +1812,7 @@ mod tests {
 
         // Test Single variant
         let single_enum = GroupingStrategyEnum::Single(SingleGroupingStrategy);
-        let groups = single_enum.group_files(data_files.clone().into_iter());
+        let groups = single_enum.group_files(data_files.clone());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].data_file_count, 2);
         assert_eq!(single_enum.to_string(), "SingleGrouping");
@@ -1727,20 +1823,20 @@ mod tests {
                 .size(20 * 1024 * 1024)
                 .build(),
         ];
-        let single_file_groups = single_enum.group_files(single.into_iter());
+        let single_file_groups = single_enum.group_files(single);
         assert_eq!(single_file_groups.len(), 1);
         assert_eq!(single_file_groups[0].data_file_count, 1);
         TestUtils::assert_paths_eq(&["single.parquet"], &single_file_groups[0].data_files);
 
         // Empty input
         let empty_files: Vec<FileScanTask> = vec![];
-        let single_empty_groups = single_enum.group_files(empty_files.into_iter());
+        let single_empty_groups = single_enum.group_files(empty_files);
         assert_eq!(single_empty_groups.len(), 0);
 
         // Test BinPack variant
         let binpack_enum =
             GroupingStrategyEnum::BinPack(BinPackGroupingStrategy::new(20 * 1024 * 1024));
-        let binpack_groups = binpack_enum.group_files(data_files.into_iter());
+        let binpack_groups = binpack_enum.group_files(data_files);
         assert!(!binpack_groups.is_empty());
         assert_eq!(binpack_enum.to_string(), "BinPackGrouping[target=20MB]");
     }
@@ -2699,6 +2795,155 @@ mod tests {
             iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(bucket_value)),
         )];
         iceberg::spec::Struct::from_iter(fields)
+    }
+
+    fn partitioned_file(name: &str, partition_num: i32) -> FileScanTask {
+        TestFileBuilder::new(name)
+            .size(1024 * 1024)
+            .with_partition(create_partition_value(partition_num))
+            .with_schema(get_test_schema_with_partition())
+            .build()
+    }
+
+    fn delete_heavy_partitioned_file(name: &str, partition_num: i32) -> FileScanTask {
+        TestFileBuilder::new(name)
+            .size(1024 * 1024)
+            .with_deletes()
+            .with_partition(create_partition_value(partition_num))
+            .with_schema(get_test_schema_with_partition())
+            .build()
+    }
+
+    fn min_file_count_filter(min_file_count: usize) -> crate::config::GroupFilters {
+        crate::config::GroupFilters {
+            min_group_file_count: Some(min_file_count),
+            min_group_size_bytes: None,
+        }
+    }
+
+    #[test]
+    fn test_grouping_strategy_enum_group_files_keeps_partition_scope() {
+        let files = vec![
+            partitioned_file("p0_file1.parquet", 0),
+            partitioned_file("p0_file2.parquet", 0),
+            partitioned_file("p1_file1.parquet", 1),
+            partitioned_file("p2_file1.parquet", 2),
+            partitioned_file("p2_file2.parquet", 2),
+        ];
+
+        let strategy = GroupingStrategyEnum::Single(SingleGroupingStrategy);
+        let groups = strategy.group_files(files);
+        let mut file_counts = groups
+            .iter()
+            .map(|group| group.data_file_count)
+            .collect::<Vec<_>>();
+        file_counts.sort_unstable();
+
+        assert_eq!(file_counts, vec![1, 2, 2]);
+    }
+
+    #[test]
+    fn test_table_scope_single_grouping_does_not_split_partitions() {
+        let files = vec![
+            partitioned_file("p0_file1.parquet", 0),
+            partitioned_file("p0_file2.parquet", 0),
+            partitioned_file("p1_file1.parquet", 1),
+            partitioned_file("p2_file1.parquet", 2),
+            partitioned_file("p2_file2.parquet", 2),
+        ];
+
+        let strategy = PlanStrategy::new_with_options(
+            PlanStrategyOptions::new(
+                vec![],
+                GroupingStrategyEnum::Single(SingleGroupingStrategy),
+                vec![],
+            )
+            .with_file_group_scope(FileGroupScope::Table),
+        );
+        let groups = strategy.group_files(files);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].data_file_count, 5);
+    }
+
+    #[test]
+    fn test_small_files_table_scope_applies_group_filter_across_partitions() {
+        let files = vec![
+            partitioned_file("p0_file1.parquet", 0),
+            partitioned_file("p0_file2.parquet", 0),
+            partitioned_file("p1_file1.parquet", 1),
+            partitioned_file("p1_file2.parquet", 1),
+            partitioned_file("p2_file1.parquet", 2),
+        ];
+        let group_filters = min_file_count_filter(5);
+        let table_scope_config = SmallFilesConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::Single)
+            .file_group_scope(FileGroupScope::Table)
+            .group_filters(group_filters.clone())
+            .build()
+            .unwrap();
+        let partition_scope_config = SmallFilesConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(group_filters)
+            .build()
+            .unwrap();
+
+        let table_scope_groups = PlanStrategy::from_small_files(&table_scope_config)
+            .execute(
+                files.clone(),
+                &CompactionPlanningConfig::SmallFiles(table_scope_config),
+            )
+            .unwrap();
+        let partition_scope_groups = PlanStrategy::from_small_files(&partition_scope_config)
+            .execute(
+                files,
+                &CompactionPlanningConfig::SmallFiles(partition_scope_config),
+            )
+            .unwrap();
+
+        assert_eq!(table_scope_groups.len(), 1);
+        assert_eq!(table_scope_groups[0].data_file_count, 5);
+        assert_eq!(partition_scope_groups.len(), 0);
+    }
+
+    #[test]
+    fn test_files_with_deletes_table_scope_applies_group_filter_across_partitions() {
+        let files = vec![
+            delete_heavy_partitioned_file("p0_file1.parquet", 0),
+            delete_heavy_partitioned_file("p1_file1.parquet", 1),
+            delete_heavy_partitioned_file("p2_file1.parquet", 2),
+        ];
+        let group_filters = min_file_count_filter(3);
+        let table_scope_config = FilesWithDeletesConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::Single)
+            .file_group_scope(FileGroupScope::Table)
+            .min_delete_file_count_threshold(1_usize)
+            .group_filters(group_filters.clone())
+            .build()
+            .unwrap();
+        let partition_scope_config = FilesWithDeletesConfigBuilder::default()
+            .grouping_strategy(GroupingStrategy::Single)
+            .min_delete_file_count_threshold(1_usize)
+            .group_filters(group_filters)
+            .build()
+            .unwrap();
+
+        let table_scope_groups = PlanStrategy::from_files_with_deletes(&table_scope_config)
+            .execute(
+                files.clone(),
+                &CompactionPlanningConfig::FilesWithDeletes(table_scope_config),
+            )
+            .unwrap();
+        let partition_scope_groups = PlanStrategy::from_files_with_deletes(&partition_scope_config)
+            .execute(
+                files,
+                &CompactionPlanningConfig::FilesWithDeletes(partition_scope_config),
+            )
+            .unwrap();
+
+        assert_eq!(table_scope_groups.len(), 1);
+        assert_eq!(table_scope_groups[0].data_file_count, 3);
+        assert_eq!(partition_scope_groups.len(), 0);
     }
 
     #[test]

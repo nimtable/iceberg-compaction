@@ -15,7 +15,8 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `data file`: a `FileScanTask` where `data_file_content == Data`
 - `delete-heavy`: when `min_delete_file_count_threshold > 0`, `deletes.len() >= min_delete_file_count_threshold`
 - `candidate set`: the set of data files that a strategy is allowed to include in compaction
-- `group gating`: group-level thresholds used to avoid frequent small rewrites
+- `file group scope`: the boundary used before applying the grouping strategy; `Partition` keeps groups within one Iceberg partition, while `Table` lets the strategy group all selected files together
+- `group gating`: group-level thresholds used to avoid frequent small rewrites; these thresholds are applied after `file group scope` and `grouping_strategy`
 - `plan budget`: the maximum number of plans that `Auto` is allowed to execute in a single run
 - `fixed-point rewrite`: for the input files rewritten in the current run, the newly committed snapshot should cause them to leave that strategy's candidate set
 
@@ -25,6 +26,8 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 
 - Intended use: explicit/manual full-table rewrite
 - Candidate set: all data files
+- Default file group scope: `Partition`
+- Use `FileGroupScope::Table` with `GroupingStrategy::Single` when the full-table rewrite must be planned as one file group
 - Does not need to be fixed-point
 - Is not used as an `Auto` fallback
 
@@ -32,6 +35,8 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 
 - Intended use: append-only or general size-based compaction
 - Candidate set: `file_size < small_file_threshold_bytes`
+- Default file group scope: `Partition`
+- Explicit `Table` scope is allowed for manual planning, but group gating then evaluates groups across all selected partitions instead of per partition
 - May use `group_filters` for group gating
 - Must be fixed-point: rewritten input files that reach the target threshold should leave the candidate set in the newly committed snapshot
 
@@ -39,6 +44,8 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 
 - Intended use: timely cleanup of delete-heavy files
 - Candidate set: `deletes.len() >= min_delete_file_count_threshold`
+- Default file group scope: `Partition`
+- Explicit `Table` scope is allowed for manual planning, but group gating then evaluates groups across all selected partitions instead of per partition
 - May use `group_filters` for group gating
 - `Auto` does not rewrite or override caller-provided group gating for this strategy
 - Under `Auto`, `min_delete_file_count_threshold == 0` disables delete-heavy detection and therefore disables this candidate
@@ -65,6 +72,7 @@ It then applies the following fixed decision order:
 Design focus:
 
 - Only choose localized rewrite strategies
+- Keep auto-generated plans at `Partition` file group scope
 - Apply a uniform budget to the final selected plan set
 
 ## Why `Auto` Does Not Fall Back to `Full`

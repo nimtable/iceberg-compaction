@@ -94,6 +94,19 @@ pub enum GroupingStrategy {
     BinPack(BinPackConfig),
 }
 
+/// File-group boundary used before applying the grouping strategy.
+///
+/// `Partition` keeps file groups within one Iceberg partition. `Table` allows
+/// the grouping strategy to see all selected files together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileGroupScope {
+    /// Group files independently within each Iceberg partition.
+    #[default]
+    Partition,
+    /// Group all selected files at table scope.
+    Table,
+}
+
 /// Group-level filters applied after grouping.
 ///
 /// These filters remove groups that don't meet certain criteria. They are
@@ -143,6 +156,13 @@ pub struct SmallFilesConfig {
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
 
+    /// Boundary for file groups before applying `grouping_strategy`.
+    ///
+    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
+    /// all selected partitions instead of independently per partition.
+    #[builder(default)]
+    pub file_group_scope: FileGroupScope,
+
     /// Optional filters to apply after grouping.
     ///
     /// Groups that don't meet these criteria will be excluded from compaction.
@@ -161,7 +181,7 @@ impl Default for SmallFilesConfig {
 
 /// Configuration for full compaction strategy.
 ///
-/// This strategy performs full compaction of all files in a partition.
+/// This strategy performs full compaction of all selected data files.
 /// Group filters are NOT supported because "full" compaction means processing
 /// ALL files without filtering.
 #[derive(Debug, Clone, Builder)]
@@ -195,6 +215,13 @@ pub struct FullCompactionConfig {
     /// All groups will be compacted regardless of size or file count.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
+
+    /// Boundary for file groups before applying `grouping_strategy`.
+    ///
+    /// Use [`FileGroupScope::Table`] with [`GroupingStrategy::Single`] when a
+    /// full-table compaction must be planned as one file group.
+    #[builder(default)]
+    pub file_group_scope: FileGroupScope,
 }
 
 impl Default for FullCompactionConfig {
@@ -237,6 +264,13 @@ pub struct FilesWithDeletesConfig {
     /// How to group files before compaction.
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
+
+    /// Boundary for file groups before applying `grouping_strategy`.
+    ///
+    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
+    /// all selected partitions instead of independently per partition.
+    #[builder(default)]
+    pub file_group_scope: FileGroupScope,
 
     /// Minimum number of delete files required to trigger compaction.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
@@ -328,6 +362,15 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
             Self::Full(c) => c.enable_heuristic_output_parallelism,
             Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
+        }
+    }
+
+    /// Returns the file-group boundary for the strategy.
+    pub fn file_group_scope(&self) -> FileGroupScope {
+        match self {
+            Self::SmallFiles(c) => c.file_group_scope,
+            Self::Full(c) => c.file_group_scope,
+            Self::FilesWithDeletes(c) => c.file_group_scope,
         }
     }
 }
@@ -548,6 +591,7 @@ impl AutoCompactionConfig {
                     max_output_parallelism: self.max_output_parallelism,
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
+                    file_group_scope: FileGroupScope::Partition,
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
                     group_filters: self.group_filters.clone(),
                 },
@@ -579,6 +623,7 @@ impl AutoCompactionConfig {
                 enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                 small_file_threshold_bytes: self.small_file_threshold_bytes,
                 grouping_strategy: self.grouping_strategy.clone(),
+                file_group_scope: FileGroupScope::Partition,
                 group_filters: self.group_filters.clone(),
             }))
         } else {
@@ -669,6 +714,50 @@ mod tests {
     fn test_auto_default_budget_is_unbounded() {
         let config = AutoCompactionConfig::default();
         assert_eq!(config.max_auto_plans_per_run, NonZeroUsize::MAX);
+    }
+
+    #[test]
+    fn test_planning_configs_default_to_partition_file_group_scope() {
+        let small_files = SmallFilesConfig::default();
+        assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
+
+        let full = FullCompactionConfig::default();
+        assert_eq!(full.file_group_scope, FileGroupScope::Partition);
+
+        let files_with_deletes = FilesWithDeletesConfig::default();
+        assert_eq!(
+            files_with_deletes.file_group_scope,
+            FileGroupScope::Partition
+        );
+    }
+
+    #[test]
+    fn test_auto_candidates_use_partition_file_group_scope() {
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: 1,
+            })
+            .build()
+            .unwrap();
+        let stats = create_test_stats(10, 1, 1);
+
+        let CompactionPlanningConfig::FilesWithDeletes(files_with_deletes) =
+            config.files_with_deletes_candidate(&stats).unwrap()
+        else {
+            panic!("Expected FilesWithDeletes");
+        };
+        let CompactionPlanningConfig::SmallFiles(small_files) =
+            config.small_files_candidate(&stats).unwrap()
+        else {
+            panic!("Expected SmallFiles");
+        };
+
+        assert_eq!(
+            files_with_deletes.file_group_scope,
+            FileGroupScope::Partition
+        );
+        assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
     }
 
     #[test]

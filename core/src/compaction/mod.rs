@@ -1398,6 +1398,8 @@ mod tests {
     };
     use crate::executor::{ExecutorType, RewriteFilesStat};
 
+    mod file_group_scope;
+
     // ----------------------
     // Test helpers to reduce duplication
     // ----------------------
