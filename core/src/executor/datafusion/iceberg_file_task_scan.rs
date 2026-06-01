@@ -577,6 +577,7 @@ mod tests {
             start: 0,
             record_count: Some(0),
             data_file_path: format!("test_{}.parquet", file_id),
+            referenced_data_file: None,
             data_file_content: DataContentType::Data,
             data_file_format: iceberg::spec::DataFileFormat::Parquet,
             schema: Arc::new(Schema::builder().build().unwrap()),
