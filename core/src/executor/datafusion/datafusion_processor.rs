@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
@@ -58,7 +61,7 @@ impl DatafusionProcessor {
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
-    ) -> Self {
+    ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
             .with_batch_size(execution_config.max_record_batch_rows)
@@ -66,7 +69,31 @@ impl DatafusionProcessor {
                 "datafusion.sql_parser.enable_ident_normalization",
                 execution_config.enable_normalized_column_identifiers,
             );
-        let ctx = Arc::new(SessionContext::new_with_config(session_config));
+
+        // When a memory budget is configured, run DataFusion with a bounded
+        // `FairSpillPool` and an OS-backed `DiskManager` so blocking operators
+        // (notably `SortExec` for sorted-table compaction) spill to disk once
+        // they exceed the budget, instead of buffering all decoded Arrow data
+        // in memory and OOM-killing the process. With no budget we keep the
+        // previous behavior: an unbounded pool and no spilling.
+        let ctx = match execution_config.max_memory_bytes {
+            Some(max_memory_bytes) if max_memory_bytes > 0 => {
+                let memory_pool =
+                    Arc::new(FairSpillPool::new(max_memory_bytes)) as Arc<dyn MemoryPool>;
+                let runtime_env = RuntimeEnvBuilder::new()
+                    .with_memory_pool(memory_pool)
+                    .with_disk_manager_builder(
+                        DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+                    )
+                    .build_arc()?;
+                Arc::new(SessionContext::new_with_config_rt(
+                    session_config,
+                    runtime_env,
+                ))
+            }
+            _ => Arc::new(SessionContext::new_with_config(session_config)),
+        };
+
         let table_register = DatafusionTableRegister::new(
             file_io,
             ctx.clone(),
@@ -75,10 +102,10 @@ impl DatafusionProcessor {
             execution_config.enable_prefetch,
         );
 
-        Self {
+        Ok(Self {
             table_register,
             ctx,
-        }
+        })
     }
 
     /// Registers all necessary tables (data files, position deletes, equality deletes) with `DataFusion`
@@ -912,6 +939,31 @@ mod tests {
     use crate::executor::datafusion::datafusion_processor::table_name::{
         DATA_FILE_TABLE, POSITION_DELETE_TABLE,
     };
+
+    /// A configured memory budget builds a processor backed by a bounded
+    /// `FairSpillPool` + disk manager (so `SortExec` spills to disk instead of
+    /// exhausting memory); the default (no budget) still builds with the
+    /// unbounded pool.
+    #[test]
+    fn test_new_with_memory_budget_builds_spilling_context() {
+        use iceberg::io::FileIOBuilder;
+
+        use crate::config::CompactionExecutionConfigBuilder;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+
+        let bounded = Arc::new(
+            CompactionExecutionConfigBuilder::default()
+                .max_memory_bytes(Some(64 * 1024 * 1024))
+                .build()
+                .unwrap(),
+        );
+        assert!(DatafusionProcessor::new(bounded, 1, file_io.clone()).is_ok());
+
+        let unbounded = Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
+        assert!(unbounded.max_memory_bytes.is_none());
+        assert!(DatafusionProcessor::new(unbounded, 1, file_io).is_ok());
+    }
 
     /// Test building SQL with no delete files
     #[test]

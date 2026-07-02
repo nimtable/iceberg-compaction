@@ -113,7 +113,7 @@ impl CompactionValidator {
             validator_config,
             executor_parallelism,
             table.file_io().clone(),
-        );
+        )?;
 
         Ok(Self {
             datafusion_processor,
