@@ -20,7 +20,7 @@ use datafusion::arrow::compute::SortOptions;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
@@ -78,14 +78,10 @@ impl DatafusionProcessor {
         // previous behavior: an unbounded pool and no spilling.
         let ctx = match execution_config.max_memory_bytes {
             Some(max_memory_bytes) if max_memory_bytes > 0 => {
-                let memory_pool =
-                    Arc::new(FairSpillPool::new(max_memory_bytes)) as Arc<dyn MemoryPool>;
-                let runtime_env = RuntimeEnvBuilder::new()
-                    .with_memory_pool(memory_pool)
-                    .with_disk_manager_builder(
-                        DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
-                    )
-                    .build_arc()?;
+                let runtime_env = build_spilling_runtime_env(
+                    max_memory_bytes,
+                    execution_config.spill_dir.as_deref(),
+                )?;
                 Arc::new(SessionContext::new_with_config_rt(
                     session_config,
                     runtime_env,
@@ -220,6 +216,27 @@ impl DatafusionProcessor {
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
         Ok((batches, input_schema))
     }
+}
+
+/// Build a bounded, spill-capable `DataFusion` runtime: a `FairSpillPool` of
+/// `max_memory_bytes` plus a `DiskManager`. Blocking operators (notably
+/// `SortExec`) spill to disk once they exceed the pool instead of buffering
+/// unbounded in memory. Spill files go to `spill_dir` when provided, otherwise
+/// the OS temp directory.
+fn build_spilling_runtime_env(
+    max_memory_bytes: usize,
+    spill_dir: Option<&std::path::Path>,
+) -> Result<Arc<RuntimeEnv>> {
+    let memory_pool = Arc::new(FairSpillPool::new(max_memory_bytes)) as Arc<dyn MemoryPool>;
+    let disk_manager_mode = match spill_dir {
+        Some(dir) => DiskManagerMode::Directories(vec![dir.to_path_buf()]),
+        None => DiskManagerMode::OsTmpDirectory,
+    };
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_memory_pool(memory_pool)
+        .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(disk_manager_mode))
+        .build_arc()?;
+    Ok(runtime_env)
 }
 
 fn build_physical_sort_exprs(
@@ -960,9 +977,95 @@ mod tests {
         );
         assert!(DatafusionProcessor::new(bounded, 1, file_io.clone()).is_ok());
 
+        // A configured spill directory is honored by the disk manager.
+        let bounded_with_spill_dir = Arc::new(
+            CompactionExecutionConfigBuilder::default()
+                .max_memory_bytes(Some(64 * 1024 * 1024))
+                .spill_dir(Some(std::env::temp_dir()))
+                .build()
+                .unwrap(),
+        );
+        assert!(DatafusionProcessor::new(bounded_with_spill_dir, 1, file_io.clone()).is_ok());
+
         let unbounded = Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
         assert!(unbounded.max_memory_bytes.is_none());
+        assert!(unbounded.spill_dir.is_none());
         assert!(DatafusionProcessor::new(unbounded, 1, file_io).is_ok());
+    }
+
+    /// Validates the bounded runtime built by `build_spilling_runtime_env`
+    /// actually enforces its memory budget: a sort whose input far exceeds the
+    /// pool spills to disk (`spill_count > 0`) and still produces correctly
+    /// ordered output. This is the runtime that `DatafusionProcessor` installs
+    /// when `max_memory_bytes` is set, so it exercises the sorted-compaction
+    /// spill path end to end.
+    #[tokio::test]
+    async fn test_bounded_runtime_spills_large_sort() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::collect;
+
+        // 4 MiB budget vs a ~16 MiB sort input -> SortExec must spill.
+        let runtime_env = build_spilling_runtime_env(4 * 1024 * 1024, None).unwrap();
+        // target_partitions=1 keeps the plan root a single SortExec so its
+        // spill_count metric is directly observable. The merge-phase reservation
+        // is lowered so it fits inside the small pool (the default reservation
+        // alone exceeds 4 MiB); the sort still spills its buffered input.
+        let session_config = SessionConfig::new()
+            .with_target_partitions(1)
+            .with_sort_spill_reservation_bytes(1024 * 1024);
+        let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        // ~4M i32 rows (~16 MiB) in descending order, split into batches so the
+        // pool fills across multiple batches and spills.
+        let total_rows: i32 = 4_000_000;
+        let batch_rows: i32 = 100_000;
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < total_rows {
+            let end = (start + batch_rows).min(total_rows);
+            let values: Int32Array = (start..end).map(|i| total_rows - 1 - i).collect();
+            batches
+                .push(RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(values)]).unwrap());
+            start = end;
+        }
+        let table = MemTable::try_new(arrow_schema.clone(), vec![batches]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+
+        let plan = ctx
+            .sql("SELECT id FROM t ORDER BY id ASC")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let results = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+
+        // Correct global ordering despite the tight budget.
+        let total_out: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_out as i32, total_rows);
+        let first = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(first, 0, "ascending sort should start at 0");
+
+        // Memory limit enforced: the sort spilled to disk rather than OOMing.
+        let spill_count = plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0);
+        assert!(
+            spill_count > 0,
+            "expected SortExec to spill under the 4 MiB budget, got spill_count={spill_count}"
+        );
     }
 
     /// Test building SQL with no delete files

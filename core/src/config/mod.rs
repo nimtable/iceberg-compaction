@@ -477,6 +477,15 @@ pub struct CompactionExecutionConfig {
     /// container cgroup) should set this to a fraction of that limit.
     #[builder(default)]
     pub max_memory_bytes: Option<usize>,
+
+    /// Directory used for on-disk spill files when `max_memory_bytes` is set.
+    ///
+    /// Only takes effect together with `max_memory_bytes`; ignored otherwise.
+    /// `None` (default) uses the OS temporary directory. Set this when the OS
+    /// temp dir is unsuitable — e.g. to point spills at a dedicated ephemeral
+    /// volume with enough free space, or away from a small/`noexec` `/tmp`.
+    #[builder(default)]
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for CompactionExecutionConfig {
