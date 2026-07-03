@@ -460,6 +460,32 @@ pub struct CompactionExecutionConfig {
     /// **Note**: This is currently experimental and may not be stable.
     #[builder(default = "DEFAULT_ENABLE_PREFETCH")]
     pub enable_prefetch: bool,
+
+    /// Optional upper bound (in bytes) on `DataFusion` execution memory.
+    ///
+    /// When set to `Some(n)` with `n > 0`, the `DataFusion` processor runs with a
+    /// bounded [`datafusion::execution::memory_pool::FairSpillPool`] of `n`
+    /// bytes plus an OS-backed `DiskManager`, so blocking operators — notably
+    /// `SortExec`, used when compacting a *sorted* table — spill to disk once
+    /// they exceed the budget instead of buffering all decoded Arrow data in
+    /// memory. Sorted compaction decodes an entire file group to Arrow
+    /// (ZSTD inflation ~5-20x) and then needs ~2x more to sort; without a bound
+    /// that can exceed the process memory limit and trigger an OOM kill.
+    ///
+    /// `None` (default) preserves the previous behavior: an unbounded memory
+    /// pool with no spilling. Callers running under a hard memory limit (e.g. a
+    /// container cgroup) should set this to a fraction of that limit.
+    #[builder(default)]
+    pub max_memory_bytes: Option<usize>,
+
+    /// Directory used for on-disk spill files when `max_memory_bytes` is set.
+    ///
+    /// Only takes effect together with `max_memory_bytes`; ignored otherwise.
+    /// `None` (default) uses the OS temporary directory. Set this when the OS
+    /// temp dir is unsuitable — e.g. to point spills at a dedicated ephemeral
+    /// volume with enough free space, or away from a small/`noexec` `/tmp`.
+    #[builder(default)]
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for CompactionExecutionConfig {
