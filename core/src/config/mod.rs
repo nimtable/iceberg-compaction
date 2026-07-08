@@ -42,6 +42,7 @@ pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per part
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
+pub const DEFAULT_NEED_ROW_PROVENANCE: bool = false; // default setting for emitting per-row provenance mapping
 
 // Auto compaction defaults
 pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
@@ -486,6 +487,17 @@ pub struct CompactionExecutionConfig {
     /// volume with enough free space, or away from a small/`noexec` `/tmp`.
     #[builder(default)]
     pub spill_dir: Option<std::path::PathBuf>,
+
+    /// Emit a per-row provenance mapping `(input_file, input_pos) -> (output_file,
+    /// output_pos)` for every surviving output row.
+    ///
+    /// When `true`, the executor forces the `SYS_HIDDEN_FILE_PATH` / `SYS_HIDDEN_POS`
+    /// columns to be scanned and retained through the merge-on-read projection, then
+    /// captures output positions via `write_with_position`. This is decoupled from the
+    /// position-delete anti-join, which is still gated on position deletes actually
+    /// existing. The written data files never contain the hidden columns in either mode.
+    #[builder(default = "DEFAULT_NEED_ROW_PROVENANCE")]
+    pub need_row_provenance: bool,
 }
 
 impl Default for CompactionExecutionConfig {

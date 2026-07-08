@@ -33,8 +33,8 @@ use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
 use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
 use crate::executor::{
-    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
-    create_compaction_executor,
+    ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, RowProvenance,
+    TableSortOrder, create_compaction_executor,
 };
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
@@ -222,6 +222,8 @@ pub struct RewriteResult {
     pub plan: CompactionPlan,
     /// Validation info for creating `CompactionValidator` later
     pub validation_info: Option<ValidationInfo>,
+    /// Per-row provenance mapping, populated only when `need_row_provenance` is enabled.
+    pub row_provenance: Vec<RowProvenance>,
 }
 
 /// Information for deferred `CompactionValidator` creation.
@@ -240,6 +242,10 @@ pub struct CompactionResult {
     pub stats: RewriteFilesStat,
     /// Updated table metadata after commit (if available)
     pub table: Option<Table>,
+    /// Per-row provenance mapping `(input_file, input_pos) -> (output_file, output_pos)`,
+    /// populated only when `need_row_provenance` is enabled via
+    /// `CompactionExecutionConfig`. Empty otherwise. Consumed by RisingWave's runner.
+    pub row_provenance: Vec<RowProvenance>,
 }
 
 impl Compaction {
@@ -397,6 +403,7 @@ impl Compaction {
             let RewriteFilesResponse {
                 data_files: output_data_files,
                 stats,
+                row_provenance,
             } = match self.executor.rewrite_files(rewrite_files_request).await {
                 Ok(response) => response,
                 Err(e) => {
@@ -427,6 +434,7 @@ impl Compaction {
                 stats,
                 plan,
                 validation_info,
+                row_provenance,
             })
         } else {
             Err(CompactionError::Execution(format!(
@@ -578,16 +586,19 @@ impl Compaction {
         // Reuse the existing stats merger to avoid duplication
         let merged_stats = self.merge_rewrite_stats(&results);
 
-        // Collect all output data files
+        // Collect all output data files and, when present, merge per-row provenance.
         let mut merged_data_files = Vec::new();
+        let mut merged_provenance: Vec<RowProvenance> = Vec::new();
         for result in results {
             merged_data_files.extend(result.output_data_files);
+            merged_provenance.extend(result.row_provenance);
         }
 
         CompactionResult {
             data_files: merged_data_files,
             stats: merged_stats,
             table,
+            row_provenance: merged_provenance,
         }
     }
 
@@ -699,6 +710,7 @@ impl Compaction {
             data_files: rewrite_result.output_data_files,
             stats: rewrite_result.stats,
             table: Some(final_table),
+            row_provenance: rewrite_result.row_provenance,
         };
 
         Ok(Some(result))
@@ -2317,12 +2329,14 @@ mod tests {
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
+            row_provenance: vec![]
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
+            row_provenance: vec![]
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])
@@ -2342,12 +2356,14 @@ mod tests {
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
+            row_provenance: vec![]
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
+            row_provenance: vec![],
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])

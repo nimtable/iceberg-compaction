@@ -55,10 +55,32 @@ pub struct RewriteFilesRequest {
     pub format_version: FormatVersion,
 }
 
+/// Per-row provenance mapping produced by a compaction rewrite when
+/// `need_row_provenance` is enabled.
+///
+/// Each entry maps a surviving input row `(input_file, input_pos)` to the
+/// location it was written to in the compaction output `(output_file, output_pos)`.
+/// `input_pos` is dense per input data file; `output_pos` is dense per output data
+/// file and resets to 0 on file rollover.
+#[derive(Debug, Clone)]
+pub struct RowProvenance {
+    /// Source data file path (from `SYS_HIDDEN_FILE_PATH`).
+    pub input_file: Arc<str>,
+    /// Row position within the source data file (from `SYS_HIDDEN_POS`).
+    pub input_pos: u64,
+    /// Output data file path the row was written to.
+    pub output_file: Arc<str>,
+    /// Dense row position within the output data file.
+    pub output_pos: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RewriteFilesResponse {
     pub data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
+    /// Per-row provenance mapping, populated only when `need_row_provenance` is
+    /// requested via `CompactionExecutionConfig`. Empty otherwise.
+    pub row_provenance: Vec<RowProvenance>,
 }
 
 #[derive(Debug, Clone, Default)]

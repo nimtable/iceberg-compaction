@@ -11,6 +11,7 @@ ctor = { workspace = true }
 datafusion = { workspace = true }
 derive_builder = "0.20"
 futures = { workspace = true }
+hashbrown = "0.17.1"
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 # iceberg-catalog-memory = { workspace = true }

@@ -370,8 +370,14 @@ struct SqlBuilder<'a> {
     /// Flag indicating if file path and position columns are needed
     equality_delete_metadatas: &'a Vec<EqualityDeleteMetadata>,
 
-    /// Flag indicating if position delete files are needed
+    /// Flag indicating that position delete files are present, which enables the
+    /// position-delete anti-join (and therefore requires the file_path/pos columns).
     need_file_path_and_pos: bool,
+
+    /// Flag indicating that per-row provenance is requested. When true, the
+    /// file_path/pos columns are scanned and retained through the final projection
+    /// even when there are no position deletes, WITHOUT enabling the anti-join.
+    need_row_provenance: bool,
 }
 
 /// Safely quotes a table name or column name to avoid SQL injection and keyword conflicts
@@ -419,6 +425,7 @@ impl<'a> SqlBuilder<'a> {
         data_file_table_name: Option<String>,
         equality_delete_metadatas: &'a Vec<EqualityDeleteMetadata>,
         need_file_path_and_pos: bool,
+        need_row_provenance: bool,
     ) -> Self {
         Self {
             project_names,
@@ -426,6 +433,7 @@ impl<'a> SqlBuilder<'a> {
             data_file_table_name,
             equality_delete_metadatas,
             need_file_path_and_pos,
+            need_row_provenance,
         }
     }
 
@@ -442,7 +450,11 @@ impl<'a> SqlBuilder<'a> {
 
         // Determine which hidden columns are needed for join conditions
         let need_seq_num = !self.equality_delete_metadatas.is_empty();
-        let need_file_path_and_pos = self.need_file_path_and_pos;
+        // The position-delete anti-join is only emitted when position deletes exist.
+        let need_pos_delete_join = self.need_file_path_and_pos;
+        // The file_path/pos columns must be scanned and carried through the query
+        // whenever the anti-join needs them OR per-row provenance is requested.
+        let need_file_path_and_pos = need_pos_delete_join || self.need_row_provenance;
 
         // Early return for simple case: no deletes at all
         if !need_seq_num && !need_file_path_and_pos {
@@ -473,8 +485,15 @@ impl<'a> SqlBuilder<'a> {
             .map(|name| quote_column(name))
             .collect();
 
-        let quoted_project_columns: Vec<String> = self
-            .project_names
+        // Outer projection columns. Normally only the real project columns, but when
+        // provenance is requested we also retain the file_path/pos hidden columns so
+        // the write loop can read them. The seq_num hidden column is always dropped.
+        let mut project_output_columns = self.project_names.clone();
+        if self.need_row_provenance {
+            project_output_columns.push(SYS_HIDDEN_FILE_PATH.to_owned());
+            project_output_columns.push(SYS_HIDDEN_POS.to_owned());
+        }
+        let quoted_project_columns: Vec<String> = project_output_columns
             .iter()
             .map(|name| quote_column(name))
             .collect();
@@ -488,7 +507,7 @@ impl<'a> SqlBuilder<'a> {
 
         // Add position delete join if needed
         // This excludes rows that have been deleted by position
-        if self.need_file_path_and_pos {
+        if need_pos_delete_join {
             let position_delete_table_name =
                 self.position_delete_table_name.as_ref().ok_or_else(|| {
                     CompactionError::Execution(
@@ -593,6 +612,10 @@ pub struct DataFusionTaskContext {
     pub(crate) equality_delete_files: Option<Vec<FileScanTask>>,
     pub(crate) position_delete_schema: Option<Schema>,
     pub(crate) equality_delete_metadatas: Option<Vec<EqualityDeleteMetadata>>,
+    /// Whether the scan should add and the query should retain the
+    /// `SYS_HIDDEN_FILE_PATH` / `SYS_HIDDEN_POS` columns. True when position deletes
+    /// exist (for the anti-join) or when per-row provenance is requested.
+    pub(crate) need_file_path_and_pos: bool,
     pub(crate) exec_sql: String,
     pub(crate) table_prefix: String,
     pub(crate) sort_order: Option<TableSortOrder>,
@@ -606,11 +629,17 @@ pub struct DataFusionTaskContextBuilder {
     table_prefix: String,
     sort_order: Option<TableSortOrder>,
     format_version: FormatVersion,
+    need_row_provenance: bool,
 }
 
 impl DataFusionTaskContextBuilder {
     pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = schema;
+        self
+    }
+
+    pub fn with_need_row_provenance(mut self, need_row_provenance: bool) -> Self {
+        self.need_row_provenance = need_row_provenance;
         self
     }
 
@@ -727,7 +756,11 @@ impl DataFusionTaskContextBuilder {
             }
         }
 
-        let need_file_path_and_pos = !ge_v3_format && !self.position_delete_files.is_empty();
+        // Position deletes present => enable the position-delete anti-join and its tables.
+        let has_pos_deletes = !ge_v3_format && !self.position_delete_files.is_empty();
+        // The file_path/pos columns are scanned & projected whenever the anti-join needs
+        // them OR provenance is requested (the latter is independent of deletes/format).
+        let need_file_path_and_pos = has_pos_deletes || self.need_row_provenance;
         let need_seq_num = !equality_delete_metadatas.is_empty();
 
         // Build schema for data file, old schema + seq_num + file_path + pos
@@ -777,7 +810,7 @@ impl DataFusionTaskContextBuilder {
 
         let sql_builder = SqlBuilder::new(
             &project_names,
-            if need_file_path_and_pos {
+            if has_pos_deletes {
                 Some(table_name::build_position_delete_table_name(
                     &self.table_prefix,
                 ))
@@ -786,7 +819,8 @@ impl DataFusionTaskContextBuilder {
             },
             Some(table_name::build_data_file_table_name(&self.table_prefix)),
             &equality_delete_metadatas,
-            need_file_path_and_pos,
+            has_pos_deletes,
+            self.need_row_provenance,
         );
 
         let exec_sql = sql_builder.build_merge_on_read_sql()?;
@@ -795,7 +829,7 @@ impl DataFusionTaskContextBuilder {
             data_file_schema: Some(data_file_schema),
             input_schema: Some(input_schema),
             data_files: Some(self.data_files),
-            position_delete_files: if need_file_path_and_pos {
+            position_delete_files: if has_pos_deletes {
                 Some(self.position_delete_files)
             } else {
                 None
@@ -805,7 +839,7 @@ impl DataFusionTaskContextBuilder {
             } else {
                 None
             },
-            position_delete_schema: if need_file_path_and_pos {
+            position_delete_schema: if has_pos_deletes {
                 position_delete_schema
             } else {
                 None
@@ -815,6 +849,7 @@ impl DataFusionTaskContextBuilder {
             } else {
                 None
             },
+            need_file_path_and_pos,
             exec_sql,
             table_prefix: self.table_prefix,
             sort_order: self.sort_order,
@@ -864,13 +899,14 @@ impl DataFusionTaskContext {
             table_prefix: "".to_owned(),
             sort_order: None,
             format_version: FormatVersion::V2,
+            need_row_provenance: false,
         })
     }
 
     pub fn need_file_path_and_pos(&self) -> bool {
-        // Must be consistent with builder logic: !self.position_delete_files.is_empty()
-        // We check if position_delete_schema exists, which is set only when position deletes are present
-        self.position_delete_schema.is_some()
+        // True when position deletes require the anti-join columns OR when per-row
+        // provenance forces the file_path/pos columns to be scanned and retained.
+        self.need_file_path_and_pos
     }
 
     pub fn need_seq_num(&self) -> bool {
@@ -1080,6 +1116,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_join_names,
             false,
+            false,
         );
         assert_eq!(
             builder.build_merge_on_read_sql().unwrap(),
@@ -1099,6 +1136,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_join_names,
             true,
+            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
@@ -1142,6 +1180,7 @@ mod tests {
             Some(POSITION_DELETE_TABLE.to_owned()),
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
+            false,
             false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1188,6 +1227,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             false,
+            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
@@ -1232,6 +1272,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             true,
+            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
@@ -1302,6 +1343,7 @@ mod tests {
             Some(DATA_FILE_TABLE.to_owned()),
             &equality_delete_metadatas,
             false,
+            false,
         );
         let sql = builder.build_merge_on_read_sql().unwrap();
 
@@ -1362,6 +1404,7 @@ mod tests {
             table_prefix: "".to_owned(),
             sort_order: None,
             format_version: FormatVersion::V2,
+            need_row_provenance: false,
         };
 
         let equality_ids = vec![1, 2];
@@ -1504,6 +1547,7 @@ mod tests {
             Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             true, // need_file_path_and_pos = true (triggers position delete logic)
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1550,6 +1594,7 @@ mod tests {
             Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             false, // need_file_path_and_pos = false
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1573,6 +1618,7 @@ mod tests {
             Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             true, // need_file_path_and_pos = true
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1596,11 +1642,59 @@ mod tests {
             Some("_data_file_table".to_owned()),
             &equality_delete_metadatas,
             false, // need_file_path_and_pos = false
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
 
         let expected_sql = r#"SELECT "id", "name" FROM "_data_file_table""#;
+        assert_eq!(sql, expected_sql);
+    }
+
+    /// Provenance requested with NO deletes: the file_path/pos hidden columns must be
+    /// scanned and retained through the final projection, WITHOUT a position-delete
+    /// anti-join (there are no position deletes).
+    #[test]
+    fn test_row_provenance_only_keeps_hidden_columns() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![];
+
+        let builder = SqlBuilder::new(
+            &project_names,
+            None, // No position delete table (no deletes)
+            Some("_data_file_table".to_owned()),
+            &equality_delete_metadatas,
+            false, // need_file_path_and_pos (anti-join) = false
+            true,  // need_row_provenance = true
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        // Outer projection retains sys_hidden_file_path/pos; no RIGHT ANTI JOIN.
+        let expected_sql = r#"SELECT "id", "name", "sys_hidden_file_path", "sys_hidden_pos" FROM (SELECT "id", "name", "sys_hidden_file_path", "sys_hidden_pos" FROM "_data_file_table") AS "final_result""#;
+        assert_eq!(sql, expected_sql);
+        assert!(!sql.contains("RIGHT ANTI JOIN"));
+    }
+
+    /// Provenance requested AND position deletes present: the anti-join stays, and the
+    /// outer projection additionally retains the file_path/pos hidden columns.
+    #[test]
+    fn test_row_provenance_with_position_deletes() {
+        let project_names = vec!["id".to_owned(), "name".to_owned()];
+        let equality_delete_metadatas = vec![];
+
+        let builder = SqlBuilder::new(
+            &project_names,
+            Some("_position_delete_table".to_owned()),
+            Some("_data_file_table".to_owned()),
+            &equality_delete_metadatas,
+            true, // need_file_path_and_pos (anti-join) = true
+            true, // need_row_provenance = true
+        );
+
+        let sql = builder.build_merge_on_read_sql().unwrap();
+
+        let expected_sql = r#"SELECT "id", "name", "sys_hidden_file_path", "sys_hidden_pos" FROM (SELECT "id", "name", "sys_hidden_file_path", "sys_hidden_pos" FROM "_position_delete_table" RIGHT ANTI JOIN (SELECT "id", "name", "sys_hidden_file_path", "sys_hidden_pos" FROM "_data_file_table") AS "_data_file_table" ON "_data_file_table"."sys_hidden_file_path" = "_position_delete_table"."sys_hidden_file_path" AND "_data_file_table"."sys_hidden_pos" = "_position_delete_table"."sys_hidden_pos") AS "final_result""#;
         assert_eq!(sql, expected_sql);
     }
 
@@ -1650,6 +1744,7 @@ mod tests {
                 Some(data_table.to_owned()),
                 &eq_delete_metadatas,
                 need_file_path_pos,
+                false,
             );
 
             // This should ideally fail or produce malformed SQL due to unescaped keywords
@@ -1713,6 +1808,7 @@ mod tests {
             None,
             Some("from".to_owned()), // Table name is SQL keyword
             &equality_delete_metadatas,
+            false,
             false,
         );
 
@@ -1789,6 +1885,7 @@ mod tests {
             Some("from".to_owned()),
             &equality_delete_metadatas,
             false,
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1813,6 +1910,7 @@ mod tests {
             Some("from".to_owned()),   // data file table with keyword
             &equality_delete_metadatas,
             true,
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1851,6 +1949,7 @@ mod tests {
             Some("select".to_owned()), // data file table with keyword
             &equality_delete_metadatas,
             false, // no position deletes for this test
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1874,6 +1973,7 @@ mod tests {
             Some("position_delete_table".to_owned()),
             Some("data_file_table".to_owned()),
             &equality_delete_metadatas,
+            false,
             false,
         );
 
@@ -1932,6 +2032,7 @@ mod tests {
             Some("normal_table".to_owned()),
             &equality_delete_metadatas,
             false,
+            false,
         );
 
         let sql = builder.build_merge_on_read_sql().unwrap();
@@ -1950,6 +2051,7 @@ mod tests {
             Some("data_table".to_owned()),
             &equality_delete_metadatas,
             true,
+            false,
         );
 
         let sql_with_pos = builder_with_pos_deletes.build_merge_on_read_sql().unwrap();
@@ -1981,6 +2083,7 @@ mod tests {
             Some("pos_delete_table".to_owned()),
             Some("data_table".to_owned()),
             &equality_delete_metadatas_with_keyword,
+            false,
             false,
         );
 
