@@ -48,21 +48,50 @@ struct RecordBatchBuffer {
     current_rows: usize,
 
     max_record_batch_rows: usize,
+
+    /// Bytes of the decoded batches currently retained in `buffer`, mirrored as
+    /// a live reservation against the `DataFusion` memory pool.
+    ///
+    /// Charging the scan's retained decode output to the pool gives the
+    /// compaction memory budget (`max_memory_bytes` -> `FairSpillPool`) teeth on
+    /// the unsorted-table path, which has no `SortExec` to reserve from the pool
+    /// and therefore otherwise never surfaces its decode footprint. Under a
+    /// bounded pool an over-budget batch fails fast with `ResourcesExhausted`
+    /// (a clean, retriable error) instead of the process being OOM-killed; with
+    /// the default unbounded pool `try_grow` always succeeds, so behavior is
+    /// unchanged.
+    ///
+    /// The reservation only ever reflects bytes we still hold: it is released as
+    /// batches are flushed or yielded downstream (and fully on drop), so it does
+    /// not over-reserve against a co-resident `SortExec` on the sorted path.
+    buffered_bytes: usize,
+    reservation: MemoryReservation,
 }
 
 impl RecordBatchBuffer {
-    fn new(max_record_batch_rows: usize) -> Self {
+    fn new(max_record_batch_rows: usize, memory_pool: &Arc<dyn MemoryPool>) -> Self {
         Self {
             buffer: vec![],
             current_rows: 0,
             max_record_batch_rows,
+            buffered_bytes: 0,
+            reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]").register(memory_pool),
         }
     }
 
     fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
+        // Charge the freshly decoded batch against the pool before we retain or
+        // forward it. When the bounded budget is exceeded by the aggregate
+        // in-flight decode output across concurrently-executing scan partitions
+        // this fails fast with `ResourcesExhausted` instead of OOM-killing.
+        let batch_bytes = batch.get_array_memory_size();
+        self.reservation.try_grow(batch_bytes)?;
+
         // Case 1: New batch itself is large enough and buffer is empty or too small to be significant
         if batch.num_rows() >= self.max_record_batch_rows && self.buffer.is_empty() {
-            // Buffer was empty, yield current large batch directly
+            // Buffer was empty, yield current large batch directly. It leaves our
+            // control on yield, so release its charge immediately.
+            self.reservation.shrink(batch_bytes);
             return Ok(Some(batch));
         }
 
@@ -70,14 +99,16 @@ impl RecordBatchBuffer {
         if !self.buffer.is_empty()
             && (self.current_rows + batch.num_rows() > self.max_record_batch_rows)
         {
-            let combined = self.finish_internal()?; // Drain and combine buffer
+            let combined = self.finish_internal()?; // Drain and combine buffer (releases the retained charge)
             self.current_rows = batch.num_rows();
+            self.buffered_bytes = batch_bytes; // retain the new batch; its charge is already grown
             self.buffer.push(batch); // Add current batch to now-empty buffer
             return Ok(combined); // Return the combined batch from buffer
         }
 
         // Case 3: Buffer has space
         self.current_rows += batch.num_rows();
+        self.buffered_bytes += batch_bytes; // charge already grown above
         self.buffer.push(batch);
         Ok(None)
     }
@@ -91,6 +122,10 @@ impl RecordBatchBuffer {
         let batches_to_combine: Vec<_> = self.buffer.drain(..).collect();
         let combined = concat_batches(&schema_to_use, &batches_to_combine)?;
         self.current_rows = 0;
+        // The retained input batches are dropped here and the combined batch
+        // leaves our control on yield, so release the charge we held for them.
+        self.reservation.shrink(self.buffered_bytes);
+        self.buffered_bytes = 0;
         Ok(Some(combined))
     }
 
@@ -330,7 +365,7 @@ async fn get_batch_stream(
     };
 
     let stream = try_stream! {
-        let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+        let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows, &memory_pool);
 
         // Account the bytes prefetch holds in memory against the DataFusion memory
         // pool. When compaction runs under a bounded budget (`max_memory_bytes` ->
@@ -721,6 +756,14 @@ mod tests {
     }
 
     use datafusion::arrow::array::Int32Array;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+
+    // Helper: build a RecordBatchBuffer backed by an unbounded pool for tests
+    // that only exercise the coalescing logic (not the memory accounting).
+    fn test_record_batch_buffer(max_record_batch_rows: usize) -> RecordBatchBuffer {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        RecordBatchBuffer::new(max_record_batch_rows, &memory_pool)
+    }
 
     // Helper function to create a RecordBatch with a single Int32 column and specified number of rows
     fn create_test_batch(num_rows: usize, schema_opt: Option<ArrowSchemaRef>) -> RecordBatch {
@@ -741,9 +784,57 @@ mod tests {
     // ... existing tests for split_n_vecs ...
 
     #[test]
+    fn test_record_batch_buffer_fails_fast_when_pool_exhausted() {
+        // A bounded pool far too small to hold a decoded batch must make `add`
+        // fail fast with `ResourcesExhausted` rather than buffer without bound.
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16));
+        let mut buffer = RecordBatchBuffer::new(1_000, &memory_pool);
+
+        // ~400 bytes of Int32 data, well over the 16-byte budget.
+        let err = buffer.add(create_test_batch(100, None)).unwrap_err();
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted, got: {err}"
+        );
+        // Nothing retained (and nothing charged) after the failed grow.
+        assert_eq!(buffer.buffered_bytes, 0);
+        assert!(buffer.buffer.is_empty());
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_releases_reservation() {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let mut buffer = RecordBatchBuffer::new(100, &memory_pool);
+
+        // Case 1: a batch that fills the buffer is yielded directly; its charge
+        // must be released immediately.
+        assert!(buffer.add(create_test_batch(100, None)).unwrap().is_some());
+        assert_eq!(
+            memory_pool.reserved(),
+            0,
+            "direct-yield must release its charge"
+        );
+        assert_eq!(buffer.buffered_bytes, 0);
+
+        // Retained (buffered) batches keep their bytes charged to the pool.
+        assert!(buffer.add(create_test_batch(30, None)).unwrap().is_none());
+        assert!(buffer.add(create_test_batch(40, None)).unwrap().is_none());
+        assert!(
+            memory_pool.reserved() > 0,
+            "retained batches must be charged"
+        );
+        assert_eq!(memory_pool.reserved(), buffer.buffered_bytes);
+
+        // finish() flushes the buffer and releases everything.
+        assert!(buffer.finish().unwrap().is_some());
+        assert_eq!(memory_pool.reserved(), 0, "finish must release all charge");
+    }
+
+    #[test]
     fn test_record_batch_buffer_empty_buffer_large_batch() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
         let large_batch = create_test_batch(max_rows, None); // Exactly max_rows
 
         // Case 1: New batch is large and buffer is empty. Yield new batch directly.
@@ -764,7 +855,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_overflow_and_yield() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         // Add some initial batches that don't fill the buffer
         let batch1 = create_test_batch(30, None);
@@ -810,7 +901,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_to_buffer_no_yield() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         let batch1 = create_test_batch(30, None);
         let batch1_rows = batch1.num_rows();
@@ -829,7 +920,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_finish_with_remaining() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         let batch1 = create_test_batch(30, None);
         let batch1_rows = batch1.num_rows();
@@ -847,7 +938,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_finish_empty() {
         let max_rows = 100;
-        let buffer = RecordBatchBuffer::new(max_rows);
+        let buffer = test_record_batch_buffer(max_rows);
         let result = buffer.finish().unwrap();
         assert!(result.is_none(), "Finish on empty buffer should yield None");
     }
@@ -855,7 +946,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_multiple_then_overflow() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         // Add batches that sum up to less than max_rows
         buffer.add(create_test_batch(20, None)).unwrap(); // current_rows = 20
@@ -891,7 +982,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_batch_exactly_fills_then_overflows() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
         // This batch makes current_rows exactly max_rows
@@ -919,7 +1010,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_to_empty_buffer_small_batch() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
         let small_batch = create_test_batch(10, None);
         let small_batch_rows = small_batch.num_rows();
 
