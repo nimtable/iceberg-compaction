@@ -493,6 +493,45 @@ impl Prefetcher {
         file_io: &FileIO,
         reservation: &mut MemoryReservation,
     ) -> DFResult<FileScanTask> {
+        // Reserve the file's *declared* size against the pool BEFORE downloading
+        // it. The download buffers the whole file in memory, so reserving only
+        // afterward (the previous behavior) let several concurrent object-store
+        // reads materialize their buffers and blow past a bounded budget during
+        // `read().await`, before any of them returned `ResourcesExhausted`.
+        // Reserving up-front means an over-budget prefetch is rejected before the
+        // read is ever started. A failure here leaves the reservation untouched,
+        // so we can propagate it directly.
+        let declared_bytes = usize::try_from(task.file_size_in_bytes).unwrap_or(usize::MAX);
+        reservation.try_grow(declared_bytes)?;
+        file_context.reserved_bytes = declared_bytes;
+
+        // Everything past the up-front reservation can fail after we already hold
+        // pool memory, so release `file_context.reserved_bytes` (the declared
+        // amount, or the reconciled actual once known) on any error to keep the
+        // pool clean if this prefetch is abandoned.
+        match self
+            .download_and_stage(task, file_context, file_io, reservation)
+            .await
+        {
+            Ok(memory_task) => Ok(memory_task),
+            Err(e) => {
+                reservation.shrink(file_context.reserved_bytes);
+                file_context.reserved_bytes = 0;
+                Err(e)
+            }
+        }
+    }
+
+    /// Download the file, reconcile the up-front reservation to the file's actual
+    /// length, and stage it in the in-memory `FileIO`. Assumes the caller has
+    /// already reserved `file_context.reserved_bytes` and will release it on error.
+    async fn download_and_stage(
+        &self,
+        task: &FileScanTask,
+        file_context: &mut FileTaskContext,
+        file_io: &FileIO,
+        reservation: &mut MemoryReservation,
+    ) -> DFResult<FileScanTask> {
         // 1. Download file from source storage (single HTTP request)
         let file_bytes = file_io
             .new_input(&file_context.original_path)
@@ -501,11 +540,13 @@ impl Prefetcher {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Reserve the in-memory copy against the pool before we hold it. Under a
-        // bounded budget this returns `ResourcesExhausted` (a clean, retriable
-        // error) instead of letting concurrent prefetches OOM the process.
-        reservation.try_grow(file_bytes.len())?;
-        file_context.reserved_bytes = file_bytes.len();
+        // Reconcile the up-front (declared) reservation with the actual byte
+        // length. Iceberg metadata is normally exact; if the file is smaller,
+        // `try_resize` releases the slack, and if it is larger it grows the
+        // difference and can still fail cleanly with `ResourcesExhausted`.
+        let actual_bytes = file_bytes.len();
+        reservation.try_resize(actual_bytes)?;
+        file_context.reserved_bytes = actual_bytes;
 
         // 2. Write to memory storage
         let memory_path = generate_memory_path(&file_context.original_path);
@@ -652,7 +693,7 @@ mod tests {
             deletes: vec![],
             sequence_number: 0,
             equality_ids: None,
-            file_size_in_bytes: 0,
+            file_size_in_bytes: length,
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -1083,5 +1124,42 @@ mod tests {
             prefetcher.clear_file(&ctx, &mut reservation).await.unwrap();
             assert_eq!(reservation.size(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_reserves_before_reading_file() {
+        use datafusion::execution::memory_pool::FairSpillPool;
+
+        // The prefetcher's source FileIO is EMPTY: it contains no file at the
+        // task's path. If the reservation were taken only after the download (the
+        // old ordering), the read would run first and fail with an IO/not-found
+        // error. Because we reserve the declared size up-front, an over-budget
+        // prefetch is rejected with `ResourcesExhausted` before the read is ever
+        // attempted -- so seeing that error (rather than an IO error against the
+        // missing file) proves the read never started.
+        let prefetcher = Prefetcher::new().unwrap();
+        let empty_source_io = FileIOBuilder::new("memory").build().unwrap();
+
+        let declared_len = 1024 * 1024; // 1 MiB, larger than the pool below
+        let mut task = create_file_scan_task(declared_len, 1);
+        task.data_file_path = "memory:/src/does_not_exist.bin".to_owned();
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024));
+        let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
+
+        let mut ctx = FileTaskContext::from_task(&task);
+        let err = prefetcher
+            .prefetch_file_into_memory(&task, &mut ctx, &empty_source_io, &mut reservation)
+            .await
+            .expect_err("prefetch must fail before reading when the budget is too small");
+
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted from the up-front reservation (proving the \
+             read never started), got: {err:?}"
+        );
+        // The failed up-front grow must leave nothing reserved or recorded.
+        assert_eq!(reservation.size(), 0);
+        assert_eq!(ctx.reserved_bytes, 0);
     }
 }
