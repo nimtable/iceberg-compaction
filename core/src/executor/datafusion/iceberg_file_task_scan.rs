@@ -25,6 +25,7 @@ use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -47,21 +48,52 @@ struct RecordBatchBuffer {
     current_rows: usize,
 
     max_record_batch_rows: usize,
+
+    /// Live reservation for the decoded batches currently retained in `buffer`,
+    /// charged against the `DataFusion` memory pool. The reservation tracks its
+    /// own allocated size, so it is the single source of truth for how many
+    /// bytes we still hold.
+    ///
+    /// Charging the scan's retained decode output to the pool gives the
+    /// compaction memory budget (`max_memory_bytes` -> `FairSpillPool`) teeth on
+    /// the unsorted-table path, which has no `SortExec` to reserve from the pool
+    /// and therefore otherwise never surfaces its decode footprint. Under a
+    /// bounded pool an over-budget batch fails fast with `ResourcesExhausted`
+    /// (a clean, retriable error) instead of the process being OOM-killed; with
+    /// the default unbounded pool `try_grow` always succeeds, so behavior is
+    /// unchanged.
+    ///
+    /// The reservation only ever reflects bytes we still hold: it is released as
+    /// batches are flushed or yielded downstream (and fully on drop), so it does
+    /// not over-reserve against a co-resident `SortExec` on the sorted path.
+    reservation: MemoryReservation,
 }
 
 impl RecordBatchBuffer {
-    fn new(max_record_batch_rows: usize) -> Self {
+    fn new(max_record_batch_rows: usize, memory_pool: &Arc<dyn MemoryPool>) -> Self {
         Self {
             buffer: vec![],
             current_rows: 0,
             max_record_batch_rows,
+            reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]").register(memory_pool),
         }
     }
 
     fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
+        // Measure the freshly decoded batch. Each case below charges it against
+        // the pool with `try_grow` before retaining or forwarding it, so when the
+        // bounded budget is exceeded by the aggregate in-flight decode output
+        // across concurrently-executing scan partitions we fail fast with
+        // `ResourcesExhausted` instead of OOM-killing.
+        let batch_bytes = batch.get_array_memory_size();
+
         // Case 1: New batch itself is large enough and buffer is empty or too small to be significant
         if batch.num_rows() >= self.max_record_batch_rows && self.buffer.is_empty() {
-            // Buffer was empty, yield current large batch directly
+            // Validate the batch against the budget so an over-budget decode
+            // still fails fast, then release the charge immediately: the batch
+            // leaves our control on yield, so we retain nothing.
+            self.reservation.try_grow(batch_bytes)?;
+            self.reservation.free();
             return Ok(Some(batch));
         }
 
@@ -69,13 +101,19 @@ impl RecordBatchBuffer {
         if !self.buffer.is_empty()
             && (self.current_rows + batch.num_rows() > self.max_record_batch_rows)
         {
-            let combined = self.finish_internal()?; // Drain and combine buffer
+            // Flush the retained buffer first (releasing its whole charge), then
+            // charge and retain the new batch. Flushing before growing keeps the
+            // reservation equal to the bytes we still hold, so `finish_internal`
+            // can release exactly the retained batches via `free`.
+            let combined = self.finish_internal()?; // Drain and combine buffer (releases the retained charge)
+            self.reservation.try_grow(batch_bytes)?;
             self.current_rows = batch.num_rows();
             self.buffer.push(batch); // Add current batch to now-empty buffer
             return Ok(combined); // Return the combined batch from buffer
         }
 
         // Case 3: Buffer has space
+        self.reservation.try_grow(batch_bytes)?;
         self.current_rows += batch.num_rows();
         self.buffer.push(batch);
         Ok(None)
@@ -90,6 +128,11 @@ impl RecordBatchBuffer {
         let batches_to_combine: Vec<_> = self.buffer.drain(..).collect();
         let combined = concat_batches(&schema_to_use, &batches_to_combine)?;
         self.current_rows = 0;
+        // The retained input batches are dropped here and the combined batch
+        // leaves our control on yield, so release the whole charge we held for
+        // them. Callers grow the reservation for any replacement batch only
+        // after this returns, so `free` never releases bytes we still need.
+        self.reservation.free();
         Ok(Some(combined))
     }
 
@@ -284,7 +327,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let fut = get_batch_stream(
             self.file_io.clone(),
@@ -293,6 +336,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
             self.need_file_path_and_pos,
             self.max_record_batch_rows,
             self.prefetch_enabled,
+            context.memory_pool().clone(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -319,6 +363,7 @@ async fn get_batch_stream(
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
     is_prefetch_enabled: bool,
+    memory_pool: Arc<dyn MemoryPool>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let optional_prefetch: Option<Prefetcher> = if is_prefetch_enabled {
         Some(Prefetcher::new()?)
@@ -327,7 +372,18 @@ async fn get_batch_stream(
     };
 
     let stream = try_stream! {
-        let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows);
+        let mut record_batch_buffer = RecordBatchBuffer::new(max_record_batch_rows, &memory_pool);
+
+        // Account the bytes prefetch holds in memory against the DataFusion memory
+        // pool. When compaction runs under a bounded budget (`max_memory_bytes` ->
+        // `FairSpillPool`), prefetching more concurrent full files than the budget
+        // allows fails cleanly with `ResourcesExhausted` instead of buffering every
+        // downloaded file in memory and OOM-killing the process. Unsorted-table
+        // compaction has no `SortExec` to reserve from the pool, so without this the
+        // pool never sees the scan's largest allocation. With the default unbounded
+        // pool `try_grow` always succeeds, so behavior is unchanged.
+        let mut prefetch_reservation =
+            MemoryConsumer::new("IcebergFileTaskScan[prefetch]").register(&memory_pool);
 
         for task in file_scan_tasks {
             let mut file_context = FileTaskContext::from_task(&task);
@@ -336,7 +392,7 @@ async fn get_batch_stream(
                 Some(prefetcher) => {
                     // We prefetch the file into memory, and return a MemoryFileIO to give to
                     // the ArrowReaderBuilder instead of the original file IO.
-                    let in_memory_task = prefetcher.prefetch_file_into_memory(&task, &mut file_context, &file_io).await?;
+                    let in_memory_task = prefetcher.prefetch_file_into_memory(&task, &mut file_context, &file_io, &mut prefetch_reservation).await?;
                     (prefetcher.memory_file_io(), in_memory_task)
                 },
                 None => (file_io.clone(), task)
@@ -378,7 +434,7 @@ async fn get_batch_stream(
 
             // 3. Clean up any memory file to avoid accmulating too much memory; ignore errors as cleanup is best-effort
             if let Some(prefetcher) = &optional_prefetch {
-                let _ = prefetcher.clear_file(&file_context).await;
+                let _ = prefetcher.clear_file(&file_context, &mut prefetch_reservation).await;
             }
         }
 
@@ -438,6 +494,44 @@ impl Prefetcher {
         task: &FileScanTask,
         file_context: &mut FileTaskContext,
         file_io: &FileIO,
+        reservation: &mut MemoryReservation,
+    ) -> DFResult<FileScanTask> {
+        // Reserve the file's *declared* size against the pool BEFORE downloading
+        // it. The download buffers the whole file in memory, so reserving only
+        // afterward (the previous behavior) let several concurrent object-store
+        // reads materialize their buffers and blow past a bounded budget during
+        // `read().await`, before any of them returned `ResourcesExhausted`.
+        // Reserving up-front means an over-budget prefetch is rejected before the
+        // read is ever started. A failure here leaves the reservation untouched,
+        // so we can propagate it directly.
+        let declared_bytes = usize::try_from(task.file_size_in_bytes).unwrap_or(usize::MAX);
+        reservation.try_grow(declared_bytes)?;
+
+        // Everything past the up-front reservation can fail after we already hold
+        // pool memory, so release whatever the reservation holds (the declared
+        // amount, or the reconciled actual once `download_and_stage` resizes it)
+        // on any error to keep the pool clean if this prefetch is abandoned.
+        match self
+            .download_and_stage(task, file_context, file_io, reservation)
+            .await
+        {
+            Ok(memory_task) => Ok(memory_task),
+            Err(e) => {
+                reservation.free();
+                Err(e)
+            }
+        }
+    }
+
+    /// Download the file, reconcile the up-front reservation to the file's actual
+    /// length, and stage it in the in-memory `FileIO`. Assumes the caller has
+    /// already grown `reservation` for this file and will release it on error.
+    async fn download_and_stage(
+        &self,
+        task: &FileScanTask,
+        file_context: &mut FileTaskContext,
+        file_io: &FileIO,
+        reservation: &mut MemoryReservation,
     ) -> DFResult<FileScanTask> {
         // 1. Download file from source storage (single HTTP request)
         let file_bytes = file_io
@@ -446,6 +540,13 @@ impl Prefetcher {
             .read()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Reconcile the up-front (declared) reservation with the actual byte
+        // length. Iceberg metadata is normally exact; if the file is smaller,
+        // `try_resize` releases the slack, and if it is larger it grows the
+        // difference and can still fail cleanly with `ResourcesExhausted`.
+        let actual_bytes = file_bytes.len();
+        reservation.try_resize(actual_bytes)?;
 
         // 2. Write to memory storage
         let memory_path = generate_memory_path(&file_context.original_path);
@@ -463,11 +564,17 @@ impl Prefetcher {
         Ok(memory_task)
     }
 
-    pub async fn clear_file(&self, file_context: &FileTaskContext) -> DFResult<()> {
+    pub async fn clear_file(
+        &self,
+        file_context: &FileTaskContext,
+        reservation: &mut MemoryReservation,
+    ) -> DFResult<()> {
         // swallow errors: this is best effort cleanup
         if let Some(memory_path) = &file_context.memory_path {
             let _ = self.memory_file_io.delete(memory_path).await;
         }
+        // Release the pool reservation for this file's in-memory copy.
+        reservation.free();
         Ok(())
     }
 }
@@ -586,7 +693,7 @@ mod tests {
             deletes: vec![],
             sequence_number: 0,
             equality_ids: None,
-            file_size_in_bytes: 0,
+            file_size_in_bytes: length,
             partition: None,
             partition_spec: None,
             name_mapping: None,
@@ -690,6 +797,14 @@ mod tests {
     }
 
     use datafusion::arrow::array::Int32Array;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+
+    // Helper: build a RecordBatchBuffer backed by an unbounded pool for tests
+    // that only exercise the coalescing logic (not the memory accounting).
+    fn test_record_batch_buffer(max_record_batch_rows: usize) -> RecordBatchBuffer {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        RecordBatchBuffer::new(max_record_batch_rows, &memory_pool)
+    }
 
     // Helper function to create a RecordBatch with a single Int32 column and specified number of rows
     fn create_test_batch(num_rows: usize, schema_opt: Option<ArrowSchemaRef>) -> RecordBatch {
@@ -710,9 +825,61 @@ mod tests {
     // ... existing tests for split_n_vecs ...
 
     #[test]
+    fn test_record_batch_buffer_fails_fast_when_pool_exhausted() {
+        // A bounded pool far too small to hold a decoded batch must make `add`
+        // fail fast with `ResourcesExhausted` rather than buffer without bound.
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16));
+        let mut buffer = RecordBatchBuffer::new(1_000, &memory_pool);
+
+        // ~400 bytes of Int32 data, well over the 16-byte budget.
+        let err = buffer.add(create_test_batch(100, None)).unwrap_err();
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted, got: {err}"
+        );
+        // Nothing retained (and nothing charged) after the failed grow.
+        assert_eq!(buffer.reservation.size(), 0);
+        assert!(buffer.buffer.is_empty());
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn test_record_batch_buffer_releases_reservation() {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let mut buffer = RecordBatchBuffer::new(100, &memory_pool);
+
+        // Case 1: a batch that fills the buffer is yielded directly; its charge
+        // must be released immediately.
+        assert!(buffer.add(create_test_batch(100, None)).unwrap().is_some());
+        assert_eq!(
+            memory_pool.reserved(),
+            0,
+            "direct-yield must release its charge"
+        );
+        assert_eq!(buffer.reservation.size(), 0);
+
+        // Retained (buffered) batches keep their exact bytes charged to the pool.
+        let b1 = create_test_batch(30, None);
+        let b2 = create_test_batch(40, None);
+        let retained_bytes = b1.get_array_memory_size() + b2.get_array_memory_size();
+        assert!(buffer.add(b1).unwrap().is_none());
+        assert!(buffer.add(b2).unwrap().is_none());
+        assert_eq!(
+            memory_pool.reserved(),
+            retained_bytes,
+            "retained batches must be charged their exact size"
+        );
+        assert_eq!(buffer.reservation.size(), retained_bytes);
+
+        // finish() flushes the buffer and releases everything.
+        assert!(buffer.finish().unwrap().is_some());
+        assert_eq!(memory_pool.reserved(), 0, "finish must release all charge");
+    }
+
+    #[test]
     fn test_record_batch_buffer_empty_buffer_large_batch() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
         let large_batch = create_test_batch(max_rows, None); // Exactly max_rows
 
         // Case 1: New batch is large and buffer is empty. Yield new batch directly.
@@ -733,7 +900,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_overflow_and_yield() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         // Add some initial batches that don't fill the buffer
         let batch1 = create_test_batch(30, None);
@@ -779,7 +946,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_to_buffer_no_yield() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         let batch1 = create_test_batch(30, None);
         let batch1_rows = batch1.num_rows();
@@ -798,7 +965,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_finish_with_remaining() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         let batch1 = create_test_batch(30, None);
         let batch1_rows = batch1.num_rows();
@@ -816,7 +983,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_finish_empty() {
         let max_rows = 100;
-        let buffer = RecordBatchBuffer::new(max_rows);
+        let buffer = test_record_batch_buffer(max_rows);
         let result = buffer.finish().unwrap();
         assert!(result.is_none(), "Finish on empty buffer should yield None");
     }
@@ -824,7 +991,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_multiple_then_overflow() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         // Add batches that sum up to less than max_rows
         buffer.add(create_test_batch(20, None)).unwrap(); // current_rows = 20
@@ -860,7 +1027,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_batch_exactly_fills_then_overflows() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
 
         buffer.add(create_test_batch(50, None)).unwrap(); // current_rows = 50
         // This batch makes current_rows exactly max_rows
@@ -888,7 +1055,7 @@ mod tests {
     #[test]
     fn test_record_batch_buffer_add_to_empty_buffer_small_batch() {
         let max_rows = 100;
-        let mut buffer = RecordBatchBuffer::new(max_rows);
+        let mut buffer = test_record_batch_buffer(max_rows);
         let small_batch = create_test_batch(10, None);
         let small_batch_rows = small_batch.num_rows();
 
@@ -897,5 +1064,103 @@ mod tests {
         assert!(result.is_none(), "Should not yield the small batch");
         assert_eq!(buffer.current_rows, small_batch_rows);
         assert_eq!(buffer.buffer.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_reservation_enforces_memory_budget() {
+        use datafusion::execution::memory_pool::{FairSpillPool, UnboundedMemoryPool};
+
+        // A source file living in an in-memory FileIO that the prefetcher reads from.
+        let source_io = FileIOBuilder::new("memory").build().unwrap();
+        let source_path = "memory:/src/prefetch_budget_test.bin";
+        let file_len = 1024 * 1024; // 1 MiB
+        source_io
+            .new_output(source_path)
+            .unwrap()
+            .write(vec![7u8; file_len].into())
+            .await
+            .unwrap();
+
+        let make_task = || {
+            let mut task = create_file_scan_task(file_len as u64, 1);
+            task.data_file_path = source_path.to_owned();
+            task
+        };
+
+        // Bounded pool smaller than the file: prefetch must fail cleanly with
+        // ResourcesExhausted instead of buffering the whole file in memory.
+        {
+            let prefetcher = Prefetcher::new().unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024));
+            let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
+
+            let task = make_task();
+            let mut ctx = FileTaskContext::from_task(&task);
+            let err = prefetcher
+                .prefetch_file_into_memory(&task, &mut ctx, &source_io, &mut reservation)
+                .await
+                .expect_err("prefetch should fail when the budget is smaller than the file");
+            assert!(
+                matches!(err, DataFusionError::ResourcesExhausted(_)),
+                "expected ResourcesExhausted, got: {err:?}"
+            );
+            // A failed grow must leave nothing reserved.
+            assert_eq!(reservation.size(), 0);
+        }
+
+        // Unbounded pool (the default): prefetch succeeds, the reservation tracks
+        // the file's bytes, and clearing the file releases them.
+        {
+            let prefetcher = Prefetcher::new().unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
+
+            let task = make_task();
+            let mut ctx = FileTaskContext::from_task(&task);
+            prefetcher
+                .prefetch_file_into_memory(&task, &mut ctx, &source_io, &mut reservation)
+                .await
+                .expect("prefetch should succeed under the default unbounded pool");
+            assert_eq!(reservation.size(), file_len);
+
+            prefetcher.clear_file(&ctx, &mut reservation).await.unwrap();
+            assert_eq!(reservation.size(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_reserves_before_reading_file() {
+        use datafusion::execution::memory_pool::FairSpillPool;
+
+        // The prefetcher's source FileIO is EMPTY: it contains no file at the
+        // task's path. If the reservation were taken only after the download (the
+        // old ordering), the read would run first and fail with an IO/not-found
+        // error. Because we reserve the declared size up-front, an over-budget
+        // prefetch is rejected with `ResourcesExhausted` before the read is ever
+        // attempted -- so seeing that error (rather than an IO error against the
+        // missing file) proves the read never started.
+        let prefetcher = Prefetcher::new().unwrap();
+        let empty_source_io = FileIOBuilder::new("memory").build().unwrap();
+
+        let declared_len = 1024 * 1024; // 1 MiB, larger than the pool below
+        let mut task = create_file_scan_task(declared_len, 1);
+        task.data_file_path = "memory:/src/does_not_exist.bin".to_owned();
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024));
+        let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
+
+        let mut ctx = FileTaskContext::from_task(&task);
+        let err = prefetcher
+            .prefetch_file_into_memory(&task, &mut ctx, &empty_source_io, &mut reservation)
+            .await
+            .expect_err("prefetch must fail before reading when the budget is too small");
+
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted from the up-front reservation (proving the \
+             read never started), got: {err:?}"
+        );
+        // The failed up-front grow must leave nothing reserved.
+        assert_eq!(reservation.size(), 0);
     }
 }
