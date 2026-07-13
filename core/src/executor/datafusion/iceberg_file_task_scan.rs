@@ -49,8 +49,10 @@ struct RecordBatchBuffer {
 
     max_record_batch_rows: usize,
 
-    /// Bytes of the decoded batches currently retained in `buffer`, mirrored as
-    /// a live reservation against the `DataFusion` memory pool.
+    /// Live reservation for the decoded batches currently retained in `buffer`,
+    /// charged against the `DataFusion` memory pool. The reservation tracks its
+    /// own allocated size, so it is the single source of truth for how many
+    /// bytes we still hold.
     ///
     /// Charging the scan's retained decode output to the pool gives the
     /// compaction memory budget (`max_memory_bytes` -> `FairSpillPool`) teeth on
@@ -64,7 +66,6 @@ struct RecordBatchBuffer {
     /// The reservation only ever reflects bytes we still hold: it is released as
     /// batches are flushed or yielded downstream (and fully on drop), so it does
     /// not over-reserve against a co-resident `SortExec` on the sorted path.
-    buffered_bytes: usize,
     reservation: MemoryReservation,
 }
 
@@ -74,24 +75,25 @@ impl RecordBatchBuffer {
             buffer: vec![],
             current_rows: 0,
             max_record_batch_rows,
-            buffered_bytes: 0,
             reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]").register(memory_pool),
         }
     }
 
     fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
-        // Charge the freshly decoded batch against the pool before we retain or
-        // forward it. When the bounded budget is exceeded by the aggregate
-        // in-flight decode output across concurrently-executing scan partitions
-        // this fails fast with `ResourcesExhausted` instead of OOM-killing.
+        // Measure the freshly decoded batch. Each case below charges it against
+        // the pool with `try_grow` before retaining or forwarding it, so when the
+        // bounded budget is exceeded by the aggregate in-flight decode output
+        // across concurrently-executing scan partitions we fail fast with
+        // `ResourcesExhausted` instead of OOM-killing.
         let batch_bytes = batch.get_array_memory_size();
-        self.reservation.try_grow(batch_bytes)?;
 
         // Case 1: New batch itself is large enough and buffer is empty or too small to be significant
         if batch.num_rows() >= self.max_record_batch_rows && self.buffer.is_empty() {
-            // Buffer was empty, yield current large batch directly. It leaves our
-            // control on yield, so release its charge immediately.
-            self.reservation.shrink(batch_bytes);
+            // Validate the batch against the budget so an over-budget decode
+            // still fails fast, then release the charge immediately: the batch
+            // leaves our control on yield, so we retain nothing.
+            self.reservation.try_grow(batch_bytes)?;
+            self.reservation.free();
             return Ok(Some(batch));
         }
 
@@ -99,16 +101,20 @@ impl RecordBatchBuffer {
         if !self.buffer.is_empty()
             && (self.current_rows + batch.num_rows() > self.max_record_batch_rows)
         {
+            // Flush the retained buffer first (releasing its whole charge), then
+            // charge and retain the new batch. Flushing before growing keeps the
+            // reservation equal to the bytes we still hold, so `finish_internal`
+            // can release exactly the retained batches via `free`.
             let combined = self.finish_internal()?; // Drain and combine buffer (releases the retained charge)
+            self.reservation.try_grow(batch_bytes)?;
             self.current_rows = batch.num_rows();
-            self.buffered_bytes = batch_bytes; // retain the new batch; its charge is already grown
             self.buffer.push(batch); // Add current batch to now-empty buffer
             return Ok(combined); // Return the combined batch from buffer
         }
 
         // Case 3: Buffer has space
+        self.reservation.try_grow(batch_bytes)?;
         self.current_rows += batch.num_rows();
-        self.buffered_bytes += batch_bytes; // charge already grown above
         self.buffer.push(batch);
         Ok(None)
     }
@@ -123,9 +129,10 @@ impl RecordBatchBuffer {
         let combined = concat_batches(&schema_to_use, &batches_to_combine)?;
         self.current_rows = 0;
         // The retained input batches are dropped here and the combined batch
-        // leaves our control on yield, so release the charge we held for them.
-        self.reservation.shrink(self.buffered_bytes);
-        self.buffered_bytes = 0;
+        // leaves our control on yield, so release the whole charge we held for
+        // them. Callers grow the reservation for any replacement batch only
+        // after this returns, so `free` never releases bytes we still need.
+        self.reservation.free();
         Ok(Some(combined))
     }
 
@@ -446,9 +453,6 @@ struct FileTaskContext {
     data_file_content: DataContentType,
     sequence_number: i64,
     memory_path: Option<String>,
-    /// Bytes reserved from the `DataFusion` memory pool for the prefetched
-    /// in-memory copy of this file; released when the file is cleared.
-    reserved_bytes: usize,
 }
 
 impl FileTaskContext {
@@ -458,7 +462,6 @@ impl FileTaskContext {
             data_file_content: task.data_file_content,
             sequence_number: task.sequence_number,
             memory_path: None,
-            reserved_bytes: 0,
         }
     }
 
@@ -503,20 +506,18 @@ impl Prefetcher {
         // so we can propagate it directly.
         let declared_bytes = usize::try_from(task.file_size_in_bytes).unwrap_or(usize::MAX);
         reservation.try_grow(declared_bytes)?;
-        file_context.reserved_bytes = declared_bytes;
 
         // Everything past the up-front reservation can fail after we already hold
-        // pool memory, so release `file_context.reserved_bytes` (the declared
-        // amount, or the reconciled actual once known) on any error to keep the
-        // pool clean if this prefetch is abandoned.
+        // pool memory, so release whatever the reservation holds (the declared
+        // amount, or the reconciled actual once `download_and_stage` resizes it)
+        // on any error to keep the pool clean if this prefetch is abandoned.
         match self
             .download_and_stage(task, file_context, file_io, reservation)
             .await
         {
             Ok(memory_task) => Ok(memory_task),
             Err(e) => {
-                reservation.shrink(file_context.reserved_bytes);
-                file_context.reserved_bytes = 0;
+                reservation.free();
                 Err(e)
             }
         }
@@ -524,7 +525,7 @@ impl Prefetcher {
 
     /// Download the file, reconcile the up-front reservation to the file's actual
     /// length, and stage it in the in-memory `FileIO`. Assumes the caller has
-    /// already reserved `file_context.reserved_bytes` and will release it on error.
+    /// already grown `reservation` for this file and will release it on error.
     async fn download_and_stage(
         &self,
         task: &FileScanTask,
@@ -546,7 +547,6 @@ impl Prefetcher {
         // difference and can still fail cleanly with `ResourcesExhausted`.
         let actual_bytes = file_bytes.len();
         reservation.try_resize(actual_bytes)?;
-        file_context.reserved_bytes = actual_bytes;
 
         // 2. Write to memory storage
         let memory_path = generate_memory_path(&file_context.original_path);
@@ -574,7 +574,7 @@ impl Prefetcher {
             let _ = self.memory_file_io.delete(memory_path).await;
         }
         // Release the pool reservation for this file's in-memory copy.
-        reservation.shrink(file_context.reserved_bytes);
+        reservation.free();
         Ok(())
     }
 }
@@ -838,7 +838,7 @@ mod tests {
             "expected ResourcesExhausted, got: {err}"
         );
         // Nothing retained (and nothing charged) after the failed grow.
-        assert_eq!(buffer.buffered_bytes, 0);
+        assert_eq!(buffer.reservation.size(), 0);
         assert!(buffer.buffer.is_empty());
         assert_eq!(memory_pool.reserved(), 0);
     }
@@ -856,16 +856,20 @@ mod tests {
             0,
             "direct-yield must release its charge"
         );
-        assert_eq!(buffer.buffered_bytes, 0);
+        assert_eq!(buffer.reservation.size(), 0);
 
-        // Retained (buffered) batches keep their bytes charged to the pool.
-        assert!(buffer.add(create_test_batch(30, None)).unwrap().is_none());
-        assert!(buffer.add(create_test_batch(40, None)).unwrap().is_none());
-        assert!(
-            memory_pool.reserved() > 0,
-            "retained batches must be charged"
+        // Retained (buffered) batches keep their exact bytes charged to the pool.
+        let b1 = create_test_batch(30, None);
+        let b2 = create_test_batch(40, None);
+        let retained_bytes = b1.get_array_memory_size() + b2.get_array_memory_size();
+        assert!(buffer.add(b1).unwrap().is_none());
+        assert!(buffer.add(b2).unwrap().is_none());
+        assert_eq!(
+            memory_pool.reserved(),
+            retained_bytes,
+            "retained batches must be charged their exact size"
         );
-        assert_eq!(memory_pool.reserved(), buffer.buffered_bytes);
+        assert_eq!(buffer.reservation.size(), retained_bytes);
 
         // finish() flushes the buffer and releases everything.
         assert!(buffer.finish().unwrap().is_some());
@@ -1102,7 +1106,6 @@ mod tests {
             );
             // A failed grow must leave nothing reserved.
             assert_eq!(reservation.size(), 0);
-            assert_eq!(ctx.reserved_bytes, 0);
         }
 
         // Unbounded pool (the default): prefetch succeeds, the reservation tracks
@@ -1118,7 +1121,6 @@ mod tests {
                 .prefetch_file_into_memory(&task, &mut ctx, &source_io, &mut reservation)
                 .await
                 .expect("prefetch should succeed under the default unbounded pool");
-            assert_eq!(ctx.reserved_bytes, file_len);
             assert_eq!(reservation.size(), file_len);
 
             prefetcher.clear_file(&ctx, &mut reservation).await.unwrap();
@@ -1158,8 +1160,7 @@ mod tests {
             "expected ResourcesExhausted from the up-front reservation (proving the \
              read never started), got: {err:?}"
         );
-        // The failed up-front grow must leave nothing reserved or recorded.
+        // The failed up-front grow must leave nothing reserved.
         assert_eq!(reservation.size(), 0);
-        assert_eq!(ctx.reserved_bytes, 0);
     }
 }
