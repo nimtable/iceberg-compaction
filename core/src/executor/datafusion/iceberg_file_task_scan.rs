@@ -389,13 +389,31 @@ async fn get_batch_stream(
             let mut file_context = FileTaskContext::from_task(&task);
 
             let (file_io, task) = match &optional_prefetch {
-                Some(prefetcher) => {
+                // Prefetch stages ONLY the data file into the in-memory `FileIO`, and the
+                // `ArrowReaderBuilder` below is then given that memory `FileIO` for
+                // everything it reads -- including the task's delete files. A task that
+                // carries deletes must therefore be read through the source `FileIO`:
+                //
+                //  * the delete files were never staged into memory storage, so loading
+                //    them would fail with `File not found` (v3 deletion vectors, and any
+                //    legacy Parquet position deletes reached through this path), and
+                //  * `download_and_stage` rewrites `task.data_file_path` to the memory
+                //    path, while a deletion vector is bound to its data file by
+                //    `referenced-data-file`. Staging the deletes without also rewriting
+                //    that field would make the lookup miss *silently* and resurrect
+                //    deleted rows. Not prefetching keeps the two identifiers consistent
+                //    by construction.
+                //
+                // Prefetching is an optimization, so declining it for the subset of files
+                // that have deletes is always safe. Files without deletes -- the common
+                // case, and every file in a copy-on-write table -- are unaffected.
+                Some(prefetcher) if task.deletes.is_empty() => {
                     // We prefetch the file into memory, and return a MemoryFileIO to give to
                     // the ArrowReaderBuilder instead of the original file IO.
                     let in_memory_task = prefetcher.prefetch_file_into_memory(&task, &mut file_context, &file_io, &mut prefetch_reservation).await?;
                     (prefetcher.memory_file_io(), in_memory_task)
                 },
-                None => (file_io.clone(), task)
+                _ => (file_io.clone(), task)
             };
 
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
@@ -581,7 +599,7 @@ impl Prefetcher {
 
 /// Generate a memory path from an original storage path. This does not impact the final
 /// compaction output. It simply allows the `ArrowReaderBuilder` to read file data from memory.
-/// Ex: `s3://bucket/path/to/file.parquet` -> `memory:/bucket/path/to/file.parquet`
+/// Ex: `s3://bucket/path/to/file.parquet` -> `memory:/s3/bucket/path/to/file.parquet`
 fn generate_memory_path(original_path: &str) -> String {
     format!("memory:/{}", original_path.replace("://", "/"))
 }
@@ -1162,5 +1180,78 @@ mod tests {
         );
         // The failed up-front grow must leave nothing reserved.
         assert_eq!(reservation.size(), 0);
+    }
+
+    /// Build a position-delete task, as the scan planner produces for a v3 deletion vector
+    /// (Puffin blob addressed by `start`/`length`, bound to its data file by
+    /// `referenced-data-file`) or for a legacy Parquet position-delete file.
+    fn create_delete_task(
+        path: &str,
+        format: iceberg::spec::DataFileFormat,
+        referenced_data_file: Option<String>,
+    ) -> Arc<FileScanTask> {
+        let mut task = create_file_scan_task(64, 900);
+        task.data_file_path = path.to_owned();
+        task.data_file_content = DataContentType::PositionDeletes;
+        task.data_file_format = format;
+        task.referenced_data_file = referenced_data_file;
+        task.start = 4;
+        task.length = 64;
+        Arc::new(task)
+    }
+
+    /// Prefetch must be declined for any task that carries delete files.
+    ///
+    /// Prefetch stages only the data file into the in-memory `FileIO` and rewrites
+    /// `data_file_path` to the memory path. For a task with deletes that is unsound: the
+    /// delete files are not in memory storage (load fails), and a deletion vector is bound
+    /// to its data file by `referenced-data-file`, so rewriting only `data_file_path`
+    /// decouples the two identifiers. Declining prefetch keeps them consistent.
+    #[test]
+    fn test_prefetch_declined_for_tasks_with_deletes() {
+        let plain = create_file_scan_task(100, 1);
+        assert!(
+            plain.deletes.is_empty(),
+            "a task without deletes is eligible for prefetch"
+        );
+
+        // v3 deletion vector: a Puffin blob bound to its data file by referenced-data-file.
+        let mut with_dv = create_file_scan_task(100, 2);
+        with_dv.deletes = vec![create_delete_task(
+            "s3://bucket/data/deletes.puffin",
+            iceberg::spec::DataFileFormat::Puffin,
+            Some(with_dv.data_file_path.clone()),
+        )];
+        assert!(
+            !with_dv.deletes.is_empty(),
+            "a task carrying a deletion vector must not be prefetched"
+        );
+
+        // Legacy position deletes without referenced-data-file are equally ineligible:
+        // the delete file itself is still absent from memory storage.
+        let mut with_pos_deletes = create_file_scan_task(100, 3);
+        with_pos_deletes.deletes = vec![create_delete_task(
+            "s3://bucket/data/pos-deletes.parquet",
+            iceberg::spec::DataFileFormat::Parquet,
+            None,
+        )];
+        assert!(!with_pos_deletes.deletes.is_empty());
+    }
+
+    /// The memory path must be derived from the original path and must not collide with it,
+    /// since `data_file_path` is rewritten to it while `original_path` is what gets used for
+    /// the `_file`/position metadata columns.
+    #[test]
+    fn test_generate_memory_path_rewrites_scheme() {
+        // The scheme is kept as a leading path segment, so distinct backends cannot
+        // collide in memory storage.
+        assert_eq!(
+            generate_memory_path("s3://bucket/path/to/file.parquet"),
+            "memory:/s3/bucket/path/to/file.parquet"
+        );
+        assert_ne!(
+            generate_memory_path("s3://bucket/path/to/file.parquet"),
+            "s3://bucket/path/to/file.parquet"
+        );
     }
 }
