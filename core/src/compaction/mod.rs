@@ -1049,7 +1049,11 @@ impl CommitManager {
 
                 let txn = Transaction::new(&table);
 
-                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
+                // The rewrite materialized the deletes that were visible at
+                // `starting_snapshot_id`. If another writer has added deletes for one of the data
+                // files being replaced since then, those deletes are not in the new files, and
+                // removing the old data file would retire them as dangling — resurrecting the rows
+                // they deleted. `validate_from_snapshot_id` turns that into a failed commit.
                 let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
@@ -1060,7 +1064,8 @@ impl CommitManager {
                             .delete_files(delete_files)
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
-                            .set_check_file_existence(true);
+                            .set_check_file_existence(true)
+                            .validate_from_snapshot_id(starting_snapshot_id);
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                         action
                     } else {
@@ -1078,7 +1083,8 @@ impl CommitManager {
                         .add_data_files(data_files)
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
-                        .set_check_file_existence(true);
+                        .set_check_file_existence(true)
+                        .validate_from_snapshot_id(starting_snapshot_id);
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                     }
