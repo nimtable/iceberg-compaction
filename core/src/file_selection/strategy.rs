@@ -736,7 +736,7 @@ impl FileSequenceNumberFilterStrategy {
 impl FileFilterStrategy for FileSequenceNumberFilterStrategy {
     fn matches(&self, data_file: &FileScanTask) -> bool {
         data_file
-            .file_sequence_number
+            .data_sequence_number
             .is_some_and(|sequence_number| sequence_number <= self.max_file_sequence_number)
     }
 }
@@ -1324,7 +1324,6 @@ mod tests {
                 predicate: None,
                 deletes,
                 sequence_number: 1,
-                file_sequence_number: Some(1),
                 file_size_in_bytes: self.size,
                 partition: self.partition,
                 partition_spec: None,
@@ -1661,9 +1660,9 @@ mod tests {
     #[test]
     fn test_sequence_bound_filters_all_planning_strategies() {
         let mut old_file = TestFileBuilder::new("old.parquet").with_deletes().build();
-        old_file.file_sequence_number = Some(3);
+        old_file.data_sequence_number = Some(3);
         let mut new_file = TestFileBuilder::new("new.parquet").with_deletes().build();
-        new_file.file_sequence_number = Some(4);
+        new_file.data_sequence_number = Some(4);
 
         let configs = [
             CompactionPlanningConfig::SmallFiles(
@@ -1708,7 +1707,7 @@ mod tests {
     #[test]
     fn test_bounded_planning_rejects_missing_file_sequence_number() {
         let mut missing = TestFileBuilder::new("missing.parquet").build();
-        missing.file_sequence_number = None;
+        missing.data_sequence_number = None;
         let config = CompactionPlanningConfig::Full(
             FullCompactionConfigBuilder::default()
                 .max_file_sequence_number(3_i64)
