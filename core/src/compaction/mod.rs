@@ -1077,14 +1077,20 @@ impl CommitManager {
                         ));
                     }
                 } else {
+                    // No `validate_from_snapshot_id` here on purpose. This path deliberately does
+                    // *not* preserve the starting snapshot's sequence number, and that is precisely
+                    // what keeps pre-existing equality deletes applicable to the replacement files.
+                    // The validation refuses to promise anything without it rather than offer a
+                    // guarantee that only holds for position deletes, so requesting it here would
+                    // simply fail the commit. Concurrent-delete protection therefore requires
+                    // `use_starting_sequence_number`.
                     let mut action = txn
                         .rewrite_files()
                         .set_enable_delete_filter_manager(true)
                         .add_data_files(data_files)
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
-                        .set_check_file_existence(true)
-                        .validate_from_snapshot_id(starting_snapshot_id);
+                        .set_check_file_existence(true);
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                     }
