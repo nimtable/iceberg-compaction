@@ -18,11 +18,12 @@
 use core::net::{IpAddr, SocketAddr};
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{Once, RwLock};
+use std::sync::{Arc, Once, RwLock};
 
 use ctor::dtor;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
 use iceberg_compaction_core::iceberg::CatalogBuilder;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use port_scanner::scan_port_addr;
 
 const REST_CATALOG_PORT: u16 = 8181;
@@ -38,6 +39,7 @@ pub const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
 pub const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
 pub const S3_REGION: &str = "s3.region";
 const S3_ENDPOINT: &str = "s3.endpoint";
+const S3_PATH_STYLE_ACCESS: &str = "s3.path-style-access";
 
 const DEFAULT_ADMIN: &str = "admin";
 const DEFAULT_PASSWORD: &str = "password";
@@ -112,6 +114,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
                 aws_region.unwrap_or(DEFAULT_REGION.to_owned()),
             ),
             (S3_ENDPOINT.to_owned(), aws_endpoint),
+            (S3_PATH_STYLE_ACCESS.to_owned(), "true".to_owned()),
         ]);
         let rest_catalog_ip = docker_compose.get_container_ip(REST_SERVICE);
         (rest_catalog_ip, props)
@@ -129,6 +132,9 @@ pub async fn get_rest_catalog() -> RestCatalog {
         format!("http://{}", rest_socket_addr),
     );
     RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
         .load("rest", props)
         .await
         .expect("rest catalog build failed")
