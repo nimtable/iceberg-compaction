@@ -50,25 +50,16 @@ impl FileSelector {
 
     /// Scans and collects all data files from a table snapshot.
     ///
-    /// Filters out non-data files (delete files). Returns raw `FileScanTask`s
-    /// for downstream processing.
+    /// Returns the data-file tasks planned for downstream processing.
+    ///
+    /// Iceberg's current scan API keeps delete files as lightweight descriptors
+    /// nested under each data task, so every top-level task is a data file.
     pub async fn scan_data_files(table: &Table, snapshot_id: i64) -> Result<Vec<FileScanTask>> {
         let scan = table.scan().snapshot_id(snapshot_id).build()?;
 
         let file_scan_stream = scan.plan_files().await?;
 
-        let data_files: Vec<FileScanTask> = file_scan_stream
-            .try_filter_map(|task| {
-                futures::future::ready(Ok(
-                    if matches!(task.data_file_content, iceberg::spec::DataContentType::Data) {
-                        Some(task)
-                    } else {
-                        None
-                    },
-                ))
-            })
-            .try_collect()
-            .await?;
+        let data_files: Vec<FileScanTask> = file_scan_stream.try_collect().await?;
         Ok(data_files)
     }
 

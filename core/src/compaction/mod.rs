@@ -20,8 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
-use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
@@ -46,6 +45,8 @@ pub use auto::{
     AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner, AutoPlanReason, AutoPlanReport,
     AutoSelectedStrategy,
 };
+
+const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
 /// Validates that all rewrite results target the same snapshot and branch.
 ///
@@ -528,7 +529,7 @@ impl Compaction {
     ) -> Result<Vec<RewriteResult>> {
         use futures::stream::{self, StreamExt};
 
-        let results: Result<Vec<RewriteResult>> = stream::iter(plans.into_iter())
+        let results: Result<Vec<RewriteResult>> = stream::iter(plans)
             .map(|plan| async move { self.rewrite_plan(plan, execution_config, table).await })
             .buffer_unordered(execution_config.max_concurrent_compaction_plans) // Limit concurrency based on config
             .collect::<Vec<_>>()
@@ -601,7 +602,7 @@ impl Compaction {
         execution_config: &CompactionExecutionConfig,
     ) -> Result<RewriteFilesRequest> {
         let schema = table.metadata().current_schema().clone();
-        let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let metrics_recorder = CompactionMetricsRecorder::new(
             self.metrics.clone(),
             self.catalog_name.clone(),
@@ -733,15 +734,17 @@ impl Compaction {
 /// Returns error if manifest list or manifest loading fails.
 async fn get_all_files_from_snapshot(
     snapshot: &Arc<Snapshot>,
-    file_io: &FileIO,
-    table_metadata: &iceberg::spec::TableMetadata,
+    table: &Table,
 ) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
-    let manifest_list = snapshot.load_manifest_list(file_io, table_metadata).await?;
+    let manifest_list = table
+        .object_cache()
+        .get_manifest_list(snapshot, &table.metadata_ref())
+        .await?;
 
     let mut data_file = vec![];
     let mut delete_file = vec![];
     for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(file_io).await?;
+        let a = manifest_file.load_manifest(table.file_io()).await?;
         let (entry, _) = a.into_parts();
         for i in entry {
             match i.content_type() {
@@ -879,7 +882,7 @@ impl CommitManager {
 
         // 1. Load all files from snapshot once
         let (all_data_files, _all_delete_files) =
-            get_all_files_from_snapshot(snapshot, table.file_io(), table.metadata()).await?;
+            get_all_files_from_snapshot(snapshot, &table).await?;
 
         // 2. Build efficient path -> DataFile index (only for data files)
         let data_file_index: HashMap<&str, &DataFile> =
@@ -1365,9 +1368,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-    use iceberg::spec::{
-        DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type, UNASSIGNED_SNAPSHOT_ID,
-    };
+    use iceberg::spec::{DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -1390,7 +1391,9 @@ mod tests {
     use uuid::Uuid;
 
     // Additional imports for new tests
-    use crate::compaction::{CommitManagerRetryConfig, CompactionPlan, RewriteResult};
+    use crate::compaction::{
+        CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
+    };
     use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
@@ -1685,8 +1688,9 @@ mod tests {
 
     async fn load_data_files_from_snapshot(table: &Table, branch: &str) -> Vec<DataFile> {
         let snapshot = table.metadata().snapshot_for_ref(branch).unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .object_cache()
+            .get_manifest_list(snapshot, &table.metadata_ref())
             .await
             .unwrap();
 
