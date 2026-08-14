@@ -132,9 +132,7 @@ pub async fn get_rest_catalog() -> RestCatalog {
         format!("http://{}", rest_socket_addr),
     );
     RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load("rest", props)
         .await
         .expect("rest catalog build failed")

@@ -84,9 +84,7 @@ impl MockRestCatalogConfig {
         props.insert(S3_REGION.to_owned(), self.s3_region.clone());
         props.insert(REST_CATALOG_PROP_URI.to_owned(), self.catalog_uri.clone());
         iceberg_compaction_core::iceberg_catalog_rest::RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
-            }))
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
             .load("rest", props)
             .await
             .expect("failed to build rest catalog")
