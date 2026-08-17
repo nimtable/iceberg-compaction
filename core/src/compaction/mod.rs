@@ -15,7 +15,7 @@
  */
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -721,40 +721,79 @@ impl Compaction {
     }
 }
 
-/// Loads all data and delete files from a snapshot.
+/// Number of manifests loaded concurrently when resolving rewrite inputs.
+///
+/// Mirrors `iceberg`'s own `DEFAULT_LOAD_CONCURRENCY_LIMIT`, which is crate-private
+/// and therefore cannot be reused here.
+const MANIFEST_LOAD_CONCURRENCY: usize = 16;
+
+/// Resolves the `wanted` data file paths to their `DataFile` records in `snapshot`.
+///
+/// # Performance
+///
+/// Entries are filtered against `wanted` *during* the manifest scan, so peak memory is
+/// `O(wanted)` rather than `O(files in the table)`. Manifests are loaded concurrently and
+/// the scan stops as soon as every wanted path has been found.
+///
+/// Deleted entries are skipped. A path can appear both as a live entry and as a tombstone
+/// from an earlier lifecycle, and only the live record is a valid rewrite input; skipping
+/// tombstones is also what makes the early exit safe, since it guarantees a path is only
+/// ever recorded from a live entry.
 ///
 /// # Errors
 ///
 /// Returns error if manifest list or manifest loading fails.
-async fn get_all_files_from_snapshot(
+async fn resolve_data_files_by_path(
     snapshot: &Arc<Snapshot>,
     table: &Table,
-) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
+    wanted: &HashSet<&str>,
+) -> Result<HashMap<String, DataFile>> {
+    use futures::StreamExt;
+
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let manifest_list = table
         .object_cache()
         .get_manifest_list(snapshot, &table.metadata_ref())
         .await?;
 
-    let mut data_file = vec![];
-    let mut delete_file = vec![];
-    for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(table.file_io()).await?;
-        let (entry, _) = a.into_parts();
-        for i in entry {
-            match i.content_type() {
-                iceberg::spec::DataContentType::Data => {
-                    data_file.push(i.data_file().clone());
-                }
-                iceberg::spec::DataContentType::EqualityDeletes => {
-                    delete_file.push(i.data_file().clone());
-                }
-                iceberg::spec::DataContentType::PositionDeletes => {
-                    delete_file.push(i.data_file().clone());
-                }
+    // The manifest futures deliberately own their inputs rather than borrowing. Borrowed
+    // futures inside `buffer_unordered` make the enclosing future's `Send` bound
+    // higher-ranked, which rustc cannot discharge, and that surfaces as a confusing
+    // "`Send` is not general enough" error in downstream callers that spawn compaction.
+    // Cloning is cheap: `FileIO` is a handle, and this list is one entry per manifest, not
+    // per data file.
+    let file_io = table.file_io().clone();
+    let manifest_files = manifest_list.entries().to_vec();
+    let mut manifests = futures::stream::iter(manifest_files)
+        .map(|manifest_file| {
+            let file_io = file_io.clone();
+            async move { manifest_file.load_manifest(&file_io).await }
+        })
+        .buffer_unordered(MANIFEST_LOAD_CONCURRENCY);
+
+    let mut resolved: HashMap<String, DataFile> = HashMap::with_capacity(wanted.len());
+    while let Some(manifest) = manifests.next().await {
+        let manifest = manifest?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() || entry.content_type() != iceberg::spec::DataContentType::Data {
+                continue;
             }
+            let path = entry.data_file().file_path();
+            if !wanted.contains(path) {
+                continue;
+            }
+            resolved.insert(path.to_owned(), entry.data_file().clone());
+        }
+
+        if resolved.len() == wanted.len() {
+            break;
         }
     }
-    Ok((data_file, delete_file))
+
+    Ok(resolved)
 }
 
 /// Configuration for commit retry behavior with exponential backoff.
@@ -872,19 +911,10 @@ impl CommitManager {
             })?;
 
         // --- Batch collect input files from all plans ---
-        use std::collections::HashMap;
 
-        // 1. Load all files from snapshot once
-        let (all_data_files, _all_delete_files) =
-            get_all_files_from_snapshot(snapshot, &table).await?;
-
-        // 2. Build efficient path -> DataFile index (only for data files)
-        let data_file_index: HashMap<&str, &DataFile> =
-            all_data_files.iter().map(|f| (f.file_path(), f)).collect();
-
-        // 3. Collect rewritten data files (to be replaced) from plans using the index
-        // Note: Only data files are collected, delete files are excluded
-        let rewritten_data_files: Vec<DataFile> = rewrite_results
+        // 1. Gather the input paths this batch replaces, in plan order.
+        //    Note: Only data files are collected, delete files are excluded.
+        let input_paths: Vec<&str> = rewrite_results
             .iter()
             .flat_map(|rr| {
                 rr.plan
@@ -893,7 +923,20 @@ impl CommitManager {
                     .iter()
                     .map(|task| task.data_file_path.as_str())
             })
-            .filter_map(|path| data_file_index.get(path).map(|&f| f.clone()))
+            .collect();
+
+        // 2. Resolve just those paths against the snapshot. Scanning for the batch's own
+        //    inputs keeps this `O(batch)`; loading the whole snapshot made commit memory
+        //    scale with total table size and OOM-killed large tables.
+        let resolved =
+            resolve_data_files_by_path(snapshot, &table, &input_paths.iter().copied().collect())
+                .await?;
+
+        // 3. Collect rewritten data files (to be replaced), preserving plan order and
+        //    silently skipping paths that are no longer present in the snapshot.
+        let rewritten_data_files: Vec<DataFile> = input_paths
+            .iter()
+            .filter_map(|path| resolved.get(*path).cloned())
             .collect();
 
         // 4. Collect added data files (newly written) from all plans
@@ -1401,7 +1444,7 @@ impl CompactionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1435,7 +1478,7 @@ mod tests {
     use crate::compaction::{
         CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
     };
-    use crate::compaction::{CompactionBuilder, CompactionPlanner};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
         SmallFilesConfigBuilder,
@@ -1827,6 +1870,70 @@ mod tests {
 
         let result = compaction.compact().await.unwrap().unwrap();
         assert_compaction_stats(&result.stats, initial_file_count, false);
+    }
+
+    /// Resolution must return exactly the requested paths, gathering them from across
+    /// multiple manifests and ignoring every other file in the snapshot. This is the
+    /// property that keeps commit memory proportional to the batch instead of to the
+    /// whole table.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_returns_only_requested_paths() {
+        let env = create_test_env().await;
+
+        // Two appends, so the snapshot spans more than one manifest.
+        let first = write_simple_files(&env.table, &env.warehouse_location, "first", 2).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), first.clone()).await;
+        let second = write_simple_files(&table, &env.warehouse_location, "second", 2).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), second.clone()).await;
+
+        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+
+        // Guard the premise of this test: the resolver must be crossing manifest boundaries.
+        let manifest_count = table
+            .object_cache()
+            .get_manifest_list(snapshot, &table.metadata_ref())
+            .await
+            .unwrap()
+            .entries()
+            .len();
+        assert!(
+            manifest_count >= 2,
+            "expected the snapshot to span multiple manifests, got {manifest_count}"
+        );
+
+        // One file from each manifest, plus a path that is not in the table at all.
+        let requested = [
+            first[0].file_path().to_owned(),
+            second[0].file_path().to_owned(),
+        ];
+        let mut wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        wanted.insert("s3://nonexistent/file.parquet");
+
+        let resolved = resolve_data_files_by_path(snapshot, &table, &wanted)
+            .await
+            .unwrap();
+
+        // The unknown path is dropped rather than erroring, and the real paths each
+        // resolve to their own record.
+        assert_eq!(resolved.len(), 2);
+        for path in &requested {
+            assert_eq!(resolved.get(path).unwrap().file_path(), path);
+        }
+    }
+
+    /// An empty request must short-circuit without reading the manifest list.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_short_circuits_on_empty_request() {
+        let env = create_test_env().await;
+        let files = write_simple_files(&env.table, &env.warehouse_location, "test", 1).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+
+        let resolved = resolve_data_files_by_path(snapshot, &table, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert!(resolved.is_empty());
     }
 
     #[tokio::test]
