@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use std::any::Any;
 use std::collections::BinaryHeap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,13 +34,16 @@ use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
-use iceberg::io::{FileIO, FileIOBuilder};
+use iceberg::io::FileIO;
+use iceberg::metadata_columns::{
+    RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::DataContentType;
-use iceberg_datafusion::physical_plan::expr_to_predicate::convert_filters_to_predicate;
+use iceberg_datafusion::physical_plan::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
 
-use super::datafusion_processor::SYS_HIDDEN_SEQ_NUM;
+use super::datafusion_processor::{SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS, SYS_HIDDEN_SEQ_NUM};
 
 struct RecordBatchBuffer {
     buffer: Vec<RecordBatch>,
@@ -145,6 +147,7 @@ impl RecordBatchBuffer {
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
     file_scan_tasks_group: Vec<Vec<FileScanTask>>,
+    file_type: DataContentType,
     plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
@@ -159,6 +162,7 @@ impl IcebergFileTaskScan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_scan_tasks: Vec<FileScanTask>,
+        file_type: DataContentType,
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
@@ -180,13 +184,21 @@ impl IcebergFileTaskScan {
                 .map(|mut task| {
                     let project_field_ids = projection
                         .iter()
-                        .filter_map(|name| task.schema().field_id_by_name(name))
+                        .filter_map(|name| match (file_type, name.as_str()) {
+                            (DataContentType::PositionDeletes, SYS_HIDDEN_FILE_PATH) => {
+                                Some(RESERVED_FIELD_ID_DELETE_FILE_PATH)
+                            }
+                            (DataContentType::PositionDeletes, SYS_HIDDEN_POS) => {
+                                Some(RESERVED_FIELD_ID_DELETE_FILE_POS)
+                            }
+                            _ => task.schema().field_id_by_name(name),
+                        })
                         .collect::<Vec<_>>();
                     let new_schema = iceberg::spec::Schema::builder()
                         .with_fields(
-                            projection
+                            project_field_ids
                                 .iter()
-                                .filter_map(|name| task.schema().field_by_name(name).cloned()),
+                                .filter_map(|id| task.schema().field_by_id(*id).cloned()),
                         )
                         .build()
                         .map_err(to_datafusion_error)?;
@@ -201,10 +213,25 @@ impl IcebergFileTaskScan {
         let file_scan_tasks_group = split_n_vecs(file_scan_tasks_projection, executor_parallelism);
         let plan_properties =
             Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
-        let predicates = convert_filters_to_predicate(filters);
+        // Synthetic columns are appended after the Iceberg reader returns a
+        // batch, so predicates that reference them cannot be evaluated by the
+        // reader against the physical file schema. DataFusion retains these
+        // filters because the provider reports inexact pushdown.
+        let pushdown_filters = filters
+            .iter()
+            .filter(|expr| {
+                expr.column_refs().iter().all(|column| {
+                    ![SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS]
+                        .contains(&column.name.as_str())
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let predicates = convert_filters_to_predicate(&pushdown_filters);
 
         Ok(Self {
             file_scan_tasks_group,
+            file_type,
             plan_properties,
             projection,
             predicates,
@@ -305,10 +332,6 @@ impl ExecutionPlan for IcebergFileTaskScan {
         "IcebergFileTaskScan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
         vec![]
     }
@@ -332,6 +355,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         let fut = get_batch_stream(
             self.file_io.clone(),
             self.file_scan_tasks_group[partition].clone(),
+            self.file_type,
             self.need_seq_num,
             self.need_file_path_and_pos,
             self.max_record_batch_rows,
@@ -355,10 +379,11 @@ impl ExecutionPlan for IcebergFileTaskScan {
 ///
 /// For now, only one file is processed at a time. Subsequent calls to the stream will
 /// eventually trigger more I/O reads.
-#[allow(clippy::unused_async)]
+#[allow(clippy::too_many_arguments, clippy::unused_async)]
 async fn get_batch_stream(
     file_io: FileIO,
     file_scan_tasks: Vec<FileScanTask>,
+    file_type: DataContentType,
     need_seq_num: bool,
     need_file_path_and_pos: bool,
     max_record_batch_rows: usize,
@@ -386,7 +411,7 @@ async fn get_batch_stream(
             MemoryConsumer::new("IcebergFileTaskScan[prefetch]").register(&memory_pool);
 
         for task in file_scan_tasks {
-            let mut file_context = FileTaskContext::from_task(&task);
+            let mut file_context = FileTaskContext::from_task(&task, file_type);
 
             let (file_io, task) = match &optional_prefetch {
                 // Prefetch stages ONLY the data file into the in-memory `FileIO`, and the
@@ -417,10 +442,13 @@ async fn get_batch_stream(
             };
 
             let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
-            let arrow_reader_builder = ArrowReaderBuilder::new(file_io).with_batch_size(max_record_batch_rows);
+            let runtime = iceberg::Runtime::try_current().map_err(to_datafusion_error)?;
+            let arrow_reader_builder = ArrowReaderBuilder::new(file_io, runtime)
+                .with_batch_size(max_record_batch_rows);
             let mut batch_stream = arrow_reader_builder.build()
                 .read(task_stream)
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error)?
+                .stream();
 
             let mut index_start = 0;
             while let Some(batch) = batch_stream.next().await {
@@ -474,10 +502,10 @@ struct FileTaskContext {
 }
 
 impl FileTaskContext {
-    fn from_task(task: &FileScanTask) -> Self {
+    fn from_task(task: &FileScanTask, file_type: DataContentType) -> Self {
         Self {
             original_path: task.data_file_path.clone(),
-            data_file_content: task.data_file_content,
+            data_file_content: file_type,
             sequence_number: task.sequence_number,
             memory_path: None,
         }
@@ -497,9 +525,7 @@ struct Prefetcher {
 impl Prefetcher {
     fn new() -> DFResult<Self> {
         Ok(Self {
-            memory_file_io: FileIOBuilder::new("memory")
-                .build()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            memory_file_io: FileIO::new_with_memory(),
         })
     }
 
@@ -691,7 +717,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, SchemaBuilder};
-    use iceberg::scan::FileScanTask;
+    use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
     use iceberg::spec::{DataContentType, Schema};
 
     use super::*;
@@ -701,21 +727,22 @@ mod tests {
             length,
             start: 0,
             record_count: Some(0),
+            first_row_id: None,
+            data_sequence_number: None,
             data_file_path: format!("test_{}.parquet", file_id),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
             data_file_format: iceberg::spec::DataFileFormat::Parquet,
             schema: Arc::new(Schema::builder().build().unwrap()),
             project_field_ids: vec![],
             predicate: None,
             deletes: vec![],
             sequence_number: 0,
-            equality_ids: None,
             file_size_in_bytes: length,
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            unified_partition_type: None,
             case_sensitive: true,
+            key_metadata: None,
         }
     }
 
@@ -1089,7 +1116,7 @@ mod tests {
         use datafusion::execution::memory_pool::{FairSpillPool, UnboundedMemoryPool};
 
         // A source file living in an in-memory FileIO that the prefetcher reads from.
-        let source_io = FileIOBuilder::new("memory").build().unwrap();
+        let source_io = FileIO::new_with_memory();
         let source_path = "memory:/src/prefetch_budget_test.bin";
         let file_len = 1024 * 1024; // 1 MiB
         source_io
@@ -1113,7 +1140,7 @@ mod tests {
             let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
 
             let task = make_task();
-            let mut ctx = FileTaskContext::from_task(&task);
+            let mut ctx = FileTaskContext::from_task(&task, DataContentType::Data);
             let err = prefetcher
                 .prefetch_file_into_memory(&task, &mut ctx, &source_io, &mut reservation)
                 .await
@@ -1134,7 +1161,7 @@ mod tests {
             let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
 
             let task = make_task();
-            let mut ctx = FileTaskContext::from_task(&task);
+            let mut ctx = FileTaskContext::from_task(&task, DataContentType::Data);
             prefetcher
                 .prefetch_file_into_memory(&task, &mut ctx, &source_io, &mut reservation)
                 .await
@@ -1158,7 +1185,7 @@ mod tests {
         // attempted -- so seeing that error (rather than an IO error against the
         // missing file) proves the read never started.
         let prefetcher = Prefetcher::new().unwrap();
-        let empty_source_io = FileIOBuilder::new("memory").build().unwrap();
+        let empty_source_io = FileIO::new_with_memory();
 
         let declared_len = 1024 * 1024; // 1 MiB, larger than the pool below
         let mut task = create_file_scan_task(declared_len, 1);
@@ -1167,7 +1194,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024));
         let mut reservation = MemoryConsumer::new("test[prefetch]").register(&pool);
 
-        let mut ctx = FileTaskContext::from_task(&task);
+        let mut ctx = FileTaskContext::from_task(&task, DataContentType::Data);
         let err = prefetcher
             .prefetch_file_into_memory(&task, &mut ctx, &empty_source_io, &mut reservation)
             .await
@@ -1189,15 +1216,21 @@ mod tests {
         path: &str,
         format: iceberg::spec::DataFileFormat,
         referenced_data_file: Option<String>,
-    ) -> Arc<FileScanTask> {
-        let mut task = create_file_scan_task(64, 900);
-        task.data_file_path = path.to_owned();
-        task.data_file_content = DataContentType::PositionDeletes;
-        task.data_file_format = format;
-        task.referenced_data_file = referenced_data_file;
-        task.start = 4;
-        task.length = 64;
-        Arc::new(task)
+    ) -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile::builder()
+            .with_file_path(path.to_owned())
+            .with_file_size_in_bytes(64)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .with_file_format(format)
+            .with_referenced_data_file(referenced_data_file)
+            .with_content_offset((format == iceberg::spec::DataFileFormat::Puffin).then_some(4))
+            .with_content_size_in_bytes(
+                (format == iceberg::spec::DataFileFormat::Puffin).then_some(64),
+            )
+            .with_record_count(Some(10))
+            .with_sequence_number(1)
+            .build()
     }
 
     /// Prefetch must be declined for any task that carries delete files.

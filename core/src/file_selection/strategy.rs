@@ -34,8 +34,9 @@ use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
 ///
-/// Delete files are deduplicated by path during construction. Position deletes
-/// have `project_field_ids` cleared; equality deletes use `equality_ids`.
+/// Delete files are deduplicated by physical file/blob identity during construction.
+/// Position deletes use Iceberg's fixed delete schema; equality deletes use their
+/// descriptor's `equality_ids`.
 ///
 /// # Fields
 /// - `total_size`: Sum of `data_files[*].length` (excludes delete file sizes)
@@ -56,31 +57,40 @@ pub struct FileGroup {
 impl FileGroup {
     /// Constructs a `FileGroup` from data files.
     ///
-    /// Deduplicates delete files by `data_file_path`. Position delete files have
-    /// `project_field_ids` reset to empty; equality delete files copy `equality_ids`
-    /// to `project_field_ids`.
+    /// Deduplicates delete files by path plus optional Puffin byte range. Position
+    /// delete files use Iceberg's fixed delete projection; equality delete files
+    /// copy descriptor `equality_ids` to `project_field_ids`.
     ///
     /// Sets `executor_parallelism` and `output_parallelism` to 1.
     pub fn new(data_files: Vec<FileScanTask>) -> Self {
         let total_size = data_files.iter().map(|task| task.length).sum();
         let data_file_count = data_files.len();
 
-        // De-duplicate delete files by path
-        let mut position_delete_map = std::collections::HashMap::new();
-        let mut equality_delete_map = std::collections::HashMap::new();
+        // A Puffin file can contain multiple deletion-vector blobs, so path alone
+        // is not a sufficient identity.
+        let mut position_delete_map = HashMap::new();
+        let mut equality_delete_map = HashMap::new();
 
         for task in &data_files {
             for delete_task in &task.deletes {
-                match &delete_task.data_file_content {
+                let identity = (
+                    delete_task.file_path.clone(),
+                    delete_task.content_offset,
+                    delete_task.content_size_in_bytes,
+                );
+                let mut standalone_task = delete_task.to_file_scan_task(task);
+                match delete_task.file_type {
                     iceberg::spec::DataContentType::PositionDeletes => {
                         position_delete_map
-                            .entry(&delete_task.data_file_path)
-                            .or_insert(delete_task);
+                            .entry(identity)
+                            .or_insert(standalone_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
+                        standalone_task.project_field_ids =
+                            delete_task.equality_ids.clone().unwrap_or_default();
                         equality_delete_map
-                            .entry(&delete_task.data_file_path)
-                            .or_insert(delete_task);
+                            .entry(identity)
+                            .or_insert(standalone_task);
                     }
                     _ => {}
                 }
@@ -89,20 +99,10 @@ impl FileGroup {
 
         let position_delete_files = position_delete_map
             .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = vec![];
-                file
-            })
             .collect::<Vec<FileScanTask>>();
 
         let equality_delete_files = equality_delete_map
             .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone().unwrap_or_default();
-                file
-            })
             .collect::<Vec<FileScanTask>>();
 
         Self {
@@ -975,6 +975,8 @@ mod tests {
     // Lazy static schema to avoid rebuilding it for every test
     use std::sync::{Arc, OnceLock};
 
+    use iceberg::scan::FileScanTaskDeleteFile;
+
     use super::*;
     use crate::config::{
         CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfigBuilder,
@@ -1038,8 +1040,6 @@ mod tests {
         }
 
         pub fn build(self) -> FileScanTask {
-            use std::sync::Arc;
-
             use iceberg::spec::{DataContentType, DataFileFormat};
 
             let deletes = if self.has_deletes {
@@ -1047,38 +1047,24 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, delete_type)| {
-                        Arc::new(FileScanTask {
-                            start: 0,
-                            length: 1024,
-                            record_count: Some(10),
-                            data_file_path: format!(
+                        FileScanTaskDeleteFile::builder()
+                            .with_file_path(format!(
                                 "{}_{}_delete.parquet",
                                 self.path.replace(".parquet", ""),
                                 i
-                            ),
-                            referenced_data_file: None,
-                            data_file_content: delete_type,
-                            data_file_format: DataFileFormat::Parquet,
-                            schema: self.schema.clone().unwrap_or(get_test_schema()),
-                            project_field_ids: if delete_type == DataContentType::EqualityDeletes {
-                                vec![1, 2]
-                            } else {
-                                vec![1]
-                            },
-                            predicate: None,
-                            deletes: vec![],
-                            sequence_number: 1,
-                            equality_ids: if delete_type == DataContentType::EqualityDeletes {
+                            ))
+                            .with_file_size_in_bytes(1024)
+                            .with_file_type(delete_type)
+                            .with_partition_spec_id(0)
+                            .with_equality_ids(if delete_type == DataContentType::EqualityDeletes {
                                 Some(vec![1, 2])
                             } else {
                                 None
-                            },
-                            file_size_in_bytes: 1024,
-                            partition: None,
-                            partition_spec: None,
-                            name_mapping: None,
-                            case_sensitive: true,
-                        })
+                            })
+                            .with_file_format(DataFileFormat::Parquet)
+                            .with_record_count(Some(10))
+                            .with_sequence_number(1)
+                            .build()
                     })
                     .collect()
             } else {
@@ -1089,21 +1075,22 @@ mod tests {
                 start: 0,
                 length: self.size,
                 record_count: Some(100),
+                first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: self.path,
-                referenced_data_file: None,
-                data_file_content: DataContentType::Data,
                 data_file_format: DataFileFormat::Parquet,
                 schema: self.schema.unwrap_or(get_test_schema()),
                 project_field_ids: vec![1, 2],
                 predicate: None,
                 deletes,
                 sequence_number: 1,
-                equality_ids: None,
                 file_size_in_bytes: self.size,
                 partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
+                unified_partition_type: None,
                 case_sensitive: true,
+                key_metadata: None,
             }
         }
     }
@@ -1144,28 +1131,21 @@ mod tests {
         pub fn create_delete_file(
             path: String,
             content_type: iceberg::spec::DataContentType,
-        ) -> Arc<FileScanTask> {
+        ) -> FileScanTaskDeleteFile {
             use iceberg::spec::DataFileFormat;
-            Arc::new(FileScanTask {
-                start: 0,
-                length: 1024,
-                record_count: Some(10),
-                data_file_path: path,
-                referenced_data_file: None,
-                data_file_content: content_type,
-                data_file_format: DataFileFormat::Parquet,
-                schema: get_test_schema(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                sequence_number: 1,
-                equality_ids: Some(vec![1, 2]),
-                file_size_in_bytes: 1024,
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                case_sensitive: true,
-            })
+            FileScanTaskDeleteFile::builder()
+                .with_file_path(path)
+                .with_file_size_in_bytes(1024)
+                .with_file_type(content_type)
+                .with_partition_spec_id(0)
+                .with_equality_ids(
+                    (content_type == iceberg::spec::DataContentType::EqualityDeletes)
+                        .then_some(vec![1, 2]),
+                )
+                .with_file_format(DataFileFormat::Parquet)
+                .with_record_count(Some(10))
+                .with_sequence_number(1)
+                .build()
         }
 
         /// Add n delete files to a `FileScanTask`
@@ -1932,73 +1912,25 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_extraction() {
         // Test that FileGroup correctly extracts and organizes delete files
-        use std::sync::Arc;
-
-        use iceberg::spec::{DataContentType, DataFileFormat};
+        use iceberg::spec::DataContentType;
 
         // Create a data file with both position and equality delete files
-        let position_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 1024,
-            record_count: Some(10),
-            data_file_path: "pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let position_delete = TestUtils::create_delete_file(
+            "pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        let mut equality_delete = TestUtils::create_delete_file(
+            "eq_delete.parquet".to_owned(),
+            DataContentType::EqualityDeletes,
+        );
+        equality_delete.file_size_in_bytes = 2048;
+        equality_delete.record_count = Some(20);
 
-        let equality_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 2048,
-            record_count: Some(20),
-            data_file_path: "eq_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::EqualityDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: Some(vec![1, 2]),
-            file_size_in_bytes: 2048,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
-
-        let data_file = FileScanTask {
-            start: 0,
-            length: 10 * 1024 * 1024, // 10MB
-            record_count: Some(1000),
-            data_file_path: "data.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![position_delete, equality_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 10 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut data_file = TestFileBuilder::new("data.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        data_file.record_count = Some(1000);
+        data_file.deletes = vec![position_delete, equality_delete];
 
         let group = FileGroup::new(vec![data_file]);
 
@@ -2026,72 +1958,23 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_dedup_and_heuristic_output_parallelism() {
         // Build two data files referencing the same delete file path to ensure dedup
-        use std::sync::Arc;
+        use iceberg::spec::DataContentType;
 
-        use iceberg::spec::{DataContentType, DataFileFormat};
+        let mut shared_pos_delete = TestUtils::create_delete_file(
+            "shared_pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        shared_pos_delete.file_size_in_bytes = 512;
 
-        let shared_pos_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 512,
-            record_count: Some(10),
-            data_file_path: "shared_pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 512,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut f1 = TestFileBuilder::new("d1.parquet")
+            .size(4 * 1024 * 1024)
+            .build();
+        f1.deletes = vec![shared_pos_delete.clone()];
 
-        let f1 = FileScanTask {
-            start: 0,
-            length: 4 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d1.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_pos_delete.clone()],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 4 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
-
-        let f2 = FileScanTask {
-            start: 0,
-            length: 4 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d2.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_pos_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 4 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut f2 = TestFileBuilder::new("d2.parquet")
+            .size(4 * 1024 * 1024)
+            .build();
+        f2.deletes = vec![shared_pos_delete];
 
         let group = FileGroup::new(vec![f1, f2]);
         // Dedup should keep one position delete
@@ -2121,95 +2004,60 @@ mod tests {
     }
 
     #[test]
-    fn test_file_group_delete_files_dedup_mixed_types() {
-        // Test deduplication of equality deletes and mixed delete types
-        use std::sync::Arc;
-
+    fn test_file_group_keeps_distinct_puffin_blobs() {
         use iceberg::spec::{DataContentType, DataFileFormat};
 
-        let shared_eq_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 1024,
-            record_count: Some(5),
-            data_file_path: "shared_eq_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::EqualityDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: Some(vec![1, 2]),
-            file_size_in_bytes: 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut first = TestUtils::create_delete_file(
+            "shared-dv.puffin".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        first.file_format = DataFileFormat::Puffin;
+        first.content_offset = Some(10);
+        first.content_size_in_bytes = Some(20);
 
-        let pos_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 512,
-            record_count: Some(3),
-            data_file_path: "pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 512,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut second = first.clone();
+        second.content_offset = Some(40);
+        second.content_size_in_bytes = Some(30);
 
-        let f1 = FileScanTask {
-            start: 0,
-            length: 5 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d1.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_eq_delete.clone(), pos_delete.clone()],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 5 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut data_file = TestFileBuilder::new("data.parquet").build();
+        data_file.deletes = vec![first, second];
 
-        let f2 = FileScanTask {
-            start: 0,
-            length: 5 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d2.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_eq_delete, pos_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 5 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut ranges = FileGroup::new(vec![data_file])
+            .position_delete_files
+            .into_iter()
+            .map(|task| (task.start, task.length))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+
+        assert_eq!(ranges, vec![(10, 20), (40, 30)]);
+    }
+
+    #[test]
+    fn test_file_group_delete_files_dedup_mixed_types() {
+        // Test deduplication of equality deletes and mixed delete types
+        use iceberg::spec::DataContentType;
+
+        let mut shared_eq_delete = TestUtils::create_delete_file(
+            "shared_eq_delete.parquet".to_owned(),
+            DataContentType::EqualityDeletes,
+        );
+        shared_eq_delete.record_count = Some(5);
+        let mut pos_delete = TestUtils::create_delete_file(
+            "pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        pos_delete.file_size_in_bytes = 512;
+        pos_delete.record_count = Some(3);
+
+        let mut f1 = TestFileBuilder::new("d1.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+        f1.deletes = vec![shared_eq_delete.clone(), pos_delete.clone()];
+
+        let mut f2 = TestFileBuilder::new("d2.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+        f2.deletes = vec![shared_eq_delete, pos_delete];
 
         let group = FileGroup::new(vec![f1, f2]);
 

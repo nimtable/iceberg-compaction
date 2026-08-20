@@ -130,6 +130,7 @@ impl DatafusionProcessor {
                         CompactionError::Unexpected("Position delete files are not set".to_owned())
                     })?,
                 &datafusion_task_ctx.position_delete_table_name(),
+                DataContentType::PositionDeletes,
             )?;
         }
 
@@ -147,6 +148,7 @@ impl DatafusionProcessor {
                     &equality_delete_schema,
                     file_scan_tasks,
                     &equality_delete_table_name,
+                    DataContentType::EqualityDeletes,
                 )?;
             }
         }
@@ -315,6 +317,7 @@ impl DatafusionTableRegister {
             schema,
             file_scan_tasks,
             table_name,
+            DataContentType::Data,
             need_seq_num,
             need_file_path_and_pos,
         )
@@ -325,8 +328,16 @@ impl DatafusionTableRegister {
         schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
+        file_type: DataContentType,
     ) -> Result<()> {
-        self.register_table_provider_impl(schema, file_scan_tasks, table_name, false, false)
+        self.register_table_provider_impl(
+            schema,
+            file_scan_tasks,
+            table_name,
+            file_type,
+            false,
+            false,
+        )
     }
 
     fn register_table_provider_impl(
@@ -334,12 +345,14 @@ impl DatafusionTableRegister {
         schema: &Schema,
         file_scan_tasks: Vec<FileScanTask>,
         table_name: &str,
+        file_type: DataContentType,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
+            file_type,
             Arc::new(schema),
             self.file_io.clone(),
             need_seq_num,
@@ -636,14 +649,12 @@ impl DataFusionTaskContextBuilder {
             .map(|mut task| {
                 if self.ge_v3_format() {
                     // Keep position deletes for reader-side filtering; drop equality deletes for joins.
-                    task.deletes.retain(|delete| {
-                        delete.data_file_content == DataContentType::PositionDeletes
-                    });
+                    task.deletes
+                        .retain(|delete| delete.file_type == DataContentType::PositionDeletes);
                 } else {
                     // Prevent ArrowReader from applying deletes; compaction handles them explicitly.
                     task.deletes.clear();
                 }
-                task.equality_ids = None;
                 task
             })
             .collect();
@@ -701,9 +712,13 @@ impl DataFusionTaskContextBuilder {
         let mut prev_equality_ids: Option<Vec<i32>> = None;
         let mut equality_delete_metadatas = Vec::new();
         for (table_idx, task) in self.equality_delete_files.iter().enumerate() {
-            let task_equality_ids = task.equality_ids.as_ref().ok_or_else(|| {
-                CompactionError::Execution("Equality delete file missing equality_ids".to_owned())
-            })?;
+            let task_equality_ids = (!task.project_field_ids.is_empty())
+                .then_some(task.project_field_ids.as_slice())
+                .ok_or_else(|| {
+                    CompactionError::Execution(
+                        "Equality delete file missing equality_ids".to_owned(),
+                    )
+                })?;
 
             if prev_equality_ids
                 .as_ref()
@@ -718,7 +733,7 @@ impl DataFusionTaskContextBuilder {
                     equality_delete_schema,
                     equality_delete_table_name,
                 ));
-                prev_equality_ids = Some(task_equality_ids.clone());
+                prev_equality_ids = Some(task_equality_ids.to_vec());
             }
 
             // Add the file scan task to the last metadata
@@ -963,11 +978,9 @@ mod tests {
     /// unbounded pool.
     #[test]
     fn test_new_with_memory_budget_builds_spilling_context() {
-        use iceberg::io::FileIOBuilder;
-
         use crate::config::CompactionExecutionConfigBuilder;
 
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let file_io = FileIO::new_with_memory();
 
         let bounded = Arc::new(
             CompactionExecutionConfigBuilder::default()

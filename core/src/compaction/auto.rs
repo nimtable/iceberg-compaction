@@ -470,7 +470,7 @@ impl AutoCompaction {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataContentType, DataFileFormat, Schema};
+    use iceberg::spec::{DataFileFormat, Schema};
 
     use super::*;
 
@@ -481,21 +481,22 @@ mod tests {
                 start: 0,
                 length,
                 record_count: Some(1),
+                first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: path.to_owned(),
-                referenced_data_file: None,
-                data_file_content: DataContentType::Data,
                 data_file_format: DataFileFormat::Parquet,
                 schema: std::sync::Arc::new(Schema::builder().build().unwrap()),
                 project_field_ids: vec![],
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 1,
-                equality_ids: None,
                 file_size_in_bytes: length,
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                unified_partition_type: None,
                 case_sensitive: true,
+                key_metadata: None,
             }
         }
 
@@ -508,21 +509,22 @@ mod tests {
             start: 0,
             length,
             record_count: Some(1),
+            first_row_id: None,
+            data_sequence_number: None,
             data_file_path: path.to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
             data_file_format: DataFileFormat::Parquet,
             schema: std::sync::Arc::new(Schema::builder().build().unwrap()),
             project_field_ids: vec![],
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
-            equality_ids: None,
             file_size_in_bytes: length,
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            unified_partition_type: None,
             case_sensitive: true,
+            key_metadata: None,
         }
     }
 

@@ -523,16 +523,16 @@ impl FileGenerator {
         let writer_builder = SharedIcebergWriterBuilder::new(self.build_delta_writer_builder()?);
         let mut writer = self.create_task_writer(writer_builder.clone())?;
 
-        let equality_delete_rate = if self.config.equality_delete_row_count == 0 {
-            None
-        } else {
-            Some(self.config.data_file_row_count / self.config.equality_delete_row_count + 1)
-        };
-        let position_delete_rate = if self.config.position_delete_row_count == 0 {
-            None
-        } else {
-            Some(self.config.data_file_row_count / self.config.position_delete_row_count + 1)
-        };
+        let equality_delete_rate = self
+            .config
+            .data_file_row_count
+            .checked_div(self.config.equality_delete_row_count)
+            .map(|rate| rate + 1);
+        let position_delete_rate = self
+            .config
+            .data_file_row_count
+            .checked_div(self.config.position_delete_row_count)
+            .map(|rate| rate + 1);
 
         let mut data_file_num = 0;
 
