@@ -163,6 +163,10 @@ pub struct SmallFilesConfig {
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
 
+    /// Inclusive upper bound for file sequence numbers selected by a round.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
+
     /// Optional filters to apply after grouping.
     ///
     /// Groups that don't meet these criteria will be excluded from compaction.
@@ -222,6 +226,10 @@ pub struct FullCompactionConfig {
     /// full-table compaction must be planned as one file group.
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
+
+    /// Inclusive upper bound for file sequence numbers selected by a round.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
 }
 
 impl Default for FullCompactionConfig {
@@ -272,6 +280,10 @@ pub struct FilesWithDeletesConfig {
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
 
+    /// Inclusive upper bound for file sequence numbers selected by a round.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
+
     /// Minimum number of delete files required to trigger compaction.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
@@ -311,6 +323,14 @@ pub enum CompactionPlanningConfig {
 }
 
 impl CompactionPlanningConfig {
+    /// Returns the inclusive file sequence bound for the planning attempt.
+    pub fn max_file_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::SmallFiles(c) => c.max_file_sequence_number,
+            Self::Full(c) => c.max_file_sequence_number,
+            Self::FilesWithDeletes(c) => c.max_file_sequence_number,
+        }
+    }
     /// Returns target file size in bytes for the strategy.
     pub fn target_file_size_bytes(&self) -> u64 {
         match self {
@@ -577,6 +597,10 @@ pub struct AutoCompactionConfig {
     #[builder(default)]
     pub grouping_strategy: GroupingStrategy,
 
+    /// Inclusive upper bound for file sequence numbers selected by a round.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
+
     #[builder(default, setter(strip_option))]
     pub group_filters: Option<GroupFilters>,
 
@@ -618,6 +642,8 @@ impl AutoCompactionConfig {
                     enable_heuristic_output_parallelism: self.enable_heuristic_output_parallelism,
                     grouping_strategy: self.grouping_strategy.clone(),
                     file_group_scope: FileGroupScope::Partition,
+                    // Auto applies the boundary before stats and candidate selection.
+                    max_file_sequence_number: None,
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
                     group_filters: self.group_filters.clone(),
                 },
@@ -650,6 +676,8 @@ impl AutoCompactionConfig {
                 small_file_threshold_bytes: self.small_file_threshold_bytes,
                 grouping_strategy: self.grouping_strategy.clone(),
                 file_group_scope: FileGroupScope::Partition,
+                // Auto applies the boundary before stats and candidate selection.
+                max_file_sequence_number: None,
                 group_filters: self.group_filters.clone(),
             }))
         } else {
@@ -746,6 +774,7 @@ mod tests {
     fn test_planning_configs_default_to_partition_file_group_scope() {
         let small_files = SmallFilesConfig::default();
         assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
+        assert_eq!(small_files.max_file_sequence_number, None);
 
         let full = FullCompactionConfig::default();
         assert_eq!(full.file_group_scope, FileGroupScope::Partition);
@@ -784,6 +813,22 @@ mod tests {
             FileGroupScope::Partition
         );
         assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
+
+        let bounded = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: 1,
+            })
+            .max_file_sequence_number(7_i64)
+            .build()
+            .unwrap();
+        let CompactionPlanningConfig::SmallFiles(small_files) = bounded
+            .small_files_candidate(&create_test_stats(10, 1, 1))
+            .unwrap()
+        else {
+            panic!("Expected SmallFiles");
+        };
+        assert_eq!(small_files.max_file_sequence_number, None);
     }
 
     #[test]

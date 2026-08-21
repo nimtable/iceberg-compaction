@@ -34,7 +34,9 @@ use super::{
 use crate::Result;
 use crate::config::AutoCompactionConfig;
 use crate::executor::ExecutorType;
-use crate::file_selection::{FileSelector, PlanStrategy, SnapshotStats};
+use crate::file_selection::{
+    FileFilterStrategy, FileSelector, FileSequenceNumberFilterStrategy, PlanStrategy, SnapshotStats,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoSelectedStrategy {
@@ -95,6 +97,18 @@ fn compute_total_data_bytes(tasks: &[FileScanTask]) -> u64 {
     tasks.iter().map(|t| t.length).sum()
 }
 
+fn apply_sequence_bound(
+    tasks: Vec<FileScanTask>,
+    max_file_sequence_number: Option<i64>,
+) -> Result<Vec<FileScanTask>> {
+    let Some(max_file_sequence_number) = max_file_sequence_number else {
+        return Ok(tasks);
+    };
+
+    FileSelector::validate_file_sequence_numbers(&tasks)?;
+    Ok(FileSequenceNumberFilterStrategy::new(max_file_sequence_number).filter(tasks))
+}
+
 /// Planner that performs analysis and plan generation in a single scan.
 ///
 /// Combines snapshot analysis (stats computation) and file grouping into one
@@ -139,8 +153,10 @@ impl AutoCompactionPlanner {
 
         let snapshot_id = snapshot.snapshot_id();
 
-        let mut tasks = Some(FileSelector::scan_data_files(table, snapshot_id).await?);
-        let total_data_bytes = compute_total_data_bytes(tasks.as_ref().unwrap());
+        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let tasks = apply_sequence_bound(tasks, self.config.max_file_sequence_number)?;
+        let total_data_bytes = compute_total_data_bytes(&tasks);
+        let mut tasks = Some(tasks);
         let stats = Self::compute_stats(
             tasks.as_ref().unwrap(),
             self.config.small_file_threshold_bytes,
@@ -473,6 +489,7 @@ mod tests {
     use iceberg::spec::{DataFileFormat, Schema};
 
     use super::*;
+    use crate::config::{AutoCompactionConfigBuilder, AutoThresholds};
 
     #[test]
     fn test_compute_total_data_bytes() {
@@ -490,6 +507,7 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 1,
+                file_sequence_number: Some(1),
                 file_size_in_bytes: length,
                 partition: None,
                 partition_spec: None,
@@ -518,6 +536,7 @@ mod tests {
             predicate: None,
             deletes: vec![],
             sequence_number: 1,
+            file_sequence_number: Some(1),
             file_size_in_bytes: length,
             partition: None,
             partition_spec: None,
@@ -650,5 +669,35 @@ mod tests {
         assert!(selected.plans.is_empty());
         assert_eq!(selected.selected_strategy, None);
         assert_eq!(selected.reason, AutoPlanReason::NoPlansProduced);
+    }
+
+    #[test]
+    fn test_bounded_auto_filters_before_stats_and_candidate_selection() {
+        let mut old_file = make_task(10, "old.parquet");
+        old_file.file_sequence_number = Some(1);
+        let mut new_file = make_task(10, "new.parquet");
+        new_file.file_sequence_number = Some(2);
+
+        let bounded_tasks = apply_sequence_bound(vec![old_file, new_file], Some(1)).unwrap();
+        let stats = AutoCompactionPlanner::compute_stats(&bounded_tasks, 100, 1);
+
+        assert_eq!(stats.total_data_files, 1);
+        assert_eq!(stats.small_files_count, 1);
+
+        let config = AutoCompactionConfigBuilder::default()
+            .thresholds(AutoThresholds {
+                min_delete_heavy_files_count: 1,
+                min_small_files_count: 2,
+            })
+            .build()
+            .unwrap();
+        assert!(config.small_files_candidate(&stats).is_none());
+
+        let unbounded_stats = AutoCompactionPlanner::compute_stats(
+            &[make_task(10, "old.parquet"), make_task(10, "new.parquet")],
+            100,
+            1,
+        );
+        assert!(config.small_files_candidate(&unbounded_stats).is_some());
     }
 }

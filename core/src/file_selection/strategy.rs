@@ -381,6 +381,43 @@ pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send 
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
 }
 
+/// Filters data files to an inclusive file-sequence boundary.
+#[derive(Debug)]
+pub struct FileSequenceNumberFilterStrategy {
+    /// Inclusive upper bound for the file sequence number.
+    pub max_file_sequence_number: i64,
+}
+
+impl FileSequenceNumberFilterStrategy {
+    pub fn new(max_file_sequence_number: i64) -> Self {
+        Self {
+            max_file_sequence_number,
+        }
+    }
+}
+
+impl FileFilterStrategy for FileSequenceNumberFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|task| {
+                task.file_sequence_number
+                    .is_some_and(|sequence_number| sequence_number <= self.max_file_sequence_number)
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for FileSequenceNumberFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FileSequenceNumber[<= {}]",
+            self.max_file_sequence_number
+        )
+    }
+}
+
 /// Enum dispatching to grouping strategy implementations.
 #[derive(Debug)]
 pub enum GroupingStrategyEnum {
@@ -726,6 +763,10 @@ impl PlanStrategy {
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
+        if config.max_file_sequence_number().is_some() {
+            crate::file_selection::FileSelector::validate_file_sequence_numbers(&data_files)?;
+        }
+
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
@@ -798,10 +839,16 @@ impl PlanStrategy {
     ///
     /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
     pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
+        file_filters.push(Box::new(SizeFilterStrategy {
             min_size: None,
             max_size: Some(config.small_file_threshold_bytes),
-        })];
+        }));
 
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
@@ -818,7 +865,12 @@ impl PlanStrategy {
     ///
     /// No file filters. No group filters (full compaction processes all groups).
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
 
         // Full compaction never uses group filters
         let (grouping, group_filters) =
@@ -835,6 +887,12 @@ impl PlanStrategy {
     /// Adds `DeleteFileCountFilterStrategy` if `min_delete_file_count_threshold > 0`.
     pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
 
         if config.min_delete_file_count_threshold > 0 {
             file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
@@ -980,7 +1038,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfigBuilder,
-        SmallFilesConfigBuilder,
+        FullCompactionConfigBuilder, SmallFilesConfigBuilder,
     };
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
@@ -1084,6 +1142,7 @@ mod tests {
                 predicate: None,
                 deletes,
                 sequence_number: 1,
+                file_sequence_number: Some(1),
                 file_size_in_bytes: self.size,
                 partition: self.partition,
                 partition_spec: None,
@@ -1299,6 +1358,64 @@ mod tests {
         // Should have different description than the other two
         assert_ne!(deletes_desc, small_files_desc);
         assert_ne!(deletes_desc, full_desc);
+    }
+
+    #[test]
+    fn test_sequence_bound_is_applied_before_grouping_for_explicit_strategies() {
+        let mut old_file = TestFileBuilder::new("old.parquet").with_deletes().build();
+        old_file.file_sequence_number = Some(3);
+        let mut new_file = TestFileBuilder::new("new.parquet").with_deletes().build();
+        new_file.file_sequence_number = Some(4);
+
+        let configs = [
+            CompactionPlanningConfig::SmallFiles(
+                SmallFilesConfigBuilder::default()
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+            CompactionPlanningConfig::Full(
+                FullCompactionConfigBuilder::default()
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+            CompactionPlanningConfig::FilesWithDeletes(
+                FilesWithDeletesConfigBuilder::default()
+                    .min_delete_file_count_threshold(1_usize)
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+
+        for config in configs {
+            let groups = PlanStrategy::from(&config)
+                .execute(vec![old_file.clone(), new_file.clone()], &config)
+                .unwrap();
+            assert_eq!(groups.iter().map(|g| g.data_file_count).sum::<usize>(), 1);
+            assert_eq!(groups[0].data_files[0].data_file_path, "old.parquet");
+        }
+    }
+
+    #[test]
+    fn test_bounded_planning_rejects_missing_file_sequence_number() {
+        let mut missing = TestFileBuilder::new("missing.parquet").build();
+        missing.file_sequence_number = None;
+        let config = CompactionPlanningConfig::Full(
+            FullCompactionConfigBuilder::default()
+                .max_file_sequence_number(3_i64)
+                .build()
+                .unwrap(),
+        );
+
+        let error = PlanStrategy::from(&config)
+            .execute(vec![missing], &config)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: bounded compaction requires file_sequence_number for every scanned data file; missing for missing.parquet"
+        );
     }
 
     #[test]

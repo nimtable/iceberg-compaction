@@ -30,12 +30,29 @@ pub struct SnapshotStats {
     pub delete_heavy_files_count: usize,
 }
 pub use packer::ListPacker;
-pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
+pub use strategy::{
+    FileFilterStrategy, FileGroup, FileSequenceNumberFilterStrategy, PlanStrategy,
+    PlanStrategyOptions,
+};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
 impl FileSelector {
+    /// Validates file sequence metadata before bounded planning filters run.
+    pub fn validate_file_sequence_numbers(data_files: &[FileScanTask]) -> Result<()> {
+        if let Some(task) = data_files
+            .iter()
+            .find(|task| task.file_sequence_number.is_none())
+        {
+            return Err(crate::CompactionError::Config(format!(
+                "bounded compaction requires file_sequence_number for every scanned data file; missing for {}",
+                task.data_file_path
+            )));
+        }
+        Ok(())
+    }
+
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
     /// Returns groups of files selected and organized by the given strategy
     pub async fn get_scan_tasks_with_strategy(

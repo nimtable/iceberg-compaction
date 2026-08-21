@@ -19,6 +19,7 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `group gating`: group-level thresholds used to avoid frequent small rewrites; these thresholds are applied after `file group scope` and `grouping_strategy`
 - `plan budget`: the maximum number of plans that `Auto` is allowed to execute in a single run
 - `fixed-point rewrite`: for the input files rewritten in the current run, the newly committed snapshot should cause them to leave that strategy's candidate set
+- `sequence bound`: an optional inclusive `max_file_sequence_number` supplied by the caller; only files with `file_sequence_number <= bound` belong to that planning attempt
 
 ## Strategy Model
 
@@ -50,6 +51,21 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `Auto` does not rewrite or override caller-provided group gating for this strategy
 - Under `Auto`, `min_delete_file_count_threshold == 0` disables delete-heavy detection and therefore disables this candidate
 - Must be fixed-point: rewritten delete-heavy input files should leave the candidate set in the newly committed snapshot
+
+### Sequence-Bounded Planning
+
+All four planning configurations (`Full`, `SmallFiles`, `FilesWithDeletes`, and
+`Auto`) accept an optional `max_file_sequence_number`. When it is set:
+
+- the planner validates that every scanned data file has a `file_sequence_number`;
+  missing metadata is an explicit planning error
+- the inclusive sequence filter runs before strategy filters, grouping, and group
+  gating
+- `Auto` applies the bound once to its scan before computing statistics and passes
+  unbounded derived configurations to its selected strategy
+
+The planner does not retain round state. Callers that need a retryable compaction
+round should keep the boundary and pass it unchanged on every planning attempt.
 
 ## `Auto` Planner
 
