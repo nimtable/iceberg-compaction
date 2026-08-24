@@ -19,13 +19,13 @@ datafusion = "54.1"
 # Local workspace members
 futures = "0.3.17"
 # branch dev_rebase_main_20260807
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f" }
-iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f" }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f" }
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2" }
+iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2" }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f" }
-iceberg-storage-opendal = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "886d69ea90d827af493de8ed4aa52a02b099056f", features = [
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2" }
+iceberg-storage-opendal = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "f57eff74f2bc443722f655c01b1b1991343f00d2", features = [
     "opendal-s3",
 ] }
 
