@@ -65,6 +65,11 @@ impl FileSelector {
 
     /// Returns the minimum data sequence among files with applicable deletes.
     ///
+    /// `tasks` must contain every live data-file task from the snapshot's complete,
+    /// unfiltered `plan_files()` result. Each `task.deletes` must conservatively
+    /// include every delete file that may apply; otherwise this threshold could
+    /// retire a delete file that is still needed by an affected data file.
+    ///
     /// Missing or invalid sequence metadata disables the optimization.
     pub(crate) fn delete_cleanup_min_data_sequence_number(tasks: &[FileScanTask]) -> Option<i64> {
         let mut min_sequence = None;
