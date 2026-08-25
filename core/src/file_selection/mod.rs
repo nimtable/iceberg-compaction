@@ -63,6 +63,20 @@ impl FileSelector {
         Ok(data_files)
     }
 
+    /// Returns the minimum data sequence among files with applicable deletes.
+    ///
+    /// Missing or invalid sequence metadata disables the optimization.
+    pub(crate) fn delete_cleanup_min_data_sequence_number(tasks: &[FileScanTask]) -> Option<i64> {
+        let mut min_sequence = None;
+        for task in tasks.iter().filter(|task| !task.deletes.is_empty()) {
+            let sequence = task
+                .data_sequence_number
+                .filter(|sequence| *sequence >= 0)?;
+            min_sequence = Some(min_sequence.map_or(sequence, |min: i64| min.min(sequence)));
+        }
+        min_sequence
+    }
+
     /// Groups pre-scanned tasks using the given strategy, skipping the scan phase.
     ///
     /// Use this when tasks have already been collected (e.g., for stats calculation)
