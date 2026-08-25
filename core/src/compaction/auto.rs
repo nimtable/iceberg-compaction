@@ -140,6 +140,8 @@ impl AutoCompactionPlanner {
         let snapshot_id = snapshot.snapshot_id();
 
         let mut tasks = Some(FileSelector::scan_data_files(table, snapshot_id).await?);
+        let delete_cleanup_min_data_sequence_number =
+            FileSelector::delete_cleanup_min_data_sequence_number(tasks.as_ref().unwrap());
         let total_data_bytes = compute_total_data_bytes(tasks.as_ref().unwrap());
         let stats = Self::compute_stats(
             tasks.as_ref().unwrap(),
@@ -166,6 +168,7 @@ impl AutoCompactionPlanner {
                 snapshot_id,
                 total_data_bytes,
                 AutoPlanReason::Recommended,
+                delete_cleanup_min_data_sequence_number,
             )?;
             if report.plans.is_empty() {
                 Some(report)
@@ -188,6 +191,7 @@ impl AutoCompactionPlanner {
                 snapshot_id,
                 total_data_bytes,
                 AutoPlanReason::Recommended,
+                delete_cleanup_min_data_sequence_number,
             )?)
         } else {
             None
@@ -208,6 +212,7 @@ impl AutoCompactionPlanner {
         snapshot_id: i64,
         total_data_bytes: u64,
         reason: AutoPlanReason,
+        delete_cleanup_min_data_sequence_number: Option<i64>,
     ) -> Result<AutoPlanReport> {
         let selected_strategy = AutoSelectedStrategy::from_planning_config(&planning_config);
         let strategy = PlanStrategy::from(&planning_config);
@@ -216,7 +221,12 @@ impl AutoCompactionPlanner {
 
         let plans: Vec<CompactionPlan> = file_groups
             .into_iter()
-            .map(|fg| CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id))
+            .map(|fg| {
+                CompactionPlan::new(fg, to_branch.to_owned(), snapshot_id)
+                    .with_delete_cleanup_min_data_sequence_number(
+                        delete_cleanup_min_data_sequence_number,
+                    )
+            })
             .filter(|p| p.has_files())
             .collect();
         Ok(Self::report_from_plans(

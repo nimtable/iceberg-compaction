@@ -997,6 +997,7 @@ mod tests {
         delete_types: Vec<iceberg::spec::DataContentType>,
         partition: Option<iceberg::spec::Struct>,
         schema: Option<Arc<iceberg::spec::Schema>>,
+        sequence_number: i64,
     }
 
     impl TestFileBuilder {
@@ -1008,6 +1009,7 @@ mod tests {
                 delete_types: vec![],
                 partition: None,
                 schema: None,
+                sequence_number: 1,
             }
         }
 
@@ -1034,6 +1036,11 @@ mod tests {
 
         pub fn with_schema(mut self, schema: Arc<iceberg::spec::Schema>) -> Self {
             self.schema = Some(schema);
+            self
+        }
+
+        pub fn with_data_sequence_number(mut self, sequence_number: i64) -> Self {
+            self.sequence_number = sequence_number;
             self
         }
 
@@ -1097,7 +1104,7 @@ mod tests {
                 project_field_ids: vec![1, 2],
                 predicate: None,
                 deletes,
-                sequence_number: 1,
+                sequence_number: self.sequence_number,
                 equality_ids: None,
                 file_size_in_bytes: self.size,
                 partition: self.partition,
@@ -1106,6 +1113,40 @@ mod tests {
                 case_sensitive: true,
             }
         }
+    }
+
+    #[test]
+    fn test_delete_cleanup_min_data_sequence_number() {
+        let tasks = vec![
+            TestFileBuilder::new("old-clean.parquet")
+                .with_data_sequence_number(1)
+                .build(),
+            TestFileBuilder::new("newer-affected.parquet")
+                .with_data_sequence_number(10)
+                .with_deletes()
+                .build(),
+            TestFileBuilder::new("oldest-affected.parquet")
+                .with_data_sequence_number(8)
+                .with_deletes()
+                .build(),
+        ];
+        assert_eq!(
+            crate::file_selection::FileSelector::delete_cleanup_min_data_sequence_number(&tasks),
+            Some(8)
+        );
+
+        let invalid_sequence = vec![
+            TestFileBuilder::new("unknown.parquet")
+                .with_data_sequence_number(-1)
+                .with_deletes()
+                .build(),
+        ];
+        assert_eq!(
+            crate::file_selection::FileSelector::delete_cleanup_min_data_sequence_number(
+                &invalid_sequence
+            ),
+            None
+        );
     }
 
     /// Helper functions for common test scenarios
