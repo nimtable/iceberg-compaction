@@ -17,7 +17,7 @@
 //! Compaction file selection and grouping strategies.
 //!
 //! Implements a three-stage pipeline:
-//! 1. File filters: Exclude files by size, delete count, or minimum file threshold
+//! 1. File filters: Select files with composable per-file predicates
 //! 2. Grouping: Choose a file-group scope, then combine files using Single
 //!    (all-in-one) or `BinPack` (First-Fit Decreasing)
 //! 3. Group filters: Remove groups below size/count thresholds
@@ -372,13 +372,96 @@ impl FileGroup {
     }
 }
 
-/// File filter applied before grouping.
+/// Per-file predicate applied before grouping.
 ///
-/// Implementations must be `Debug + Display + Sync + Send`. Applied sequentially
-/// by [`PlanStrategy`].
+/// Concrete filters can be composed with [`and`](Self::and) and [`or`](Self::or)
+/// before being type-erased for [`PlanStrategy`]. Filters in [`PlanStrategy`] are
+/// still applied sequentially, so the top-level list has implicit AND semantics.
 pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
-    /// Returns filtered subset of data files.
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
+    /// Returns whether a data file belongs to the candidate set.
+    fn matches(&self, data_file: &FileScanTask) -> bool;
+
+    /// Returns the matching data files in their original order.
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|data_file| self.matches(data_file))
+            .collect()
+    }
+
+    /// Combines two concrete filters with short-circuiting AND semantics.
+    #[must_use]
+    fn and<R>(self, right: R) -> AndFileFilter<Self, R>
+    where
+        Self: Sized,
+        R: FileFilterStrategy,
+    {
+        AndFileFilter { left: self, right }
+    }
+
+    /// Combines two concrete filters with short-circuiting OR semantics.
+    #[must_use]
+    fn or<R>(self, right: R) -> OrFileFilter<Self, R>
+    where
+        Self: Sized,
+        R: FileFilterStrategy,
+    {
+        OrFileFilter { left: self, right }
+    }
+}
+
+/// Two concrete file filters combined with AND semantics.
+#[derive(Debug)]
+pub struct AndFileFilter<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> FileFilterStrategy for AndFileFilter<L, R>
+where
+    L: FileFilterStrategy,
+    R: FileFilterStrategy,
+{
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        self.left.matches(data_file) && self.right.matches(data_file)
+    }
+}
+
+impl<L, R> std::fmt::Display for AndFileFilter<L, R>
+where
+    L: std::fmt::Display,
+    R: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} AND {})", self.left, self.right)
+    }
+}
+
+/// Two concrete file filters combined with OR semantics.
+#[derive(Debug)]
+pub struct OrFileFilter<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> FileFilterStrategy for OrFileFilter<L, R>
+where
+    L: FileFilterStrategy,
+    R: FileFilterStrategy,
+{
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        self.left.matches(data_file) || self.right.matches(data_file)
+    }
+}
+
+impl<L, R> std::fmt::Display for OrFileFilter<L, R>
+where
+    L: std::fmt::Display,
+    R: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} OR {})", self.left, self.right)
+    }
 }
 
 /// Enum dispatching to grouping strategy implementations.
@@ -509,19 +592,14 @@ pub struct SizeFilterStrategy {
 }
 
 impl FileFilterStrategy for SizeFilterStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|task| {
-                let file_size = task.length;
-                match (self.min_size, self.max_size) {
-                    (Some(min), Some(max)) => file_size >= min && file_size < max,
-                    (Some(min), None) => file_size >= min,
-                    (None, Some(max)) => file_size < max,
-                    (None, None) => true,
-                }
-            })
-            .collect()
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        let file_size = data_file.length;
+        match (self.min_size, self.max_size) {
+            (Some(min), Some(max)) => file_size >= min && file_size < max,
+            (Some(min), None) => file_size >= min,
+            (None, Some(max)) => file_size < max,
+            (None, None) => true,
+        }
     }
 }
 
@@ -561,14 +639,8 @@ impl DeleteFileCountFilterStrategy {
 }
 
 impl FileFilterStrategy for DeleteFileCountFilterStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|task| {
-                let delete_count = task.deletes.len();
-                delete_count >= self.min_delete_file_count
-            })
-            .collect()
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        data_file.deletes.len() >= self.min_delete_file_count
     }
 }
 
@@ -1199,6 +1271,91 @@ mod tests {
             }
             task
         }
+    }
+
+    fn composite_filter_test_files() -> Vec<FileScanTask> {
+        vec![
+            TestFileBuilder::new("small-clean.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("large-delete-heavy.parquet")
+                    .size(64 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("small-delete-heavy.parquet")
+                    .size(10 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            TestFileBuilder::new("large-clean.parquet")
+                .size(64 * 1024 * 1024)
+                .build(),
+        ]
+    }
+
+    fn small_file_filter() -> SizeFilterStrategy {
+        SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(32 * 1024 * 1024),
+        }
+    }
+
+    fn delete_heavy_filter() -> DeleteFileCountFilterStrategy {
+        DeleteFileCountFilterStrategy::new(2)
+    }
+
+    #[test]
+    fn test_and_file_filter_requires_both_predicates() {
+        let filter = small_file_filter().and(delete_heavy_filter());
+
+        let result = filter.filter(composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(&["small-delete-heavy.parquet"], &result);
+        assert_eq!(
+            filter.to_string(),
+            "(SizeFilter[<32MB] AND DeleteFileCountFilter[>=2 deletes])"
+        );
+    }
+
+    #[test]
+    fn test_or_file_filter_accepts_either_predicate_without_duplicates() {
+        let filter = small_file_filter().or(delete_heavy_filter());
+
+        let result = filter.filter(composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(
+            &[
+                "small-clean.parquet",
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ],
+            &result,
+        );
+        assert_eq!(
+            filter.to_string(),
+            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes])"
+        );
+    }
+
+    #[test]
+    fn test_file_filter_combinators_can_be_nested() {
+        let candidate_filter = small_file_filter().or(delete_heavy_filter());
+        let large_file_filter = SizeFilterStrategy {
+            min_size: Some(32 * 1024 * 1024),
+            max_size: None,
+        };
+        let filter = candidate_filter.and(large_file_filter);
+
+        let result = filter.filter(composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &result);
+        assert_eq!(
+            filter.to_string(),
+            "((SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) AND SizeFilter[>32MB])"
+        );
     }
 
     #[test]
