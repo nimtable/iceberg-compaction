@@ -47,33 +47,33 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - Default file group scope: `Partition`
 - Explicit `Table` scope is allowed for manual planning, but group gating then evaluates groups across all selected partitions instead of per partition
 - May use `group_filters` for group gating
-- `Auto` does not rewrite or override caller-provided group gating for this strategy
-- Under `Auto`, `min_delete_file_count_threshold == 0` disables delete-heavy detection and therefore disables this candidate
 - Must be fixed-point: rewritten delete-heavy input files should leave the candidate set in the newly committed snapshot
 
-## `Auto` Planner
+## `Auto`
 
-`Auto` only chooses between two localized rewrite strategies: `FilesWithDeletes` and `SmallFiles`.
+`Auto` builds one localized candidate set from two per-file predicates:
 
-Zero-valued auto thresholds are treated as disabled for the corresponding candidate.
+```text
+candidate(file) = is_small(file) OR is_delete_heavy(file)
+```
 
-Within a single scan, `Auto` produces two candidate plan sets:
+`small_file_threshold_bytes` and `min_delete_file_count_threshold` configure
+the two predicates directly. Zero disables the corresponding predicate.
 
-1. `FilesWithDeletes` plan
-2. `SmallFiles` plan
+The predicates are composed before grouping. Auto then runs the unified
+candidate set through exactly one planning pipeline:
 
-It then applies the following fixed decision order:
-
-1. If the delete plan is non-empty, select `FilesWithDeletes`
-2. Otherwise, if the small-files plan is non-empty, select `SmallFiles`
-3. Apply `max_auto_plans_per_run` uniformly to the selected plan set
-4. If the selected plan set becomes empty after capping, return an empty result
+1. File-level `small OR delete-heavy` selection
+2. File-group scoping and grouping
+3. Caller-provided group filters
+4. Per-run plan budget
 
 Design focus:
 
-- Only choose localized rewrite strategies
-- Keep auto-generated plans at `Partition` file group scope
-- Apply a uniform budget to the final selected plan set
+- A file matching both predicates enters the candidate set once
+- Small and delete-heavy files may be compacted in the same group
+- The default file group scope is `Partition`
+- The plan budget applies to the final unified plan set
 
 ## Why `Auto` Does Not Fall Back to `Full`
 
@@ -85,42 +85,13 @@ For that reason, `Auto` does not introduce a full-like special case and does not
 
 ## Planner Budget
 
-`max_auto_plans_per_run` is planner-level configuration, not external invocation policy. Its default is unlimited.
+`planning.max_plans_per_run` is planner-level configuration, not external invocation policy. Its default is unlimited.
 It is represented as a positive integer budget; zero is not a valid configuration value.
 
-Rationale:
-
-- The planner directly returns executable plans, so budget enforcement should happen inside the planner
-- `planned_input_bytes`, `planned_input_files`, `rewrite_ratio`, and `reason` stay consistent with the final returned plan set
-- It avoids forcing upper layers to recalculate report fields after trimming plans again
+The planner directly returns executable plans, so budget enforcement happens
+inside the planner rather than requiring callers to trim the result again.
 
 The current budget unit is `plan count`, not input bytes. This assumes grouping already keeps the size of each individual plan within a reasonable range.
-
-## Return Semantics
-
-### Non-Empty Results
-
-- `Recommended`: safe to execute by default
-- `BudgetCapped`: a candidate strategy was selected, and the returned plans are the subset that fit within the configured budget
-
-### Empty Results
-
-- `NoCandidate`: no strategy threshold was met
-- `NoPlansProduced`: a strategy threshold was met, but all plans were filtered out by group gating
-- `NoSnapshot`: the target branch does not have an associated snapshot
-
-### Report Path
-
-The report result retains the following fields:
-
-- `selected_strategy`
-- `plans`
-- `planned_input_bytes`
-- `planned_input_files`
-- `rewrite_ratio`
-- `reason`
-
-The `reason` in the report must match the final returned plan set. In other words, if the planner caps the plan set due to budget, `reason` must describe the capped result rather than the pre-cap candidate state.
 
 ## High-Frequency Invocation Boundaries
 
@@ -143,9 +114,8 @@ The reason is straightforward: those signals are outside the snapshot-local view
 ### Responsibilities of the Library
 
 - Scan the current snapshot and produce candidate plans
-- Choose between `FilesWithDeletes` and `SmallFiles`
-- Apply `max_auto_plans_per_run`
-- Return a report that is consistent with the final returned plan set
+- Build one unified candidate set from the configured predicates
+- Apply `planning.max_plans_per_run`
 
 ### Responsibilities of External Systems
 
