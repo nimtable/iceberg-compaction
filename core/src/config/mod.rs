@@ -16,8 +16,6 @@
 
 //! Compaction configuration types and constants.
 
-use std::num::NonZeroUsize;
-
 use derive_builder::Builder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -41,8 +39,6 @@ pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per part
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
-
-pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: NonZeroUsize = NonZeroUsize::MAX;
 
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
@@ -331,10 +327,6 @@ pub struct AutoCompactionConfig {
 
     #[builder(default, setter(strip_option))]
     pub group_filters: Option<GroupFilters>,
-
-    /// Maximum number of plans returned by one Auto planning run.
-    #[builder(default = "DEFAULT_MAX_AUTO_PLANS_PER_RUN")]
-    pub max_plans_per_run: NonZeroUsize,
 }
 
 impl Default for AutoCompactionConfig {
@@ -433,14 +425,6 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.file_group_scope,
             Self::Full(c) => c.file_group_scope,
             Self::FilesWithDeletes(c) => c.file_group_scope,
-        }
-    }
-
-    /// Returns the per-run plan budget when the strategy defines one.
-    pub fn max_plans_per_run(&self) -> Option<NonZeroUsize> {
-        match self {
-            Self::Auto(c) => Some(c.max_plans_per_run),
-            Self::SmallFiles(_) | Self::Full(_) | Self::FilesWithDeletes(_) => None,
         }
     }
 }
@@ -601,7 +585,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_auto_defaults_define_both_predicates_and_unbounded_budget() {
+    fn test_auto_defaults_define_both_predicates() {
         let config = AutoCompactionConfig::default();
 
         assert_eq!(
@@ -611,11 +595,6 @@ mod tests {
         assert_eq!(
             config.min_delete_file_count_threshold,
             DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD
-        );
-        assert_eq!(config.max_plans_per_run, NonZeroUsize::MAX);
-        assert_eq!(
-            CompactionPlanningConfig::Auto(config).max_plans_per_run(),
-            Some(NonZeroUsize::MAX)
         );
     }
 
