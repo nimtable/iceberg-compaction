@@ -38,13 +38,7 @@ use crate::executor::{
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
-pub mod auto;
 mod validator;
-
-pub use auto::{
-    AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner, AutoPlanReason, AutoPlanReport,
-    AutoSelectedStrategy,
-};
 
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
@@ -1361,7 +1355,7 @@ impl CompactionPlanner {
 
             // Convert each FileGroup to a separate CompactionPlan
             // Filter out empty plans to avoid unnecessary processing
-            let plans = file_groups
+            let mut plans: Vec<_> = file_groups
                 .into_iter()
                 .map(|file_group| {
                     CompactionPlan::new(
@@ -1375,6 +1369,10 @@ impl CompactionPlanner {
                 })
                 .filter(|plan| plan.has_files())
                 .collect();
+
+            if let Some(max_plans) = self.config.max_plans_per_run() {
+                plans.truncate(max_plans.get());
+            }
 
             Ok(plans)
         } else {
@@ -1408,6 +1406,7 @@ impl CompactionPlanner {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1443,7 +1442,8 @@ mod tests {
     };
     use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
-        CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
+        AutoCompactionConfigBuilder, BinPackConfig, CompactionConfigBuilder,
+        CompactionExecutionConfigBuilder, CompactionPlanningConfig, GroupingStrategy,
         SmallFilesConfigBuilder,
     };
     use crate::executor::{ExecutorType, RewriteFilesStat};
@@ -2083,6 +2083,29 @@ mod tests {
         assert!(plan.recommended_output_parallelism() > 0);
         assert_eq!(plan.to_branch, MAIN_BRANCH);
         assert!(plan.has_files(), "Plan should have files");
+    }
+
+    #[tokio::test]
+    async fn test_auto_plan_compaction_applies_plan_budget() {
+        let env = create_test_env().await;
+        let data_files = write_simple_files(&env.table, &env.warehouse_location, "auto", 3).await;
+        let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+        let auto_config = AutoCompactionConfigBuilder::default()
+            .small_file_threshold_bytes(u64::MAX)
+            .min_delete_file_count_threshold(0_usize)
+            .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(1)))
+            .max_plans_per_run(NonZeroUsize::new(2).unwrap())
+            .build()
+            .unwrap();
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::Auto(auto_config));
+
+        let plans = planner.plan_compaction(&updated_table).await.unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans.iter().map(CompactionPlan::file_count).sum::<usize>(),
+            2
+        );
     }
 
     /// Test `plan_compaction` with non-existent branch
