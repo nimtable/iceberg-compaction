@@ -29,7 +29,10 @@ use std::collections::HashMap;
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{CompactionPlanningConfig, FileGroupScope, GroupingStrategy, SPLIT_OVERHEAD};
+use crate::config::{
+    CompactionPlanningConfig, CompactionStrategy, FileGroupScope, GroupFilters, GroupingStrategy,
+    SPLIT_OVERHEAD,
+};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -170,7 +173,8 @@ impl FileGroup {
     /// ## Input/Executor Parallelism (from Iceberg's `inputSplitSize`)
     /// - Calculates optimal split size for reading: `input_size / expected_output_files + SPLIT_OVERHEAD`
     /// - Input parallelism = `ceil(input_total_bytes / input_split_size)`
-    /// - Also considers file count constraints: `ceil(files_count / max_file_count_per_partition)`
+    /// - Also considers executor input-partition file count constraints:
+    ///   `ceil(files_count / max_file_count_per_partition)`
     /// - Takes the max of size-based and count-based parallelism
     ///
     /// Input parallelism is capped by `max_input_parallelism`, output parallelism is capped by `max_output_parallelism`.
@@ -188,14 +192,14 @@ impl FileGroup {
             ));
         }
 
-        let target_file_size = config.target_file_size_bytes();
+        let target_file_size = config.target_file_size_bytes;
         let min_file_size = Self::default_min_file_size(target_file_size);
         let max_file_size = Self::default_max_file_size(target_file_size);
 
         // Calculate output parallelism using Iceberg's expectedOutputFiles algorithm
         let output_parallelism =
             Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
-                .min(config.max_output_parallelism())
+                .min(config.max_output_parallelism)
                 .max(1);
 
         // Apply output parallelism heuristic if enabled
@@ -212,13 +216,13 @@ impl FileGroup {
         // Also consider file count constraints
         let total_files_count = files_to_compact.input_files_count();
         let partition_by_count = total_files_count
-            .div_ceil(config.max_file_count_per_partition())
+            .div_ceil(config.max_file_count_per_partition)
             .max(1);
 
         // Input parallelism is the max of size-based and count-based, capped by max_input_parallelism
         let input_parallelism = partition_by_size
             .max(partition_by_count)
-            .min(config.max_input_parallelism());
+            .min(config.max_input_parallelism);
 
         Ok((input_parallelism, output_parallelism))
     }
@@ -230,7 +234,7 @@ impl FileGroup {
         config: &CompactionPlanningConfig,
         current_output_parallelism: usize,
     ) -> usize {
-        if !config.enable_heuristic_output_parallelism() || current_output_parallelism <= 1 {
+        if !config.enable_heuristic_output_parallelism || current_output_parallelism <= 1 {
             return current_output_parallelism;
         }
 
@@ -240,7 +244,7 @@ impl FileGroup {
             .map(|f| f.file_size_in_bytes)
             .sum::<u64>();
 
-        if total_data_file_size > 0 && total_data_file_size < config.target_file_size_bytes() {
+        if total_data_file_size > 0 && total_data_file_size < config.target_file_size_bytes {
             1
         } else {
             current_output_parallelism
@@ -866,99 +870,6 @@ impl PlanStrategy {
         (grouping, group_filter_strategies)
     }
 
-    /// Constructs strategy for small files compaction.
-    ///
-    /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
-    pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
-            min_size: None,
-            max_size: Some(config.small_file_threshold_bytes),
-        })];
-
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
-            &config.grouping_strategy,
-            config.group_filters.as_ref(),
-        );
-
-        Self::new_with_options(
-            PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
-    }
-
-    /// Constructs strategy for full compaction.
-    ///
-    /// No file filters. No group filters (full compaction processes all groups).
-    pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
-        // Full compaction never uses group filters
-        let (grouping, group_filters) =
-            Self::build_grouping_and_filters(&config.grouping_strategy, None);
-
-        Self::new_with_options(
-            PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
-    }
-
-    /// Constructs strategy for files with delete files.
-    ///
-    /// Adds `DeleteFileCountFilterStrategy` if `min_delete_file_count_threshold > 0`.
-    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
-
-        if config.min_delete_file_count_threshold > 0 {
-            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
-                config.min_delete_file_count_threshold,
-            )));
-        }
-
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
-            &config.grouping_strategy,
-            config.group_filters.as_ref(),
-        );
-
-        Self::new_with_options(
-            PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
-    }
-
-    /// Constructs the unified Auto candidate pipeline.
-    ///
-    /// A non-zero threshold enables its predicate. When both predicates are
-    /// enabled, they are composed before type erasure so candidate selection is
-    /// `small OR delete-heavy`, followed by one grouping pipeline.
-    pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Self {
-        let size_filter = SizeFilterStrategy {
-            min_size: None,
-            max_size: Some(config.small_file_threshold_bytes),
-        };
-        let delete_filter =
-            DeleteFileCountFilterStrategy::new(config.min_delete_file_count_threshold);
-
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = match (
-            config.small_file_threshold_bytes > 0,
-            config.min_delete_file_count_threshold > 0,
-        ) {
-            (true, true) => vec![Box::new(size_filter.or(delete_filter))],
-            (true, false) => vec![Box::new(size_filter)],
-            (false, true) => vec![Box::new(delete_filter)],
-            (false, false) => vec![Box::new(size_filter)],
-        };
-
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
-            &config.grouping_strategy,
-            config.group_filters.as_ref(),
-        );
-
-        Self::new_with_options(
-            PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
-    }
-
     /// Test-only builder accepting raw filter parameters.
     ///
     /// # Arguments
@@ -994,17 +905,57 @@ impl PlanStrategy {
 
 impl From<&CompactionPlanningConfig> for PlanStrategy {
     fn from(config: &CompactionPlanningConfig) -> Self {
-        match config {
-            CompactionPlanningConfig::Auto(auto_config) => PlanStrategy::from_auto(auto_config),
-            CompactionPlanningConfig::SmallFiles(small_files_config) => {
-                PlanStrategy::from_small_files(small_files_config)
-            }
-            CompactionPlanningConfig::Full(full_config) => PlanStrategy::from_full(full_config),
+        // Cross-cutting planning-scope filters must be inserted before the
+        // strategy-specific candidate filter so the top-level AND semantics
+        // apply uniformly to Full and selective strategies.
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
-            CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
-                PlanStrategy::from_files_with_deletes(deletes_config)
+        let group_filter_config: Option<&GroupFilters> = match &config.strategy {
+            CompactionStrategy::Full => None,
+            CompactionStrategy::SmallFiles(strategy) => {
+                file_filters.push(Box::new(SizeFilterStrategy {
+                    min_size: None,
+                    max_size: Some(strategy.small_file_threshold_bytes),
+                }));
+                strategy.group_filters.as_ref()
             }
-        }
+            CompactionStrategy::FilesWithDeletes(strategy) => {
+                if strategy.min_delete_file_count_threshold > 0 {
+                    file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+                        strategy.min_delete_file_count_threshold,
+                    )));
+                }
+                strategy.group_filters.as_ref()
+            }
+            CompactionStrategy::Auto(strategy) => {
+                let size_filter = SizeFilterStrategy {
+                    min_size: None,
+                    max_size: Some(strategy.small_file_threshold_bytes),
+                };
+                let delete_filter =
+                    DeleteFileCountFilterStrategy::new(strategy.min_delete_file_count_threshold);
+                let candidate_filter: Box<dyn FileFilterStrategy> = match (
+                    strategy.small_file_threshold_bytes > 0,
+                    strategy.min_delete_file_count_threshold > 0,
+                ) {
+                    (true, true) => Box::new(size_filter.or(delete_filter)),
+                    (true, false) => Box::new(size_filter),
+                    (false, true) => Box::new(delete_filter),
+                    // A size upper bound of zero matches no files.
+                    (false, false) => Box::new(size_filter),
+                };
+                file_filters.push(candidate_filter);
+                strategy.group_filters.as_ref()
+            }
+        };
+
+        let (grouping, group_filters) =
+            Self::build_grouping_and_filters(&config.grouping_strategy, group_filter_config);
+
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
     }
 }
 
@@ -1086,8 +1037,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AutoCompactionConfigBuilder, CompactionPlanningConfig, FileGroupScope,
-        FilesWithDeletesConfigBuilder, SmallFilesConfigBuilder,
+        AutoCompactionConfigBuilder, CompactionPlanningConfig, CompactionPlanningConfigBuilder,
+        CompactionStrategy, FileGroupScope, FilesWithDeletesConfigBuilder, SmallFilesConfigBuilder,
     };
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
@@ -1400,7 +1351,7 @@ mod tests {
             .min_delete_file_count_threshold(2_usize)
             .build()
             .unwrap();
-        let planning_config = CompactionPlanningConfig::Auto(auto_config);
+        let planning_config = CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
         let strategy = PlanStrategy::from(&planning_config);
 
         let groups = strategy
@@ -1442,7 +1393,8 @@ mod tests {
                 .min_delete_file_count_threshold(delete_threshold)
                 .build()
                 .unwrap();
-            let planning_config = CompactionPlanningConfig::Auto(auto_config);
+            let planning_config =
+                CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
             let strategy = PlanStrategy::from(&planning_config);
             let files = strategy
                 .execute(composite_filter_test_files(), &planning_config)
@@ -1558,8 +1510,9 @@ mod tests {
 
     #[test]
     fn test_file_strategy_factory() {
-        let small_files_config =
-            CompactionPlanningConfig::SmallFiles(crate::config::SmallFilesConfig::default());
+        let small_files_config = CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(
+            crate::config::SmallFilesConfig::default(),
+        ));
 
         let small_files_strategy = PlanStrategy::from(&small_files_config);
         let small_files_desc = small_files_strategy.to_string();
@@ -1569,8 +1522,7 @@ mod tests {
                 || small_files_desc.contains("BinPackGrouping")
         );
 
-        let full_config =
-            CompactionPlanningConfig::Full(crate::config::FullCompactionConfig::default());
+        let full_config = CompactionPlanningConfig::default();
         let routed_full = PlanStrategy::from(&full_config);
 
         let full_desc = routed_full.to_string();
@@ -1584,9 +1536,9 @@ mod tests {
         );
 
         // Verify FilesWithDeletes config
-        let deletes_config = CompactionPlanningConfig::FilesWithDeletes(
+        let deletes_config = CompactionPlanningConfig::new(CompactionStrategy::FilesWithDeletes(
             crate::config::FilesWithDeletesConfig::default(),
-        );
+        ));
         let deletes_strategy = PlanStrategy::from(&deletes_config);
         let deletes_desc = deletes_strategy.to_string();
 
@@ -1680,14 +1632,15 @@ mod tests {
         for (min_count, input_count, expected_groups) in test_cases {
             // Use SmallFilesConfig with Single grouping + group filters
             let small_files_config = SmallFilesConfigBuilder::default()
-                .grouping_strategy(GroupingStrategy::Single)
                 .group_filters(crate::config::GroupFilters {
                     min_group_file_count: Some(min_count),
                     min_group_size_bytes: None,
                 })
                 .build()
                 .unwrap();
-            let strategy = PlanStrategy::from_small_files(&small_files_config);
+            let config =
+                CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(small_files_config));
+            let strategy = PlanStrategy::from(&config);
 
             let files: Vec<FileScanTask> = (0..input_count)
                 .map(|i| {
@@ -1697,12 +1650,7 @@ mod tests {
                 })
                 .collect();
 
-            let result = strategy
-                .execute(
-                    files,
-                    &CompactionPlanningConfig::SmallFiles(small_files_config.clone()),
-                )
-                .unwrap();
+            let result = strategy.execute(files, &config).unwrap();
             assert_eq!(
                 result.len(),
                 expected_groups,
@@ -1725,7 +1673,8 @@ mod tests {
             .small_file_threshold_bytes(20 * 1024 * 1024_u64) // 20MB threshold
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
+        let config =
+            CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(small_files_config));
 
         let strategy = PlanStrategy::from(&config);
 
@@ -1761,8 +1710,8 @@ mod tests {
             "small3.parquet"
         ]);
 
-        let small_file_threshold = match config {
-            CompactionPlanningConfig::SmallFiles(sf_config) => sf_config.small_file_threshold_bytes,
+        let small_file_threshold = match &config.strategy {
+            CompactionStrategy::SmallFiles(sf_config) => sf_config.small_file_threshold_bytes,
             _ => panic!("Expected small files config"),
         };
         for file in &result {
@@ -1771,14 +1720,15 @@ mod tests {
 
         let min_count_small_files_config = SmallFilesConfigBuilder::default()
             .small_file_threshold_bytes(20 * 1024 * 1024_u64)
-            .grouping_strategy(GroupingStrategy::Single)
             .group_filters(crate::config::GroupFilters {
                 min_group_file_count: Some(3),
                 min_group_size_bytes: None,
             })
             .build()
             .unwrap();
-        let min_count_config = CompactionPlanningConfig::SmallFiles(min_count_small_files_config);
+        let min_count_config = CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(
+            min_count_small_files_config,
+        ));
         let min_count_strategy = PlanStrategy::from(&min_count_config);
 
         let insufficient_files = vec![
@@ -1808,17 +1758,16 @@ mod tests {
             TestUtils::execute_strategy_flat(&min_count_strategy, sufficient_files);
         assert_eq!(sufficient_result.len(), 3);
 
-        let default_small_files_config = SmallFilesConfigBuilder::default()
-            .grouping_strategy(crate::config::GroupingStrategy::Single)
-            .build()
-            .unwrap();
-        let default_config = CompactionPlanningConfig::SmallFiles(default_small_files_config);
+        let default_small_files_config = SmallFilesConfigBuilder::default().build().unwrap();
+        let default_config = CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(
+            default_small_files_config,
+        ));
 
-        match &default_config {
-            CompactionPlanningConfig::SmallFiles(config) => {
+        match &default_config.strategy {
+            CompactionStrategy::SmallFiles(config) => {
                 // Default config should have Single grouping strategy with no group filters
                 assert!(matches!(
-                    config.grouping_strategy,
+                    default_config.grouping_strategy,
                     crate::config::GroupingStrategy::Single
                 ));
                 assert!(config.group_filters.is_none());
@@ -1850,8 +1799,8 @@ mod tests {
         ];
         let multi_result = TestUtils::execute_strategy_flat(&default_strategy, multiple_files);
         assert_eq!(multi_result.len(), 3);
-        let small_file_threshold_default = match &default_config {
-            CompactionPlanningConfig::SmallFiles(config) => config.small_file_threshold_bytes,
+        let small_file_threshold_default = match &default_config.strategy {
+            CompactionStrategy::SmallFiles(config) => config.small_file_threshold_bytes,
             _ => panic!("Expected small files config"),
         };
         for file in &multi_result {
@@ -2121,15 +2070,16 @@ mod tests {
     #[test]
     fn test_file_group_parallelism_calculation() {
         // Test FileGroup::calculate_parallelism functionality
-        let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(10 * 1024 * 1024_u64) // 10MB per partition
+        let config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .max_file_count_per_partition(5_usize) // 5 files per partition
             .max_input_parallelism(8_usize) // Max 8 parallel input tasks
             .max_output_parallelism(8_usize) // Max 8 parallel output tasks
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         // Test normal case
         let files = vec![
@@ -2151,7 +2101,7 @@ mod tests {
         assert!(executor_parallelism >= 1);
         assert!(output_parallelism >= 1);
         assert!(output_parallelism <= executor_parallelism);
-        assert!(executor_parallelism <= config.max_input_parallelism());
+        assert!(executor_parallelism <= config.max_input_parallelism);
 
         // Test error case - empty group
         let empty_group = FileGroup::empty();
@@ -2180,14 +2130,15 @@ mod tests {
         let original_exec_p = original_group.executor_parallelism;
         let original_output_p = original_group.output_parallelism;
 
-        let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(10 * 1024 * 1024_u64)
+        let config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .max_file_count_per_partition(5_usize)
             .max_input_parallelism(8_usize)
             .max_output_parallelism(8_usize)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         let new_group = original_group
             .clone()
@@ -2279,15 +2230,16 @@ mod tests {
         );
 
         // Heuristic output parallelism: data total is 8MB, below default 1GB target, so 1 output
-        let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(1_u64) // allow partitioning to be driven by counts
+        let config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .max_file_count_per_partition(1_usize)
             .max_input_parallelism(8_usize)
             .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         let (exec_p, out_p) = FileGroup::calculate_parallelism(&group, &config).unwrap();
         assert!(exec_p >= 1);
@@ -2377,16 +2329,14 @@ mod tests {
     #[test]
     fn test_full_compaction_with_binpack_grouping() {
         let binpack_config = crate::config::BinPackConfig::new(50 * 1024 * 1024);
-        let full_config = crate::config::FullCompactionConfigBuilder::default()
+        let config = CompactionPlanningConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::BinPack(binpack_config))
-            .min_size_per_partition(20 * 1024 * 1024_u64)
             .max_file_count_per_partition(1_usize)
             .max_input_parallelism(8_usize)
             .max_output_parallelism(8_usize)
             .enable_heuristic_output_parallelism(true)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::Full(full_config);
 
         let strategy = PlanStrategy::from(&config);
 
@@ -2435,7 +2385,7 @@ mod tests {
                 idx
             );
             assert!(
-                group.executor_parallelism <= config.max_input_parallelism(),
+                group.executor_parallelism <= config.max_input_parallelism,
                 "Group {} should respect max_input_parallelism",
                 idx
             );
@@ -2543,7 +2493,9 @@ mod tests {
             .min_delete_file_count_threshold(2_usize)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::FilesWithDeletes(files_with_deletes_config);
+        let config = CompactionPlanningConfig::new(CompactionStrategy::FilesWithDeletes(
+            files_with_deletes_config,
+        ));
         let strategy = PlanStrategy::from(&config);
 
         assert!(strategy.to_string().contains("DeleteFileCountFilter"));
@@ -2575,11 +2527,10 @@ mod tests {
     #[test]
     fn test_full_compaction_with_single_grouping() {
         // Test that Full Compaction with Single grouping creates a single group
-        let full_config = crate::config::FullCompactionConfigBuilder::default()
+        let config = CompactionPlanningConfigBuilder::default()
             .grouping_strategy(crate::config::GroupingStrategy::Single)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::Full(full_config);
 
         let strategy = PlanStrategy::from(&config);
 
@@ -2637,14 +2588,15 @@ mod tests {
     #[test]
     fn test_parallelism_calculation_overflow_safety() {
         // Test that extremely large file sizes don't cause overflow in div_ceil
-        let small_files_config = SmallFilesConfigBuilder::default()
-            .min_size_per_partition(1_u64)
+        let config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .max_file_count_per_partition(1_usize)
             .max_input_parallelism(1000_usize)
             .max_output_parallelism(1000_usize)
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
         // Create a group with very large file size (near u64::MAX / 2)
         let huge_file = TestFileBuilder::new("huge.parquet")
@@ -2659,20 +2611,22 @@ mod tests {
         let (exec_p, out_p) = result.unwrap();
         assert!(exec_p >= 1);
         assert!(out_p >= 1);
-        assert!(exec_p <= config.max_input_parallelism());
+        assert!(exec_p <= config.max_input_parallelism);
     }
 
     // Test 1: Output parallelism limiting small files
     #[test]
     fn test_output_parallelism_prevents_small_files() {
-        let config = SmallFilesConfigBuilder::default()
+        let planning_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .target_file_size_bytes(1024 * 1024 * 1024_u64) // 1GB target
             .max_input_parallelism(32_usize)
             .max_output_parallelism(4_usize) // Limit to 4 output files
             .enable_heuristic_output_parallelism(false)
             .build()
             .unwrap();
-        let planning_config = CompactionPlanningConfig::SmallFiles(config);
 
         // Case 1: Many tiny files - should consolidate efficiently
         // 1000 files * 1MB = 1GB total
@@ -2703,7 +2657,7 @@ mod tests {
             "Total size should be 1000MB"
         );
         assert!(
-            tiny_total_size < planning_config.target_file_size_bytes(),
+            tiny_total_size < planning_config.target_file_size_bytes,
             "Total size should be less than target, justifying single output file"
         );
 
@@ -2732,7 +2686,7 @@ mod tests {
         // Verify each output file would be >= target size
         let avg_output_size = group.input_total_bytes() / output_parallelism as u64;
         assert!(
-            avg_output_size >= planning_config.target_file_size_bytes(),
+            avg_output_size >= planning_config.target_file_size_bytes,
             "Each output file should be >= target ({}GB >= 1GB)",
             avg_output_size / 1024 / 1024 / 1024
         );
@@ -2805,7 +2759,7 @@ mod tests {
 
         // Each file should be > 1GB (since we're distributing 10.1GB across 4 files)
         assert!(
-            avg_with_small_remainder > planning_config.target_file_size_bytes(),
+            avg_with_small_remainder > planning_config.target_file_size_bytes,
             "Small remainder should be absorbed, making each file > target size"
         );
     }
@@ -2813,16 +2767,17 @@ mod tests {
     /// Test 2: Input parallelism is constrained by multiple factors
     #[test]
     fn test_input_parallelism_multiple_constraints() {
-        let config = SmallFilesConfigBuilder::default()
+        let planning_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                crate::config::SmallFilesConfig::default(),
+            ))
             .target_file_size_bytes(1024 * 1024 * 1024_u64) // 1GB target
-            .min_size_per_partition(200 * 1024 * 1024_u64) // 200MB per partition
             .max_file_count_per_partition(10_usize) // Max 10 files per partition
             .max_input_parallelism(8_usize) // Cap at 8
             .max_output_parallelism(4_usize)
             .enable_heuristic_output_parallelism(false)
             .build()
             .unwrap();
-        let planning_config = CompactionPlanningConfig::SmallFiles(config);
 
         // Case 1: Count constraint dominates and hits cap
         // 100 files * 10MB = 1GB total
@@ -3031,29 +2986,33 @@ mod tests {
             partitioned_file("p2_file1.parquet", 2),
         ];
         let group_filters = min_file_count_filter(5);
-        let table_scope_config = SmallFilesConfigBuilder::default()
+        let table_scope_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                SmallFilesConfigBuilder::default()
+                    .group_filters(group_filters.clone())
+                    .build()
+                    .unwrap(),
+            ))
             .grouping_strategy(GroupingStrategy::Single)
             .file_group_scope(FileGroupScope::Table)
-            .group_filters(group_filters.clone())
             .build()
             .unwrap();
-        let partition_scope_config = SmallFilesConfigBuilder::default()
+        let partition_scope_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::SmallFiles(
+                SmallFilesConfigBuilder::default()
+                    .group_filters(group_filters)
+                    .build()
+                    .unwrap(),
+            ))
             .grouping_strategy(GroupingStrategy::Single)
-            .group_filters(group_filters)
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from_small_files(&table_scope_config)
-            .execute(
-                files.clone(),
-                &CompactionPlanningConfig::SmallFiles(table_scope_config),
-            )
+        let table_scope_groups = PlanStrategy::from(&table_scope_config)
+            .execute(files.clone(), &table_scope_config)
             .unwrap();
-        let partition_scope_groups = PlanStrategy::from_small_files(&partition_scope_config)
-            .execute(
-                files,
-                &CompactionPlanningConfig::SmallFiles(partition_scope_config),
-            )
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config)
+            .execute(files, &partition_scope_config)
             .unwrap();
 
         assert_eq!(table_scope_groups.len(), 1);
@@ -3069,31 +3028,35 @@ mod tests {
             delete_heavy_partitioned_file("p2_file1.parquet", 2),
         ];
         let group_filters = min_file_count_filter(3);
-        let table_scope_config = FilesWithDeletesConfigBuilder::default()
+        let table_scope_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::FilesWithDeletes(
+                FilesWithDeletesConfigBuilder::default()
+                    .min_delete_file_count_threshold(1_usize)
+                    .group_filters(group_filters.clone())
+                    .build()
+                    .unwrap(),
+            ))
             .grouping_strategy(GroupingStrategy::Single)
             .file_group_scope(FileGroupScope::Table)
-            .min_delete_file_count_threshold(1_usize)
-            .group_filters(group_filters.clone())
             .build()
             .unwrap();
-        let partition_scope_config = FilesWithDeletesConfigBuilder::default()
+        let partition_scope_config = CompactionPlanningConfigBuilder::default()
+            .strategy(CompactionStrategy::FilesWithDeletes(
+                FilesWithDeletesConfigBuilder::default()
+                    .min_delete_file_count_threshold(1_usize)
+                    .group_filters(group_filters)
+                    .build()
+                    .unwrap(),
+            ))
             .grouping_strategy(GroupingStrategy::Single)
-            .min_delete_file_count_threshold(1_usize)
-            .group_filters(group_filters)
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from_files_with_deletes(&table_scope_config)
-            .execute(
-                files.clone(),
-                &CompactionPlanningConfig::FilesWithDeletes(table_scope_config),
-            )
+        let table_scope_groups = PlanStrategy::from(&table_scope_config)
+            .execute(files.clone(), &table_scope_config)
             .unwrap();
-        let partition_scope_groups = PlanStrategy::from_files_with_deletes(&partition_scope_config)
-            .execute(
-                files,
-                &CompactionPlanningConfig::FilesWithDeletes(partition_scope_config),
-            )
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config)
+            .execute(files, &partition_scope_config)
             .unwrap();
 
         assert_eq!(table_scope_groups.len(), 1);
@@ -3185,15 +3148,15 @@ mod tests {
 
         // 2. Create strategy with Single grouping + min_group_file_count filter
         let small_files_config = SmallFilesConfigBuilder::default()
-            .grouping_strategy(GroupingStrategy::Single)
             .group_filters(crate::config::GroupFilters {
                 min_group_file_count: Some(2),
                 min_group_size_bytes: None,
             })
             .build()
             .unwrap();
-        let config = CompactionPlanningConfig::SmallFiles(small_files_config.clone());
-        let strategy = PlanStrategy::from_small_files(&small_files_config);
+        let config =
+            CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(small_files_config));
+        let strategy = PlanStrategy::from(&config);
 
         // 3. Execute strategy
         let groups = strategy.execute(files, &config).unwrap();

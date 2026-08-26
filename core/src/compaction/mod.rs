@@ -1438,7 +1438,7 @@ mod tests {
     use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
-        SmallFilesConfigBuilder,
+        CompactionStrategy, SmallFilesConfigBuilder,
     };
     use crate::executor::{ExecutorType, RewriteFilesStat};
 
@@ -1885,11 +1885,13 @@ mod tests {
         let small_file_threshold = 10_000;
 
         let compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::SmallFiles(
-                SmallFilesConfigBuilder::default()
-                    .small_file_threshold_bytes(small_file_threshold)
-                    .build()
-                    .unwrap(),
+            .planning(CompactionPlanningConfig::new(
+                CompactionStrategy::SmallFiles(
+                    SmallFilesConfigBuilder::default()
+                        .small_file_threshold_bytes(small_file_threshold)
+                        .build()
+                        .unwrap(),
+                ),
             ))
             .build()
             .unwrap();
@@ -2063,9 +2065,7 @@ mod tests {
 
         let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
 
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::Full(
-            crate::config::FullCompactionConfig::default(),
-        ));
+        let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
 
         let plans = planner.plan_compaction(&updated_table).await.unwrap();
 
@@ -2126,9 +2126,7 @@ mod tests {
         let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
 
         let full_compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::Full(
-                crate::config::FullCompactionConfig::default(),
-            ))
+            .planning(CompactionPlanningConfig::default())
             .build()
             .unwrap();
         let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
@@ -2301,12 +2299,12 @@ mod tests {
         let updated_table = tx.commit(env.catalog.as_ref()).await.unwrap();
 
         let small_file_threshold = 10_000u64;
-        let planning_config = CompactionPlanningConfig::SmallFiles(
+        let planning_config = CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(
             SmallFilesConfigBuilder::default()
                 .small_file_threshold_bytes(small_file_threshold)
                 .build()
                 .unwrap(),
-        );
+        ));
 
         let branch_planner = CompactionPlanner::new(planning_config.clone());
 

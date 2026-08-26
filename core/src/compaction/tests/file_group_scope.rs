@@ -28,9 +28,7 @@ use tempfile::TempDir;
 
 use super::{TestEnv, append_and_commit, create_namespace, simple_table_schema};
 use crate::compaction::CompactionPlanner;
-use crate::config::{
-    CompactionPlanningConfig, FileGroupScope, FullCompactionConfigBuilder, GroupingStrategy,
-};
+use crate::config::{CompactionPlanningConfigBuilder, FileGroupScope, GroupingStrategy};
 
 #[tokio::test]
 async fn test_plan_compaction_with_table_file_group_scope() {
@@ -58,13 +56,13 @@ async fn test_plan_compaction_with_table_file_group_scope() {
 }
 
 fn planner(file_group_scope: FileGroupScope) -> CompactionPlanner {
-    CompactionPlanner::new(CompactionPlanningConfig::Full(
-        FullCompactionConfigBuilder::default()
+    CompactionPlanner::new(
+        CompactionPlanningConfigBuilder::default()
             .grouping_strategy(GroupingStrategy::Single)
             .file_group_scope(file_group_scope)
             .build()
             .unwrap(),
-    ))
+    )
 }
 
 async fn create_partitioned_test_env() -> TestEnv {
