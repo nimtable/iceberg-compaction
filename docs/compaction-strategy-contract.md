@@ -8,7 +8,6 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 2. `Auto` should make decisions based only on the current snapshot, without assuming the caller knows historical execution state.
 3. `Auto` should prefer localized rewrites with explicit candidate sets.
 4. `Auto` should not rewrite healthy files across the whole table by default.
-5. The amount of work performed by a single `Auto` run must be bounded.
 
 ## Terms
 
@@ -17,7 +16,6 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `candidate set`: the set of data files that a strategy is allowed to include in compaction
 - `file group scope`: the boundary used before applying the grouping strategy; `Partition` keeps groups within one Iceberg partition, while `Table` lets the strategy group all selected files together
 - `group gating`: group-level thresholds used to avoid frequent small rewrites; these thresholds are applied after `file group scope` and `grouping_strategy`
-- `plan budget`: the maximum number of plans that `Auto` is allowed to execute in a single run
 - `fixed-point rewrite`: for the input files rewritten in the current run, the newly committed snapshot should cause them to leave that strategy's candidate set
 
 ## Strategy Model
@@ -66,14 +64,12 @@ candidate set through exactly one planning pipeline:
 1. File-level `small OR delete-heavy` selection
 2. File-group scoping and grouping
 3. Caller-provided group filters
-4. Per-run plan budget
 
 Design focus:
 
 - A file matching both predicates enters the candidate set once
 - Small and delete-heavy files may be compacted in the same group
 - The default file group scope is `Partition`
-- The plan budget applies to the final unified plan set
 
 ## Why `Auto` Does Not Fall Back to `Full`
 
@@ -83,22 +79,10 @@ Both `SmallFiles` and `FilesWithDeletes` have explicit candidate sets. After suc
 
 For that reason, `Auto` does not introduce a full-like special case and does not use `Full` as a fallback path.
 
-## Planner Budget
-
-`planning.max_plans_per_run` is planner-level configuration, not external invocation policy. Its default is unlimited.
-It is represented as a positive integer budget; zero is not a valid configuration value.
-
-The planner directly returns executable plans, so budget enforcement happens
-inside the planner rather than requiring callers to trim the result again.
-
-The current budget unit is `plan count`, not input bytes. This assumes grouping already keeps the size of each individual plan within a reasonable range.
-
 ## High-Frequency Invocation Boundaries
 
-The current design only guarantees two things:
-
-1. Selective paths will try to converge naturally
-2. The work done by a single `Auto` run is bounded by the planner budget
+Selective paths try to converge naturally because successfully rewritten files
+usually leave the candidate set.
 
 The current design does not guarantee:
 
@@ -115,11 +99,11 @@ The reason is straightforward: those signals are outside the snapshot-local view
 
 - Scan the current snapshot and produce candidate plans
 - Build one unified candidate set from the configured predicates
-- Apply `planning.max_plans_per_run`
 
 ### Responsibilities of External Systems
 
 - Decide when to call `Auto`
+- Bound how many returned plans are admitted for one scheduling run
 - Decide whether snapshot age or snapshot count should gate triggering
 - Decide whether repeated calls against the same snapshot should be skipped
 - Implement cooldown or other cross-invocation throttling policies
