@@ -990,6 +990,40 @@ impl PlanStrategy {
         )
     }
 
+    /// Constructs the unified Auto candidate pipeline.
+    ///
+    /// A non-zero threshold enables its predicate. When both predicates are
+    /// enabled, they are composed before type erasure so candidate selection is
+    /// `small OR delete-heavy`, followed by one grouping pipeline.
+    pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Self {
+        let size_filter = SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(config.small_file_threshold_bytes),
+        };
+        let delete_filter =
+            DeleteFileCountFilterStrategy::new(config.min_delete_file_count_threshold);
+
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = match (
+            config.small_file_threshold_bytes > 0,
+            config.min_delete_file_count_threshold > 0,
+        ) {
+            (true, true) => vec![Box::new(size_filter.or(delete_filter))],
+            (true, false) => vec![Box::new(size_filter)],
+            (false, true) => vec![Box::new(delete_filter)],
+            (false, false) => vec![Box::new(size_filter)],
+        };
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(
+            &config.grouping_strategy,
+            config.group_filters.as_ref(),
+        );
+
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
+    }
+
     /// Test-only builder accepting raw filter parameters.
     ///
     /// # Arguments
@@ -1026,6 +1060,7 @@ impl PlanStrategy {
 impl From<&CompactionPlanningConfig> for PlanStrategy {
     fn from(config: &CompactionPlanningConfig) -> Self {
         match config {
+            CompactionPlanningConfig::Auto(auto_config) => PlanStrategy::from_auto(auto_config),
             CompactionPlanningConfig::SmallFiles(small_files_config) => {
                 PlanStrategy::from_small_files(small_files_config)
             }
@@ -1114,8 +1149,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfigBuilder,
-        SmallFilesConfigBuilder,
+        AutoCompactionConfigBuilder, CompactionPlanningConfig, FileGroupScope,
+        FilesWithDeletesConfigBuilder, SmallFilesConfigBuilder,
     };
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
@@ -1518,6 +1553,68 @@ mod tests {
         let result = TestUtils::execute_strategy_flat(&strategy, composite_filter_test_files());
 
         TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &result);
+    }
+
+    #[test]
+    fn test_auto_strategy_groups_the_union_of_candidate_files() {
+        let auto_config = AutoCompactionConfigBuilder::default()
+            .small_file_threshold_bytes(32 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(2_usize)
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::Auto(auto_config);
+        let strategy = PlanStrategy::from(&planning_config);
+
+        let groups = strategy
+            .execute(composite_filter_test_files(), &planning_config)
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        TestUtils::assert_paths_eq(
+            &[
+                "small-clean.parquet",
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ],
+            &groups[0].data_files,
+        );
+        assert_eq!(
+            strategy.to_string(),
+            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) -> SingleGrouping -> NoGroupFilters"
+        );
+    }
+
+    #[test]
+    fn test_auto_strategy_zero_threshold_disables_its_predicate() {
+        let cases: [(u64, usize, Vec<&str>); 3] = [
+            (0, 2, vec![
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            (32 * 1024 * 1024, 0, vec![
+                "small-clean.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            (0, 0, vec![]),
+        ];
+
+        for (small_threshold, delete_threshold, expected_paths) in cases {
+            let auto_config = AutoCompactionConfigBuilder::default()
+                .small_file_threshold_bytes(small_threshold)
+                .min_delete_file_count_threshold(delete_threshold)
+                .build()
+                .unwrap();
+            let planning_config = CompactionPlanningConfig::Auto(auto_config);
+            let strategy = PlanStrategy::from(&planning_config);
+            let files = strategy
+                .execute(composite_filter_test_files(), &planning_config)
+                .unwrap()
+                .into_iter()
+                .flat_map(FileGroup::into_files)
+                .collect::<Vec<_>>();
+
+            TestUtils::assert_paths_eq(&expected_paths, &files);
+        }
     }
 
     #[test]
