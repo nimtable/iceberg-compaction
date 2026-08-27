@@ -223,6 +223,9 @@ pub struct CompactionPlanningConfig {
     #[builder(default)]
     pub strategy: CompactionStrategy,
 
+    /// Target bytes used to recommend output parallelism for each compaction
+    /// plan. The writer's rolling threshold is configured independently by
+    /// [`CompactionExecutionConfig::target_file_size_bytes`].
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -274,6 +277,8 @@ impl Default for CompactionPlanningConfig {
 /// Execution configuration for compaction operations.
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
+    /// Rolling threshold passed to the data-file writer. Planning uses its own
+    /// target to recommend output parallelism.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 

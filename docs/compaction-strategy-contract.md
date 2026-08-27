@@ -24,13 +24,25 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 | --- | --- | --- |
 | Planning scope and pipeline | `CompactionPlanningConfig` | Per-attempt bounds, grouping, file-group scope, and recommended parallelism |
 | Compaction policy | `CompactionStrategy` | Candidate predicate and any selective group gating |
-| Runtime pipeline | `PlanStrategy` | Compile the configuration into file filters, grouping, group filters, and parallelism calculation |
+| Runtime selection pipeline | `PlanStrategy` | Compile policy into file filters, grouping, and group filters |
+| Selection result | `SelectedFileGroup` | Carry a complete selected group without execution hints |
+| Plan assembly | `CompactionPlanner` | Calculate parallelism and create a complete `CompactionPlan` |
 | Execution | `CompactionExecutionConfig` | Read, rewrite, spill, and write behavior for an admitted plan |
 | Scheduling | External caller | Round identity, retry, admission limits, cooldown, and cross-attempt progress |
 
 `CompactionPlanningConfig` is the stable dispatch layer shared by every planning
 run. `CompactionStrategy` stores only policy-specific settings. `Full` has no
 policy-specific configuration.
+
+`PlanStrategy::select` does not accept planning settings and cannot create an
+executable plan. `CompactionPlanner` uses its single planning configuration to
+turn each `SelectedFileGroup` into a `CompactionPlan`, which owns the calculated
+input and output parallelism. This prevents a selected group from being used as
+a plan with default or stale execution hints.
+
+The planning and execution configurations intentionally have separate
+`target_file_size_bytes` values. Planning uses its value to recommend output
+parallelism; execution uses its value as the writer's rolling threshold.
 
 `group_filters` stay in the selective strategy payloads even though the runtime
 pipeline applies them after grouping. They are eligibility policy: allowing

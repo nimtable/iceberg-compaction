@@ -52,7 +52,9 @@ impl CompactionExecutor for DataFusionExecutor {
         let RewriteFilesRequest {
             file_io,
             schema,
-            file_group,
+            selected_file_group,
+            executor_parallelism,
+            output_parallelism,
             execution_config,
             partition_spec,
             metrics_recorder,
@@ -61,17 +63,13 @@ impl CompactionExecutor for DataFusionExecutor {
             format_version,
         } = request;
         let mut stats = RewriteFilesStat::default();
-        stats.record_input(&file_group);
+        stats.record_input(&selected_file_group);
         let sort_order_id = sort_order.clone().map(|sort_order| sort_order.id as i32);
-
-        // Extract parallelism before file_group is moved
-        let executor_parallelism = file_group.executor_parallelism;
-        let output_parallelism = file_group.output_parallelism;
 
         let datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(schema.clone())
             .with_format_version(format_version)
-            .with_input_data_files(file_group)
+            .with_input_data_files(selected_file_group)
             .with_sort_order(sort_order.clone())
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
