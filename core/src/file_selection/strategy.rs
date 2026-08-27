@@ -381,14 +381,6 @@ pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send 
     /// Returns whether a data file belongs to the candidate set.
     fn matches(&self, data_file: &FileScanTask) -> bool;
 
-    /// Returns the matching data files in their original order.
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|data_file| self.matches(data_file))
-            .collect()
-    }
-
     /// Combines two concrete filters with short-circuiting AND semantics.
     #[must_use]
     fn and<R>(self, right: R) -> AndFileFilter<Self, R>
@@ -800,7 +792,7 @@ impl PlanStrategy {
     ) -> Result<Vec<FileGroup>> {
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
-            filtered_files = filter.filter(filtered_files);
+            filtered_files.retain(|data_file| filter.matches(data_file));
         }
 
         let file_groups = self.group_files(filtered_files);
@@ -1307,11 +1299,21 @@ mod tests {
         DeleteFileCountFilterStrategy::new(2)
     }
 
+    fn filter_files(
+        filter: &impl FileFilterStrategy,
+        files: Vec<FileScanTask>,
+    ) -> Vec<FileScanTask> {
+        files
+            .into_iter()
+            .filter(|file| filter.matches(file))
+            .collect()
+    }
+
     #[test]
     fn test_and_file_filter_requires_both_predicates() {
         let filter = small_file_filter().and(delete_heavy_filter());
 
-        let result = filter.filter(composite_filter_test_files());
+        let result = filter_files(&filter, composite_filter_test_files());
 
         TestUtils::assert_paths_eq(&["small-delete-heavy.parquet"], &result);
         assert_eq!(
@@ -1324,7 +1326,7 @@ mod tests {
     fn test_or_file_filter_accepts_either_predicate_without_duplicates() {
         let filter = small_file_filter().or(delete_heavy_filter());
 
-        let result = filter.filter(composite_filter_test_files());
+        let result = filter_files(&filter, composite_filter_test_files());
 
         TestUtils::assert_paths_eq(
             &[
@@ -1349,7 +1351,7 @@ mod tests {
         };
         let filter = candidate_filter.and(large_file_filter);
 
-        let result = filter.filter(composite_filter_test_files());
+        let result = filter_files(&filter, composite_filter_test_files());
 
         TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &result);
         assert_eq!(
@@ -1415,7 +1417,7 @@ mod tests {
                 .build(),
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(test_files);
+        let result = filter_files(&strategy, test_files);
         assert_eq!(result.len(), 3);
         TestUtils::assert_paths_eq(
             &["min_edge.parquet", "medium1.parquet", "medium2.parquet"],
@@ -1442,7 +1444,7 @@ mod tests {
                 .size(11 * 1024 * 1024)
                 .build(),
         ];
-        let result = exact_strategy.filter(test_files);
+        let result = filter_files(&exact_strategy, test_files);
         assert_eq!(result.len(), 0);
 
         // Test min > max (invalid range - should return empty)
@@ -1455,7 +1457,7 @@ mod tests {
                 .size(30 * 1024 * 1024)
                 .build(),
         ];
-        let result = invalid_strategy.filter(test_files);
+        let result = filter_files(&invalid_strategy, test_files);
         assert_eq!(result.len(), 0, "Invalid range should filter out all files");
     }
 
@@ -2409,7 +2411,7 @@ mod tests {
             ),
         ];
 
-        let result = strategy.filter(test_files);
+        let result = filter_files(&strategy, test_files);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].data_file_path, "three_deletes.parquet");
         assert_eq!(result[1].data_file_path, "five_deletes.parquet");
@@ -2433,7 +2435,7 @@ mod tests {
                     .with_deletes()
                     .build(),
             ];
-            let result = strategy.filter(test_files);
+            let result = filter_files(&strategy, test_files);
             assert_eq!(result.len(), expected_count);
         }
     }
