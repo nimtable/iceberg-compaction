@@ -25,7 +25,7 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 | Planning scope and pipeline | `CompactionPlanningConfig` | Per-attempt bounds, grouping, file-group scope, and recommended parallelism |
 | Compaction policy | `CompactionStrategy` | Candidate predicate and any selective group gating |
 | Runtime selection pipeline | `PlanStrategy` | Compile policy into file filters, grouping, and group filters |
-| Selection result | `SelectedFileGroup` | Carry a complete selected group without execution hints |
+| Selection result | `FileGroup` | Carry a complete selected group without execution hints |
 | Plan assembly | `CompactionPlanner` | Calculate parallelism and create a complete `CompactionPlan` |
 | Execution | `CompactionExecutionConfig` | Read, rewrite, spill, and write behavior for an admitted plan |
 | Scheduling | External caller | Round identity, retry, admission limits, cooldown, and cross-attempt progress |
@@ -34,9 +34,9 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 run. `CompactionStrategy` stores only policy-specific settings. `Full` has no
 policy-specific configuration.
 
-`PlanStrategy::select` does not accept planning settings and cannot create an
+`PlanStrategy::execute` does not accept planning settings and cannot create an
 executable plan. `CompactionPlanner` uses its single planning configuration to
-turn each `SelectedFileGroup` into a `CompactionPlan`, which owns the calculated
+turn each `FileGroup` into a `CompactionPlan`, which owns the calculated
 input and output parallelism. This prevents a selected group from being used as
 a plan with default or stale execution hints.
 

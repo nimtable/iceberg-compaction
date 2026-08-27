@@ -32,7 +32,7 @@ use crate::error::Result;
 use crate::executor::datafusion::datafusion_processor::{
     DataFusionTaskContext, DatafusionProcessor,
 };
-use crate::file_selection::SelectedFileGroup;
+use crate::file_selection::FileGroup;
 
 pub struct CompactionValidator {
     datafusion_processor: DatafusionProcessor,
@@ -45,7 +45,7 @@ pub struct CompactionValidator {
 impl CompactionValidator {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        selected_file_group: SelectedFileGroup,
+        file_group: FileGroup,
         output_files: Vec<DataFile>,
         executor_parallelism: usize,
         input_schema: Arc<Schema>,
@@ -93,7 +93,7 @@ impl CompactionValidator {
         // TODO: we can only select a single column for count validation
         let input_datafusion_task_ctx = DataFusionTaskContext::builder()?
             .with_schema(input_schema)
-            .with_input_data_files(selected_file_group)
+            .with_input_data_files(file_group)
             .with_table_prefix("input".to_owned())
             .build()?;
 

@@ -23,7 +23,7 @@ use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 
 use crate::common::CompactionMetricsRecorder;
 use crate::config::CompactionExecutionConfig;
-use crate::file_selection::SelectedFileGroup;
+use crate::file_selection::FileGroup;
 
 pub mod mock;
 pub use mock::MockExecutor;
@@ -46,7 +46,7 @@ pub struct TableSortOrder {
 pub struct RewriteFilesRequest {
     pub file_io: FileIO,
     pub schema: Arc<Schema>,
-    pub selected_file_group: SelectedFileGroup,
+    pub file_group: FileGroup,
     pub executor_parallelism: usize,
     pub output_parallelism: usize,
     pub execution_config: Arc<CompactionExecutionConfig>,
@@ -79,24 +79,24 @@ pub struct RewriteFilesStat {
 }
 
 impl RewriteFilesStat {
-    pub fn record_input(&mut self, selected_file_group: &SelectedFileGroup) {
-        self.input_files_count = selected_file_group.input_files_count();
-        self.input_total_bytes = selected_file_group.input_total_bytes();
+    pub fn record_input(&mut self, file_group: &FileGroup) {
+        self.input_files_count = file_group.input_files_count();
+        self.input_total_bytes = file_group.input_total_bytes();
 
-        self.input_data_file_count = selected_file_group.data_files.len();
-        self.input_position_delete_file_count = selected_file_group.position_delete_files.len();
-        self.input_equality_delete_file_count = selected_file_group.equality_delete_files.len();
-        self.input_data_file_total_bytes = selected_file_group
+        self.input_data_file_count = file_group.data_files.len();
+        self.input_position_delete_file_count = file_group.position_delete_files.len();
+        self.input_equality_delete_file_count = file_group.equality_delete_files.len();
+        self.input_data_file_total_bytes = file_group
             .data_files
             .iter()
             .map(|task| task.file_size_in_bytes)
             .sum::<u64>();
-        self.input_position_delete_file_total_bytes = selected_file_group
+        self.input_position_delete_file_total_bytes = file_group
             .position_delete_files
             .iter()
             .map(|task| task.file_size_in_bytes)
             .sum::<u64>();
-        self.input_equality_delete_file_total_bytes = selected_file_group
+        self.input_equality_delete_file_total_bytes = file_group
             .equality_delete_files
             .iter()
             .map(|task| task.file_size_in_bytes)

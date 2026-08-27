@@ -43,7 +43,7 @@ use crate::config::{
 /// sizes. Execution parallelism belongs to the compaction plan assembled from
 /// this selected group.
 #[derive(Debug, Clone)]
-pub struct SelectedFileGroup {
+pub struct FileGroup {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,
     pub equality_delete_files: Vec<FileScanTask>,
@@ -52,7 +52,7 @@ pub struct SelectedFileGroup {
     pub data_file_count: usize,
 }
 
-impl SelectedFileGroup {
+impl FileGroup {
     /// Constructs a selected group from data files.
     ///
     /// Deduplicates delete files by path plus optional Puffin byte range. Position
@@ -256,7 +256,7 @@ impl GroupingStrategyEnum {
     /// This preserves the historical public API behavior. Use [`PlanStrategy`]
     /// with [`FileGroupScope::Table`] when the grouping strategy should see
     /// all selected files together.
-    pub fn group_files<I>(&self, data_files: I) -> Vec<SelectedFileGroup>
+    pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
     where I: IntoIterator<Item = FileScanTask> {
         group_files_by_partition(data_files.into_iter())
             .into_values()
@@ -264,7 +264,7 @@ impl GroupingStrategyEnum {
             .collect()
     }
 
-    fn group_files_without_partitioning<I>(&self, data_files: I) -> Vec<SelectedFileGroup>
+    fn group_files_without_partitioning<I>(&self, data_files: I) -> Vec<FileGroup>
     where I: IntoIterator<Item = FileScanTask> {
         let data_files = data_files.into_iter();
         match self {
@@ -289,7 +289,7 @@ impl std::fmt::Display for GroupingStrategyEnum {
 /// by [`PlanStrategy`].
 pub trait GroupFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
     /// Returns filtered subset of groups.
-    fn filter_groups(&self, groups: Vec<SelectedFileGroup>) -> Vec<SelectedFileGroup>;
+    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup>;
 }
 
 /// Single grouping strategy. Groups all files into one selected group.
@@ -299,13 +299,13 @@ pub trait GroupFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send
 pub struct SingleGroupingStrategy;
 
 impl SingleGroupingStrategy {
-    pub fn group_files<I>(&self, data_files: I) -> Vec<SelectedFileGroup>
+    pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
     where I: Iterator<Item = FileScanTask> {
         let files: Vec<FileScanTask> = data_files.collect();
         if files.is_empty() {
             vec![]
         } else {
-            vec![SelectedFileGroup::new(files)]
+            vec![FileGroup::new(files)]
         }
     }
 }
@@ -329,7 +329,7 @@ impl BinPackGroupingStrategy {
         Self { target_group_size }
     }
 
-    pub fn group_files<I>(&self, data_files: I) -> Vec<SelectedFileGroup>
+    pub fn group_files<I>(&self, data_files: I) -> Vec<FileGroup>
     where I: Iterator<Item = FileScanTask> {
         let files: Vec<FileScanTask> = data_files.collect();
 
@@ -342,7 +342,7 @@ impl BinPackGroupingStrategy {
 
         groups
             .into_iter()
-            .map(SelectedFileGroup::new)
+            .map(FileGroup::new)
             .filter(|group| !group.is_empty())
             .collect()
     }
@@ -442,7 +442,7 @@ pub struct MinGroupSizeStrategy {
 }
 
 impl GroupFilterStrategy for MinGroupSizeStrategy {
-    fn filter_groups(&self, groups: Vec<SelectedFileGroup>) -> Vec<SelectedFileGroup> {
+    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
         groups
             .into_iter()
             .filter(|group| group.total_size >= self.min_group_size_bytes)
@@ -469,7 +469,7 @@ pub struct MinGroupFileCountStrategy {
 }
 
 impl GroupFilterStrategy for MinGroupFileCountStrategy {
-    fn filter_groups(&self, groups: Vec<SelectedFileGroup>) -> Vec<SelectedFileGroup> {
+    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
         groups
             .into_iter()
             .filter(|group| group.data_file_count >= self.min_file_count)
@@ -523,9 +523,9 @@ impl PlanStrategyOptions {
     }
 }
 
-/// Three-stage pipeline: file filters → grouping → group filters.
+/// Three-stage file-selection pipeline: file filters → grouping → group filters.
 ///
-/// Filters and group filters are applied sequentially. See [`select`](Self::select) for details.
+/// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
 #[derive(Debug)]
 pub struct PlanStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
@@ -564,11 +564,11 @@ impl PlanStrategy {
         }
     }
 
-    /// Selects and groups files:
+    /// Executes the pipeline:
     /// 1. Apply each file filter sequentially
     /// 2. Group files using the configured file-group scope and grouping strategy
     /// 3. Apply each group filter sequentially
-    pub fn select(&self, data_files: Vec<FileScanTask>) -> Vec<SelectedFileGroup> {
+    pub fn execute(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
@@ -584,7 +584,7 @@ impl PlanStrategy {
         file_groups
     }
 
-    fn group_files(&self, data_files: Vec<FileScanTask>) -> Vec<SelectedFileGroup> {
+    fn group_files(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
         match self.file_group_scope {
             FileGroupScope::Table => self.grouping.group_files_without_partitioning(data_files),
             FileGroupScope::Partition => self.grouping.group_files(data_files),
@@ -809,11 +809,11 @@ mod tests {
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
     fn plan_parallelism(
-        selected_file_group: &SelectedFileGroup,
+        file_group: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
         let plan = CompactionPlanner::new(config.clone()).create_plan(
-            selected_file_group.clone(),
+            file_group.clone(),
             iceberg::spec::MAIN_BRANCH,
             1,
         )?;
@@ -984,7 +984,7 @@ mod tests {
             data_files: Vec<FileScanTask>,
         ) -> Vec<FileScanTask> {
             strategy
-                .select(data_files)
+                .execute(data_files)
                 .into_iter()
                 .flat_map(|group| group.into_files())
                 .collect()
@@ -1127,7 +1127,7 @@ mod tests {
         let planning_config = CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
         let strategy = PlanStrategy::from(&planning_config);
 
-        let groups = strategy.select(composite_filter_test_files());
+        let groups = strategy.execute(composite_filter_test_files());
 
         assert_eq!(groups.len(), 1);
         TestUtils::assert_paths_eq(
@@ -1168,9 +1168,9 @@ mod tests {
                 CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
             let strategy = PlanStrategy::from(&planning_config);
             let files = strategy
-                .select(composite_filter_test_files())
+                .execute(composite_filter_test_files())
                 .into_iter()
-                .flat_map(SelectedFileGroup::into_files)
+                .flat_map(FileGroup::into_files)
                 .collect::<Vec<_>>();
 
             TestUtils::assert_paths_eq(&expected_paths, &files);
@@ -1346,7 +1346,7 @@ mod tests {
                 .build(),
         ];
 
-        let groups = strategy.select(test_files);
+        let groups = strategy.execute(test_files);
 
         assert_eq!(groups.len(), 2);
         let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
@@ -1369,7 +1369,7 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = strategy.select(large_files);
+        let large_groups = strategy.execute(large_files);
         assert_eq!(large_groups.len(), 2);
         assert_eq!(large_groups[0].data_file_count, 1);
         assert_eq!(large_groups[1].data_file_count, 1);
@@ -1418,7 +1418,7 @@ mod tests {
                 })
                 .collect();
 
-            let result = strategy.select(files);
+            let result = strategy.execute(files);
             assert_eq!(
                 result.len(),
                 expected_groups,
@@ -1580,7 +1580,7 @@ mod tests {
     #[test]
     fn test_group_filter_strategies_with_file_groups() {
         let groups = vec![
-            SelectedFileGroup::new(vec![
+            FileGroup::new(vec![
                 TestFileBuilder::new("small1.parquet")
                     .size(5 * 1024 * 1024)
                     .build(),
@@ -1588,7 +1588,7 @@ mod tests {
                     .size(10 * 1024 * 1024)
                     .build(),
             ]), // 15MB, 2 files
-            SelectedFileGroup::new(vec![
+            FileGroup::new(vec![
                 TestFileBuilder::new("large1.parquet")
                     .size(50 * 1024 * 1024)
                     .build(),
@@ -1599,7 +1599,7 @@ mod tests {
                     .size(75 * 1024 * 1024)
                     .build(),
             ]), // 225MB, 3 files
-            SelectedFileGroup::new(vec![
+            FileGroup::new(vec![
                 TestFileBuilder::new("single.parquet")
                     .size(20 * 1024 * 1024)
                     .build(),
@@ -1777,7 +1777,7 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = bin_pack_strategy.select(large_files);
+        let large_groups = bin_pack_strategy.execute(large_files);
         assert_eq!(
             large_groups.len(),
             4,
@@ -1861,7 +1861,7 @@ mod tests {
                 .build(), // 25MB
         ];
 
-        let group = SelectedFileGroup::new(files);
+        let group = FileGroup::new(files);
         let (executor_parallelism, output_parallelism) = plan_parallelism(&group, &config).unwrap();
 
         assert!(executor_parallelism >= 1);
@@ -1870,7 +1870,7 @@ mod tests {
         assert!(executor_parallelism <= config.max_input_parallelism);
 
         // Test error case - empty group
-        let empty_group = SelectedFileGroup::empty();
+        let empty_group = FileGroup::empty();
         let result = plan_parallelism(&empty_group, &config);
         assert!(result.is_err());
 
@@ -1885,7 +1885,7 @@ mod tests {
 
     #[test]
     fn test_file_group_delete_files_extraction() {
-        // Test that SelectedFileGroup correctly extracts and organizes delete files
+        // Test that FileGroup correctly extracts and organizes delete files
         use iceberg::spec::DataContentType;
 
         // Create a data file with both position and equality delete files
@@ -1906,7 +1906,7 @@ mod tests {
         data_file.record_count = Some(1000);
         data_file.deletes = vec![position_delete, equality_delete];
 
-        let group = SelectedFileGroup::new(vec![data_file]);
+        let group = FileGroup::new(vec![data_file]);
 
         // Verify that delete files were extracted correctly
         assert_eq!(group.position_delete_files.len(), 1);
@@ -1950,7 +1950,7 @@ mod tests {
             .build();
         f2.deletes = vec![shared_pos_delete];
 
-        let group = SelectedFileGroup::new(vec![f1, f2]);
+        let group = FileGroup::new(vec![f1, f2]);
         // Dedup should keep one position delete
         assert_eq!(group.position_delete_files.len(), 1);
         assert_eq!(
@@ -1997,7 +1997,7 @@ mod tests {
         let mut data_file = TestFileBuilder::new("data.parquet").build();
         data_file.deletes = vec![first, second];
 
-        let mut ranges = SelectedFileGroup::new(vec![data_file])
+        let mut ranges = FileGroup::new(vec![data_file])
             .position_delete_files
             .into_iter()
             .map(|task| (task.start, task.length))
@@ -2034,7 +2034,7 @@ mod tests {
             .build();
         f2.deletes = vec![shared_eq_delete, pos_delete];
 
-        let group = SelectedFileGroup::new(vec![f1, f2]);
+        let group = FileGroup::new(vec![f1, f2]);
 
         // Both delete types should be deduplicated
         assert_eq!(group.position_delete_files.len(), 1);
@@ -2084,7 +2084,7 @@ mod tests {
                 .build(),
         ];
 
-        let groups = strategy.select(test_files.clone());
+        let groups = strategy.execute(test_files.clone());
 
         assert_eq!(
             groups.len(),
@@ -2226,7 +2226,7 @@ mod tests {
                 .build(),
         ];
 
-        let result = strategy.select(test_files.clone());
+        let result = strategy.execute(test_files.clone());
 
         // Full compaction should include ALL files, creating groups but not filtering any
         let total_files_in_groups: usize = result.iter().map(|g| g.data_file_count).sum();
@@ -2279,7 +2279,7 @@ mod tests {
             .size(u64::MAX / 2)
             .build();
 
-        let group = SelectedFileGroup::new(vec![huge_file]);
+        let group = FileGroup::new(vec![huge_file]);
         let result = plan_parallelism(&group, &config);
 
         // Should not panic or overflow, should calculate valid parallelism
@@ -2316,7 +2316,7 @@ mod tests {
             })
             .collect();
 
-        let tiny_group = SelectedFileGroup::new(tiny_files);
+        let tiny_group = FileGroup::new(tiny_files);
         let (_, tiny_output_p) = plan_parallelism(&tiny_group, &planning_config).unwrap();
 
         assert_eq!(
@@ -2349,7 +2349,7 @@ mod tests {
             })
             .collect();
 
-        let group = SelectedFileGroup::new(files);
+        let group = FileGroup::new(files);
         let (_, output_parallelism) = plan_parallelism(&group, &planning_config).unwrap();
 
         assert_eq!(
@@ -2372,7 +2372,7 @@ mod tests {
                 .build(),
         ];
 
-        let small_group = SelectedFileGroup::new(small_files);
+        let small_group = FileGroup::new(small_files);
         let (_, small_output_p) = plan_parallelism(&small_group, &planning_config).unwrap();
 
         assert_eq!(
@@ -2389,7 +2389,7 @@ mod tests {
             })
             .collect();
 
-        let exact_group = SelectedFileGroup::new(exact_files);
+        let exact_group = FileGroup::new(exact_files);
         let (_, exact_output_p) = plan_parallelism(&exact_group, &planning_config).unwrap();
 
         assert_eq!(
@@ -2416,7 +2416,7 @@ mod tests {
                 .build(), // 100MB tiny remainder
         ];
 
-        let small_remainder_group = SelectedFileGroup::new(files_small_remainder);
+        let small_remainder_group = FileGroup::new(files_small_remainder);
         let (_, small_remainder_output_p) =
             plan_parallelism(&small_remainder_group, &planning_config).unwrap();
 
@@ -2464,7 +2464,7 @@ mod tests {
             })
             .collect();
 
-        let group1 = SelectedFileGroup::new(many_small_files);
+        let group1 = FileGroup::new(many_small_files);
         let (input_p1, _) = plan_parallelism(&group1, &planning_config).unwrap();
 
         assert_eq!(
@@ -2484,7 +2484,7 @@ mod tests {
             })
             .collect();
 
-        let group2 = SelectedFileGroup::new(medium_count_files);
+        let group2 = FileGroup::new(medium_count_files);
         let (input_p2, _) = plan_parallelism(&group2, &planning_config).unwrap();
 
         assert!(
@@ -2507,7 +2507,7 @@ mod tests {
             })
             .collect();
 
-        let group3 = SelectedFileGroup::new(few_files);
+        let group3 = FileGroup::new(few_files);
         let (input_p3, _) = plan_parallelism(&group3, &planning_config).unwrap();
 
         assert!(input_p3 >= 1, "Should have at least 1 parallelism");
@@ -2529,7 +2529,7 @@ mod tests {
             })
             .collect();
 
-        let group4 = SelectedFileGroup::new(large_files);
+        let group4 = FileGroup::new(large_files);
         let (input_p4, _) = plan_parallelism(&group4, &planning_config).unwrap();
 
         assert_eq!(
@@ -2680,8 +2680,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from(&table_scope_config).select(files.clone());
-        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).select(files);
+        let table_scope_groups = PlanStrategy::from(&table_scope_config).execute(files.clone());
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).execute(files);
 
         assert_eq!(table_scope_groups.len(), 1);
         assert_eq!(table_scope_groups[0].data_file_count, 5);
@@ -2720,8 +2720,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from(&table_scope_config).select(files.clone());
-        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).select(files);
+        let table_scope_groups = PlanStrategy::from(&table_scope_config).execute(files.clone());
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).execute(files);
 
         assert_eq!(table_scope_groups.len(), 1);
         assert_eq!(table_scope_groups[0].data_file_count, 3);
@@ -2767,7 +2767,7 @@ mod tests {
             None, // no group filters
         );
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         assert_eq!(
@@ -2821,7 +2821,7 @@ mod tests {
         let strategy = PlanStrategy::from(&config);
 
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 0, 2, 3)");
@@ -2880,7 +2880,7 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         assert_eq!(
@@ -2945,7 +2945,7 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         assert_eq!(groups.len(), 4, "Should have 4 groups (two per partition)");
@@ -3003,7 +3003,7 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         // Verify a 5MB file from Partition 0 was filtered out.
@@ -3072,7 +3072,7 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // 4. Assertions
         assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 2, 3, 4)");
@@ -3124,7 +3124,7 @@ mod tests {
         // Create Single grouping strategy
         let strategy = PlanStrategy::new_custom(None, None, GroupingStrategy::Single, None);
 
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // Should have 3 groups:
         // - Group 1: unpartitioned files (None + empty partition)
@@ -3191,7 +3191,7 @@ mod tests {
             None,
         );
 
-        let groups = strategy.select(files);
+        let groups = strategy.execute(files);
 
         // Verify partitions are kept separate:
         // - Unpartitioned (None + empty): 70MB total -> should be binpacked into groups
@@ -3231,13 +3231,10 @@ mod tests {
             .target_file_size_bytes(0_u64)
             .build()
             .unwrap();
-        let selected_file_group = SelectedFileGroup::new(vec![
+        let file_group = FileGroup::new(vec![
             TestFileBuilder::new("small.parquet").size(1024).build(),
         ]);
 
-        assert_eq!(
-            plan_parallelism(&selected_file_group, &config).unwrap(),
-            (1, 1)
-        );
+        assert_eq!(plan_parallelism(&file_group, &config).unwrap(), (1, 1));
     }
 }

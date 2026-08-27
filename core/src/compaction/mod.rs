@@ -35,7 +35,7 @@ use crate::executor::{
     ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
 };
-use crate::file_selection::{FileSelector, SelectedFileGroup};
+use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
 mod validator;
@@ -527,7 +527,7 @@ impl Compaction {
         for rewrite_result in rewrite_results {
             if rewrite_result.validation_enabled {
                 let mut validator = CompactionValidator::new(
-                    rewrite_result.plan.selected_file_group,
+                    rewrite_result.plan.file_group,
                     rewrite_result.output_data_files,
                     rewrite_result.plan.executor_parallelism,
                     committed_table.metadata().current_schema().clone(),
@@ -590,7 +590,7 @@ impl Compaction {
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
             schema,
-            selected_file_group: plan.selected_file_group.clone(),
+            file_group: plan.file_group.clone(),
             executor_parallelism: plan.executor_parallelism,
             output_parallelism: plan.output_parallelism,
             execution_config: Arc::new(execution_config.clone()),
@@ -648,7 +648,7 @@ impl Compaction {
         // Run validation if enabled
         if rewrite_result.validation_enabled {
             let mut validator = CompactionValidator::new(
-                rewrite_result.plan.selected_file_group.clone(),
+                rewrite_result.plan.file_group.clone(),
                 rewrite_result.output_data_files.clone(),
                 rewrite_result.plan.executor_parallelism,
                 final_table.metadata().current_schema().clone(),
@@ -872,7 +872,7 @@ impl CommitManager {
             .iter()
             .flat_map(|rr| {
                 rr.plan
-                    .selected_file_group
+                    .file_group
                     .data_files
                     .iter()
                     .map(|task| task.data_file_path.as_str())
@@ -1237,7 +1237,7 @@ fn custom_snapshot_properties(snapshot: &Snapshot) -> HashMap<String, String> {
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
     /// Selected files to be compacted together.
-    selected_file_group: SelectedFileGroup,
+    file_group: FileGroup,
     executor_parallelism: usize,
     output_parallelism: usize,
     /// Target branch for committing the compaction result
@@ -1256,15 +1256,15 @@ impl CompactionPlan {
     /// Returns an error when parallelism cannot be calculated for the selected
     /// files.
     fn new(
-        selected_file_group: SelectedFileGroup,
+        file_group: FileGroup,
         to_branch: impl Into<Cow<'static, str>>,
         snapshot_id: i64,
         planning_config: &CompactionPlanningConfig,
     ) -> Result<Self> {
         let (executor_parallelism, output_parallelism) =
-            Self::calculate_parallelism(&selected_file_group, planning_config)?;
+            Self::calculate_parallelism(&file_group, planning_config)?;
         Ok(Self {
-            selected_file_group,
+            file_group,
             executor_parallelism,
             output_parallelism,
             to_branch: to_branch.into(),
@@ -1275,10 +1275,10 @@ impl CompactionPlan {
 
     /// Calculates executor and output parallelism while assembling a plan.
     fn calculate_parallelism(
-        selected_file_group: &SelectedFileGroup,
+        file_group: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
-        let input_size = selected_file_group.input_total_bytes();
+        let input_size = file_group.input_total_bytes();
         if input_size == 0 {
             return Err(CompactionError::Execution(
                 "No files to calculate task parallelism".to_owned(),
@@ -1293,16 +1293,13 @@ impl CompactionPlan {
             Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
                 .min(config.max_output_parallelism)
                 .max(1);
-        let output_parallelism = Self::apply_output_parallelism_heuristic(
-            selected_file_group,
-            config,
-            output_parallelism,
-        );
+        let output_parallelism =
+            Self::apply_output_parallelism_heuristic(file_group, config, output_parallelism);
 
         let split_size =
             Self::input_split_size(input_size, target_file_size, min_file_size, max_file_size);
         let partition_by_size = input_size.div_ceil(split_size).max(1) as usize;
-        let partition_by_count = selected_file_group
+        let partition_by_count = file_group
             .input_files_count()
             .div_ceil(config.max_file_count_per_partition)
             .max(1);
@@ -1314,7 +1311,7 @@ impl CompactionPlan {
     }
 
     fn apply_output_parallelism_heuristic(
-        selected_file_group: &SelectedFileGroup,
+        file_group: &FileGroup,
         config: &CompactionPlanningConfig,
         current_output_parallelism: usize,
     ) -> usize {
@@ -1322,7 +1319,7 @@ impl CompactionPlan {
             return current_output_parallelism;
         }
 
-        let total_data_file_size = selected_file_group
+        let total_data_file_size = file_group
             .data_files
             .iter()
             .map(|file| file.file_size_in_bytes)
@@ -1405,7 +1402,7 @@ impl CompactionPlan {
     #[cfg(test)]
     fn empty(to_branch: impl Into<Cow<'static, str>>, snapshot_id: i64) -> Self {
         Self {
-            selected_file_group: SelectedFileGroup::empty(),
+            file_group: FileGroup::empty(),
             executor_parallelism: 1,
             output_parallelism: 1,
             to_branch: to_branch.into(),
@@ -1423,24 +1420,24 @@ impl CompactionPlan {
     }
 
     /// Returns the selected files carried by this plan.
-    pub fn selected_file_group(&self) -> &SelectedFileGroup {
-        &self.selected_file_group
+    pub fn file_group(&self) -> &FileGroup {
+        &self.file_group
     }
 
     /// Returns total number of files to be compacted.
     pub fn file_count(&self) -> usize {
-        self.selected_file_group.input_files_count()
+        self.file_group.input_files_count()
     }
 
     /// Returns total size in bytes of files to be compacted.
     pub fn total_bytes(&self) -> u64 {
-        self.selected_file_group.input_total_bytes()
+        self.file_group.input_total_bytes()
     }
 
     /// Returns whether this plan has any files to compact.
     /// Returns `false` if the file group is empty, `true` otherwise.
     pub fn has_files(&self) -> bool {
-        !self.selected_file_group.is_empty()
+        !self.file_group.is_empty()
     }
 
     /// Returns recommended executor parallelism calculated during planning.
@@ -1472,11 +1469,11 @@ impl CompactionPlanner {
     /// Parallelism always comes from this planner's planning configuration.
     pub fn create_plan(
         &self,
-        selected_file_group: SelectedFileGroup,
+        file_group: FileGroup,
         to_branch: impl Into<Cow<'static, str>>,
         snapshot_id: i64,
     ) -> Result<CompactionPlan> {
-        CompactionPlan::new(selected_file_group, to_branch, snapshot_id, &self.config)
+        CompactionPlan::new(file_group, to_branch, snapshot_id, &self.config)
     }
 
     /// Plans compaction for a specific branch.
@@ -1503,11 +1500,11 @@ impl CompactionPlanner {
             // Filter out empty plans to avoid unnecessary processing
             let plans = file_groups
                 .into_iter()
-                .filter(|selected_file_group| !selected_file_group.is_empty())
-                .map(|selected_file_group| {
+                .filter(|file_group| !file_group.is_empty())
+                .map(|file_group| {
                     Ok(self
                         .create_plan(
-                            selected_file_group,
+                            file_group,
                             to_branch.to_owned(),
                             branch_snapshot.snapshot_id(),
                         )?
@@ -1535,7 +1532,7 @@ impl CompactionPlanner {
         &self,
         table: &Table,
         snapshot_id: i64,
-    ) -> Result<(Vec<SelectedFileGroup>, Option<i64>)> {
+    ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
         let strategy = PlanStrategy::from(&self.config);
@@ -2222,10 +2219,6 @@ mod tests {
         assert!(!plans.is_empty());
         let plan = &plans[0];
         assert_eq!(plan.file_count(), expected_file_count);
-        assert_eq!(
-            plan.selected_file_group().data_file_count,
-            expected_file_count
-        );
         assert!(plan.total_bytes() > 0);
         assert_eq!(plan.recommended_executor_parallelism(), expected_file_count);
         assert_eq!(plan.recommended_output_parallelism(), 1);
@@ -2469,7 +2462,7 @@ mod tests {
 
         assert_eq!(branch_plan.file_count(), 1);
         assert_eq!(branch_plan.to_branch, new_branch);
-        let input_file_path = branch_plan.selected_file_group().data_files[0].data_file_path();
+        let input_file_path = branch_plan.file_group().data_files[0].data_file_path();
         assert!(input_file_path.contains("small-branch"));
 
         let branch_compaction =

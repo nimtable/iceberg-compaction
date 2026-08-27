@@ -24,20 +24,22 @@ pub mod packer;
 pub mod strategy;
 
 pub use packer::ListPacker;
-pub use strategy::{PlanStrategy, PlanStrategyOptions, SelectedFileGroup};
+pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
 impl FileSelector {
-    /// Gets and groups selected files from a table snapshot.
+    /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
+    /// Returns groups of files selected and organized by the given strategy.
+    /// The caller is responsible for calculating per-group parallelism.
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
         strategy: PlanStrategy,
-    ) -> Result<Vec<SelectedFileGroup>> {
+    ) -> Result<Vec<FileGroup>> {
         let data_files = Self::scan_data_files(table, snapshot_id).await?;
-        Ok(strategy.select(data_files))
+        Ok(strategy.execute(data_files))
     }
 
     /// Scans and collects all data files from a table snapshot.
@@ -81,7 +83,7 @@ impl FileSelector {
     pub fn group_tasks_with_strategy(
         tasks: Vec<FileScanTask>,
         strategy: PlanStrategy,
-    ) -> Vec<SelectedFileGroup> {
-        strategy.select(tasks)
+    ) -> Vec<FileGroup> {
+        strategy.execute(tasks)
     }
 }

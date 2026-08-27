@@ -42,7 +42,7 @@ use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use crate::config::CompactionExecutionConfig;
 use crate::error::{CompactionError, Result};
 use crate::executor::TableSortOrder;
-use crate::file_selection::SelectedFileGroup;
+use crate::file_selection::FileGroup;
 
 // System hidden columns used for Iceberg merge-on-read operations
 pub const SYS_HIDDEN_SEQ_NUM: &str = "sys_hidden_seq_num";
@@ -642,8 +642,8 @@ impl DataFusionTaskContextBuilder {
         self
     }
 
-    pub fn with_input_data_files(mut self, selected_file_group: SelectedFileGroup) -> Self {
-        self.data_files = selected_file_group
+    pub fn with_input_data_files(mut self, file_group: FileGroup) -> Self {
+        self.data_files = file_group
             .data_files
             .into_iter()
             .map(|mut task| {
@@ -658,8 +658,8 @@ impl DataFusionTaskContextBuilder {
                 task
             })
             .collect();
-        self.position_delete_files = selected_file_group.position_delete_files;
-        self.equality_delete_files = selected_file_group.equality_delete_files;
+        self.position_delete_files = file_group.position_delete_files;
+        self.equality_delete_files = file_group.equality_delete_files;
         self
     }
 
