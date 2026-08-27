@@ -31,15 +31,15 @@ pub struct FileSelector;
 
 impl FileSelector {
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
-    /// Returns groups of files selected and organized by the given strategy
+    /// Returns groups of files selected and organized by the given strategy.
+    /// The caller is responsible for calculating per-group parallelism.
     pub async fn get_scan_tasks_with_strategy(
         table: &Table,
         snapshot_id: i64,
         strategy: PlanStrategy,
-        config: &crate::config::CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
         let data_files = Self::scan_data_files(table, snapshot_id).await?;
-        strategy.execute(data_files, config)
+        Ok(strategy.execute(data_files))
     }
 
     /// Scans and collects all data files from a table snapshot.
@@ -79,12 +79,12 @@ impl FileSelector {
     /// Groups pre-scanned tasks using the given strategy, skipping the scan phase.
     ///
     /// Use this when tasks have already been collected (e.g., for stats calculation)
-    /// to avoid redundant `plan_files()` calls.
+    /// to avoid redundant `plan_files()` calls. The caller is responsible for
+    /// calculating per-group parallelism.
     pub fn group_tasks_with_strategy(
         tasks: Vec<FileScanTask>,
         strategy: PlanStrategy,
-        config: &crate::config::CompactionPlanningConfig,
-    ) -> Result<Vec<FileGroup>> {
-        strategy.execute(tasks, config)
+    ) -> Vec<FileGroup> {
+        strategy.execute(tasks)
     }
 }

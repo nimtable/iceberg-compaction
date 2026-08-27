@@ -21,6 +21,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::common::available_parallelism;
+use crate::{CompactionError, Result};
 
 pub const DEFAULT_PREFIX: &str = "iceberg-compact";
 pub const DEFAULT_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
@@ -144,6 +145,10 @@ impl Default for SmallFilesConfig {
 #[builder(setter(into))]
 pub struct FilesWithDeletesConfig {
     /// Minimum number of delete files required to trigger compaction.
+    ///
+    /// Zero matches every data file because every file has at least zero delete
+    /// files. This differs from [`AutoCompactionConfig`], where zero disables
+    /// one arm of the composite candidate predicate.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
@@ -223,6 +228,9 @@ pub struct CompactionPlanningConfig {
     #[builder(default)]
     pub strategy: CompactionStrategy,
 
+    /// Target bytes used to recommend output parallelism for each planned file
+    /// group. The writer's rolling threshold is configured independently by
+    /// [`CompactionExecutionConfig::target_file_size_bytes`].
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -261,6 +269,32 @@ impl CompactionPlanningConfig {
             ..Self::default()
         }
     }
+
+    /// Validates common planning settings before file selection and parallelism
+    /// calculation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionError::Config`] when a divisor or parallelism limit
+    /// is zero.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            (
+                "max_file_count_per_partition",
+                self.max_file_count_per_partition,
+            ),
+            ("max_input_parallelism", self.max_input_parallelism),
+            ("max_output_parallelism", self.max_output_parallelism),
+        ] {
+            if value == 0 {
+                return Err(CompactionError::Config(format!(
+                    "{name} must be greater than 0"
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for CompactionPlanningConfig {
@@ -274,6 +308,9 @@ impl Default for CompactionPlanningConfig {
 /// Execution configuration for compaction operations.
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
+    /// Rolling threshold passed to the data-file writer. Planning uses its own
+    /// target to recommend output parallelism; the two values may intentionally
+    /// differ when callers want fewer writer tasks that each roll multiple files.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -440,6 +477,37 @@ mod tests {
 
         assert!(matches!(config.strategy, CompactionStrategy::Full));
         assert_eq!(config.file_group_scope, FileGroupScope::Partition);
+    }
+
+    #[test]
+    fn test_planning_config_rejects_zero_parallelism_inputs() {
+        let cases = [
+            (
+                CompactionPlanningConfigBuilder::default()
+                    .max_file_count_per_partition(0_usize)
+                    .build()
+                    .unwrap(),
+                "Invalid configuration: max_file_count_per_partition must be greater than 0",
+            ),
+            (
+                CompactionPlanningConfigBuilder::default()
+                    .max_input_parallelism(0_usize)
+                    .build()
+                    .unwrap(),
+                "Invalid configuration: max_input_parallelism must be greater than 0",
+            ),
+            (
+                CompactionPlanningConfigBuilder::default()
+                    .max_output_parallelism(0_usize)
+                    .build()
+                    .unwrap(),
+                "Invalid configuration: max_output_parallelism must be greater than 0",
+            ),
+        ];
+
+        for (config, expected_error) in cases {
+            assert_eq!(config.validate().unwrap_err().to_string(), expected_error);
+        }
     }
 
     #[test]

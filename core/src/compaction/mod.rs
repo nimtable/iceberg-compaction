@@ -1391,10 +1391,14 @@ impl CompactionPlanner {
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
+        self.config.validate()?;
         let strategy = PlanStrategy::from(&self.config);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
-        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
+        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy)
+            .into_iter()
+            .map(|group| group.with_calculated_parallelism(&self.config))
+            .collect::<Result<Vec<_>>>()?;
         Ok((file_groups, min_sequence))
     }
 }
@@ -2065,7 +2069,13 @@ mod tests {
 
         let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
 
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
+        let planning_config = crate::config::CompactionPlanningConfigBuilder::default()
+            .max_file_count_per_partition(1_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
+            .build()
+            .unwrap();
+        let planner = CompactionPlanner::new(planning_config);
 
         let plans = planner.plan_compaction(&updated_table).await.unwrap();
 
@@ -2073,8 +2083,8 @@ mod tests {
         let plan = &plans[0];
         assert_eq!(plan.file_count(), expected_file_count);
         assert!(plan.total_bytes() > 0);
-        assert!(plan.recommended_executor_parallelism() > 0);
-        assert!(plan.recommended_output_parallelism() > 0);
+        assert_eq!(plan.recommended_executor_parallelism(), expected_file_count);
+        assert_eq!(plan.recommended_output_parallelism(), 1);
         assert_eq!(plan.to_branch, MAIN_BRANCH);
         assert!(plan.has_files(), "Plan should have files");
     }
