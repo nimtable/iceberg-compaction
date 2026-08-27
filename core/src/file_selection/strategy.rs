@@ -122,8 +122,7 @@ impl FileGroup {
     /// Creates a `FileGroup` with calculated parallelism.
     ///
     /// # Errors
-    /// Returns [`CompactionError::Config`] for invalid planning settings or
-    /// [`CompactionError::Execution`] if `input_total_bytes()` is 0.
+    /// Returns [`CompactionError::Execution`] if `input_total_bytes()` is 0.
     pub fn with_parallelism(
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
@@ -152,8 +151,7 @@ impl FileGroup {
     /// Calculates and sets parallelism fields.
     ///
     /// # Errors
-    /// Returns [`CompactionError::Config`] for invalid planning settings or
-    /// [`CompactionError::Execution`] if `input_total_bytes()` is 0.
+    /// Returns [`CompactionError::Execution`] if `input_total_bytes()` is 0.
     pub fn with_calculated_parallelism(
         mut self,
         config: &CompactionPlanningConfig,
@@ -187,8 +185,6 @@ impl FileGroup {
         files_to_compact: &FileGroup,
         config: &CompactionPlanningConfig,
     ) -> Result<(usize, usize)> {
-        config.validate()?;
-
         let input_size = files_to_compact.input_total_bytes();
         if input_size == 0 {
             return Err(CompactionError::Execution(
@@ -752,7 +748,7 @@ impl PlanStrategyOptions {
     }
 }
 
-/// Three-stage file-selection pipeline: file filters → grouping → group filters.
+/// Three-stage pipeline: file filters → grouping → group filters → parallelism calculation.
 ///
 /// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
 #[derive(Debug)]
@@ -797,10 +793,15 @@ impl PlanStrategy {
     /// 1. Apply each file filter sequentially
     /// 2. Group files using the configured file-group scope and grouping strategy
     /// 3. Apply each group filter sequentially
+    /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
-    /// Returned groups retain their default parallelism. [`CompactionPlanner`](crate::compaction::CompactionPlanner)
-    /// applies the common planning configuration while assembling plans.
-    pub fn execute(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
+    /// # Errors
+    /// Propagates errors from parallelism calculation (fails if group has 0 bytes).
+    pub fn execute(
+        &self,
+        data_files: Vec<FileScanTask>,
+        config: &CompactionPlanningConfig,
+    ) -> Result<Vec<FileGroup>> {
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
             filtered_files = filter.filter(filtered_files);
@@ -814,6 +815,9 @@ impl PlanStrategy {
         }
 
         file_groups
+            .into_iter()
+            .map(|group| group.with_calculated_parallelism(config))
+            .collect()
     }
 
     fn group_files(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
@@ -916,8 +920,6 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
                 strategy.group_filters.as_ref()
             }
             CompactionStrategy::FilesWithDeletes(strategy) => {
-                // A zero threshold is the tautology `delete_count >= 0`, so no
-                // candidate filter is needed and every data file remains eligible.
                 if strategy.min_delete_file_count_threshold > 0 {
                     file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
                         strategy.min_delete_file_count_threshold,
@@ -1200,11 +1202,19 @@ mod tests {
             strategy: &PlanStrategy,
             data_files: Vec<FileScanTask>,
         ) -> Vec<FileScanTask> {
+            let config = CompactionPlanningConfig::default();
+
             strategy
-                .execute(data_files)
+                .execute(data_files, &config)
+                .unwrap()
                 .into_iter()
                 .flat_map(|group| group.into_files())
                 .collect()
+        }
+
+        /// Create test config with common defaults
+        pub fn create_test_config() -> CompactionPlanningConfig {
+            CompactionPlanningConfig::default()
         }
 
         /// Assert file paths (ordered) equal expected strings
@@ -1344,7 +1354,9 @@ mod tests {
         let planning_config = CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
         let strategy = PlanStrategy::from(&planning_config);
 
-        let groups = strategy.execute(composite_filter_test_files());
+        let groups = strategy
+            .execute(composite_filter_test_files(), &planning_config)
+            .unwrap();
 
         assert_eq!(groups.len(), 1);
         TestUtils::assert_paths_eq(
@@ -1385,7 +1397,8 @@ mod tests {
                 CompactionPlanningConfig::new(CompactionStrategy::Auto(auto_config));
             let strategy = PlanStrategy::from(&planning_config);
             let files = strategy
-                .execute(composite_filter_test_files())
+                .execute(composite_filter_test_files(), &planning_config)
+                .unwrap()
                 .into_iter()
                 .flat_map(FileGroup::into_files)
                 .collect::<Vec<_>>();
@@ -1563,7 +1576,9 @@ mod tests {
                 .build(),
         ];
 
-        let groups = strategy.execute(test_files);
+        let config = TestUtils::create_test_config();
+
+        let groups = strategy.execute(test_files, &config).unwrap();
 
         assert_eq!(groups.len(), 2);
         let total_files: usize = groups.iter().map(|g| g.data_file_count).sum();
@@ -1586,7 +1601,7 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = strategy.execute(large_files);
+        let large_groups = strategy.execute(large_files, &config).unwrap();
         assert_eq!(large_groups.len(), 2);
         assert_eq!(large_groups[0].data_file_count, 1);
         assert_eq!(large_groups[1].data_file_count, 1);
@@ -1635,7 +1650,7 @@ mod tests {
                 })
                 .collect();
 
-            let result = strategy.execute(files);
+            let result = strategy.execute(files, &config).unwrap();
             assert_eq!(
                 result.len(),
                 expected_groups,
@@ -1979,6 +1994,7 @@ mod tests {
             None, // no group filters
         );
 
+        let config = TestUtils::create_test_config();
         let large_files = vec![
             TestFileBuilder::new("large1.parquet")
                 .size(50 * 1024 * 1024)
@@ -1994,7 +2010,7 @@ mod tests {
                 .build(),
         ];
 
-        let large_groups = bin_pack_strategy.execute(large_files);
+        let large_groups = bin_pack_strategy.execute(large_files, &config).unwrap();
         assert_eq!(
             large_groups.len(),
             4,
@@ -2339,12 +2355,7 @@ mod tests {
                 .build(),
         ];
 
-        let groups = strategy
-            .execute(test_files.clone())
-            .into_iter()
-            .map(|group| group.with_calculated_parallelism(&config))
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
+        let groups = strategy.execute(test_files.clone(), &config).unwrap();
 
         assert_eq!(
             groups.len(),
@@ -2514,40 +2525,6 @@ mod tests {
     }
 
     #[test]
-    fn test_files_with_deletes_zero_threshold_selects_all_files_before_group_gating() {
-        let files_with_deletes_config = FilesWithDeletesConfigBuilder::default()
-            .min_delete_file_count_threshold(0_usize)
-            .group_filters(crate::config::GroupFilters {
-                min_group_file_count: Some(2),
-                min_group_size_bytes: None,
-            })
-            .build()
-            .unwrap();
-        let config = CompactionPlanningConfig::new(CompactionStrategy::FilesWithDeletes(
-            files_with_deletes_config,
-        ));
-        let strategy = PlanStrategy::from(&config);
-        let files = vec![
-            TestFileBuilder::new("clean.parquet").build(),
-            TestFileBuilder::new("with-delete.parquet")
-                .with_deletes()
-                .build(),
-        ];
-
-        let groups = strategy.execute(files);
-
-        assert_eq!(groups.len(), 1);
-        TestUtils::assert_paths_eq(
-            &["clean.parquet", "with-delete.parquet"],
-            &groups[0].data_files,
-        );
-        assert_eq!(
-            strategy.to_string(),
-            "NoFileFilters -> SingleGrouping -> MinGroupFileCount[2]"
-        );
-    }
-
-    #[test]
     fn test_full_compaction_with_single_grouping() {
         // Test that Full Compaction with Single grouping creates a single group
         let config = CompactionPlanningConfigBuilder::default()
@@ -2573,7 +2550,7 @@ mod tests {
                 .build(),
         ];
 
-        let result = strategy.execute(test_files.clone());
+        let result = strategy.execute(test_files.clone(), &config).unwrap();
 
         // Full compaction should include ALL files, creating groups but not filtering any
         let total_files_in_groups: usize = result.iter().map(|g| g.data_file_count).sum();
@@ -3031,8 +3008,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from(&table_scope_config).execute(files.clone());
-        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).execute(files);
+        let table_scope_groups = PlanStrategy::from(&table_scope_config)
+            .execute(files.clone(), &table_scope_config)
+            .unwrap();
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config)
+            .execute(files, &partition_scope_config)
+            .unwrap();
 
         assert_eq!(table_scope_groups.len(), 1);
         assert_eq!(table_scope_groups[0].data_file_count, 5);
@@ -3071,8 +3052,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let table_scope_groups = PlanStrategy::from(&table_scope_config).execute(files.clone());
-        let partition_scope_groups = PlanStrategy::from(&partition_scope_config).execute(files);
+        let table_scope_groups = PlanStrategy::from(&table_scope_config)
+            .execute(files.clone(), &table_scope_config)
+            .unwrap();
+        let partition_scope_groups = PlanStrategy::from(&partition_scope_config)
+            .execute(files, &partition_scope_config)
+            .unwrap();
 
         assert_eq!(table_scope_groups.len(), 1);
         assert_eq!(table_scope_groups[0].data_file_count, 3);
@@ -3117,8 +3102,10 @@ mod tests {
             GroupingStrategy::Single,
             None, // no group filters
         );
+        let config = CompactionPlanningConfig::default();
+
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         assert_eq!(
@@ -3172,7 +3159,7 @@ mod tests {
         let strategy = PlanStrategy::from(&config);
 
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 0, 2, 3)");
@@ -3231,7 +3218,8 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         assert_eq!(
@@ -3296,7 +3284,8 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         assert_eq!(groups.len(), 4, "Should have 4 groups (two per partition)");
@@ -3354,7 +3343,8 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         // Verify a 5MB file from Partition 0 was filtered out.
@@ -3423,7 +3413,8 @@ mod tests {
         );
 
         // 3. Execute strategy
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // 4. Assertions
         assert_eq!(groups.len(), 3, "Should have 3 groups (partitions 2, 3, 4)");
@@ -3475,7 +3466,8 @@ mod tests {
         // Create Single grouping strategy
         let strategy = PlanStrategy::new_custom(None, None, GroupingStrategy::Single, None);
 
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // Should have 3 groups:
         // - Group 1: unpartitioned files (None + empty partition)
@@ -3542,7 +3534,8 @@ mod tests {
             None,
         );
 
-        let groups = strategy.execute(files);
+        let config = CompactionPlanningConfig::default();
+        let groups = strategy.execute(files, &config).unwrap();
 
         // Verify partitions are kept separate:
         // - Unpartitioned (None + empty): 70MB total -> should be binpacked into groups

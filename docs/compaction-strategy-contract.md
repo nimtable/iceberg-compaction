@@ -24,8 +24,7 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 | --- | --- | --- |
 | Planning scope and pipeline | `CompactionPlanningConfig` | Per-attempt bounds, grouping, file-group scope, and recommended parallelism |
 | Compaction policy | `CompactionStrategy` | Candidate predicate and any selective group gating |
-| Runtime selection pipeline | `PlanStrategy` | Compile the configuration into file filters, grouping, and group filters |
-| Plan assembly | `CompactionPlanner` | Validate common planning settings, calculate per-group parallelism, and create plans |
+| Runtime pipeline | `PlanStrategy` | Compile the configuration into file filters, grouping, group filters, and parallelism calculation |
 | Execution | `CompactionExecutionConfig` | Read, rewrite, spill, and write behavior for an admitted plan |
 | Scheduling | External caller | Round identity, retry, admission limits, cooldown, and cross-attempt progress |
 
@@ -35,10 +34,9 @@ policy-specific configuration.
 
 `group_filters` stay in the selective strategy payloads even though the runtime
 pipeline applies them after grouping. They are eligibility policy: allowing
-them directly on the `Full` variant would make a supposedly complete rewrite
-silently omit groups. A selective predicate may still be configured broadly;
-for example, standalone `FilesWithDeletes` with threshold zero selects every
-file before applying its group gates.
+them on `Full` would make a supposedly complete rewrite silently omit groups.
+Keeping them on `SmallFiles`, `FilesWithDeletes`, and `Auto` makes that invalid
+combination unrepresentable without adding runtime validation.
 
 ### Extension Rules
 
@@ -68,7 +66,6 @@ otherwise an incomplete scan could be mistaken for a drained round.
 | `Full` | Select every visible data file |
 | `Full` plus a sequence bound | Select every data file visible to that bounded round |
 | `Full` plus group gating | Invalid; this is intentionally not configurable |
-| `FilesWithDeletes` with threshold zero | Select every data file before selective group gating |
 | `Auto` | Select `small OR delete-heavy` |
 | `Auto` plus a sequence bound | Select `within_bound AND (small OR delete-heavy)` |
 | `Auto` with both predicates disabled | Valid no-op; produce no candidates |
