@@ -63,12 +63,15 @@ candidate set through exactly one planning pipeline:
 
 1. File-level `small OR delete-heavy` selection
 2. File-group scoping and grouping
-3. Caller-provided group filters
+3. Built-in group filter: at least two data files, or any delete-heavy file
+4. Caller-provided group filters
 
 Design focus:
 
 - A file matching both predicates enters the candidate set once
 - Small and delete-heavy files may be compacted in the same group
+- Small-only singleton groups are rejected to avoid rewrites that cannot reduce file count
+- Delete-heavy singleton groups remain eligible for delete cleanup
 - The default file group scope is `Partition`
 
 ## Why `Auto` Does Not Fall Back to `Full`

@@ -20,7 +20,7 @@
 //! 1. File filters: Select files with composable per-file predicates
 //! 2. Grouping: Choose a file-group scope, then combine files using Single
 //!    (all-in-one) or `BinPack` (First-Fit Decreasing)
-//! 3. Group filters: Remove groups below size/count thresholds
+//! 3. Group filters: Apply strategy-specific and caller-provided group predicates
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
@@ -704,6 +704,46 @@ impl std::fmt::Display for MinGroupFileCountStrategy {
     }
 }
 
+/// Built-in Auto gate for useful small-file rewrites and delete cleanup.
+#[derive(Debug)]
+struct AutoGroupFilter {
+    delete_filter: Option<DeleteFileCountFilterStrategy>,
+}
+
+impl AutoGroupFilter {
+    fn new(min_delete_file_count: usize) -> Self {
+        Self {
+            delete_filter: (min_delete_file_count > 0)
+                .then(|| DeleteFileCountFilterStrategy::new(min_delete_file_count)),
+        }
+    }
+
+    fn contains_delete_heavy_file(&self, group: &FileGroup) -> bool {
+        self.delete_filter
+            .as_ref()
+            .is_some_and(|filter| group.data_files.iter().any(|file| filter.matches(file)))
+    }
+}
+
+impl GroupFilterStrategy for AutoGroupFilter {
+    fn filter_groups(&self, groups: Vec<FileGroup>) -> Vec<FileGroup> {
+        groups
+            .into_iter()
+            .filter(|group| group.data_file_count >= 2 || self.contains_delete_heavy_file(group))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for AutoGroupFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(delete_filter) = &self.delete_filter {
+            write!(f, "AutoGroupFilter[>=2 files OR {}]", delete_filter)
+        } else {
+            write!(f, "AutoGroupFilter[>=2 files]")
+        }
+    }
+}
+
 /// Options for constructing a [`PlanStrategy`].
 ///
 /// The default file group scope is [`FileGroupScope::Partition`], matching the
@@ -929,7 +969,9 @@ impl PlanStrategy {
     ///
     /// A non-zero threshold enables its predicate. When both predicates are
     /// enabled, they are composed before type erasure so candidate selection is
-    /// `small OR delete-heavy`, followed by one grouping pipeline.
+    /// `small OR delete-heavy`, followed by one grouping pipeline. A private
+    /// built-in group filter then rejects small-only singleton groups while
+    /// preserving delete-heavy singletons, before caller-provided group filters.
     pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Self {
         let size_filter = SizeFilterStrategy {
             min_size: None,
@@ -948,9 +990,13 @@ impl PlanStrategy {
             (false, false) => vec![Box::new(size_filter)],
         };
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
+        let (grouping, mut group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
             config.group_filters.as_ref(),
+        );
+        group_filters.insert(
+            0,
+            Box::new(AutoGroupFilter::new(config.min_delete_file_count_threshold)),
         );
 
         Self::new_with_options(
@@ -1418,8 +1464,109 @@ mod tests {
         );
         assert_eq!(
             strategy.to_string(),
-            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) -> SingleGrouping -> NoGroupFilters"
+            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) -> SingleGrouping -> AutoGroupFilter[>=2 files OR DeleteFileCountFilter[>=2 deletes]]"
         );
+    }
+
+    #[test]
+    fn test_auto_strategy_group_admission() {
+        let cases: Vec<(usize, Vec<FileScanTask>, Vec<&str>)> = vec![
+            (
+                2,
+                vec![
+                    TestFileBuilder::new("single-small-clean.parquet")
+                        .size(10 * 1024 * 1024)
+                        .build(),
+                ],
+                vec![],
+            ),
+            (
+                2,
+                vec![TestUtils::add_delete_files(
+                    TestFileBuilder::new("single-large-delete-heavy.parquet")
+                        .size(64 * 1024 * 1024)
+                        .build(),
+                    2,
+                )],
+                vec!["single-large-delete-heavy.parquet"],
+            ),
+            (
+                2,
+                vec![TestUtils::add_delete_files(
+                    TestFileBuilder::new("single-small-delete-heavy.parquet")
+                        .size(10 * 1024 * 1024)
+                        .build(),
+                    2,
+                )],
+                vec!["single-small-delete-heavy.parquet"],
+            ),
+            (
+                0,
+                vec![TestUtils::add_delete_files(
+                    TestFileBuilder::new("single-small-delete-disabled.parquet")
+                        .size(10 * 1024 * 1024)
+                        .build(),
+                    2,
+                )],
+                vec![],
+            ),
+            (
+                2,
+                vec![
+                    TestFileBuilder::new("small-1.parquet")
+                        .size(10 * 1024 * 1024)
+                        .build(),
+                    TestFileBuilder::new("small-2.parquet")
+                        .size(10 * 1024 * 1024)
+                        .build(),
+                ],
+                vec!["small-1.parquet", "small-2.parquet"],
+            ),
+        ];
+
+        for (delete_threshold, input_files, expected_paths) in cases {
+            let auto_config = AutoCompactionConfigBuilder::default()
+                .small_file_threshold_bytes(32 * 1024 * 1024_u64)
+                .min_delete_file_count_threshold(delete_threshold)
+                .build()
+                .unwrap();
+            let planning_config = CompactionPlanningConfig::Auto(auto_config);
+            let strategy = PlanStrategy::from(&planning_config);
+            let selected_files = strategy
+                .execute(input_files, &planning_config)
+                .unwrap()
+                .into_iter()
+                .flat_map(FileGroup::into_files)
+                .collect::<Vec<_>>();
+
+            TestUtils::assert_paths_eq(&expected_paths, &selected_files);
+        }
+    }
+
+    #[test]
+    fn test_auto_strategy_applies_caller_group_filters_after_builtin_gate() {
+        let auto_config = AutoCompactionConfigBuilder::default()
+            .min_delete_file_count_threshold(2_usize)
+            .group_filters(crate::config::GroupFilters {
+                min_group_size_bytes: None,
+                min_group_file_count: Some(2),
+            })
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::Auto(auto_config);
+        let strategy = PlanStrategy::from(&planning_config);
+        let delete_heavy_singleton = TestUtils::add_delete_files(
+            TestFileBuilder::new("single-delete-heavy.parquet")
+                .size(64 * 1024 * 1024)
+                .build(),
+            2,
+        );
+
+        let groups = strategy
+            .execute(vec![delete_heavy_singleton], &planning_config)
+            .unwrap();
+
+        assert!(groups.is_empty());
     }
 
     #[test]
