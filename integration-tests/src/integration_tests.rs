@@ -26,7 +26,8 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::{
     BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
-    CompactionPlanningConfig, GroupFiltersBuilder, GroupingStrategy, SmallFilesConfigBuilder,
+    CompactionPlanningConfigBuilder, CompactionStrategy, GroupFiltersBuilder, GroupingStrategy,
+    SmallFilesConfig, SmallFilesConfigBuilder,
 };
 
 use crate::docker_compose::get_rest_catalog;
@@ -280,12 +281,12 @@ async fn test_compaction_with_prefetching_enabled() {
     write_data_to_table(catalog.clone(), &table, &schema, 10, 1_000).await;
 
     // The Planning configuration isn't important for this test
-    let small_files_config = SmallFilesConfigBuilder::default()
+    let planning_config = CompactionPlanningConfigBuilder::default()
+        .strategy(CompactionStrategy::SmallFiles(SmallFilesConfig::default()))
         .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
         .build()
-        .expect("Failed to build small files config");
+        .expect("Failed to build planning config");
 
-    let planning_config = CompactionPlanningConfig::SmallFiles(small_files_config);
     let config = CompactionConfigBuilder::default()
         .execution(
             CompactionExecutionConfigBuilder::default()
@@ -432,11 +433,14 @@ async fn test_min_files_in_group_applies_to_partitioned_table() {
                 .build()
                 .expect("Failed to build group filters"),
         )
-        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
         .build()
         .expect("Failed to build small files config");
 
-    let planning_config = CompactionPlanningConfig::SmallFiles(small_files_config);
+    let planning_config = CompactionPlanningConfigBuilder::default()
+        .strategy(CompactionStrategy::SmallFiles(small_files_config))
+        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
+        .build()
+        .expect("Failed to build planning config");
     let config = CompactionConfigBuilder::default()
         .planning(planning_config)
         .build()
@@ -509,13 +513,16 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
                 .build()
                 .expect("Failed to build group filters"),
         )
-        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
         .build()
         .expect("Failed to build small files config");
 
     // The key configuration is setting target_file_size_bytes to a value small enough to
     // trigger rolling the file within each partition.
-    let planning_config = CompactionPlanningConfig::SmallFiles(small_files_config);
+    let planning_config = CompactionPlanningConfigBuilder::default()
+        .strategy(CompactionStrategy::SmallFiles(small_files_config))
+        .grouping_strategy(GroupingStrategy::BinPack(BinPackConfig::new(2 * MB)))
+        .build()
+        .expect("Failed to build planning config");
     let config = CompactionConfigBuilder::default()
         .execution(
             CompactionExecutionConfigBuilder::default()

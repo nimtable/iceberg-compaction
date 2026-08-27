@@ -47,6 +47,8 @@ pub struct RewriteFilesRequest {
     pub file_io: FileIO,
     pub schema: Arc<Schema>,
     pub file_group: FileGroup,
+    pub executor_parallelism: usize,
+    pub output_parallelism: usize,
     pub execution_config: Arc<CompactionExecutionConfig>,
     pub partition_spec: Arc<PartitionSpec>,
     pub metrics_recorder: Option<CompactionMetricsRecorder>,

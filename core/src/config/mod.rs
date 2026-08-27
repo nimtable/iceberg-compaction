@@ -34,8 +34,8 @@ pub const DEFAULT_NORMALIZED_COLUMN_IDENTIFIERS: bool = true;
 pub const DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION: bool = false;
 pub const DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR: f64 = 0.3;
 pub const DEFAULT_SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
-pub const DEFAULT_MIN_SIZE_PER_PARTITION: u64 = 512 * 1024 * 1024; // 512 MB per partition
-pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32; // 32 files per partition
+// Maximum files per executor input partition, not per Iceberg table partition.
+pub const DEFAULT_MAX_FILE_COUNT_PER_PARTITION: usize = 32;
 pub const DEFAULT_MAX_CONCURRENT_COMPACTION_PLANS: usize = 4; // default max concurrent compaction plans
 pub const DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD: usize = 128; // default minimum delete file count for compaction
 pub const DEFAULT_ENABLE_PREFETCH: bool = false; // default setting for prefetching data files (set to false while its experimental)
@@ -99,10 +99,7 @@ pub enum FileGroupScope {
     Table,
 }
 
-/// Group-level filters applied after grouping.
-///
-/// These filters remove groups that don't meet certain criteria. They are
-/// orthogonal to the grouping strategy and can be used with any strategy.
+/// Group-level filters applied after grouping by selective strategies.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Builder)]
 #[builder(setter(into, strip_option), default)]
 pub struct GroupFilters {
@@ -114,46 +111,13 @@ pub struct GroupFilters {
 
 /// Configuration for small files compaction strategy.
 ///
-/// This strategy targets small files for compaction. It supports both grouping
-/// strategies and group-level filtering to control which groups get compacted.
+/// This strategy targets small files for compaction. Common planning pipeline
+/// settings are configured through [`CompactionPlanningConfig`].
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct SmallFilesConfig {
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size_bytes: u64,
-
-    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
-
-    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
-    pub max_file_count_per_partition: usize,
-
-    /// Maximum parallelism for input (reading) operations.
-    /// Defaults to 4x available CPU parallelism.
-    #[builder(default = "available_parallelism().get() * 4")]
-    pub max_input_parallelism: usize,
-
-    /// Maximum parallelism for output (writing) operations.
-    /// Defaults to available CPU parallelism.
-    #[builder(default = "available_parallelism().get()")]
-    pub max_output_parallelism: usize,
-
-    #[builder(default = "true")]
-    pub enable_heuristic_output_parallelism: bool,
-
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
     pub small_file_threshold_bytes: u64,
-
-    /// How to group files before compaction.
-    #[builder(default)]
-    pub grouping_strategy: GroupingStrategy,
-
-    /// Boundary for file groups before applying `grouping_strategy`.
-    ///
-    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
-    /// all selected partitions instead of independently per partition.
-    #[builder(default)]
-    pub file_group_scope: FileGroupScope,
 
     /// Optional filters to apply after grouping.
     ///
@@ -171,99 +135,14 @@ impl Default for SmallFilesConfig {
     }
 }
 
-/// Configuration for full compaction strategy.
-///
-/// This strategy performs full compaction of all selected data files.
-/// Group filters are NOT supported because "full" compaction means processing
-/// ALL files without filtering.
-#[derive(Debug, Clone, Builder)]
-#[builder(setter(into))]
-pub struct FullCompactionConfig {
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size_bytes: u64,
-
-    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
-
-    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
-    pub max_file_count_per_partition: usize,
-
-    /// Maximum parallelism for input (reading) operations.
-    /// Defaults to 4x available CPU parallelism.
-    #[builder(default = "available_parallelism().get() * 4")]
-    pub max_input_parallelism: usize,
-
-    /// Maximum parallelism for output (writing) operations.
-    /// Defaults to available CPU parallelism.
-    #[builder(default = "available_parallelism().get()")]
-    pub max_output_parallelism: usize,
-
-    #[builder(default = "true")]
-    pub enable_heuristic_output_parallelism: bool,
-
-    /// How to group files before compaction.
-    ///
-    /// Note: Group filters are not supported for full compaction.
-    /// All groups will be compacted regardless of size or file count.
-    #[builder(default)]
-    pub grouping_strategy: GroupingStrategy,
-
-    /// Boundary for file groups before applying `grouping_strategy`.
-    ///
-    /// Use [`FileGroupScope::Table`] with [`GroupingStrategy::Single`] when a
-    /// full-table compaction must be planned as one file group.
-    #[builder(default)]
-    pub file_group_scope: FileGroupScope,
-}
-
-impl Default for FullCompactionConfig {
-    fn default() -> Self {
-        FullCompactionConfigBuilder::default()
-            .build()
-            .expect("FullCompactionConfig default should always build")
-    }
-}
-
 /// Configuration for files-with-deletes compaction strategy.
 ///
 /// This strategy targets data files that have associated delete files.
-/// It supports group filtering to control which groups get compacted.
+/// Common planning pipeline settings are configured through
+/// [`CompactionPlanningConfig`].
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FilesWithDeletesConfig {
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size_bytes: u64,
-
-    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
-
-    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
-    pub max_file_count_per_partition: usize,
-
-    /// Maximum parallelism for input (reading) operations.
-    /// Defaults to 4x available CPU parallelism.
-    #[builder(default = "available_parallelism().get() * 4")]
-    pub max_input_parallelism: usize,
-
-    /// Maximum parallelism for output (writing) operations.
-    /// Defaults to available CPU parallelism.
-    #[builder(default = "available_parallelism().get()")]
-    pub max_output_parallelism: usize,
-
-    #[builder(default = "true")]
-    pub enable_heuristic_output_parallelism: bool,
-
-    /// How to group files before compaction.
-    #[builder(default)]
-    pub grouping_strategy: GroupingStrategy,
-
-    /// Boundary for file groups before applying `grouping_strategy`.
-    ///
-    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
-    /// all selected partitions instead of independently per partition.
-    #[builder(default)]
-    pub file_group_scope: FileGroupScope,
-
     /// Minimum number of delete files required to trigger compaction.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
@@ -286,29 +165,11 @@ impl Default for FilesWithDeletesConfig {
 /// Planning configuration for automatic compaction.
 ///
 /// Auto selects the union of small and delete-heavy data files, then sends the
-/// unified candidate set through one grouping pipeline. A zero file threshold
-/// disables that predicate for the planning run.
+/// unified candidate set through the common planning pipeline. A zero file
+/// threshold disables that predicate for the planning run.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct AutoCompactionConfig {
-    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
-    pub target_file_size_bytes: u64,
-
-    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
-    pub min_size_per_partition: u64,
-
-    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
-    pub max_file_count_per_partition: usize,
-
-    #[builder(default = "available_parallelism().get() * 4")]
-    pub max_input_parallelism: usize,
-
-    #[builder(default = "available_parallelism().get()")]
-    pub max_output_parallelism: usize,
-
-    #[builder(default = "true")]
-    pub enable_heuristic_output_parallelism: bool,
-
     /// Files smaller than this value participate in the Auto candidate set.
     /// Zero disables the small-file predicate.
     #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
@@ -318,12 +179,6 @@ pub struct AutoCompactionConfig {
     /// set. Zero disables the delete-heavy predicate.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
-
-    #[builder(default)]
-    pub grouping_strategy: GroupingStrategy,
-
-    #[builder(default)]
-    pub file_group_scope: FileGroupScope,
 
     #[builder(default, setter(strip_option))]
     pub group_filters: Option<GroupFilters>,
@@ -348,96 +203,82 @@ fn default_writer_properties() -> WriterProperties {
         .build()
 }
 
-/// Planning configuration variants for different compaction strategies.
-#[derive(Debug, Clone)]
-pub enum CompactionPlanningConfig {
-    Auto(AutoCompactionConfig),
+/// Strategy-specific policy used by the common planning pipeline.
+///
+/// `Full` intentionally has no payload or group gating: it selects every file
+/// visible to the planning scope.
+#[derive(Debug, Clone, Default)]
+pub enum CompactionStrategy {
+    #[default]
+    Full,
     SmallFiles(SmallFilesConfig),
-    Full(FullCompactionConfig),
     FilesWithDeletes(FilesWithDeletesConfig),
+    Auto(AutoCompactionConfig),
+}
+
+/// Common planning scope and pipeline plus one candidate-selection strategy.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct CompactionPlanningConfig {
+    #[builder(default)]
+    pub strategy: CompactionStrategy,
+
+    /// Target bytes used to recommend output parallelism for each compaction
+    /// plan. The writer's rolling threshold is configured independently by
+    /// [`CompactionExecutionConfig::target_file_size_bytes`].
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    /// Maximum files per executor input partition when recommending input
+    /// parallelism. This does not refer to an Iceberg table partition.
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
+    #[builder(default = "available_parallelism().get()")]
+    pub max_output_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    /// How to group selected files before compaction.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Boundary for file groups before applying [`GroupingStrategy`].
+    #[builder(default)]
+    pub file_group_scope: FileGroupScope,
 }
 
 impl CompactionPlanningConfig {
-    /// Returns target file size in bytes for the strategy.
-    pub fn target_file_size_bytes(&self) -> u64 {
-        match self {
-            Self::Auto(c) => c.target_file_size_bytes,
-            Self::SmallFiles(c) => c.target_file_size_bytes,
-            Self::Full(c) => c.target_file_size_bytes,
-            Self::FilesWithDeletes(c) => c.target_file_size_bytes,
-        }
-    }
-
-    /// Returns minimum size per partition for the strategy.
-    pub fn min_size_per_partition(&self) -> u64 {
-        match self {
-            Self::Auto(c) => c.min_size_per_partition,
-            Self::SmallFiles(c) => c.min_size_per_partition,
-            Self::Full(c) => c.min_size_per_partition,
-            Self::FilesWithDeletes(c) => c.min_size_per_partition,
-        }
-    }
-
-    /// Returns maximum file count per partition for the strategy.
-    pub fn max_file_count_per_partition(&self) -> usize {
-        match self {
-            Self::Auto(c) => c.max_file_count_per_partition,
-            Self::SmallFiles(c) => c.max_file_count_per_partition,
-            Self::Full(c) => c.max_file_count_per_partition,
-            Self::FilesWithDeletes(c) => c.max_file_count_per_partition,
-        }
-    }
-
-    /// Returns maximum parallelism for input (reading) operations.
-    pub fn max_input_parallelism(&self) -> usize {
-        match self {
-            Self::Auto(c) => c.max_input_parallelism,
-            Self::SmallFiles(c) => c.max_input_parallelism,
-            Self::Full(c) => c.max_input_parallelism,
-            Self::FilesWithDeletes(c) => c.max_input_parallelism,
-        }
-    }
-
-    /// Returns maximum parallelism for output (writing) operations.
-    pub fn max_output_parallelism(&self) -> usize {
-        match self {
-            Self::Auto(c) => c.max_output_parallelism,
-            Self::SmallFiles(c) => c.max_output_parallelism,
-            Self::Full(c) => c.max_output_parallelism,
-            Self::FilesWithDeletes(c) => c.max_output_parallelism,
-        }
-    }
-
-    /// Returns whether heuristic output parallelism is enabled.
-    pub fn enable_heuristic_output_parallelism(&self) -> bool {
-        match self {
-            Self::Auto(c) => c.enable_heuristic_output_parallelism,
-            Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
-            Self::Full(c) => c.enable_heuristic_output_parallelism,
-            Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
-        }
-    }
-
-    /// Returns the file-group boundary for the strategy.
-    pub fn file_group_scope(&self) -> FileGroupScope {
-        match self {
-            Self::Auto(c) => c.file_group_scope,
-            Self::SmallFiles(c) => c.file_group_scope,
-            Self::Full(c) => c.file_group_scope,
-            Self::FilesWithDeletes(c) => c.file_group_scope,
+    /// Creates a planning pipeline with default common settings.
+    pub fn new(strategy: CompactionStrategy) -> Self {
+        Self {
+            strategy,
+            ..Self::default()
         }
     }
 }
 
 impl Default for CompactionPlanningConfig {
     fn default() -> Self {
-        Self::Full(FullCompactionConfig::default())
+        CompactionPlanningConfigBuilder::default()
+            .build()
+            .expect("CompactionPlanningConfig default should always build")
     }
 }
 
 /// Execution configuration for compaction operations.
 #[derive(Builder, Debug, Clone)]
 pub struct CompactionExecutionConfig {
+    /// Rolling threshold passed to the data-file writer. Planning uses its own
+    /// target to recommend output parallelism.
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -599,21 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn test_planning_configs_default_to_partition_file_group_scope() {
-        let small_files = SmallFilesConfig::default();
-        assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
+    fn test_planning_config_defaults_to_full_partition_pipeline() {
+        let config = CompactionPlanningConfig::default();
 
-        let full = FullCompactionConfig::default();
-        assert_eq!(full.file_group_scope, FileGroupScope::Partition);
-
-        let files_with_deletes = FilesWithDeletesConfig::default();
-        assert_eq!(
-            files_with_deletes.file_group_scope,
-            FileGroupScope::Partition
-        );
-
-        let auto = AutoCompactionConfig::default();
-        assert_eq!(auto.file_group_scope, FileGroupScope::Partition);
+        assert!(matches!(config.strategy, CompactionStrategy::Full));
+        assert_eq!(config.file_group_scope, FileGroupScope::Partition);
     }
 
     #[test]

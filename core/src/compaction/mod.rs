@@ -30,7 +30,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
-use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
+use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig, SPLIT_OVERHEAD};
 use crate::executor::{
     ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
@@ -40,6 +40,7 @@ use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
 mod validator;
 
+#[cfg(test)]
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
 /// Validates that all rewrite results target the same snapshot and branch.
@@ -215,15 +216,8 @@ pub struct RewriteResult {
     pub output_data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
     pub plan: CompactionPlan,
-    /// Validation info for creating `CompactionValidator` later
-    pub validation_info: Option<ValidationInfo>,
-}
-
-/// Information for deferred `CompactionValidator` creation.
-#[derive(Debug, Clone)]
-pub struct ValidationInfo {
-    pub file_group: FileGroup,
-    pub executor_parallelism: usize,
+    /// Whether this rewrite should be validated after commit.
+    pub validation_enabled: bool,
 }
 
 /// Result of a successful compaction containing rewritten files and metadata.
@@ -386,7 +380,7 @@ impl Compaction {
 
             // Step 1: Create rewrite request
             let rewrite_files_request =
-                self.create_rewrite_request(table, &plan.file_group, execution_config)?;
+                self.create_rewrite_request(table, &plan, execution_config)?;
 
             // Step 2: Execute rewrite
             let RewriteFilesResponse {
@@ -402,17 +396,7 @@ impl Compaction {
 
             // Step 3: (Delayed) Input file collection moved to commit phase to avoid duplicate IO
 
-            // Step 4: Setup validation info if enabled
-            let validation_info = if execution_config.enable_validate_compaction {
-                Some(ValidationInfo {
-                    file_group: plan.file_group.clone(),
-                    executor_parallelism: plan.file_group.executor_parallelism,
-                })
-            } else {
-                None
-            };
-
-            // Step 5: Update metrics - record plan-level metrics
+            // Step 4: Update metrics - record plan-level metrics
             metrics_recorder.record_plan_execution_duration(now.elapsed().as_millis() as _);
             metrics_recorder.record_plan_file_count(stats.input_files_count);
             metrics_recorder.record_plan_size_bytes(stats.input_total_bytes);
@@ -421,7 +405,7 @@ impl Compaction {
                 output_data_files,
                 stats,
                 plan,
-                validation_info,
+                validation_enabled: execution_config.enable_validate_compaction,
             })
         } else {
             Err(CompactionError::Execution(format!(
@@ -541,11 +525,11 @@ impl Compaction {
         committed_table: &Table,
     ) -> Result<()> {
         for rewrite_result in rewrite_results {
-            if let Some(validation_info) = rewrite_result.validation_info {
+            if rewrite_result.validation_enabled {
                 let mut validator = CompactionValidator::new(
-                    validation_info.file_group,
+                    rewrite_result.plan.file_group,
                     rewrite_result.output_data_files,
-                    validation_info.executor_parallelism,
+                    rewrite_result.plan.executor_parallelism,
                     committed_table.metadata().current_schema().clone(),
                     committed_table.metadata().current_schema().clone(),
                     committed_table.clone(),
@@ -592,7 +576,7 @@ impl Compaction {
     fn create_rewrite_request(
         &self,
         table: &Table,
-        file_group: &FileGroup,
+        plan: &CompactionPlan,
         execution_config: &CompactionExecutionConfig,
     ) -> Result<RewriteFilesRequest> {
         let schema = table.metadata().current_schema().clone();
@@ -606,7 +590,9 @@ impl Compaction {
         Ok(RewriteFilesRequest {
             file_io: table.file_io().clone(),
             schema,
-            file_group: file_group.clone(),
+            file_group: plan.file_group.clone(),
+            executor_parallelism: plan.executor_parallelism,
+            output_parallelism: plan.output_parallelism,
             execution_config: Arc::new(execution_config.clone()),
             location_generator,
             partition_spec: table.metadata().default_partition_spec().clone(),
@@ -660,13 +646,11 @@ impl Compaction {
             .await?;
 
         // Run validation if enabled
-        if execution_config.enable_validate_compaction
-            && let Some(validation_info) = &rewrite_result.validation_info
-        {
+        if rewrite_result.validation_enabled {
             let mut validator = CompactionValidator::new(
-                validation_info.file_group.clone(),
+                rewrite_result.plan.file_group.clone(),
                 rewrite_result.output_data_files.clone(),
-                validation_info.executor_parallelism,
+                rewrite_result.plan.executor_parallelism,
                 final_table.metadata().current_schema().clone(),
                 final_table.metadata().current_schema().clone(),
                 final_table.clone(),
@@ -1252,8 +1236,10 @@ fn custom_snapshot_properties(snapshot: &Snapshot) -> HashMap<String, String> {
 /// Compaction plan describing files to rewrite and target commit location.
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    /// Group of files to be compacted together
-    pub file_group: FileGroup,
+    /// Selected files to be compacted together.
+    file_group: FileGroup,
+    executor_parallelism: usize,
+    output_parallelism: usize,
     /// Target branch for committing the compaction result
     pub to_branch: Cow<'static, str>,
     /// Snapshot ID from which files were selected
@@ -1263,14 +1249,162 @@ pub struct CompactionPlan {
 }
 
 impl CompactionPlan {
-    /// Creates a new compaction plan.
-    pub fn new(
+    /// Creates a complete plan from a selected file group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parallelism cannot be calculated for the selected
+    /// files.
+    fn new(
         file_group: FileGroup,
         to_branch: impl Into<Cow<'static, str>>,
         snapshot_id: i64,
-    ) -> Self {
-        Self {
+        planning_config: &CompactionPlanningConfig,
+    ) -> Result<Self> {
+        let (executor_parallelism, output_parallelism) =
+            Self::calculate_parallelism(&file_group, planning_config)?;
+        Ok(Self {
             file_group,
+            executor_parallelism,
+            output_parallelism,
+            to_branch: to_branch.into(),
+            snapshot_id,
+            delete_cleanup_min_data_sequence_number: None,
+        })
+    }
+
+    /// Calculates executor and output parallelism while assembling a plan.
+    fn calculate_parallelism(
+        file_group: &FileGroup,
+        config: &CompactionPlanningConfig,
+    ) -> Result<(usize, usize)> {
+        let input_size = file_group.input_total_bytes();
+        if input_size == 0 {
+            return Err(CompactionError::Execution(
+                "No files to calculate task parallelism".to_owned(),
+            ));
+        }
+
+        let target_file_size = config.target_file_size_bytes;
+        let min_file_size = Self::default_min_file_size(target_file_size);
+        let max_file_size = Self::default_max_file_size(target_file_size);
+
+        let output_parallelism =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size)
+                .min(config.max_output_parallelism)
+                .max(1);
+        let output_parallelism =
+            Self::apply_output_parallelism_heuristic(file_group, config, output_parallelism);
+
+        let split_size =
+            Self::input_split_size(input_size, target_file_size, min_file_size, max_file_size);
+        let partition_by_size = input_size.div_ceil(split_size).max(1) as usize;
+        let partition_by_count = file_group
+            .input_files_count()
+            .div_ceil(config.max_file_count_per_partition)
+            .max(1);
+        let input_parallelism = partition_by_size
+            .max(partition_by_count)
+            .min(config.max_input_parallelism);
+
+        Ok((input_parallelism, output_parallelism))
+    }
+
+    fn apply_output_parallelism_heuristic(
+        file_group: &FileGroup,
+        config: &CompactionPlanningConfig,
+        current_output_parallelism: usize,
+    ) -> usize {
+        if !config.enable_heuristic_output_parallelism || current_output_parallelism <= 1 {
+            return current_output_parallelism;
+        }
+
+        let total_data_file_size = file_group
+            .data_files
+            .iter()
+            .map(|file| file.file_size_in_bytes)
+            .sum::<u64>();
+
+        if total_data_file_size > 0 && total_data_file_size < config.target_file_size_bytes {
+            1
+        } else {
+            current_output_parallelism
+        }
+    }
+
+    fn write_max_file_size(target_file_size: u64, max_file_size: u64) -> u64 {
+        let diff = max_file_size.saturating_sub(target_file_size);
+        target_file_size + diff / 2
+    }
+
+    fn expected_output_files(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> usize {
+        if target_file_size == 0 || input_size < target_file_size {
+            return 1;
+        }
+
+        let num_files_with_remainder = input_size.div_ceil(target_file_size);
+        let num_files_without_remainder = input_size / target_file_size;
+        if num_files_without_remainder == 0 {
+            return 1;
+        }
+
+        let remainder = input_size % target_file_size;
+        let avg_file_size_without_remainder = input_size / num_files_without_remainder;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if remainder > min_file_size {
+            num_files_with_remainder as usize
+        } else if avg_file_size_without_remainder
+            <= (target_file_size + target_file_size / 10).min(write_max)
+        {
+            num_files_without_remainder as usize
+        } else {
+            num_files_with_remainder as usize
+        }
+    }
+
+    fn input_split_size(
+        input_size: u64,
+        target_file_size: u64,
+        min_file_size: u64,
+        max_file_size: u64,
+    ) -> u64 {
+        if target_file_size == 0 {
+            return input_size.saturating_add(SPLIT_OVERHEAD);
+        }
+
+        let expected_files =
+            Self::expected_output_files(input_size, target_file_size, min_file_size, max_file_size);
+        let estimated_split_size = (input_size / expected_files.max(1) as u64) + SPLIT_OVERHEAD;
+        let write_max = Self::write_max_file_size(target_file_size, max_file_size);
+
+        if estimated_split_size < target_file_size {
+            target_file_size
+        } else {
+            estimated_split_size.min(write_max)
+        }
+    }
+
+    fn default_min_file_size(target_file_size: u64) -> u64 {
+        target_file_size.saturating_mul(3) / 4
+    }
+
+    fn default_max_file_size(target_file_size: u64) -> u64 {
+        target_file_size.saturating_mul(9) / 5
+    }
+
+    /// Creates an empty no-op plan.
+    #[cfg(test)]
+    fn empty(to_branch: impl Into<Cow<'static, str>>, snapshot_id: i64) -> Self {
+        Self {
+            file_group: FileGroup::empty(),
+            executor_parallelism: 1,
+            output_parallelism: 1,
             to_branch: to_branch.into(),
             snapshot_id,
             delete_cleanup_min_data_sequence_number: None,
@@ -1285,14 +1419,9 @@ impl CompactionPlan {
         self
     }
 
-    /// Creates an empty plan for testing.
-    pub fn dummy() -> Self {
-        Self {
-            file_group: FileGroup::empty(),
-            to_branch: Cow::Borrowed(MAIN_BRANCH),
-            snapshot_id: UNASSIGNED_SNAPSHOT_ID,
-            delete_cleanup_min_data_sequence_number: None,
-        }
+    /// Returns the selected files carried by this plan.
+    pub fn file_group(&self) -> &FileGroup {
+        &self.file_group
     }
 
     /// Returns total number of files to be compacted.
@@ -1311,14 +1440,14 @@ impl CompactionPlan {
         !self.file_group.is_empty()
     }
 
-    /// Returns recommended executor parallelism from file group.
+    /// Returns recommended executor parallelism calculated during planning.
     pub fn recommended_executor_parallelism(&self) -> usize {
-        self.file_group.executor_parallelism
+        self.executor_parallelism
     }
 
-    /// Returns recommended output parallelism from file group.
+    /// Returns recommended output parallelism calculated during planning.
     pub fn recommended_output_parallelism(&self) -> usize {
-        self.file_group.output_parallelism
+        self.output_parallelism
     }
 }
 
@@ -1331,6 +1460,20 @@ impl CompactionPlanner {
     /// Creates a new planner with the given configuration.
     pub fn new(config: CompactionPlanningConfig) -> Self {
         Self { config }
+    }
+
+    /// Assembles a complete plan from an explicitly selected file group.
+    ///
+    /// This is the customization point for callers that build a
+    /// [`PlanStrategy`](crate::file_selection::PlanStrategy) directly.
+    /// Parallelism always comes from this planner's planning configuration.
+    pub fn create_plan(
+        &self,
+        file_group: FileGroup,
+        to_branch: impl Into<Cow<'static, str>>,
+        snapshot_id: i64,
+    ) -> Result<CompactionPlan> {
+        CompactionPlan::new(file_group, to_branch, snapshot_id, &self.config)
     }
 
     /// Plans compaction for a specific branch.
@@ -1353,22 +1496,23 @@ impl CompactionPlanner {
                 .group_files_for_compaction(table, branch_snapshot.snapshot_id())
                 .await?;
 
-            // Convert each FileGroup to a separate CompactionPlan
+            // Convert each selected group to a complete CompactionPlan.
             // Filter out empty plans to avoid unnecessary processing
             let plans = file_groups
                 .into_iter()
+                .filter(|file_group| !file_group.is_empty())
                 .map(|file_group| {
-                    CompactionPlan::new(
-                        file_group,
-                        to_branch.to_owned(),
-                        branch_snapshot.snapshot_id(),
-                    )
-                    .with_delete_cleanup_min_data_sequence_number(
-                        delete_cleanup_min_data_sequence_number,
-                    )
+                    Ok(self
+                        .create_plan(
+                            file_group,
+                            to_branch.to_owned(),
+                            branch_snapshot.snapshot_id(),
+                        )?
+                        .with_delete_cleanup_min_data_sequence_number(
+                            delete_cleanup_min_data_sequence_number,
+                        ))
                 })
-                .filter(|plan| plan.has_files())
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             Ok(plans)
         } else {
@@ -1394,7 +1538,7 @@ impl CompactionPlanner {
         let strategy = PlanStrategy::from(&self.config);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
-        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
+        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy);
         Ok((file_groups, min_sequence))
     }
 }
@@ -1438,7 +1582,7 @@ mod tests {
     use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
-        SmallFilesConfigBuilder,
+        CompactionPlanningConfigBuilder, CompactionStrategy, SmallFilesConfigBuilder,
     };
     use crate::executor::{ExecutorType, RewriteFilesStat};
 
@@ -1885,11 +2029,13 @@ mod tests {
         let small_file_threshold = 10_000;
 
         let compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::SmallFiles(
-                SmallFilesConfigBuilder::default()
-                    .small_file_threshold_bytes(small_file_threshold)
-                    .build()
-                    .unwrap(),
+            .planning(CompactionPlanningConfig::new(
+                CompactionStrategy::SmallFiles(
+                    SmallFilesConfigBuilder::default()
+                        .small_file_threshold_bytes(small_file_threshold)
+                        .build()
+                        .unwrap(),
+                ),
             ))
             .build()
             .unwrap();
@@ -1964,8 +2110,6 @@ mod tests {
     /// Test empty input scenarios (table, plan, results)
     #[tokio::test]
     async fn test_empty_input_scenarios() {
-        use crate::file_selection::FileGroup;
-
         let env = create_test_env().await;
 
         let planner = CompactionPlanner::new(CompactionPlanningConfig::default());
@@ -1976,8 +2120,7 @@ mod tests {
         let result = compaction.compact().await.unwrap();
         assert!(result.is_none());
 
-        let empty_plan =
-            CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID);
+        let empty_plan = CompactionPlan::empty(MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID);
         let result = compaction
             .compact_with_plan(empty_plan, &compaction.config.as_ref().unwrap().execution)
             .await
@@ -2063,9 +2206,13 @@ mod tests {
 
         let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
 
-        let planner = CompactionPlanner::new(CompactionPlanningConfig::Full(
-            crate::config::FullCompactionConfig::default(),
-        ));
+        let planning_config = CompactionPlanningConfigBuilder::default()
+            .max_file_count_per_partition(1_usize)
+            .max_input_parallelism(8_usize)
+            .max_output_parallelism(8_usize)
+            .build()
+            .unwrap();
+        let planner = CompactionPlanner::new(planning_config);
 
         let plans = planner.plan_compaction(&updated_table).await.unwrap();
 
@@ -2073,8 +2220,8 @@ mod tests {
         let plan = &plans[0];
         assert_eq!(plan.file_count(), expected_file_count);
         assert!(plan.total_bytes() > 0);
-        assert!(plan.recommended_executor_parallelism() > 0);
-        assert!(plan.recommended_output_parallelism() > 0);
+        assert_eq!(plan.recommended_executor_parallelism(), expected_file_count);
+        assert_eq!(plan.recommended_output_parallelism(), 1);
         assert_eq!(plan.to_branch, MAIN_BRANCH);
         assert!(plan.has_files(), "Plan should have files");
     }
@@ -2126,9 +2273,7 @@ mod tests {
         let updated_table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
 
         let full_compaction_config = CompactionConfigBuilder::default()
-            .planning(CompactionPlanningConfig::Full(
-                crate::config::FullCompactionConfig::default(),
-            ))
+            .planning(CompactionPlanningConfig::default())
             .build()
             .unwrap();
         let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
@@ -2153,14 +2298,11 @@ mod tests {
     /// Test `compact_with_plan` with empty plan (merged from `test_compact_with_plan_empty` an`test_compact_no_files`es)
     #[tokio::test]
     async fn test_compact_with_empty_plan() {
-        use crate::file_selection::FileGroup;
-
         let env = create_test_env().await;
 
         let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
 
-        let empty_plan =
-            CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID);
+        let empty_plan = CompactionPlan::empty(MAIN_BRANCH, UNASSIGNED_SNAPSHOT_ID);
 
         let result = compaction
             .compact_with_plan(empty_plan, &compaction.config.as_ref().unwrap().execution)
@@ -2301,12 +2443,12 @@ mod tests {
         let updated_table = tx.commit(env.catalog.as_ref()).await.unwrap();
 
         let small_file_threshold = 10_000u64;
-        let planning_config = CompactionPlanningConfig::SmallFiles(
+        let planning_config = CompactionPlanningConfig::new(CompactionStrategy::SmallFiles(
             SmallFilesConfigBuilder::default()
                 .small_file_threshold_bytes(small_file_threshold)
                 .build()
                 .unwrap(),
-        );
+        ));
 
         let branch_planner = CompactionPlanner::new(planning_config.clone());
 
@@ -2320,7 +2462,7 @@ mod tests {
 
         assert_eq!(branch_plan.file_count(), 1);
         assert_eq!(branch_plan.to_branch, new_branch);
-        let input_file_path = branch_plan.file_group.data_files[0].data_file_path();
+        let input_file_path = branch_plan.file_group().data_files[0].data_file_path();
         assert!(input_file_path.contains("small-branch"));
 
         let branch_compaction =
@@ -2344,8 +2486,6 @@ mod tests {
     /// Consolidated commit validation scenarios to avoid repeated init
     #[tokio::test]
     async fn test_commit_validations() {
-        use crate::file_selection::FileGroup;
-
         // Shared environment
         let env = create_test_env().await;
 
@@ -2355,19 +2495,19 @@ mod tests {
             .build();
 
         // 1) Branch mismatch
-        let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 1);
-        let plan2 = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1);
+        let plan1 = CompactionPlan::empty(MAIN_BRANCH, 1);
+        let plan2 = CompactionPlan::empty("feature-branch", 1);
         let r1 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan1,
-            validation_info: None,
+            validation_enabled: false,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
-            validation_info: None,
+            validation_enabled: false,
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])
@@ -2380,19 +2520,19 @@ mod tests {
         );
 
         // 2) Snapshot mismatch (same branch)
-        let plan1 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 1);
-        let plan2 = CompactionPlan::new(FileGroup::empty(), MAIN_BRANCH, 2);
+        let plan1 = CompactionPlan::empty(MAIN_BRANCH, 1);
+        let plan2 = CompactionPlan::empty(MAIN_BRANCH, 2);
         let r1 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan1,
-            validation_info: None,
+            validation_enabled: false,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
-            validation_info: None,
+            validation_enabled: false,
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])
@@ -2420,8 +2560,6 @@ mod tests {
     #[tokio::test]
     async fn test_rewrite_plan_branch_validation() {
         use crate::config::CompactionExecutionConfigBuilder;
-        use crate::file_selection::FileGroup;
-
         // Reuse shared env
         let env = create_test_env().await;
 
@@ -2431,7 +2569,7 @@ mod tests {
             .build();
 
         // Create a plan for a different branch
-        let plan = CompactionPlan::new(FileGroup::empty(), "feature-branch", 1);
+        let plan = CompactionPlan::empty("feature-branch", 1);
 
         let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
         let table = env.catalog.load_table(&env.table_ident).await.unwrap();
@@ -2511,8 +2649,7 @@ mod tests {
         let table = env.catalog.load_table(&env.table_ident).await.unwrap();
 
         // Create a plan with non-existent snapshot ID
-        let invalid_plan = CompactionPlan::new(
-            crate::file_selection::FileGroup::empty(),
+        let invalid_plan = CompactionPlan::empty(
             MAIN_BRANCH,
             999999, // Non-existent snapshot ID
         );

@@ -18,6 +18,70 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `group gating`: group-level thresholds used to avoid frequent small rewrites; these thresholds are applied after `file group scope` and `grouping_strategy`
 - `fixed-point rewrite`: for the input files rewritten in the current run, the newly committed snapshot should cause them to leave that strategy's candidate set
 
+## Configuration Layers
+
+| Layer | Configuration owner | Responsibility |
+| --- | --- | --- |
+| Planning scope and pipeline | `CompactionPlanningConfig` | Per-attempt bounds, grouping, file-group scope, and recommended parallelism |
+| Compaction policy | `CompactionStrategy` | Candidate predicate and any selective group gating |
+| Runtime selection pipeline | `PlanStrategy` | Compile policy into file filters, grouping, and group filters |
+| Selection result | `FileGroup` | Carry a complete selected group without execution hints |
+| Plan assembly | `CompactionPlanner` | Calculate parallelism and create a complete `CompactionPlan` |
+| Execution | `CompactionExecutionConfig` | Read, rewrite, spill, and write behavior for an admitted plan |
+| Scheduling | External caller | Round identity, retry, admission limits, cooldown, and cross-attempt progress |
+
+`CompactionPlanningConfig` is the stable dispatch layer shared by every planning
+run. `CompactionStrategy` stores only policy-specific settings. `Full` has no
+policy-specific configuration.
+
+`PlanStrategy::execute` does not accept planning settings and cannot create an
+executable plan. `CompactionPlanner` uses its single planning configuration to
+turn each `FileGroup` into a `CompactionPlan`, which owns the calculated
+input and output parallelism. This prevents a selected group from being used as
+a plan with default or stale execution hints.
+
+The planning and execution configurations intentionally have separate
+`target_file_size_bytes` values. Planning uses its value to recommend output
+parallelism; execution uses its value as the writer's rolling threshold.
+
+`group_filters` stay in the selective strategy payloads even though the runtime
+pipeline applies them after grouping. They are eligibility policy: allowing
+them on `Full` would make a supposedly complete rewrite silently omit groups.
+Keeping them on `SmallFiles`, `FilesWithDeletes`, and `Auto` makes that invalid
+combination unrepresentable without adding runtime validation.
+
+### Extension Rules
+
+New planning inputs should be placed by semantics rather than by which runtime
+trait happens to implement them:
+
+- A visibility or completeness bound belongs to the common planning scope and
+  is applied to every strategy.
+- A condition describing an unhealthy file belongs to the candidate policy.
+- A condition describing whether an already-built group is actionable belongs
+  to selective group gating.
+- State spanning planning attempts belongs to the external scheduler.
+
+The public configuration is intentionally not a generic boolean-expression
+tree. Built-in policies compile to concrete filter compositions once per
+planning attempt; file matching does not interpret `CompactionStrategy` for
+every file. Callers that need a custom runtime pipeline can construct
+`PlanStrategy` directly.
+
+For example, sequence-bounded planning should eventually compile to
+`within_sequence_bound AND candidate_policy`. The bound is not an `Auto`
+setting, and missing sequence metadata must fail validation before filtering;
+otherwise an incomplete scan could be mistaken for a drained round.
+
+| Combination | Expected meaning |
+| --- | --- |
+| `Full` | Select every visible data file |
+| `Full` plus a sequence bound | Select every data file visible to that bounded round |
+| `Full` plus group gating | Invalid; this is intentionally not configurable |
+| `Auto` | Select `small OR delete-heavy` |
+| `Auto` plus a sequence bound | Select `within_bound AND (small OR delete-heavy)` |
+| `Auto` with both predicates disabled | Valid no-op; produce no candidates |
+
 ## Strategy Model
 
 ### `Full`
