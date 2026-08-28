@@ -61,6 +61,7 @@ impl DatafusionProcessor {
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
+        shared_runtime: Option<Arc<RuntimeEnv>>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
@@ -70,24 +71,33 @@ impl DatafusionProcessor {
                 execution_config.enable_normalized_column_identifiers,
             );
 
-        // When a memory budget is configured, run DataFusion with a bounded
-        // `FairSpillPool` and an OS-backed `DiskManager` so blocking operators
-        // (notably `SortExec` for sorted-table compaction) spill to disk once
-        // they exceed the budget, instead of buffering all decoded Arrow data
-        // in memory and OOM-killing the process. With no budget we keep the
-        // previous behavior: an unbounded pool and no spilling.
-        let ctx = match execution_config.max_memory_bytes {
-            Some(max_memory_bytes) if max_memory_bytes > 0 => {
-                let runtime_env = build_spilling_runtime_env(
-                    max_memory_bytes,
-                    execution_config.spill_dir.as_deref(),
-                )?;
-                Arc::new(SessionContext::new_with_config_rt(
-                    session_config,
-                    runtime_env,
-                ))
-            }
-            _ => Arc::new(SessionContext::new_with_config(session_config)),
+        // Memory-pool selection, in priority order:
+        // 1. `shared_runtime` (built once and shared across all concurrent
+        //    `rewrite_files` calls on a single executor) — makes `max_memory_bytes`
+        //    a *pod-wide* ceiling instead of a per-plan one. See
+        //    `DataFusionExecutor::shared_runtime_env`.
+        // 2. else a per-call bounded `FairSpillPool` + OS `DiskManager` when a
+        //    budget is configured, so blocking operators (notably `SortExec`) spill
+        //    to disk once they exceed the budget instead of OOM-killing the process.
+        // 3. else the previous behavior: an unbounded pool and no spilling.
+        let ctx = match shared_runtime {
+            Some(runtime_env) => Arc::new(SessionContext::new_with_config_rt(
+                session_config,
+                runtime_env,
+            )),
+            None => match execution_config.max_memory_bytes {
+                Some(max_memory_bytes) if max_memory_bytes > 0 => {
+                    let runtime_env = build_spilling_runtime_env(
+                        max_memory_bytes,
+                        execution_config.spill_dir.as_deref(),
+                    )?;
+                    Arc::new(SessionContext::new_with_config_rt(
+                        session_config,
+                        runtime_env,
+                    ))
+                }
+                _ => Arc::new(SessionContext::new_with_config(session_config)),
+            },
         };
 
         let table_register = DatafusionTableRegister::new(
@@ -225,7 +235,7 @@ impl DatafusionProcessor {
 /// `SortExec`) spill to disk once they exceed the pool instead of buffering
 /// unbounded in memory. Spill files go to `spill_dir` when provided, otherwise
 /// the OS temp directory.
-fn build_spilling_runtime_env(
+pub(crate) fn build_spilling_runtime_env(
     max_memory_bytes: usize,
     spill_dir: Option<&std::path::Path>,
 ) -> Result<Arc<RuntimeEnv>> {
@@ -988,7 +998,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DatafusionProcessor::new(bounded, 1, file_io.clone()).is_ok());
+        assert!(DatafusionProcessor::new(bounded, 1, file_io.clone(), None).is_ok());
 
         // A configured spill directory is honored by the disk manager.
         let bounded_with_spill_dir = Arc::new(
@@ -998,12 +1008,12 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DatafusionProcessor::new(bounded_with_spill_dir, 1, file_io.clone()).is_ok());
+        assert!(DatafusionProcessor::new(bounded_with_spill_dir, 1, file_io.clone(), None).is_ok());
 
         let unbounded = Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
         assert!(unbounded.max_memory_bytes.is_none());
         assert!(unbounded.spill_dir.is_none());
-        assert!(DatafusionProcessor::new(unbounded, 1, file_io).is_ok());
+        assert!(DatafusionProcessor::new(unbounded, 1, file_io, None).is_ok());
     }
 
     /// Validates the bounded runtime built by `build_spilling_runtime_env`

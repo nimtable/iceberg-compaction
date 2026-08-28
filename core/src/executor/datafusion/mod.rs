@@ -14,10 +14,11 @@
 * limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::StreamExt;
 use futures::future::try_join_all;
@@ -43,8 +44,58 @@ use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 
-#[derive(Debug, Default)]
-pub struct DataFusionExecutor {}
+#[derive(Default)]
+pub struct DataFusionExecutor {
+    /// Runtime (bounded `FairSpillPool` + `DiskManager`) built once and shared
+    /// across every `rewrite_files` call on this executor. igloo runs all the
+    /// concurrent plans of one invocation through a single `Compaction`, which
+    /// holds a single `DataFusionExecutor`, so caching the runtime here makes
+    /// `max_memory_bytes` a *pod-wide* ceiling instead of a per-plan one:
+    /// two concurrent unsorted plans would otherwise hold two independent
+    /// `max_memory_bytes` pools and blow the pod's memory limit (F6 OOM).
+    ///
+    /// Lazily initialized from the first request whose `execution_config` sets a
+    /// budget; all plans in an invocation share the same config, so the first
+    /// config governs the shared pool for that invocation. `None` (unbudgeted)
+    /// requests keep the previous per-call, unbounded behavior.
+    shared_runtime: Mutex<Option<Arc<RuntimeEnv>>>,
+}
+
+impl std::fmt::Debug for DataFusionExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataFusionExecutor").finish_non_exhaustive()
+    }
+}
+
+impl DataFusionExecutor {
+    /// Returns the shared bounded runtime for this executor, building it once on
+    /// first use, or `None` when no memory budget is configured (unbounded,
+    /// per-call behavior preserved).
+    ///
+    /// Sync and holds the lock only to read/populate the cache — the guard is
+    /// dropped before the caller `.await`s, so it never crosses an await point.
+    fn shared_runtime_env(
+        &self,
+        execution_config: &CompactionExecutionConfig,
+    ) -> Result<Option<Arc<RuntimeEnv>>> {
+        let Some(max_memory_bytes) = execution_config.max_memory_bytes.filter(|n| *n > 0) else {
+            return Ok(None);
+        };
+
+        let mut guard = self.shared_runtime.lock().map_err(|e| {
+            CompactionError::Unexpected(format!("shared runtime lock poisoned: {e}"))
+        })?;
+        if let Some(runtime_env) = guard.as_ref() {
+            return Ok(Some(runtime_env.clone()));
+        }
+        let runtime_env = datafusion_processor::build_spilling_runtime_env(
+            max_memory_bytes,
+            execution_config.spill_dir.as_deref(),
+        )?;
+        *guard = Some(runtime_env.clone());
+        Ok(Some(runtime_env))
+    }
+}
 
 #[async_trait]
 impl CompactionExecutor for DataFusionExecutor {
@@ -74,10 +125,12 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_input_data_files(file_group)
             .with_sort_order(sort_order.clone())
             .build()?;
+        let shared_runtime = self.shared_runtime_env(&execution_config)?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),
             executor_parallelism,
             file_io.clone(),
+            shared_runtime,
         )?
         .execute(datafusion_task_ctx, output_parallelism)
         .await?;
