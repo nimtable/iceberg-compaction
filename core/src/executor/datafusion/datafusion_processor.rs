@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
@@ -254,15 +253,11 @@ fn build_output_partitioning(
         return Ok(round_robin);
     }
 
-    let data_files = datafusion_task_ctx.data_files.iter().flatten();
-    let all_files_use_current_spec = data_files.clone().all(|task| {
-        task.partition_spec.as_ref().map(|spec| spec.spec_id()) == Some(partition_spec.spec_id())
-    });
-    let distinct_partition_count = data_files
-        .map(|task| task.partition.as_ref())
-        .collect::<HashSet<_>>()
-        .len();
-    if all_files_use_current_spec && distinct_partition_count <= 1 {
+    let data_files = datafusion_task_ctx
+        .data_files
+        .as_deref()
+        .unwrap_or_default();
+    if can_use_round_robin_for_partitioned_group(data_files, partition_spec) {
         return Ok(round_robin);
     }
 
@@ -272,6 +267,29 @@ fn build_output_partitioning(
         vec![Arc::new(expr) as Arc<dyn PhysicalExpr>],
         output_parallelism,
     ))
+}
+
+/// Returns whether round-robin is safe for a partitioned input group.
+///
+/// Every input file must use the current partition spec and have the same
+/// partition value. Files using an older or unknown spec require hash
+/// repartitioning because one old partition may map to multiple current ones.
+fn can_use_round_robin_for_partitioned_group(
+    data_files: &[FileScanTask],
+    current_spec: &iceberg::spec::PartitionSpec,
+) -> bool {
+    let Some(first_file) = data_files.first() else {
+        return true;
+    };
+    let first_partition = first_file.partition.as_ref();
+
+    data_files.iter().all(|file| {
+        let uses_current_spec = file
+            .partition_spec
+            .as_deref()
+            .is_some_and(|spec| spec.spec_id() == current_spec.spec_id());
+        uses_current_spec && file.partition.as_ref() == first_partition
+    })
 }
 
 /// Installs the requested output distribution. Hash partitioning is always
