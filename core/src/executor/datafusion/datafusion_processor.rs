@@ -245,13 +245,13 @@ fn build_output_partitioning(
     input_schema: &Schema,
     output_parallelism: usize,
 ) -> Result<Partitioning> {
-    let round_robin = || Partitioning::RoundRobinBatch(output_parallelism);
+    let round_robin = Partitioning::RoundRobinBatch(output_parallelism);
 
     let Some(partition_spec) = &datafusion_task_ctx.partition_spec else {
-        return Ok(round_robin());
+        return Ok(round_robin);
     };
     if partition_spec.is_unpartitioned() || output_parallelism <= 1 {
-        return Ok(round_robin());
+        return Ok(round_robin);
     }
 
     let data_files = datafusion_task_ctx.data_files.iter().flatten();
@@ -263,7 +263,7 @@ fn build_output_partitioning(
         .collect::<HashSet<_>>()
         .len();
     if all_files_use_current_spec && distinct_partition_count <= 1 {
-        return Ok(round_robin());
+        return Ok(round_robin);
     }
 
     let expr =
