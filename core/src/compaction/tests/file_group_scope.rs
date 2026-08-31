@@ -62,7 +62,7 @@ async fn test_plan_compaction_with_table_file_group_scope() {
         .collect::<Vec<_>>();
     partition_scoped_output_parallelism.sort_unstable();
     assert_eq!(partition_scoped_output_parallelism, vec![8, 16, 16]);
-    assert_eq!(table_scoped_plans[0].recommended_output_parallelism(), 4);
+    assert_eq!(table_scoped_plans[0].recommended_output_parallelism(), 10);
     assert_eq!(table_scoped_plans[0].to_branch, MAIN_BRANCH);
 
     let unpartitioned_env = create_test_env().await;

@@ -24,7 +24,7 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
@@ -201,6 +201,21 @@ impl FileGroup {
         // Apply output parallelism heuristic if enabled
         let output_parallelism =
             Self::apply_output_parallelism_heuristic(files_to_compact, config, output_parallelism);
+
+        // Each output stream owns a partition-aware writer, so a group spanning multiple
+        // partitions can fan out to one active writer per distinct partition and stream.
+        let distinct_partition_count = files_to_compact
+            .data_files
+            .iter()
+            .map(|file| {
+                file.partition
+                    .clone()
+                    .unwrap_or_else(iceberg::spec::Struct::empty)
+            })
+            .collect::<HashSet<_>>()
+            .len()
+            .max(1);
+        let output_parallelism = (output_parallelism / distinct_partition_count).max(1);
 
         // Calculate input split size using Iceberg's inputSplitSize algorithm
         let split_size =
