@@ -30,7 +30,7 @@ use mixtrics::registry::noop::NoopMetricsRegistry;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
-use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig};
+use crate::config::{CompactionExecutionConfig, CompactionPlanningConfig, FileGroupScope};
 use crate::executor::{
     ExecutorType, RewriteFilesRequest, RewriteFilesResponse, RewriteFilesStat, TableSortOrder,
     create_compaction_executor,
@@ -41,6 +41,7 @@ use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 mod validator;
 
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
+const PARTITIONED_TABLE_OUTPUT_PARALLELISM_DIVISOR: usize = 8;
 
 /// Validates that all rewrite results target the same snapshot and branch.
 ///
@@ -1394,7 +1395,21 @@ impl CompactionPlanner {
         let strategy = PlanStrategy::from(&self.config);
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
-        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
+        let mut file_groups =
+            FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
+
+        if self.config.file_group_scope() == FileGroupScope::Table
+            && !table.metadata().default_partition_spec().is_unpartitioned()
+        {
+            // Each output stream owns a partition-aware writer. A table-scoped group can therefore
+            // fan out to multiple active partition writers per stream.
+            for file_group in &mut file_groups {
+                file_group.output_parallelism = (file_group.output_parallelism
+                    / PARTITIONED_TABLE_OUTPUT_PARALLELISM_DIVISOR)
+                    .max(1);
+            }
+        }
+
         Ok((file_groups, min_sequence))
     }
 }

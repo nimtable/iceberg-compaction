@@ -26,11 +26,13 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
-use super::{TestEnv, append_and_commit, create_namespace, simple_table_schema};
+use super::{TestEnv, append_and_commit, create_namespace, create_test_env, simple_table_schema};
 use crate::compaction::CompactionPlanner;
 use crate::config::{
     CompactionPlanningConfig, FileGroupScope, FullCompactionConfigBuilder, GroupingStrategy,
 };
+
+const TEST_FILE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[tokio::test]
 async fn test_plan_compaction_with_table_file_group_scope() {
@@ -54,7 +56,28 @@ async fn test_plan_compaction_with_table_file_group_scope() {
     assert_eq!(partition_scoped_plans.len(), 3);
     assert_eq!(table_scoped_plans.len(), 1);
     assert_eq!(table_scoped_plans[0].file_count(), 5);
+    let mut partition_scoped_output_parallelism = partition_scoped_plans
+        .iter()
+        .map(|plan| plan.recommended_output_parallelism())
+        .collect::<Vec<_>>();
+    partition_scoped_output_parallelism.sort_unstable();
+    assert_eq!(partition_scoped_output_parallelism, vec![8, 16, 16]);
+    assert_eq!(table_scoped_plans[0].recommended_output_parallelism(), 4);
     assert_eq!(table_scoped_plans[0].to_branch, MAIN_BRANCH);
+
+    let unpartitioned_env = create_test_env().await;
+    let unpartitioned_table = append_and_commit(
+        &unpartitioned_env.table,
+        unpartitioned_env.catalog.as_ref(),
+        unpartitioned_data_files(&unpartitioned_env.table),
+    )
+    .await;
+    let unpartitioned_plans = planner(FileGroupScope::Table)
+        .plan_compaction(&unpartitioned_table)
+        .await
+        .unwrap();
+    assert_eq!(unpartitioned_plans.len(), 1);
+    assert_eq!(unpartitioned_plans[0].recommended_output_parallelism(), 32);
 }
 
 fn planner(file_group_scope: FileGroupScope) -> CompactionPlanner {
@@ -62,6 +85,8 @@ fn planner(file_group_scope: FileGroupScope) -> CompactionPlanner {
         FullCompactionConfigBuilder::default()
             .grouping_strategy(GroupingStrategy::Single)
             .file_group_scope(file_group_scope)
+            .max_output_parallelism(32_usize)
+            .enable_heuristic_output_parallelism(false)
             .build()
             .unwrap(),
     ))
@@ -121,7 +146,8 @@ async fn create_partitioned_table<C: Catalog>(catalog: &C, table_ident: &TableId
 
 fn partitioned_data_files(table: &Table) -> Vec<DataFile> {
     let spec_id = table.metadata().default_partition_spec_id();
-    let data_file = |path, partition_id| data_file_with_partition(path, partition_id, spec_id);
+    let data_file =
+        |path, partition_id| data_file_with_partition(path, partition_value(partition_id), spec_id);
 
     vec![
         data_file("file:///test/p0_file1.parquet", 0),
@@ -132,14 +158,27 @@ fn partitioned_data_files(table: &Table) -> Vec<DataFile> {
     ]
 }
 
-fn data_file_with_partition(path: &str, partition_id: i32, partition_spec_id: i32) -> DataFile {
+fn unpartitioned_data_files(table: &Table) -> Vec<DataFile> {
+    let spec_id = table.metadata().default_partition_spec_id();
+    (0..5)
+        .map(|index| {
+            data_file_with_partition(
+                &format!("file:///test/unpartitioned_file{index}.parquet"),
+                Struct::empty(),
+                spec_id,
+            )
+        })
+        .collect()
+}
+
+fn data_file_with_partition(path: &str, partition: Struct, partition_spec_id: i32) -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_format(DataFileFormat::Parquet)
         .file_path(path.to_owned())
-        .file_size_in_bytes(1024)
+        .file_size_in_bytes(TEST_FILE_SIZE_BYTES)
         .record_count(10)
-        .partition(partition_value(partition_id))
+        .partition(partition)
         .partition_spec_id(partition_spec_id)
         .build()
         .unwrap()
