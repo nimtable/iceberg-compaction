@@ -141,48 +141,44 @@ async fn write_batch_stream<F>(
 where
     F: FnOnce() -> Result<Box<dyn IcebergWriter>> + Send + 'static,
 {
-    let mut writer = None;
-    let mut writer_factory = Some(writer_factory);
+    let fetch_batch_start = Instant::now();
+    let Some(first_batch) = batch_stream.as_mut().next().await else {
+        return Ok(Vec::new());
+    };
+    if let Some(metrics_recorder) = &metrics_recorder {
+        metrics_recorder
+            .record_datafusion_batch_fetch_duration(fetch_batch_start.elapsed().as_millis() as f64);
+    }
 
-    let mut fetch_batch_start = Instant::now();
-    while let Some(batch_result) = batch_stream.as_mut().next().await {
-        if let Some(metrics_recorder) = &metrics_recorder {
-            metrics_recorder.record_datafusion_batch_fetch_duration(
-                fetch_batch_start.elapsed().as_millis() as f64,
-            );
-        }
+    let mut batch = first_batch?;
+    let mut writer = writer_factory()?;
 
-        let batch = batch_result?;
+    loop {
         let record_count = batch.num_rows() as u64;
         let batch_bytes = batch.get_array_memory_size() as u64;
 
-        // Repartitioning can leave output streams empty, so build only on first use.
-        if writer.is_none() {
-            let writer_factory = writer_factory
-                .take()
-                .expect("writer factory must only be called once");
-            writer = Some(writer_factory()?);
-        }
-
         let write_start = Instant::now();
-        writer
-            .as_mut()
-            .expect("writer must be initialized before writing")
-            .write(batch)
-            .await?;
+        writer.write(batch).await?;
         if let Some(metrics_recorder) = &metrics_recorder {
             metrics_recorder
                 .record_datafusion_batch_write_duration(write_start.elapsed().as_millis() as f64);
             metrics_recorder.record_batch_stats(record_count, batch_bytes);
         }
 
-        fetch_batch_start = Instant::now();
+        let fetch_batch_start = Instant::now();
+        let Some(next_batch) = batch_stream.as_mut().next().await else {
+            break;
+        };
+        if let Some(metrics_recorder) = &metrics_recorder {
+            metrics_recorder.record_datafusion_batch_fetch_duration(
+                fetch_batch_start.elapsed().as_millis() as f64,
+            );
+        }
+
+        batch = next_batch?;
     }
 
-    match writer {
-        Some(mut writer) => Ok(writer.close().await?),
-        None => Ok(Vec::new()),
-    }
+    Ok(writer.close().await?)
 }
 
 pub fn build_iceberg_data_file_writer(
