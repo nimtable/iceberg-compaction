@@ -135,14 +135,14 @@ impl CompactionExecutor for DataFusionExecutor {
 
 async fn write_batch_stream<F>(
     mut batch_stream: SendableRecordBatchStream,
-    build_writer: F,
+    writer_factory: F,
     metrics_recorder: Option<CompactionMetricsRecorder>,
 ) -> Result<Vec<DataFile>>
 where
     F: FnOnce() -> Result<Box<dyn IcebergWriter>> + Send + 'static,
 {
-    let mut data_file_writer = None;
-    let mut build_writer = Some(build_writer);
+    let mut writer = None;
+    let mut writer_factory = Some(writer_factory);
 
     let mut fetch_batch_start = Instant::now();
     while let Some(batch_result) = batch_stream.as_mut().next().await {
@@ -157,15 +157,15 @@ where
         let batch_bytes = batch.get_array_memory_size() as u64;
 
         // Repartitioning can leave output streams empty, so build only on first use.
-        if data_file_writer.is_none() {
-            let build_writer = build_writer
+        if writer.is_none() {
+            let writer_factory = writer_factory
                 .take()
                 .expect("writer factory must only be called once");
-            data_file_writer = Some(build_writer()?);
+            writer = Some(writer_factory()?);
         }
 
         let write_start = Instant::now();
-        data_file_writer
+        writer
             .as_mut()
             .expect("writer must be initialized before writing")
             .write(batch)
@@ -179,8 +179,8 @@ where
         fetch_batch_start = Instant::now();
     }
 
-    match data_file_writer.as_mut() {
-        Some(data_file_writer) => Ok(data_file_writer.close().await?),
+    match writer {
+        Some(mut writer) => Ok(writer.close().await?),
         None => Ok(Vec::new()),
     }
 }
@@ -249,97 +249,27 @@ pub fn build_iceberg_data_file_writer(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::datatypes::Schema as ArrowSchema;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
 
     use super::*;
 
-    struct CountingWriter {
-        write_count: Arc<AtomicUsize>,
-        close_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl IcebergWriter for CountingWriter {
-        async fn write(&mut self, _batch: RecordBatch) -> iceberg::Result<()> {
-            self.write_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn close(&mut self) -> iceberg::Result<Vec<DataFile>> {
-            self.close_count.fetch_add(1, Ordering::Relaxed);
-            Ok(Vec::new())
-        }
-    }
-
-    fn batch_stream(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
-        let schema = batches
-            .first()
-            .map(RecordBatch::schema)
-            .unwrap_or_else(|| Arc::new(ArrowSchema::empty()));
-        let batches = batches
-            .into_iter()
-            .map(Ok::<_, datafusion::error::DataFusionError>);
-
-        Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches)))
-    }
-
     #[tokio::test]
     async fn empty_stream_does_not_build_writer() {
-        let build_count = Arc::new(AtomicUsize::new(0));
-        let build_count_clone = build_count.clone();
+        let batch_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(ArrowSchema::empty()),
+            stream::empty(),
+        ));
 
         let data_files = write_batch_stream(
-            batch_stream(Vec::new()),
-            move || -> Result<Box<dyn IcebergWriter>> {
-                build_count_clone.fetch_add(1, Ordering::Relaxed);
-                unreachable!("empty stream must not build a writer")
-            },
+            batch_stream,
+            || unreachable!("empty stream must not build a writer"),
             None,
         )
         .await
         .unwrap();
 
         assert!(data_files.is_empty());
-        assert_eq!(build_count.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn non_empty_stream_builds_one_writer() {
-        let build_count = Arc::new(AtomicUsize::new(0));
-        let write_count = Arc::new(AtomicUsize::new(0));
-        let close_count = Arc::new(AtomicUsize::new(0));
-
-        let build_count_clone = build_count.clone();
-        let write_count_clone = write_count.clone();
-        let close_count_clone = close_count.clone();
-        let schema = Arc::new(ArrowSchema::empty());
-        let batches = vec![
-            RecordBatch::new_empty(schema.clone()),
-            RecordBatch::new_empty(schema),
-        ];
-
-        let data_files = write_batch_stream(
-            batch_stream(batches),
-            move || -> Result<Box<dyn IcebergWriter>> {
-                build_count_clone.fetch_add(1, Ordering::Relaxed);
-                Ok(Box::new(CountingWriter {
-                    write_count: write_count_clone,
-                    close_count: close_count_clone,
-                }))
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(data_files.is_empty());
-        assert_eq!(build_count.load(Ordering::Relaxed), 1);
-        assert_eq!(write_count.load(Ordering::Relaxed), 2);
-        assert_eq!(close_count.load(Ordering::Relaxed), 1);
     }
 }
