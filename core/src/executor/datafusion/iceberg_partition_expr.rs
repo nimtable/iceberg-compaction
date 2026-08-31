@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::any::Any;
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -69,6 +70,10 @@ impl IcebergPartitionExpr {
 }
 
 impl PhysicalExpr for IcebergPartitionExpr {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn data_type(&self, _input_schema: &ArrowSchema) -> DFResult<DataType> {
         Ok(self.partition_arrow_type.clone())
     }
