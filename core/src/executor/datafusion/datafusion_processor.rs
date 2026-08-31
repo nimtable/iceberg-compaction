@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
@@ -223,18 +224,22 @@ impl DatafusionProcessor {
 
 /// Chooses how rows are distributed across the output writer streams.
 ///
-/// For every partitioned table, hash by the complete Iceberg partition value
-/// so each partition is written by exactly one stream. Each output stream owns
-/// a partition-aware fanout writer, so with round-robin distribution every
-/// stream sees every partition and the total number of open writers grows with
-/// `output streams x partitions` (and every partition's output is sliced into
-/// at least one file per stream). Hashing keeps the writer count at one per
-/// distinct partition in total and lets output parallelism stay at its
-/// size-based value.
+/// For partitioned tables spanning multiple partitions, hash by the complete
+/// Iceberg partition value so each partition is written by exactly one stream.
+/// Each output stream owns a partition-aware fanout writer, so with round-robin
+/// distribution every stream sees every partition and the total number of open
+/// writers grows with `output streams x partitions` (and every partition's
+/// output is sliced into at least one file per stream). Hashing keeps the writer
+/// count at one per distinct partition in total and lets output parallelism stay
+/// at its size-based value.
 ///
-/// Unpartitioned tables keep round-robin distribution because they have no
-/// writer fan-out. A partition expression construction failure is returned to
-/// the caller rather than silently violating partition affinity.
+/// Unpartitioned tables and single-partition groups keep round-robin
+/// distribution so they can use all output streams without unbounded writer
+/// fan-out. The latter optimization is only safe when every input file uses the
+/// current partition spec; an older spec's single manifest partition value may
+/// fan out into multiple values under the current spec. A partition expression
+/// construction failure is returned to the caller rather than silently
+/// violating partition affinity.
 fn build_output_partitioning(
     datafusion_task_ctx: &DataFusionTaskContext,
     input_schema: &Schema,
@@ -246,6 +251,18 @@ fn build_output_partitioning(
         return Ok(round_robin());
     };
     if partition_spec.is_unpartitioned() || output_parallelism <= 1 {
+        return Ok(round_robin());
+    }
+
+    let data_files = datafusion_task_ctx.data_files.iter().flatten();
+    let all_files_use_current_spec = data_files.clone().all(|task| {
+        task.partition_spec.as_ref().map(|spec| spec.spec_id()) == Some(partition_spec.spec_id())
+    });
+    let distinct_partition_count = data_files
+        .map(|task| task.partition.as_ref())
+        .collect::<HashSet<_>>()
+        .len();
+    if all_files_use_current_spec && distinct_partition_count <= 1 {
         return Ok(round_robin());
     }
 
@@ -2134,15 +2151,19 @@ mod tests {
             )
         }
 
-        fn identity_spec(schema: &Schema) -> PartitionSpecRef {
+        fn identity_spec_with_id(schema: &Schema, spec_id: i32) -> PartitionSpecRef {
             Arc::new(
                 PartitionSpec::builder(schema.clone())
-                    .with_spec_id(1)
+                    .with_spec_id(spec_id)
                     .add_partition_field("p", "p", Transform::Identity)
                     .unwrap()
                     .build()
                     .unwrap(),
             )
+        }
+
+        fn identity_spec(schema: &Schema) -> PartitionSpecRef {
+            identity_spec_with_id(schema, 1)
         }
 
         fn unpartitioned_spec(schema: &Schema) -> PartitionSpecRef {
@@ -2158,7 +2179,11 @@ mod tests {
             Struct::from_iter(vec![Some(Literal::Primitive(PrimitiveLiteral::Int(value)))])
         }
 
-        fn data_file_task(schema: &Arc<Schema>, partition: Option<Struct>) -> FileScanTask {
+        fn data_file_task(
+            schema: &Arc<Schema>,
+            partition: Option<Struct>,
+            partition_spec: Option<PartitionSpecRef>,
+        ) -> FileScanTask {
             FileScanTask {
                 length: 1024,
                 start: 0,
@@ -2174,7 +2199,7 @@ mod tests {
                 sequence_number: 0,
                 file_size_in_bytes: 1024,
                 partition,
-                partition_spec: None,
+                partition_spec,
                 name_mapping: None,
                 unified_partition_type: None,
                 case_sensitive: true,
@@ -2189,7 +2214,7 @@ mod tests {
         ) -> DataFusionTaskContext {
             let data_files = partitions
                 .into_iter()
-                .map(|p| data_file_task(schema, p))
+                .map(|p| data_file_task(schema, p, partition_spec.clone()))
                 .collect();
             let mut builder = DataFusionTaskContext::builder()
                 .unwrap()
@@ -2220,15 +2245,27 @@ mod tests {
             ));
         }
 
-        /// A single-partition group still hashes so its partition belongs to
-        /// exactly one output stream.
+        /// A single-partition group written under the current spec keeps
+        /// round-robin so all output streams can write it in parallel. If an
+        /// input file uses an older spec, hash because that one manifest value
+        /// may fan out under the current spec.
         #[test]
-        fn test_hash_for_single_partition_group() {
+        fn test_single_partition_group_respects_spec_evolution() {
             let schema = partitioned_table_schema();
-            let ctx = build_ctx(&schema, Some(identity_spec(&schema)), vec![
+            let current_spec = identity_spec(&schema);
+            let ctx = build_ctx(&schema, Some(current_spec.clone()), vec![
                 Some(partition_value(7)),
                 Some(partition_value(7)),
             ]);
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                Partitioning::RoundRobinBatch(8)
+            ));
+
+            let mut ctx = ctx;
+            for task in ctx.data_files.as_mut().unwrap() {
+                task.partition_spec = Some(identity_spec_with_id(&schema, 0));
+            }
             assert!(matches!(
                 build_output_partitioning(&ctx, &schema, 8).unwrap(),
                 Partitioning::Hash(_, 8)
