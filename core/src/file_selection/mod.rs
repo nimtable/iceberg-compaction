@@ -23,24 +23,15 @@ use crate::Result;
 pub mod packer;
 pub mod strategy;
 
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotStats {
-    pub total_data_files: usize,
-    pub small_files_count: usize,
-    pub delete_heavy_files_count: usize,
-}
 pub use packer::ListPacker;
-pub use strategy::{
-    FileFilterStrategy, FileGroup, FileSequenceNumberFilterStrategy, PlanStrategy,
-    PlanStrategyOptions,
-};
+pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
 
 impl FileSelector {
     /// Validates file sequence metadata before bounded planning filters run.
-    pub fn validate_file_sequence_numbers(data_files: &[FileScanTask]) -> Result<()> {
+    pub(crate) fn validate_file_sequence_numbers(data_files: &[FileScanTask]) -> Result<()> {
         if let Some(task) = data_files
             .iter()
             .find(|task| task.file_sequence_number.is_none())
@@ -78,6 +69,25 @@ impl FileSelector {
 
         let data_files: Vec<FileScanTask> = file_scan_stream.try_collect().await?;
         Ok(data_files)
+    }
+
+    /// Returns the minimum data sequence among files with applicable deletes.
+    ///
+    /// `tasks` must contain every live data-file task from the snapshot's complete,
+    /// unfiltered `plan_files()` result. Each `task.deletes` must conservatively
+    /// include every delete file that may apply; otherwise this threshold could
+    /// retire a delete file that is still needed by an affected data file.
+    ///
+    /// Missing or invalid sequence metadata disables the optimization.
+    pub(crate) fn delete_cleanup_min_data_sequence_number(tasks: &[FileScanTask]) -> Option<i64> {
+        let mut min_sequence = None;
+        for task in tasks.iter().filter(|task| !task.deletes.is_empty()) {
+            let sequence = task
+                .data_sequence_number
+                .filter(|sequence| *sequence >= 0)?;
+            min_sequence = Some(min_sequence.map_or(sequence, |min: i64| min.min(sequence)));
+        }
+        min_sequence
     }
 
     /// Groups pre-scanned tasks using the given strategy, skipping the scan phase.

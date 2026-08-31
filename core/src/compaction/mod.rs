@@ -38,13 +38,7 @@ use crate::executor::{
 use crate::file_selection::{FileGroup, FileSelector};
 use crate::{CompactionConfig, CompactionError, CompactionExecutor, Result};
 
-pub mod auto;
 mod validator;
-
-pub use auto::{
-    AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner, AutoPlanReason, AutoPlanReport,
-    AutoSelectedStrategy,
-};
 
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
@@ -921,11 +915,19 @@ impl CommitManager {
         rewrite_results: Vec<RewriteResult>,
         to_branch: &str,
     ) -> Result<Table> {
+        let delete_cleanup_min_data_sequence_number = rewrite_results
+            .first()
+            .and_then(|result| result.plan.delete_cleanup_min_data_sequence_number);
         let (added_data_files, rewritten_data_files) = self
             .collect_files_from_results(&rewrite_results, to_branch)
             .await?;
-        self.rewrite_files(added_data_files, rewritten_data_files, to_branch)
-            .await
+        self.rewrite_files_with_delete_cleanup_sequence(
+            added_data_files,
+            rewritten_data_files,
+            to_branch,
+            delete_cleanup_min_data_sequence_number,
+        )
+        .await
     }
 
     /// Overwrites files from results: file collection, validation, and commit.
@@ -955,6 +957,22 @@ impl CommitManager {
         added_data_files: Vec<DataFile>,
         rewritten_data_files: Vec<DataFile>,
         to_branch: &str,
+    ) -> Result<Table> {
+        self.rewrite_files_with_delete_cleanup_sequence(
+            added_data_files,
+            rewritten_data_files,
+            to_branch,
+            None,
+        )
+        .await
+    }
+
+    async fn rewrite_files_with_delete_cleanup_sequence(
+        &self,
+        added_data_files: Vec<DataFile>,
+        rewritten_data_files: Vec<DataFile>,
+        to_branch: &str,
+        delete_cleanup_min_data_sequence_number: Option<i64>,
     ) -> Result<Table> {
         let data_files = added_data_files;
         let delete_files = rewritten_data_files;
@@ -986,7 +1004,7 @@ impl CommitManager {
                 let txn = Transaction::new(&table);
 
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
-                let rewrite_action = if use_starting_sequence_number {
+                let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
                         let mut action = txn
@@ -1020,6 +1038,11 @@ impl CommitManager {
                     }
                     action
                 };
+
+                if let Some(sequence_number) = delete_cleanup_min_data_sequence_number {
+                    rewrite_action = rewrite_action
+                        .set_delete_file_cleanup_min_data_sequence_number(sequence_number);
+                }
 
                 let txn = rewrite_action.apply(txn)?;
                 match txn.commit(catalog.as_ref()).await {
@@ -1235,6 +1258,8 @@ pub struct CompactionPlan {
     pub to_branch: Cow<'static, str>,
     /// Snapshot ID from which files were selected
     pub snapshot_id: i64,
+    /// Minimum data sequence among files with applicable deletes in the planned snapshot.
+    delete_cleanup_min_data_sequence_number: Option<i64>,
 }
 
 impl CompactionPlan {
@@ -1248,7 +1273,16 @@ impl CompactionPlan {
             file_group,
             to_branch: to_branch.into(),
             snapshot_id,
+            delete_cleanup_min_data_sequence_number: None,
         }
+    }
+
+    pub(crate) fn with_delete_cleanup_min_data_sequence_number(
+        mut self,
+        sequence_number: Option<i64>,
+    ) -> Self {
+        self.delete_cleanup_min_data_sequence_number = sequence_number;
+        self
     }
 
     /// Creates an empty plan for testing.
@@ -1257,6 +1291,7 @@ impl CompactionPlan {
             file_group: FileGroup::empty(),
             to_branch: Cow::Borrowed(MAIN_BRANCH),
             snapshot_id: UNASSIGNED_SNAPSHOT_ID,
+            delete_cleanup_min_data_sequence_number: None,
         }
     }
 
@@ -1314,7 +1349,7 @@ impl CompactionPlanner {
     ) -> Result<Vec<CompactionPlan>> {
         if let Some(branch_snapshot) = table.metadata().snapshot_for_ref(to_branch) {
             // Step 1: Group files for compaction (extensible)
-            let file_groups: Vec<FileGroup> = self
+            let (file_groups, delete_cleanup_min_data_sequence_number) = self
                 .group_files_for_compaction(table, branch_snapshot.snapshot_id())
                 .await?;
 
@@ -1327,6 +1362,9 @@ impl CompactionPlanner {
                         file_group,
                         to_branch.to_owned(),
                         branch_snapshot.snapshot_id(),
+                    )
+                    .with_delete_cleanup_min_data_sequence_number(
+                        delete_cleanup_min_data_sequence_number,
                     )
                 })
                 .filter(|plan| plan.has_files())
@@ -1350,11 +1388,14 @@ impl CompactionPlanner {
         &self,
         table: &Table,
         snapshot_id: i64,
-    ) -> Result<Vec<FileGroup>> {
+    ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
         let strategy = PlanStrategy::from(&self.config);
-        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy, &self.config).await
+        let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
+        let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
+        let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
+        Ok((file_groups, min_sequence))
     }
 }
 
@@ -1863,7 +1904,7 @@ mod tests {
             .snapshot_for_ref(MAIN_BRANCH)
             .unwrap();
 
-        let files_to_compact = planner
+        let (files_to_compact, _) = planner
             .group_files_for_compaction(&updated_table, snapshot_before.snapshot_id())
             .await
             .unwrap();
