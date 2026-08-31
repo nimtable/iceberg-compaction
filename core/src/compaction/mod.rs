@@ -522,7 +522,7 @@ impl Compaction {
     ) -> Result<Vec<RewriteResult>> {
         use futures::stream::{self, StreamExt};
 
-        let results: Result<Vec<RewriteResult>> = stream::iter(plans.into_iter())
+        let results: Result<Vec<RewriteResult>> = stream::iter(plans)
             .map(|plan| async move { self.rewrite_plan(plan, execution_config, table).await })
             .buffer_unordered(execution_config.max_concurrent_compaction_plans) // Limit concurrency based on config
             .collect::<Vec<_>>()
