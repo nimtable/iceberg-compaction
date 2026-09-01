@@ -731,9 +731,12 @@ const MANIFEST_LOAD_CONCURRENCY: usize = 16;
 ///
 /// # Performance
 ///
-/// Entries are filtered against `wanted` *during* the manifest scan, so peak memory is
-/// `O(wanted)` rather than `O(files in the table)`. Manifests are loaded concurrently and
-/// the scan stops as soon as every wanted path has been found.
+/// Entries are filtered against `wanted` *during* the manifest scan, so the resolved map
+/// is `O(wanted)` rather than `O(files in the table)`. Peak memory is that plus a bounded
+/// manifest working set, not strictly `O(wanted)`: `load_manifest` fully materializes each
+/// manifest, and `buffer_unordered` keeps up to `MANIFEST_LOAD_CONCURRENCY` decoded
+/// manifests in flight at once. The scan stops as soon as every wanted path has been
+/// found.
 ///
 /// Deleted entries are skipped. A path can appear both as a live entry and as a tombstone
 /// from an earlier lifecycle, and only the live record is a valid rewrite input; skipping
@@ -1934,6 +1937,150 @@ mod tests {
             .unwrap();
 
         assert!(resolved.is_empty());
+    }
+
+    /// A live entry and a same-path tombstone from an earlier lifecycle can coexist in one
+    /// manifest list. Deleting a file does not rewrite the *old* manifest that originally
+    /// added it -- that manifest is immutable and, empirically, the snapshot producer stops
+    /// referencing it once none of its entries are live, splitting the survivors into a
+    /// fresh manifest instead. So reproducing the shadow case means splicing the old,
+    /// no-longer-referenced manifest (still physically on disk and still perfectly valid)
+    /// back into a manifest list alongside the new delete manifest. Resolution must return
+    /// the live record and must not let the tombstone shadow it, regardless of which
+    /// manifest the concurrent scan visits first.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_prefers_live_entry_over_tombstone() {
+        let env = create_test_env().await;
+
+        // Both files land in one manifest.
+        let first = write_simple_files(&env.table, &env.warehouse_location, "first", 2).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), first.clone()).await;
+        let live_snapshot = table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap()
+            .clone();
+        let live_manifest_list = table
+            .object_cache()
+            .get_manifest_list(&live_snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            live_manifest_list.entries().len(),
+            1,
+            "expected both files in a single manifest"
+        );
+        let live_manifest = live_manifest_list.entries()[0].clone();
+
+        // Delete only `first[0]`. `first[1]` stays alive, but (per the doc comment above)
+        // the snapshot producer moves it to a fresh manifest rather than leaving the old
+        // one referenced, so `live_manifest` -- still valid on disk -- is now an orphan
+        // that still asserts `first[0]` is alive.
+        let transaction = Transaction::new(&table);
+        let overwrite = transaction
+            .overwrite_files()
+            .delete_files(vec![first[0].clone()]);
+        let tx = overwrite.apply(transaction).unwrap();
+        let table = tx.commit(env.catalog.as_ref()).await.unwrap();
+        let dead_snapshot = table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap()
+            .clone();
+        let dead_manifest_list = table
+            .object_cache()
+            .get_manifest_list(&dead_snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        let mut dead_manifest = None;
+        for candidate in dead_manifest_list.entries() {
+            let manifest = candidate.load_manifest(table.file_io()).await.unwrap();
+            let has_tombstone = manifest.entries().iter().any(|entry| {
+                entry.data_file().file_path() == first[0].file_path() && !entry.is_alive()
+            });
+            if has_tombstone {
+                dead_manifest = Some(candidate.clone());
+                break;
+            }
+        }
+        let dead_manifest =
+            dead_manifest.expect("the delete commit must have written a tombstone manifest");
+
+        // Splice the orphaned live manifest and the fresh delete manifest into one
+        // manifest list, wrapped in a standalone snapshot that a real commit would never
+        // produce, but that exercises exactly the historical-lifecycle shadow this fix
+        // guards against.
+        let manifest_list_path = format!(
+            "{}/metadata/test-spliced-manifest-list-{}.avro",
+            env.warehouse_location,
+            Uuid::new_v4()
+        );
+        let output_file = table.file_io().new_output(&manifest_list_path).unwrap();
+        let file_writer = output_file.writer().await.unwrap();
+        let spliced_snapshot_id = dead_snapshot.snapshot_id() + 1_000_000;
+        let mut writer = iceberg::spec::ManifestListWriter::v2(
+            file_writer,
+            spliced_snapshot_id,
+            Some(dead_snapshot.snapshot_id()),
+            dead_snapshot.sequence_number() + 1,
+        );
+        writer
+            .add_manifests(vec![live_manifest, dead_manifest].into_iter())
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let spliced_snapshot = Arc::new(
+            iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(spliced_snapshot_id)
+                .with_parent_snapshot_id(Some(dead_snapshot.snapshot_id()))
+                .with_sequence_number(dead_snapshot.sequence_number() + 1)
+                .with_timestamp_ms(dead_snapshot.timestamp_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(iceberg::spec::Summary {
+                    operation: iceberg::spec::Operation::Overwrite,
+                    additional_properties: HashMap::new(),
+                })
+                .build(),
+        );
+
+        // Guard the premise: the spliced manifest list must contain both a live entry and
+        // a tombstone for the deleted path, otherwise this test isn't exercising the
+        // shadowing case at all.
+        let manifest_list = table
+            .object_cache()
+            .get_manifest_list(&spliced_snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        let (mut saw_live, mut saw_dead) = (false, false);
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.data_file().file_path() != first[0].file_path() {
+                    continue;
+                }
+                if entry.is_alive() {
+                    saw_live = true;
+                } else {
+                    saw_dead = true;
+                }
+            }
+        }
+        assert!(
+            saw_live && saw_dead,
+            "expected both a live entry and a tombstone for the deleted path, \
+             saw_live={saw_live} saw_dead={saw_dead}"
+        );
+
+        let wanted: HashSet<&str> = std::iter::once(first[0].file_path()).collect();
+        let resolved = resolve_data_files_by_path(&spliced_snapshot, &table, &wanted)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved.get(first[0].file_path()).unwrap().file_path(),
+            first[0].file_path()
+        );
     }
 
     #[tokio::test]
