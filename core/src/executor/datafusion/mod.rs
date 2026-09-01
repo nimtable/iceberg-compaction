@@ -43,6 +43,7 @@ use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
 pub mod iceberg_partition_expr;
+pub mod partition_salt_expr;
 
 #[derive(Debug, Default)]
 pub struct DataFusionExecutor {}

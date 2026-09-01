@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
@@ -40,6 +41,7 @@ use iceberg::spec::{
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
 use super::iceberg_partition_expr::IcebergPartitionExpr;
+use super::partition_salt_expr::PartitionSaltExpr;
 use crate::config::CompactionExecutionConfig;
 use crate::error::{CompactionError, Result};
 use crate::executor::TableSortOrder;
@@ -55,6 +57,7 @@ const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SY
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
     ctx: Arc<SessionContext>,
+    execution_config: Arc<CompactionExecutionConfig>,
 }
 
 impl DatafusionProcessor {
@@ -102,6 +105,7 @@ impl DatafusionProcessor {
         Ok(Self {
             table_register,
             ctx,
+            execution_config,
         })
     }
 
@@ -177,8 +181,12 @@ impl DatafusionProcessor {
         let sort_order = datafusion_task_ctx.sort_order.clone();
         // Decide the output distribution before table registration consumes
         // the data file scan tasks.
-        let output_partitioning =
-            build_output_partitioning(&datafusion_task_ctx, &input_schema, output_parallelism)?;
+        let output_partitioning = build_output_partitioning(
+            &datafusion_task_ctx,
+            &input_schema,
+            output_parallelism,
+            self.execution_config.target_file_size_bytes,
+        )?;
         self.register_tables(datafusion_task_ctx)?;
 
         let df = self.ctx.sql(&exec_sql).await?;
@@ -239,10 +247,19 @@ impl DatafusionProcessor {
 /// fan out into multiple values under the current spec. A partition expression
 /// construction failure is returned to the caller rather than silently
 /// violating partition affinity.
+///
+/// Hash routing caps the effective sort/write parallelism at the number of
+/// distinct partitions in the group. When that would leave a partition larger
+/// than the target file size on a single stream, a secondary
+/// [`PartitionSaltExpr`] hash key splits it over up to
+/// `ceil(bytes / target_file_size)` salt lanes (see
+/// [`partition_split_factors`]), restoring parallelism without changing the
+/// output file count.
 fn build_output_partitioning(
     datafusion_task_ctx: &DataFusionTaskContext,
     input_schema: &Schema,
     output_parallelism: usize,
+    target_file_size_bytes: u64,
 ) -> Result<Partitioning> {
     let round_robin = Partitioning::RoundRobinBatch(output_parallelism);
 
@@ -261,12 +278,80 @@ fn build_output_partitioning(
         return Ok(round_robin);
     }
 
-    let expr =
-        IcebergPartitionExpr::try_new(Arc::new(input_schema.clone()), partition_spec.clone())?;
-    Ok(Partitioning::Hash(
-        vec![Arc::new(expr) as Arc<dyn PhysicalExpr>],
+    let input_schema = Arc::new(input_schema.clone());
+    let expr = IcebergPartitionExpr::try_new(input_schema.clone(), partition_spec.clone())?;
+    let mut hash_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(expr)];
+
+    let split_factors = partition_split_factors(
+        data_files,
+        partition_spec,
+        target_file_size_bytes,
         output_parallelism,
-    ))
+    );
+    if !split_factors.is_empty() {
+        hash_exprs.push(Arc::new(PartitionSaltExpr::try_new(
+            input_schema,
+            partition_spec.clone(),
+            split_factors,
+        )?));
+    }
+
+    Ok(Partitioning::Hash(hash_exprs, output_parallelism))
+}
+
+/// Computes the salt split factor for every oversized partition of a group:
+/// `k = clamp(ceil(input_bytes / target_file_size), 1, output_parallelism)`,
+/// keeping only partitions with `k >= 2`. An empty result means no salting.
+///
+/// The estimate intentionally uses input bytes: merge-on-read drops deleted
+/// rows and compression may differ, so lanes can come out under the target
+/// size. That only affects how full the files are, never their partition
+/// purity, and matches the sizing error the unsalted rolling writer already
+/// has on its final file.
+///
+/// Salting is skipped (empty map) unless every file carries the current
+/// partition spec and a partition value: the split table is keyed by
+/// plan-time manifest partition values, which only match the runtime-computed
+/// values under that condition (an older spec's manifest value may fan out
+/// into several current-spec values). This mirrors the conservative direction
+/// of [`can_use_round_robin_for_partitioned_group`].
+fn partition_split_factors(
+    data_files: &[FileScanTask],
+    current_spec: &iceberg::spec::PartitionSpec,
+    target_file_size_bytes: u64,
+    output_parallelism: usize,
+) -> HashMap<iceberg::spec::Struct, u32> {
+    if target_file_size_bytes == 0 {
+        return HashMap::new();
+    }
+    let all_current_spec_with_partition = data_files.iter().all(|file| {
+        file.partition.is_some()
+            && file
+                .partition_spec
+                .as_deref()
+                .is_some_and(|spec| spec.spec_id() == current_spec.spec_id())
+    });
+    if !all_current_spec_with_partition {
+        return HashMap::new();
+    }
+
+    let mut bytes_per_partition: HashMap<iceberg::spec::Struct, u64> = HashMap::new();
+    for file in data_files {
+        let partition = file
+            .partition
+            .clone()
+            .expect("checked above: every file has a partition value");
+        *bytes_per_partition.entry(partition).or_default() += file.file_size_in_bytes;
+    }
+
+    let max_factor = u64::try_from(output_parallelism).unwrap_or(u64::MAX);
+    bytes_per_partition
+        .into_iter()
+        .filter_map(|(partition, bytes)| {
+            let factor = bytes.div_ceil(target_file_size_bytes).min(max_factor);
+            (factor >= 2).then_some((partition, u32::try_from(factor).unwrap_or(u32::MAX)))
+        })
+        .collect()
 }
 
 /// Returns whether round-robin is safe for a partitioned input group.
@@ -2148,6 +2233,9 @@ mod tests {
 
         use super::*;
 
+        /// Large enough that the 1 KiB test files never trigger salting.
+        const TEST_TARGET_FILE_SIZE: u64 = 1024 * 1024 * 1024;
+
         fn partitioned_table_schema() -> Arc<Schema> {
             Arc::new(
                 Schema::builder()
@@ -2202,8 +2290,17 @@ mod tests {
             partition: Option<Struct>,
             partition_spec: Option<PartitionSpecRef>,
         ) -> FileScanTask {
+            data_file_task_with_size(schema, partition, partition_spec, 1024)
+        }
+
+        fn data_file_task_with_size(
+            schema: &Arc<Schema>,
+            partition: Option<Struct>,
+            partition_spec: Option<PartitionSpecRef>,
+            file_size_in_bytes: u64,
+        ) -> FileScanTask {
             FileScanTask {
-                length: 1024,
+                length: file_size_in_bytes,
                 start: 0,
                 record_count: Some(1),
                 first_row_id: None,
@@ -2215,7 +2312,7 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 0,
-                file_size_in_bytes: 1024,
+                file_size_in_bytes,
                 partition,
                 partition_spec,
                 name_mapping: None,
@@ -2252,13 +2349,13 @@ mod tests {
 
             let ctx = build_ctx(&schema, None, vec![None]);
             assert!(matches!(
-                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap(),
                 Partitioning::RoundRobinBatch(8)
             ));
 
             let ctx = build_ctx(&schema, Some(unpartitioned_spec(&schema)), vec![None]);
             assert!(matches!(
-                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap(),
                 Partitioning::RoundRobinBatch(8)
             ));
         }
@@ -2276,7 +2373,7 @@ mod tests {
                 Some(partition_value(7)),
             ]);
             assert!(matches!(
-                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap(),
                 Partitioning::RoundRobinBatch(8)
             ));
 
@@ -2285,7 +2382,7 @@ mod tests {
                 task.partition_spec = Some(identity_spec_with_id(&schema, 0));
             }
             assert!(matches!(
-                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap(),
                 Partitioning::Hash(_, 8)
             ));
         }
@@ -2302,7 +2399,8 @@ mod tests {
             ];
 
             let ctx = build_ctx(&schema, Some(identity_spec(&schema)), partitions.clone());
-            let partitioning = build_output_partitioning(&ctx, &schema, 32).unwrap();
+            let partitioning =
+                build_output_partitioning(&ctx, &schema, 32, TEST_TARGET_FILE_SIZE).unwrap();
             match partitioning {
                 Partitioning::Hash(exprs, n) => {
                     assert_eq!(exprs.len(), 1);
@@ -2315,7 +2413,7 @@ mod tests {
             // output parallelism.
             let ctx = build_ctx(&schema, Some(identity_spec(&schema)), partitions);
             assert!(matches!(
-                build_output_partitioning(&ctx, &schema, 2).unwrap(),
+                build_output_partitioning(&ctx, &schema, 2, TEST_TARGET_FILE_SIZE).unwrap(),
                 Partitioning::Hash(_, 2)
             ));
         }
@@ -2417,6 +2515,249 @@ mod tests {
             }
             assert_eq!(seen_rows, total_rows as usize);
             assert_eq!(partition_to_stream.len(), distinct_partitions as usize);
+        }
+
+        /// Split factors are computed from per-partition input bytes: only
+        /// partitions above the target file size are split, the factor is
+        /// `ceil(bytes / target)` capped at the output parallelism, and any
+        /// old/missing spec disables salting entirely.
+        #[test]
+        fn test_split_factors_for_oversized_partitions() {
+            let schema = partitioned_table_schema();
+            let current_spec = identity_spec(&schema);
+            let target = 100u64;
+
+            let data_files = vec![
+                // Partition 1: 250 + 60 = 310 bytes -> ceil(310/100) = 4 lanes.
+                data_file_task_with_size(
+                    &schema,
+                    Some(partition_value(1)),
+                    Some(current_spec.clone()),
+                    250,
+                ),
+                data_file_task_with_size(
+                    &schema,
+                    Some(partition_value(1)),
+                    Some(current_spec.clone()),
+                    60,
+                ),
+                // Partition 2: 90 bytes -> fits one target file, not split.
+                data_file_task_with_size(
+                    &schema,
+                    Some(partition_value(2)),
+                    Some(current_spec.clone()),
+                    90,
+                ),
+                // Partition 3: 950 bytes -> ceil = 10, capped by parallelism.
+                data_file_task_with_size(
+                    &schema,
+                    Some(partition_value(3)),
+                    Some(current_spec.clone()),
+                    950,
+                ),
+            ];
+
+            let factors = partition_split_factors(&data_files, &current_spec, target, 8);
+            assert_eq!(factors.len(), 2);
+            assert_eq!(factors.get(&partition_value(1)), Some(&4));
+            assert_eq!(factors.get(&partition_value(3)), Some(&8));
+
+            // One file on an older spec disables salting for the whole group:
+            // the plan-time byte statistics may not describe current-spec
+            // partition values.
+            let mut mixed = data_files.clone();
+            mixed.push(data_file_task_with_size(
+                &schema,
+                Some(partition_value(1)),
+                Some(identity_spec_with_id(&schema, 0)),
+                500,
+            ));
+            assert!(partition_split_factors(&mixed, &current_spec, target, 8).is_empty());
+
+            // Same for a file without spec information.
+            let mut missing = data_files;
+            missing.push(data_file_task_with_size(
+                &schema,
+                Some(partition_value(1)),
+                None,
+                500,
+            ));
+            assert!(partition_split_factors(&missing, &current_spec, target, 8).is_empty());
+        }
+
+        /// A multi-partition group containing a partition larger than the
+        /// target file size gets the secondary salt hash key; groups of only
+        /// target-sized partitions keep the plain partition-value key.
+        #[test]
+        fn test_hash_with_salt_for_oversized_partition() {
+            let schema = partitioned_table_schema();
+            let current_spec = identity_spec(&schema);
+
+            let build = |sizes: Vec<(i32, u64)>| {
+                let data_files = sizes
+                    .into_iter()
+                    .map(|(p, size)| {
+                        data_file_task_with_size(
+                            &schema,
+                            Some(partition_value(p)),
+                            Some(current_spec.clone()),
+                            size,
+                        )
+                    })
+                    .collect();
+                DataFusionTaskContext::builder()
+                    .unwrap()
+                    .with_schema(schema.clone())
+                    .with_data_files(data_files)
+                    .with_partition_spec(current_spec.clone())
+                    .build()
+                    .unwrap()
+            };
+
+            let ctx = build(vec![
+                (1, 3 * TEST_TARGET_FILE_SIZE),
+                (2, TEST_TARGET_FILE_SIZE / 2),
+            ]);
+            match build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap() {
+                Partitioning::Hash(exprs, 8) => {
+                    assert_eq!(exprs.len(), 2, "expected partition + salt hash keys");
+                }
+                other => panic!("expected hash partitioning, got {other:?}"),
+            }
+
+            let ctx = build(vec![
+                (1, TEST_TARGET_FILE_SIZE / 2),
+                (2, TEST_TARGET_FILE_SIZE / 2),
+            ]);
+            match build_output_partitioning(&ctx, &schema, 8, TEST_TARGET_FILE_SIZE).unwrap() {
+                Partitioning::Hash(exprs, 8) => {
+                    assert_eq!(exprs.len(), 1, "small partitions must not be salted");
+                }
+                other => panic!("expected hash partitioning, got {other:?}"),
+            }
+        }
+
+        /// End-to-end: with the salt key, an oversized partition spreads over
+        /// more than one output stream (bounded by its split factor) while an
+        /// unsalted partition still lands on exactly one stream, and no rows
+        /// are lost.
+        #[tokio::test]
+        async fn test_salted_repartition_spreads_oversized_partition() {
+            use datafusion::arrow::array::Int32Array;
+            use datafusion::arrow::datatypes::{
+                DataType as ArrowDataType, Field, Schema as ArrowSchema,
+            };
+            use datafusion::arrow::record_batch::RecordBatch;
+            use datafusion::datasource::MemTable;
+            use datafusion::physical_plan::collect_partitioned;
+
+            use crate::executor::datafusion::iceberg_partition_expr::IcebergPartitionExpr;
+            use crate::executor::datafusion::partition_salt_expr::PartitionSaltExpr;
+
+            let schema = partitioned_table_schema();
+            let spec = identity_spec(&schema);
+
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("p", ArrowDataType::Int32, false),
+            ]));
+            let total_rows = 1200;
+            // Partition 1 is the oversized hot partition; partition 2 is cold.
+            let partition_of = |id: i32| if id % 6 == 0 { 2 } else { 1 };
+            let input_partitions = (0..4)
+                .map(|input_partition| {
+                    let ids = (input_partition..total_rows)
+                        .step_by(4)
+                        .collect::<Int32Array>();
+                    let partition_values = ids
+                        .iter()
+                        .map(|id| id.map(partition_of))
+                        .collect::<Int32Array>();
+                    vec![
+                        RecordBatch::try_new(arrow_schema.clone(), vec![
+                            Arc::new(ids),
+                            Arc::new(partition_values),
+                        ])
+                        .unwrap(),
+                    ]
+                })
+                .collect();
+
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+            let table = MemTable::try_new(arrow_schema, input_partitions).unwrap();
+            ctx.register_table("t", Arc::new(table)).unwrap();
+            let plan = ctx
+                .sql("SELECT id, p FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+
+            let split_factor = 4u32;
+            let partition_expr =
+                IcebergPartitionExpr::try_new(schema.clone(), spec.clone()).unwrap();
+            let salt_expr = PartitionSaltExpr::try_new(
+                schema,
+                spec,
+                std::collections::HashMap::from([(partition_value(1), split_factor)]),
+            )
+            .unwrap();
+
+            let output_parallelism = 8;
+            let repartitioned = repartition_output_plan(
+                plan,
+                Partitioning::Hash(
+                    vec![Arc::new(partition_expr), Arc::new(salt_expr)],
+                    output_parallelism,
+                ),
+            )
+            .unwrap();
+
+            let output = collect_partitioned(repartitioned, ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(output.len(), output_parallelism);
+
+            let mut seen_rows = 0;
+            let mut hot_streams = std::collections::HashSet::new();
+            let mut cold_streams = std::collections::HashSet::new();
+            for (stream_idx, batches) in output.into_iter().enumerate() {
+                for batch in batches {
+                    seen_rows += batch.num_rows();
+                    let p_column = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        match p_column.value(i) {
+                            1 => {
+                                hot_streams.insert(stream_idx);
+                            }
+                            2 => {
+                                cold_streams.insert(stream_idx);
+                            }
+                            other => panic!("unexpected partition value {other}"),
+                        }
+                    }
+                }
+            }
+            assert_eq!(seen_rows, total_rows as usize);
+            assert!(
+                hot_streams.len() >= 2,
+                "salted partition should spread over multiple streams, got {hot_streams:?}"
+            );
+            assert!(
+                hot_streams.len() <= split_factor as usize,
+                "salted partition must stay within its split factor, got {hot_streams:?}"
+            );
+            assert_eq!(
+                cold_streams.len(),
+                1,
+                "unsalted partition must stay on one stream, got {cold_streams:?}"
+            );
         }
     }
 }
