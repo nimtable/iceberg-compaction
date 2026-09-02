@@ -485,6 +485,7 @@ impl Compaction {
                 starting_snapshot_id: snapshot.snapshot_id(),
                 use_starting_sequence_number: true,
                 basic_schema_id: table.metadata().current_schema().schema_id(),
+                target_branch_sequence_guard: None,
             };
 
             let commit_manager = CommitManager::new(
@@ -790,6 +791,20 @@ pub struct CommitManager {
     metrics_recorder: CompactionMetricsRecorder,
     /// Schema ID for validation
     basic_schema_id: i32,
+    /// Optional monotonicity guard for publishing a source snapshot to a target branch.
+    target_branch_sequence_guard: Option<TargetBranchSequenceGuard>,
+}
+
+/// Guards a target branch from being overwritten by an older source snapshot.
+///
+/// The source snapshot sequence number is written to `snapshot_property` on every successful
+/// commit. A later commit is rejected when the target branch already records a greater source
+/// sequence number. The check and the commit share the same refreshed table metadata, so an
+/// optimistic-lock retry re-evaluates the guard before publishing.
+#[derive(Debug, Clone)]
+pub struct TargetBranchSequenceGuard {
+    /// Snapshot summary property used to persist the last published source sequence number.
+    pub snapshot_property: String,
 }
 
 /// Parameters for commit consistency validation.
@@ -800,6 +815,8 @@ pub struct CommitConsistencyParams {
     pub use_starting_sequence_number: bool,
     /// Table schema ID for validation
     pub basic_schema_id: i32,
+    /// Optional monotonicity guard for commits that publish one branch's snapshot to another.
+    pub target_branch_sequence_guard: Option<TargetBranchSequenceGuard>,
 }
 
 impl CommitManager {
@@ -828,6 +845,7 @@ impl CommitManager {
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
             metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
+            target_branch_sequence_guard: consistency_params.target_branch_sequence_guard,
         }
     }
 
@@ -982,6 +1000,7 @@ impl CommitManager {
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
             let metrics_recorder = self.metrics_recorder.clone();
+            let target_branch_sequence_guard = self.target_branch_sequence_guard.clone();
 
             async move {
                 // reload the table to get the latest state
@@ -1012,7 +1031,15 @@ impl CommitManager {
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
                             .set_check_file_existence(true);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        action.set_snapshot_properties(guarded_snapshot_properties(
+                            snapshot,
+                            table
+                                .metadata()
+                                .snapshot_for_ref(to_branch)
+                                .map(AsRef::as_ref),
+                            to_branch,
+                            target_branch_sequence_guard.as_ref(),
+                        )?);
                         action
                     } else {
                         return Err(iceberg::Error::new(
@@ -1105,6 +1132,7 @@ impl CommitManager {
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
             let metrics_recorder = self.metrics_recorder.clone();
+            let target_branch_sequence_guard = self.target_branch_sequence_guard.clone();
 
             async move {
                 // reload the table to get the latest state
@@ -1134,7 +1162,15 @@ impl CommitManager {
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
                             .set_check_file_existence(true);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        action.set_snapshot_properties(guarded_snapshot_properties(
+                            snapshot,
+                            table
+                                .metadata()
+                                .snapshot_for_ref(to_branch)
+                                .map(AsRef::as_ref),
+                            to_branch,
+                            target_branch_sequence_guard.as_ref(),
+                        )?);
                         action
                     } else {
                         return Err(iceberg::Error::new(
@@ -1232,6 +1268,54 @@ const KNOWN_SNAPSHOT_SUMMARY_KEYS: &[&str] = &[
     "total-position-deletes",
     "changed-partition-count",
 ];
+
+fn guarded_snapshot_properties(
+    source_snapshot: &Snapshot,
+    target_snapshot: Option<&Snapshot>,
+    target_branch: &str,
+    guard: Option<&TargetBranchSequenceGuard>,
+) -> std::result::Result<HashMap<String, String>, iceberg::Error> {
+    let mut properties = custom_snapshot_properties(source_snapshot);
+    let Some(guard) = guard else {
+        return Ok(properties);
+    };
+
+    let source_sequence_number = source_snapshot.sequence_number();
+    if let Some(published_sequence_number) = target_snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(&guard.snapshot_property)
+        })
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                iceberg::Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Invalid source snapshot sequence number '{value}' in property '{}' on target branch '{target_branch}'",
+                        guard.snapshot_property
+                    ),
+                )
+            })
+        })
+        .transpose()?
+        && published_sequence_number > source_sequence_number
+    {
+        return Err(iceberg::Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Refusing to publish stale source snapshot sequence {source_sequence_number} to target branch '{target_branch}', which already published sequence {published_sequence_number}"
+            ),
+        ));
+    }
+
+    properties.insert(
+        guard.snapshot_property.clone(),
+        source_sequence_number.to_string(),
+    );
+    Ok(properties)
+}
 
 /// Extracts non-standard (custom) properties from a snapshot's summary.
 fn custom_snapshot_properties(snapshot: &Snapshot) -> HashMap<String, String> {
@@ -1407,7 +1491,8 @@ mod tests {
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type, UNASSIGNED_SNAPSHOT_ID,
+        DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Snapshot, Type,
+        UNASSIGNED_SNAPSHOT_ID,
     };
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -1423,7 +1508,7 @@ mod tests {
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
@@ -1431,7 +1516,10 @@ mod tests {
     use uuid::Uuid;
 
     // Additional imports for new tests
-    use crate::compaction::{CommitManagerRetryConfig, CompactionPlan, RewriteResult};
+    use crate::compaction::{
+        CommitConsistencyParams, CommitManagerRetryConfig, CompactionPlan, RewriteResult,
+        TargetBranchSequenceGuard, guarded_snapshot_properties,
+    };
     use crate::compaction::{CompactionBuilder, CompactionPlanner};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
@@ -2711,6 +2799,212 @@ mod tests {
         assert!(
             !custom.contains_key("partitions.date=2024-01-01"),
             "Partition keys must be filtered out"
+        );
+    }
+
+    fn snapshot_with_sequence_property(
+        snapshot_id: i64,
+        sequence_number: i64,
+        property: Option<(&str, &str)>,
+    ) -> Snapshot {
+        let additional_properties = property
+            .map(|(key, value)| HashMap::from([(key.to_owned(), value.to_owned())]))
+            .unwrap_or_default();
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_timestamp_ms(snapshot_id)
+            .with_sequence_number(sequence_number)
+            .with_schema_id(0)
+            .with_manifest_list("unused-manifest-list.avro")
+            .with_summary(iceberg::spec::Summary {
+                operation: iceberg::spec::Operation::Overwrite,
+                additional_properties,
+            })
+            .build()
+    }
+
+    #[test]
+    fn test_target_branch_sequence_guard_rejects_stale_source_snapshot() {
+        let property = "test.source-snapshot-sequence-number";
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+        };
+        let source_snapshot = snapshot_with_sequence_property(10, 10, None);
+        let target_snapshot = snapshot_with_sequence_property(20, 20, Some((property, "11")));
+
+        let error = guarded_snapshot_properties(
+            &source_snapshot,
+            Some(&target_snapshot),
+            MAIN_BRANCH,
+            Some(&guard),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("Refusing to publish stale"));
+    }
+
+    #[test]
+    fn test_target_branch_sequence_guard_records_monotonic_source_sequence() {
+        let property = "test.source-snapshot-sequence-number";
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+        };
+        let source_snapshot = snapshot_with_sequence_property(20, 20, None);
+        let target_snapshot = snapshot_with_sequence_property(10, 10, Some((property, "20")));
+
+        let properties = guarded_snapshot_properties(
+            &source_snapshot,
+            Some(&target_snapshot),
+            MAIN_BRANCH,
+            Some(&guard),
+        )
+        .unwrap();
+
+        assert_eq!(properties.get(property).map(String::as_str), Some("20"));
+    }
+
+    #[test]
+    fn test_target_branch_sequence_guard_rejects_invalid_property() {
+        let property = "test.source-snapshot-sequence-number";
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+        };
+        let source_snapshot = snapshot_with_sequence_property(20, 20, None);
+        let target_snapshot =
+            snapshot_with_sequence_property(10, 10, Some((property, "not-a-number")));
+
+        let error = guarded_snapshot_properties(
+            &source_snapshot,
+            Some(&target_snapshot),
+            MAIN_BRANCH,
+            Some(&guard),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid source snapshot sequence")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_target_branch_sequence_guard_blocks_stale_commit() {
+        const INGESTION_BRANCH: &str = "ingestion";
+        const SEQUENCE_PROPERTY: &str = "test.source-snapshot-sequence-number";
+
+        let env = create_branch_test_env().await;
+        let source_files =
+            write_simple_files(&env.table, &env.warehouse_location, "source-one", 1).await;
+        let transaction = Transaction::new(&env.table);
+        let transaction = transaction
+            .fast_append()
+            .set_target_branch(INGESTION_BRANCH.to_owned())
+            .add_data_files(source_files.clone())
+            .apply(transaction)
+            .unwrap();
+        let source_one_table = transaction.commit(env.catalog.as_ref()).await.unwrap();
+        let source_one_snapshot = source_one_table
+            .metadata()
+            .snapshot_for_ref(INGESTION_BRANCH)
+            .unwrap();
+        let source_one_snapshot_id = source_one_snapshot.snapshot_id();
+        let source_one_sequence_number = source_one_snapshot.sequence_number();
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_retry_config(CommitManagerRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build();
+        let guarded_manager = |starting_snapshot_id, table: &Table| {
+            compaction.build_commit_manager(CommitConsistencyParams {
+                starting_snapshot_id,
+                use_starting_sequence_number: true,
+                basic_schema_id: table.metadata().current_schema().schema_id(),
+                target_branch_sequence_guard: Some(TargetBranchSequenceGuard {
+                    snapshot_property: SEQUENCE_PROPERTY.to_owned(),
+                }),
+            })
+        };
+
+        let first_published_table = guarded_manager(source_one_snapshot_id, &source_one_table)
+            .overwrite_files(source_files, vec![], MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_published_table
+                .metadata()
+                .snapshot_for_ref(MAIN_BRANCH)
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get(SEQUENCE_PROPERTY)
+                .map(String::as_str),
+            Some(source_one_sequence_number.to_string().as_str())
+        );
+
+        let source_two_files = write_simple_files(
+            &first_published_table,
+            &env.warehouse_location,
+            "source-two",
+            1,
+        )
+        .await;
+        let transaction = Transaction::new(&first_published_table);
+        let transaction = transaction
+            .fast_append()
+            .set_target_branch(INGESTION_BRANCH.to_owned())
+            .add_data_files(source_two_files.clone())
+            .apply(transaction)
+            .unwrap();
+        let source_two_table = transaction.commit(env.catalog.as_ref()).await.unwrap();
+        let source_two_snapshot = source_two_table
+            .metadata()
+            .snapshot_for_ref(INGESTION_BRANCH)
+            .unwrap();
+        let source_two_snapshot_id = source_two_snapshot.snapshot_id();
+        let source_two_sequence_number = source_two_snapshot.sequence_number();
+
+        let second_published_table = guarded_manager(source_two_snapshot_id, &source_two_table)
+            .overwrite_files(source_two_files.clone(), vec![], MAIN_BRANCH)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_published_table
+                .metadata()
+                .snapshot_for_ref(MAIN_BRANCH)
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get(SEQUENCE_PROPERTY)
+                .map(String::as_str),
+            Some(source_two_sequence_number.to_string().as_str())
+        );
+
+        let stale_error = guarded_manager(source_one_snapshot_id, &second_published_table)
+            .overwrite_files(vec![], source_two_files, MAIN_BRANCH)
+            .await
+            .unwrap_err();
+        assert!(
+            stale_error
+                .to_string()
+                .contains("Refusing to publish stale")
+        );
+
+        let final_table = env.catalog.load_table(&env.table_ident).await.unwrap();
+        assert_eq!(
+            final_table
+                .metadata()
+                .snapshot_for_ref(MAIN_BRANCH)
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get(SEQUENCE_PROPERTY)
+                .map(String::as_str),
+            Some(source_two_sequence_number.to_string().as_str())
         );
     }
 }
