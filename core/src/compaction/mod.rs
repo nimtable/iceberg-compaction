@@ -1043,6 +1043,7 @@ impl CommitManager {
                             .set_check_file_existence(true);
                         action.set_snapshot_properties(publication_snapshot_properties(
                             snapshot,
+                            starting_snapshot_id,
                             target_branch_snapshot_guard.as_ref(),
                         ));
                         action
@@ -1065,6 +1066,7 @@ impl CommitManager {
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
                         action.set_snapshot_properties(publication_snapshot_properties(
                             snapshot,
+                            starting_snapshot_id,
                             target_branch_snapshot_guard.as_ref(),
                         ));
                     }
@@ -1181,6 +1183,7 @@ impl CommitManager {
                             .set_check_file_existence(true);
                         action.set_snapshot_properties(publication_snapshot_properties(
                             snapshot,
+                            starting_snapshot_id,
                             target_branch_snapshot_guard.as_ref(),
                         ));
                         action
@@ -1202,6 +1205,7 @@ impl CommitManager {
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
                         action.set_snapshot_properties(publication_snapshot_properties(
                             snapshot,
+                            starting_snapshot_id,
                             target_branch_snapshot_guard.as_ref(),
                         ));
                     }
@@ -1282,6 +1286,7 @@ const KNOWN_SNAPSHOT_SUMMARY_KEYS: &[&str] = &[
     "total-equality-deletes",
     "total-position-deletes",
     "changed-partition-count",
+    SOURCE_SNAPSHOT_ID_PROPERTY,
 ];
 
 /// Standard Iceberg snapshot-summary property written by cherry-pick-style publications.
@@ -1310,14 +1315,15 @@ fn validate_target_branch_snapshot(
 }
 
 fn publication_snapshot_properties(
-    source_snapshot: &Snapshot,
+    snapshot: &Snapshot,
+    source_snapshot_id: i64,
     guard: Option<&TargetBranchSnapshotGuard>,
 ) -> HashMap<String, String> {
-    let mut properties = custom_snapshot_properties(source_snapshot);
+    let mut properties = custom_snapshot_properties(snapshot);
     if guard.is_some() {
         properties.insert(
             SOURCE_SNAPSHOT_ID_PROPERTY.to_owned(),
-            source_snapshot.snapshot_id().to_string(),
+            source_snapshot_id.to_string(),
         );
     }
     properties
