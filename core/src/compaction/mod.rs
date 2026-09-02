@@ -805,6 +805,11 @@ pub struct CommitManager {
 pub struct TargetBranchSequenceGuard {
     /// Snapshot summary property used to persist the last published source sequence number.
     pub snapshot_property: String,
+    /// Target snapshot against which the caller computed its metadata diff.
+    ///
+    /// The commit is rejected if the target branch moves before an optimistic retry. This keeps
+    /// an add/delete file diff from being applied to a different target snapshot.
+    pub expected_target_snapshot_id: Option<i64>,
 }
 
 /// Parameters for commit consistency validation.
@@ -1280,6 +1285,17 @@ fn guarded_snapshot_properties(
         return Ok(properties);
     };
 
+    let target_snapshot_id = target_snapshot.map(Snapshot::snapshot_id);
+    if target_snapshot_id != guard.expected_target_snapshot_id {
+        return Err(iceberg::Error::new(
+            ErrorKind::PreconditionFailed,
+            format!(
+                "Refusing to publish against changed target branch '{target_branch}': expected snapshot {:?}, found {target_snapshot_id:?}",
+                guard.expected_target_snapshot_id
+            ),
+        ));
+    }
+
     let source_sequence_number = source_snapshot.sequence_number();
     if let Some(published_sequence_number) = target_snapshot
         .and_then(|snapshot| {
@@ -1303,7 +1319,7 @@ fn guarded_snapshot_properties(
         && published_sequence_number > source_sequence_number
     {
         return Err(iceberg::Error::new(
-            ErrorKind::DataInvalid,
+            ErrorKind::PreconditionFailed,
             format!(
                 "Refusing to publish stale source snapshot sequence {source_sequence_number} to target branch '{target_branch}', which already published sequence {published_sequence_number}"
             ),
@@ -2826,11 +2842,12 @@ mod tests {
     #[test]
     fn test_target_branch_sequence_guard_rejects_stale_source_snapshot() {
         let property = "test.source-snapshot-sequence-number";
-        let guard = TargetBranchSequenceGuard {
-            snapshot_property: property.to_owned(),
-        };
         let source_snapshot = snapshot_with_sequence_property(10, 10, None);
         let target_snapshot = snapshot_with_sequence_property(20, 20, Some((property, "11")));
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+            expected_target_snapshot_id: Some(target_snapshot.snapshot_id()),
+        };
 
         let error = guarded_snapshot_properties(
             &source_snapshot,
@@ -2840,18 +2857,19 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
         assert!(error.to_string().contains("Refusing to publish stale"));
     }
 
     #[test]
     fn test_target_branch_sequence_guard_records_monotonic_source_sequence() {
         let property = "test.source-snapshot-sequence-number";
-        let guard = TargetBranchSequenceGuard {
-            snapshot_property: property.to_owned(),
-        };
         let source_snapshot = snapshot_with_sequence_property(20, 20, None);
         let target_snapshot = snapshot_with_sequence_property(10, 10, Some((property, "20")));
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+            expected_target_snapshot_id: Some(target_snapshot.snapshot_id()),
+        };
 
         let properties = guarded_snapshot_properties(
             &source_snapshot,
@@ -2867,12 +2885,13 @@ mod tests {
     #[test]
     fn test_target_branch_sequence_guard_rejects_invalid_property() {
         let property = "test.source-snapshot-sequence-number";
-        let guard = TargetBranchSequenceGuard {
-            snapshot_property: property.to_owned(),
-        };
         let source_snapshot = snapshot_with_sequence_property(20, 20, None);
         let target_snapshot =
             snapshot_with_sequence_property(10, 10, Some((property, "not-a-number")));
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+            expected_target_snapshot_id: Some(target_snapshot.snapshot_id()),
+        };
 
         let error = guarded_snapshot_properties(
             &source_snapshot,
@@ -2888,6 +2907,28 @@ mod tests {
                 .to_string()
                 .contains("Invalid source snapshot sequence")
         );
+    }
+
+    #[test]
+    fn test_target_branch_sequence_guard_rejects_changed_target_snapshot() {
+        let property = "test.source-snapshot-sequence-number";
+        let source_snapshot = snapshot_with_sequence_property(20, 20, None);
+        let target_snapshot = snapshot_with_sequence_property(11, 11, Some((property, "10")));
+        let guard = TargetBranchSequenceGuard {
+            snapshot_property: property.to_owned(),
+            expected_target_snapshot_id: Some(10),
+        };
+
+        let error = guarded_snapshot_properties(
+            &source_snapshot,
+            Some(&target_snapshot),
+            MAIN_BRANCH,
+            Some(&guard),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+        assert!(error.to_string().contains("changed target branch"));
     }
 
     #[tokio::test]
@@ -2926,6 +2967,10 @@ mod tests {
                 basic_schema_id: table.metadata().current_schema().schema_id(),
                 target_branch_sequence_guard: Some(TargetBranchSequenceGuard {
                     snapshot_property: SEQUENCE_PROPERTY.to_owned(),
+                    expected_target_snapshot_id: table
+                        .metadata()
+                        .snapshot_for_ref(MAIN_BRANCH)
+                        .map(|snapshot| snapshot.snapshot_id()),
                 }),
             })
         };
@@ -2968,6 +3013,7 @@ mod tests {
         let source_two_snapshot_id = source_two_snapshot.snapshot_id();
         let source_two_sequence_number = source_two_snapshot.sequence_number();
 
+        let changed_target_manager = guarded_manager(source_two_snapshot_id, &source_two_table);
         let second_published_table = guarded_manager(source_two_snapshot_id, &source_two_table)
             .overwrite_files(source_two_files.clone(), vec![], MAIN_BRANCH)
             .await
@@ -2982,6 +3028,16 @@ mod tests {
                 .get(SEQUENCE_PROPERTY)
                 .map(String::as_str),
             Some(source_two_sequence_number.to_string().as_str())
+        );
+
+        let changed_target_error = changed_target_manager
+            .overwrite_files(vec![], vec![], MAIN_BRANCH)
+            .await
+            .unwrap_err();
+        assert!(
+            changed_target_error
+                .to_string()
+                .contains("changed target branch")
         );
 
         let stale_error = guarded_manager(source_one_snapshot_id, &second_published_table)
