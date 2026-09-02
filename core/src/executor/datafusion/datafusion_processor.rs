@@ -21,8 +21,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -34,11 +34,12 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
-    DataContentType, FormatVersion, NestedField, PrimitiveType, Schema, SortOrderRef, Transform,
-    Type,
+    DataContentType, FormatVersion, NestedField, PartitionSpecRef, PrimitiveType, Schema,
+    SortOrderRef, Transform, Type,
 };
 
 use super::file_scan_task_table_provider::IcebergFileScanTaskTableProvider;
+use super::iceberg_partition_expr::IcebergPartitionExpr;
 use crate::config::CompactionExecutionConfig;
 use crate::error::{CompactionError, Result};
 use crate::executor::TableSortOrder;
@@ -174,21 +175,21 @@ impl DatafusionProcessor {
         let exec_sql = datafusion_task_ctx.exec_sql.clone();
 
         let sort_order = datafusion_task_ctx.sort_order.clone();
+        // Decide the output distribution before table registration consumes
+        // the data file scan tasks.
+        let output_partitioning =
+            build_output_partitioning(&datafusion_task_ctx, &input_schema, output_parallelism)?;
         self.register_tables(datafusion_task_ctx)?;
 
         let df = self.ctx.sql(&exec_sql).await?;
         let physical_plan = df.create_physical_plan().await?;
 
-        // Conditionally create a new physical_plan if repartitioning is needed
-        let plan_to_execute: Arc<dyn ExecutionPlan + 'static> =
-            if physical_plan.output_partitioning().partition_count() != output_parallelism {
-                Arc::new(RepartitionExec::try_new(
-                    physical_plan,
-                    Partitioning::RoundRobinBatch(output_parallelism),
-                )?)
-            } else {
-                physical_plan
-            };
+        // Repartition so the plan produces exactly the output streams the
+        // writers expect. Hash distribution must always go through a
+        // `RepartitionExec` (the scan's own partitioning is not clustered by
+        // Iceberg partition value); round-robin is only needed when the
+        // stream count differs.
+        let plan_to_execute = repartition_output_plan(physical_plan, output_partitioning)?;
 
         let schema = plan_to_execute.schema().clone();
 
@@ -217,6 +218,97 @@ impl DatafusionProcessor {
         // Use execute_stream_partitioned to execute all partitions at once
         let batches = execute_stream_partitioned(plan_to_execute, self.ctx.task_ctx())?;
         Ok((batches, input_schema))
+    }
+}
+
+/// Chooses how rows are distributed across the output writer streams.
+///
+/// For partitioned tables spanning multiple partitions, hash by the complete
+/// Iceberg partition value so each partition is written by exactly one stream.
+/// Each output stream owns a partition-aware fanout writer, so with round-robin
+/// distribution every stream sees every partition and the total number of open
+/// writers grows with `output streams x partitions` (and every partition's
+/// output is sliced into at least one file per stream). Hashing keeps the writer
+/// count at one per distinct partition in total and lets output parallelism stay
+/// at its size-based value.
+///
+/// Unpartitioned tables and single-partition groups keep round-robin
+/// distribution so they can use all output streams without unbounded writer
+/// fan-out. The latter optimization is only safe when every input file uses the
+/// current partition spec; an older spec's single manifest partition value may
+/// fan out into multiple values under the current spec. A partition expression
+/// construction failure is returned to the caller rather than silently
+/// violating partition affinity.
+fn build_output_partitioning(
+    datafusion_task_ctx: &DataFusionTaskContext,
+    input_schema: &Schema,
+    output_parallelism: usize,
+) -> Result<Partitioning> {
+    let round_robin = Partitioning::RoundRobinBatch(output_parallelism);
+
+    let Some(partition_spec) = &datafusion_task_ctx.partition_spec else {
+        return Ok(round_robin);
+    };
+    if partition_spec.is_unpartitioned() || output_parallelism <= 1 {
+        return Ok(round_robin);
+    }
+
+    let data_files = datafusion_task_ctx
+        .data_files
+        .as_deref()
+        .unwrap_or_default();
+    if can_use_round_robin_for_partitioned_group(data_files, partition_spec) {
+        return Ok(round_robin);
+    }
+
+    let expr =
+        IcebergPartitionExpr::try_new(Arc::new(input_schema.clone()), partition_spec.clone())?;
+    Ok(Partitioning::Hash(
+        vec![Arc::new(expr) as Arc<dyn PhysicalExpr>],
+        output_parallelism,
+    ))
+}
+
+/// Returns whether round-robin is safe for a partitioned input group.
+///
+/// Every input file must use the current partition spec and have the same
+/// partition value. Files using an older or unknown spec require hash
+/// repartitioning because one old partition may map to multiple current ones.
+fn can_use_round_robin_for_partitioned_group(
+    data_files: &[FileScanTask],
+    current_spec: &iceberg::spec::PartitionSpec,
+) -> bool {
+    let Some(first_file) = data_files.first() else {
+        return true;
+    };
+    let first_partition = first_file.partition.as_ref();
+
+    data_files.iter().all(|file| {
+        let uses_current_spec = file
+            .partition_spec
+            .as_deref()
+            .is_some_and(|spec| spec.spec_id() == current_spec.spec_id());
+        uses_current_spec && file.partition.as_ref() == first_partition
+    })
+}
+
+/// Installs the requested output distribution. Hash partitioning is always
+/// materialized because matching stream counts do not imply that the input is
+/// already clustered by Iceberg partition value.
+fn repartition_output_plan(
+    physical_plan: Arc<dyn ExecutionPlan>,
+    output_partitioning: Partitioning,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if matches!(&output_partitioning, Partitioning::Hash(_, _))
+        || physical_plan.output_partitioning().partition_count()
+            != output_partitioning.partition_count()
+    {
+        Ok(Arc::new(RepartitionExec::try_new(
+            physical_plan,
+            output_partitioning,
+        )?))
+    } else {
+        Ok(physical_plan)
     }
 }
 
@@ -609,6 +701,7 @@ pub struct DataFusionTaskContext {
     pub(crate) exec_sql: String,
     pub(crate) table_prefix: String,
     pub(crate) sort_order: Option<TableSortOrder>,
+    pub(crate) partition_spec: Option<PartitionSpecRef>,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -619,6 +712,7 @@ pub struct DataFusionTaskContextBuilder {
     table_prefix: String,
     sort_order: Option<TableSortOrder>,
     format_version: FormatVersion,
+    partition_spec: Option<PartitionSpecRef>,
 }
 
 impl DataFusionTaskContextBuilder {
@@ -639,6 +733,13 @@ impl DataFusionTaskContextBuilder {
 
     pub fn with_format_version(mut self, format_version: FormatVersion) -> Self {
         self.format_version = format_version;
+        self
+    }
+
+    /// Sets the table's default partition spec, enabling partition-value hash
+    /// distribution of output streams for partitioned tables.
+    pub fn with_partition_spec(mut self, partition_spec: PartitionSpecRef) -> Self {
+        self.partition_spec = Some(partition_spec);
         self
     }
 
@@ -833,6 +934,7 @@ impl DataFusionTaskContextBuilder {
             exec_sql,
             table_prefix: self.table_prefix,
             sort_order: self.sort_order,
+            partition_spec: self.partition_spec,
         })
     }
 
@@ -879,6 +981,7 @@ impl DataFusionTaskContext {
             table_prefix: "".to_owned(),
             sort_order: None,
             format_version: FormatVersion::V2,
+            partition_spec: None,
         })
     }
 
@@ -1375,6 +1478,7 @@ mod tests {
             table_prefix: "".to_owned(),
             sort_order: None,
             format_version: FormatVersion::V2,
+            partition_spec: None,
         };
 
         let equality_ids = vec![1, 2];
@@ -2036,6 +2140,284 @@ mod tests {
         for (input, expected) in quoted_identifiers {
             let result = quote_identifier(input);
             assert_eq!(result, expected);
+        }
+    }
+
+    mod output_partitioning {
+        use iceberg::spec::{Literal, PartitionSpec, PartitionSpecRef, PrimitiveLiteral, Struct};
+
+        use super::*;
+
+        fn partitioned_table_schema() -> Arc<Schema> {
+            Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        Arc::new(NestedField::required(
+                            1,
+                            "id",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                        Arc::new(NestedField::required(
+                            2,
+                            "p",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    ])
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn identity_spec_with_id(schema: &Schema, spec_id: i32) -> PartitionSpecRef {
+            Arc::new(
+                PartitionSpec::builder(schema.clone())
+                    .with_spec_id(spec_id)
+                    .add_partition_field("p", "p", Transform::Identity)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn identity_spec(schema: &Schema) -> PartitionSpecRef {
+            identity_spec_with_id(schema, 1)
+        }
+
+        fn unpartitioned_spec(schema: &Schema) -> PartitionSpecRef {
+            Arc::new(
+                PartitionSpec::builder(schema.clone())
+                    .with_spec_id(0)
+                    .build()
+                    .unwrap(),
+            )
+        }
+
+        fn partition_value(value: i32) -> Struct {
+            Struct::from_iter(vec![Some(Literal::Primitive(PrimitiveLiteral::Int(value)))])
+        }
+
+        fn data_file_task(
+            schema: &Arc<Schema>,
+            partition: Option<Struct>,
+            partition_spec: Option<PartitionSpecRef>,
+        ) -> FileScanTask {
+            FileScanTask {
+                length: 1024,
+                start: 0,
+                record_count: Some(1),
+                first_row_id: None,
+                data_sequence_number: None,
+                data_file_path: "test.parquet".to_owned(),
+                data_file_format: iceberg::spec::DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 0,
+                file_sequence_number: Some(0),
+                file_size_in_bytes: 1024,
+                partition,
+                partition_spec,
+                name_mapping: None,
+                unified_partition_type: None,
+                case_sensitive: true,
+                key_metadata: None,
+            }
+        }
+
+        fn build_ctx(
+            schema: &Arc<Schema>,
+            partition_spec: Option<PartitionSpecRef>,
+            partitions: Vec<Option<Struct>>,
+        ) -> DataFusionTaskContext {
+            let data_files = partitions
+                .into_iter()
+                .map(|p| data_file_task(schema, p, partition_spec.clone()))
+                .collect();
+            let mut builder = DataFusionTaskContext::builder()
+                .unwrap()
+                .with_schema(schema.clone())
+                .with_data_files(data_files);
+            if let Some(spec) = partition_spec {
+                builder = builder.with_partition_spec(spec);
+            }
+            builder.build().unwrap()
+        }
+
+        /// Without a partition spec (or with an unpartitioned one) the output
+        /// stays round-robin distributed.
+        #[test]
+        fn test_round_robin_without_partitioning() {
+            let schema = partitioned_table_schema();
+
+            let ctx = build_ctx(&schema, None, vec![None]);
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                Partitioning::RoundRobinBatch(8)
+            ));
+
+            let ctx = build_ctx(&schema, Some(unpartitioned_spec(&schema)), vec![None]);
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                Partitioning::RoundRobinBatch(8)
+            ));
+        }
+
+        /// A single-partition group written under the current spec keeps
+        /// round-robin so all output streams can write it in parallel. If an
+        /// input file uses an older spec, hash because that one manifest value
+        /// may fan out under the current spec.
+        #[test]
+        fn test_single_partition_group_respects_spec_evolution() {
+            let schema = partitioned_table_schema();
+            let current_spec = identity_spec(&schema);
+            let ctx = build_ctx(&schema, Some(current_spec.clone()), vec![
+                Some(partition_value(7)),
+                Some(partition_value(7)),
+            ]);
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                Partitioning::RoundRobinBatch(8)
+            ));
+
+            let mut ctx = ctx;
+            for task in ctx.data_files.as_mut().unwrap() {
+                task.partition_spec = Some(identity_spec_with_id(&schema, 0));
+            }
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 8).unwrap(),
+                Partitioning::Hash(_, 8)
+            ));
+        }
+
+        /// A partitioned table spanning multiple partitions hashes by the
+        /// Iceberg partition value while preserving size-based parallelism.
+        #[test]
+        fn test_hash_for_multi_partition_group() {
+            let schema = partitioned_table_schema();
+            let partitions = vec![
+                Some(partition_value(1)),
+                Some(partition_value(2)),
+                Some(partition_value(3)),
+            ];
+
+            let ctx = build_ctx(&schema, Some(identity_spec(&schema)), partitions.clone());
+            let partitioning = build_output_partitioning(&ctx, &schema, 32).unwrap();
+            match partitioning {
+                Partitioning::Hash(exprs, n) => {
+                    assert_eq!(exprs.len(), 1);
+                    assert_eq!(n, 32);
+                }
+                other => panic!("expected hash partitioning, got {other:?}"),
+            }
+
+            // More partitions than output parallelism: keep the size-based
+            // output parallelism.
+            let ctx = build_ctx(&schema, Some(identity_spec(&schema)), partitions);
+            assert!(matches!(
+                build_output_partitioning(&ctx, &schema, 2).unwrap(),
+                Partitioning::Hash(_, 2)
+            ));
+        }
+
+        /// End-to-end: repartitioning by `IcebergPartitionExpr` routes every
+        /// distinct partition value to exactly one output stream and preserves
+        /// all rows.
+        #[tokio::test]
+        async fn test_hash_repartition_routes_each_partition_to_one_stream() {
+            use datafusion::arrow::array::Int32Array;
+            use datafusion::arrow::datatypes::{
+                DataType as ArrowDataType, Field, Schema as ArrowSchema,
+            };
+            use datafusion::arrow::record_batch::RecordBatch;
+            use datafusion::datasource::MemTable;
+            use datafusion::physical_plan::collect_partitioned;
+
+            use crate::executor::datafusion::iceberg_partition_expr::IcebergPartitionExpr;
+
+            let schema = partitioned_table_schema();
+            let spec = identity_spec(&schema);
+
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("p", ArrowDataType::Int32, false),
+            ]));
+            let total_rows = 1000;
+            let distinct_partitions = 7;
+            let input_partitions = (0..4)
+                .map(|input_partition| {
+                    let ids = (input_partition..total_rows)
+                        .step_by(4)
+                        .collect::<Int32Array>();
+                    let partition_values = ids
+                        .iter()
+                        .map(|id| id.map(|id| id % distinct_partitions))
+                        .collect::<Int32Array>();
+                    vec![
+                        RecordBatch::try_new(arrow_schema.clone(), vec![
+                            Arc::new(ids),
+                            Arc::new(partition_values),
+                        ])
+                        .unwrap(),
+                    ]
+                })
+                .collect();
+
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+            let table = MemTable::try_new(arrow_schema, input_partitions).unwrap();
+            ctx.register_table("t", Arc::new(table)).unwrap();
+            let plan = ctx
+                .sql("SELECT id, p FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+
+            let expr = IcebergPartitionExpr::try_new(schema, spec).unwrap();
+            let output_parallelism = 4;
+            assert_eq!(
+                plan.output_partitioning().partition_count(),
+                output_parallelism
+            );
+            let repartitioned = repartition_output_plan(
+                plan,
+                Partitioning::Hash(vec![Arc::new(expr)], output_parallelism),
+            )
+            .unwrap();
+
+            let output = collect_partitioned(repartitioned, ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(output.len(), output_parallelism);
+
+            let mut seen_rows = 0;
+            let mut partition_to_stream = std::collections::HashMap::new();
+            for (stream_idx, batches) in output.into_iter().enumerate() {
+                for batch in batches {
+                    seen_rows += batch.num_rows();
+                    let p_column = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        let assigned = partition_to_stream
+                            .entry(p_column.value(i))
+                            .or_insert(stream_idx);
+                        assert_eq!(
+                            *assigned,
+                            stream_idx,
+                            "partition {} appeared in more than one output stream",
+                            p_column.value(i)
+                        );
+                    }
+                }
+            }
+            assert_eq!(seen_rows, total_rows as usize);
+            assert_eq!(partition_to_stream.len(), distinct_partitions as usize);
         }
     }
 }

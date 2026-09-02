@@ -42,6 +42,7 @@ pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
 pub mod file_scan_task_table_provider;
 pub mod iceberg_file_task_scan;
+pub mod iceberg_partition_expr;
 
 #[derive(Debug, Default)]
 pub struct DataFusionExecutor {}
@@ -73,6 +74,7 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_format_version(format_version)
             .with_input_data_files(file_group)
             .with_sort_order(sort_order.clone())
+            .with_partition_spec(partition_spec.clone())
             .build()?;
         let (batches, input_schema) = DatafusionProcessor::new(
             execution_config.clone(),
