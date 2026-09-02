@@ -26,10 +26,10 @@ anyhow = "1.0"
 iceberg = { workspace = true }
 # iceberg-catalog-memory = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
 # Main library
 iceberg-compaction-core = { path = "../core" }
 iceberg-datafusion = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 
