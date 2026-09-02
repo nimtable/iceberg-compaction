@@ -3063,4 +3063,64 @@ mod tests {
             Some(source_two_sequence_number.to_string().as_str())
         );
     }
+
+    #[tokio::test]
+    async fn test_target_branch_sequence_guard_records_watermark_without_file_changes() {
+        const SEQUENCE_PROPERTY: &str = "test.source-snapshot-sequence-number";
+
+        let env = create_branch_test_env().await;
+        let source_files =
+            write_simple_files(&env.table, &env.warehouse_location, "source", 1).await;
+        let transaction = Transaction::new(&env.table);
+        let transaction = transaction
+            .fast_append()
+            .add_data_files(source_files.clone())
+            .apply(transaction)
+            .unwrap();
+        let source_table = transaction.commit(env.catalog.as_ref()).await.unwrap();
+        let source_snapshot = source_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+        let source_snapshot_id = source_snapshot.snapshot_id();
+        let source_sequence_number = source_snapshot.sequence_number();
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_retry_config(CommitManagerRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build();
+        let committed_table = compaction
+            .build_commit_manager(CommitConsistencyParams {
+                starting_snapshot_id: source_snapshot_id,
+                use_starting_sequence_number: true,
+                basic_schema_id: source_table.metadata().current_schema().schema_id(),
+                target_branch_sequence_guard: Some(TargetBranchSequenceGuard {
+                    snapshot_property: SEQUENCE_PROPERTY.to_owned(),
+                    expected_target_snapshot_id: Some(source_snapshot_id),
+                }),
+            })
+            .overwrite_files(vec![], vec![], MAIN_BRANCH)
+            .await
+            .unwrap();
+        let committed_snapshot = committed_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap();
+
+        assert_ne!(committed_snapshot.snapshot_id(), source_snapshot_id);
+        assert_eq!(
+            committed_snapshot
+                .summary()
+                .additional_properties
+                .get(SEQUENCE_PROPERTY)
+                .map(String::as_str),
+            Some(source_sequence_number.to_string().as_str())
+        );
+        assert_eq!(
+            load_data_files_from_snapshot(&committed_table, MAIN_BRANCH).await,
+            source_files
+        );
+    }
 }
