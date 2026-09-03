@@ -1924,15 +1924,36 @@ mod tests {
         }
     }
 
-    /// An empty request must short-circuit without reading the manifest list.
+    /// An empty request must short-circuit *before* reading the manifest list, not merely
+    /// happen to return an empty result because there was nothing to match. Proven with a
+    /// snapshot whose `manifest_list` points at a path that does not exist: scanning a valid
+    /// snapshot with an empty `wanted` set would also return an empty map even without the
+    /// short-circuit, so that alone doesn't distinguish "skipped the read" from "did the read
+    /// and it happened to match nothing". If the short-circuit were removed, this call would
+    /// instead try to read the nonexistent path and return `Err`, so `.unwrap()` only survives
+    /// while the empty-request check runs first.
     #[tokio::test]
     async fn test_resolve_data_files_by_path_short_circuits_on_empty_request() {
         let env = create_test_env().await;
-        let files = write_simple_files(&env.table, &env.warehouse_location, "test", 1).await;
-        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
-        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
 
-        let resolved = resolve_data_files_by_path(snapshot, &table, &HashSet::new())
+        let bogus_snapshot = Arc::new(
+            iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(0)
+                .with_manifest_list(format!(
+                    "{}/metadata/does-not-exist-{}.avro",
+                    env.warehouse_location,
+                    Uuid::new_v4()
+                ))
+                .with_summary(iceberg::spec::Summary {
+                    operation: iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build(),
+        );
+
+        let resolved = resolve_data_files_by_path(&bogus_snapshot, &env.table, &HashSet::new())
             .await
             .unwrap();
 
@@ -1940,101 +1961,118 @@ mod tests {
     }
 
     /// A live entry and a same-path tombstone from an earlier lifecycle can coexist in one
-    /// manifest list. Deleting a file does not rewrite the *old* manifest that originally
-    /// added it -- that manifest is immutable and, empirically, the snapshot producer stops
-    /// referencing it once none of its entries are live, splitting the survivors into a
-    /// fresh manifest instead. So reproducing the shadow case means splicing the old,
-    /// no-longer-referenced manifest (still physically on disk and still perfectly valid)
-    /// back into a manifest list alongside the new delete manifest. Resolution must return
-    /// the live record and must not let the tombstone shadow it, regardless of which
-    /// manifest the concurrent scan visits first.
+    /// manifest list -- deleting a file does not rewrite the *old* manifest that originally
+    /// added it, and, empirically, the snapshot producer stops referencing that manifest once
+    /// none of its entries are live rather than editing it in place. Resolution must return
+    /// the live record and must not let the tombstone shadow it.
+    ///
+    /// Both entries are written into a *single* synthetic manifest, live first then the
+    /// tombstone, deliberately rather than mirroring the two-separate-manifests shape the doc
+    /// comment above describes. Two reasons:
+    ///
+    /// - `resolve_data_files_by_path` only re-checks its `resolved.len() == wanted.len()` early
+    ///   exit *between* manifests, not between entries within one (`core/src/compaction/mod.rs`,
+    ///   the `while let Some(manifest) = manifests.next().await` loop). With one path spread
+    ///   across two manifests loaded concurrently via `buffer_unordered`, whichever manifest
+    ///   happens to be visited first satisfies the exit on its own and the second manifest is
+    ///   never even loaded -- so with a two-manifest layout, whether the tombstone is seen at
+    ///   all (with or without the resolver's `is_alive` check) depends on manifest completion
+    ///   order, which `buffer_unordered` does not guarantee. That made an earlier version of
+    ///   this test pass 20/20 runs with the resolver's `!entry.is_alive()` check deleted, for a
+    ///   different reason than the one below.
+    /// - A single manifest's `entries()` are iterated in a fixed, sequential order with no
+    ///   concurrency involved, so putting the live entry before the tombstone makes the
+    ///   overwrite-if-both-are-inserted order deterministic: if the resolver's live/dead skip
+    ///   is ever removed, the tombstone (inserted second) unconditionally overwrites the live
+    ///   entry (inserted first) in the result map, every single run, not just probabilistically.
+    ///
+    /// The live and tombstone `DataFile`s also carry *different* `record_count`s for the same
+    /// `file_path`, so the final assertion can tell which one the resolver actually returned.
+    /// A real `overwrite_files().delete_files(...)` commit cannot produce that distinction to
+    /// test against: `ReplaceFilesOperation::delete_entries` (`transaction/replace_files.rs`)
+    /// looks up the still-live entry by path and clones *its* `DataFile` verbatim into the
+    /// tombstone (`old_entry.data_file().clone()`), so a genuine tombstone is always
+    /// byte-for-byte identical to the entry it replaces. An earlier version of this test built
+    /// both entries from a real delete commit and asserted only `file_path`, which is identical
+    /// either way regardless of the resolver's correctness. The manifest here is therefore
+    /// built directly with `ManifestWriterBuilder`, independent of any commit, so the two
+    /// entries can be given distinguishable `DataFile`s.
     #[tokio::test]
     async fn test_resolve_data_files_by_path_prefers_live_entry_over_tombstone() {
         let env = create_test_env().await;
+        let table = &env.table;
+        let schema = table.metadata().current_schema().clone();
+        let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
 
-        // Both files land in one manifest.
-        let first = write_simple_files(&env.table, &env.warehouse_location, "first", 2).await;
-        let table = append_and_commit(&env.table, env.catalog.as_ref(), first.clone()).await;
-        let live_snapshot = table
-            .metadata()
-            .snapshot_for_ref(MAIN_BRANCH)
-            .unwrap()
-            .clone();
-        let live_manifest_list = table
-            .object_cache()
-            .get_manifest_list(&live_snapshot, &table.metadata_ref())
-            .await
-            .unwrap();
-        assert_eq!(
-            live_manifest_list.entries().len(),
-            1,
-            "expected both files in a single manifest"
+        let shared_path = format!(
+            "{}/data/shadowed-{}.parquet",
+            env.warehouse_location,
+            Uuid::new_v4()
         );
-        let live_manifest = live_manifest_list.entries()[0].clone();
+        let build_data_file = |record_count: u64| {
+            iceberg::spec::DataFileBuilder::default()
+                .content(iceberg::spec::DataContentType::Data)
+                .file_path(shared_path.clone())
+                .file_format(iceberg::spec::DataFileFormat::Parquet)
+                .partition_spec_id(partition_spec.spec_id())
+                .record_count(record_count)
+                .file_size_in_bytes(1)
+                .build()
+                .unwrap()
+        };
+        // Same path, deliberately different `record_count`s -- see the doc comment above.
+        let live_data_file = build_data_file(1);
+        let tombstone_data_file = build_data_file(999);
+        assert_ne!(
+            live_data_file.record_count(),
+            tombstone_data_file.record_count(),
+            "the live and tombstone records must be distinguishable for this test to \
+             mean anything"
+        );
 
-        // Delete only `first[0]`. `first[1]` stays alive, but (per the doc comment above)
-        // the snapshot producer moves it to a fresh manifest rather than leaving the old
-        // one referenced, so `live_manifest` -- still valid on disk -- is now an orphan
-        // that still asserts `first[0]` is alive.
-        let transaction = Transaction::new(&table);
-        let overwrite = transaction
-            .overwrite_files()
-            .delete_files(vec![first[0].clone()]);
-        let tx = overwrite.apply(transaction).unwrap();
-        let table = tx.commit(env.catalog.as_ref()).await.unwrap();
-        let dead_snapshot = table
-            .metadata()
-            .snapshot_for_ref(MAIN_BRANCH)
-            .unwrap()
-            .clone();
-        let dead_manifest_list = table
-            .object_cache()
-            .get_manifest_list(&dead_snapshot, &table.metadata_ref())
-            .await
+        let manifest_path = format!(
+            "{}/metadata/shadow-{}.avro",
+            env.warehouse_location,
+            Uuid::new_v4()
+        );
+        let mut manifest_writer = iceberg::spec::ManifestWriterBuilder::new(
+            table.file_io().new_output(&manifest_path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v2_data();
+        // Live first, tombstone second -- see the doc comment above for why the order
+        // matters to this test's determinism.
+        manifest_writer
+            .add_existing_file(live_data_file.clone(), 1, 1, Some(1))
             .unwrap();
-        let mut dead_manifest = None;
-        for candidate in dead_manifest_list.entries() {
-            let manifest = candidate.load_manifest(table.file_io()).await.unwrap();
-            let has_tombstone = manifest.entries().iter().any(|entry| {
-                entry.data_file().file_path() == first[0].file_path() && !entry.is_alive()
-            });
-            if has_tombstone {
-                dead_manifest = Some(candidate.clone());
-                break;
-            }
-        }
-        let dead_manifest =
-            dead_manifest.expect("the delete commit must have written a tombstone manifest");
+        manifest_writer
+            .add_delete_file(tombstone_data_file.clone(), 1, Some(1))
+            .unwrap();
+        let mut manifest = manifest_writer.write_manifest_file().await.unwrap();
+        // Real commits assign these at commit time; stamp them explicitly since this
+        // manifest is never actually committed. Must be non-negative or the manifest list
+        // writer below rejects it as "unassigned".
+        manifest.sequence_number = 1;
+        manifest.min_sequence_number = 1;
 
-        // Splice the orphaned live manifest and the fresh delete manifest into one
-        // manifest list, wrapped in a standalone snapshot that a real commit would never
-        // produce, but that exercises exactly the historical-lifecycle shadow this fix
-        // guards against.
         let manifest_list_path = format!(
-            "{}/metadata/test-spliced-manifest-list-{}.avro",
+            "{}/metadata/test-manifest-list-{}.avro",
             env.warehouse_location,
             Uuid::new_v4()
         );
         let output_file = table.file_io().new_output(&manifest_list_path).unwrap();
         let file_writer = output_file.writer().await.unwrap();
-        let spliced_snapshot_id = dead_snapshot.snapshot_id() + 1_000_000;
-        let mut writer = iceberg::spec::ManifestListWriter::v2(
-            file_writer,
-            spliced_snapshot_id,
-            Some(dead_snapshot.snapshot_id()),
-            dead_snapshot.sequence_number() + 1,
-        );
-        writer
-            .add_manifests(vec![live_manifest, dead_manifest].into_iter())
-            .unwrap();
+        let mut writer = iceberg::spec::ManifestListWriter::v2(file_writer, 1, None, 1);
+        writer.add_manifests(std::iter::once(manifest)).unwrap();
         writer.close().await.unwrap();
 
-        let spliced_snapshot = Arc::new(
+        let snapshot = Arc::new(
             iceberg::spec::Snapshot::builder()
-                .with_snapshot_id(spliced_snapshot_id)
-                .with_parent_snapshot_id(Some(dead_snapshot.snapshot_id()))
-                .with_sequence_number(dead_snapshot.sequence_number() + 1)
-                .with_timestamp_ms(dead_snapshot.timestamp_ms())
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(0)
                 .with_manifest_list(manifest_list_path)
                 .with_summary(iceberg::spec::Summary {
                     operation: iceberg::spec::Operation::Overwrite,
@@ -2043,43 +2081,42 @@ mod tests {
                 .build(),
         );
 
-        // Guard the premise: the spliced manifest list must contain both a live entry and
-        // a tombstone for the deleted path, otherwise this test isn't exercising the
+        // Guard the premise: the manifest must contain both a live entry and a tombstone
+        // for the shared path, in that order, otherwise this test isn't exercising the
         // shadowing case at all.
         let manifest_list = table
             .object_cache()
-            .get_manifest_list(&spliced_snapshot, &table.metadata_ref())
+            .get_manifest_list(&snapshot, &table.metadata_ref())
             .await
             .unwrap();
-        let (mut saw_live, mut saw_dead) = (false, false);
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
-            for entry in manifest.entries() {
-                if entry.data_file().file_path() != first[0].file_path() {
-                    continue;
-                }
-                if entry.is_alive() {
-                    saw_live = true;
-                } else {
-                    saw_dead = true;
-                }
-            }
-        }
-        assert!(
-            saw_live && saw_dead,
-            "expected both a live entry and a tombstone for the deleted path, \
-             saw_live={saw_live} saw_dead={saw_dead}"
+        assert_eq!(manifest_list.entries().len(), 1);
+        let loaded_manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        let statuses: Vec<_> = loaded_manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry.data_file().file_path() == shared_path)
+            .map(|entry| entry.is_alive())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![true, false],
+            "expected exactly one live entry followed by one tombstone for the shared path, \
+             got is_alive()={statuses:?}"
         );
 
-        let wanted: HashSet<&str> = std::iter::once(first[0].file_path()).collect();
-        let resolved = resolve_data_files_by_path(&spliced_snapshot, &table, &wanted)
+        let wanted: HashSet<&str> = std::iter::once(shared_path.as_str()).collect();
+        let resolved = resolve_data_files_by_path(&snapshot, table, &wanted)
             .await
             .unwrap();
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(
-            resolved.get(first[0].file_path()).unwrap().file_path(),
-            first[0].file_path()
+            resolved.get(&shared_path).unwrap().record_count(),
+            live_data_file.record_count(),
+            "resolver must return the live entry's record, not the tombstone's"
         );
     }
 
