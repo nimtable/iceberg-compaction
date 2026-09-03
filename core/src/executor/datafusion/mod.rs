@@ -14,7 +14,7 @@
 * limitations under the License.
 */
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -54,11 +54,24 @@ pub struct DataFusionExecutor {
     /// two concurrent unsorted plans would otherwise hold two independent
     /// `max_memory_bytes` pools and blow the pod's memory limit (F6 OOM).
     ///
-    /// Lazily initialized from the first request whose `execution_config` sets a
-    /// budget; all plans in an invocation share the same config, so the first
-    /// config governs the shared pool for that invocation. `None` (unbudgeted)
-    /// requests keep the previous per-call, unbounded behavior.
-    shared_runtime: Mutex<Option<Arc<RuntimeEnv>>>,
+    /// `OnceLock` so every call after the first successful build is a lock-free
+    /// read. Lazily initialized from the first request whose `execution_config`
+    /// sets a budget; all plans in an invocation share the same config, so the
+    /// first config governs the shared pool for that invocation. `None`
+    /// (unbudgeted) requests keep the previous per-call, unbounded behavior.
+    ///
+    /// Only the success case is cached here: `build_spilling_runtime_env` is
+    /// fallible (e.g. it can fail to create `spill_dir`), and `OnceLock`'s
+    /// initializer must be infallible, so an `Err` is never stored — it's
+    /// returned to that caller and retried on the next call, same as before
+    /// this was split out of the `build_lock`-guarded slow path below.
+    shared_runtime: OnceLock<Arc<RuntimeEnv>>,
+    /// Serializes concurrent first-time builds so only one `RuntimeEnv` is ever
+    /// constructed even when multiple plans race on the very first call —
+    /// otherwise two racing builds could each pass the `shared_runtime.get()`
+    /// check, transiently defeating the single-pool guarantee this cache exists
+    /// for. Held only across the synchronous build, never across an `.await`.
+    build_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for DataFusionExecutor {
@@ -72,8 +85,9 @@ impl DataFusionExecutor {
     /// first use, or `None` when no memory budget is configured (unbounded,
     /// per-call behavior preserved).
     ///
-    /// Sync and holds the lock only to read/populate the cache — the guard is
-    /// dropped before the caller `.await`s, so it never crosses an await point.
+    /// Sync; the fast path (already built) never locks. The slow path (first
+    /// build) briefly holds `build_lock`, dropped before the caller `.await`s,
+    /// so it never crosses an await point.
     fn shared_runtime_env(
         &self,
         execution_config: &CompactionExecutionConfig,
@@ -82,17 +96,24 @@ impl DataFusionExecutor {
             return Ok(None);
         };
 
-        let mut guard = self.shared_runtime.lock().map_err(|e| {
-            CompactionError::Unexpected(format!("shared runtime lock poisoned: {e}"))
+        if let Some(runtime_env) = self.shared_runtime.get() {
+            return Ok(Some(runtime_env.clone()));
+        }
+
+        let _guard = self.build_lock.lock().map_err(|e| {
+            CompactionError::Unexpected(format!("shared runtime build lock poisoned: {e}"))
         })?;
-        if let Some(runtime_env) = guard.as_ref() {
+        // Someone else may have finished building while we waited for the lock.
+        if let Some(runtime_env) = self.shared_runtime.get() {
             return Ok(Some(runtime_env.clone()));
         }
         let runtime_env = datafusion_processor::build_spilling_runtime_env(
             max_memory_bytes,
             execution_config.spill_dir.as_deref(),
         )?;
-        *guard = Some(runtime_env.clone());
+        // Can only fail if another thread set it between our check and here,
+        // which `build_lock` rules out.
+        let _ = self.shared_runtime.set(runtime_env.clone());
         Ok(Some(runtime_env))
     }
 }
