@@ -2215,7 +2215,6 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 0,
-                file_sequence_number: Some(0),
                 file_size_in_bytes: 1024,
                 partition,
                 partition_spec,

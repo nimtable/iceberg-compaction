@@ -1049,7 +1049,11 @@ impl CommitManager {
 
                 let txn = Transaction::new(&table);
 
-                // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
+                // The rewrite materialized the deletes that were visible at
+                // `starting_snapshot_id`. If another writer has added deletes for one of the data
+                // files being replaced since then, those deletes are not in the new files, and
+                // removing the old data file would retire them as dangling — resurrecting the rows
+                // they deleted. `validate_from_snapshot_id` turns that into a failed commit.
                 let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
@@ -1060,7 +1064,8 @@ impl CommitManager {
                             .delete_files(delete_files)
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
-                            .set_check_file_existence(true);
+                            .set_check_file_existence(true)
+                            .validate_from_snapshot_id(starting_snapshot_id);
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                         action
                     } else {
@@ -1072,6 +1077,13 @@ impl CommitManager {
                         ));
                     }
                 } else {
+                    // No `validate_from_snapshot_id` here on purpose. This path deliberately does
+                    // *not* preserve the starting snapshot's sequence number, and that is precisely
+                    // what keeps pre-existing equality deletes applicable to the replacement files.
+                    // The validation refuses to promise anything without it rather than offer a
+                    // guarantee that only holds for position deletes, so requesting it here would
+                    // simply fail the commit. Concurrent-delete protection therefore requires
+                    // `use_starting_sequence_number`.
                     let mut action = txn
                         .rewrite_files()
                         .set_enable_delete_filter_manager(true)
@@ -1816,6 +1828,293 @@ mod tests {
                 CompactionConfigBuilder::default().build().unwrap(),
             ))
             .build()
+    }
+
+    /// Creates a V3 table, which is what deletion vectors require.
+    async fn create_v3_test_env() -> TestEnv {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table_v3".into());
+        catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(simple_table_schema())
+                    .format_version(iceberg::spec::FormatVersion::V3)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert_eq!(
+            table.metadata().format_version(),
+            iceberg::spec::FormatVersion::V3,
+            "the fixture must actually be V3, or deletion vectors are not exercised"
+        );
+
+        TestEnv {
+            temp_dir,
+            warehouse_location,
+            catalog,
+            table_ident,
+            table,
+        }
+    }
+
+    /// Writes **one** Puffin file containing a deletion vector for each entry in `deletes`, and
+    /// returns the delete-file entries that reference the blobs inside it.
+    ///
+    /// A single Puffin carrying several deletion vectors is the case that distinguishes a correct
+    /// implementation from a broken one: anything that reasons about deletion vectors by *file path*
+    /// rather than by blob will treat these as one unit, and retiring one will silently retire the
+    /// other — resurrecting rows. Note `iceberg-rust`'s own `DeletionVectorWriter` emits one Puffin
+    /// per data file, so this shape only arises from other engines and has to be built by hand.
+    async fn write_shared_puffin_deletion_vectors(
+        table: &Table,
+        warehouse_location: &str,
+        deletes: &[(String, u64)],
+    ) -> Vec<DataFile> {
+        use std::collections::HashMap as StdHashMap;
+
+        use iceberg::puffin::{CompressionCodec, PuffinWriter};
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
+        let puffin_path = format!("{warehouse_location}/data/shared-deletes.puffin");
+        // Must go through the table's own `file_io`, not a freestanding
+        // `LocalFsStorageFactory`-backed one: `MemoryCatalog`'s `file_io` is a separate virtual
+        // store keyed by path string, not real disk, so a write through any other `FileIO`
+        // instance -- even to the same-looking absolute path -- is invisible to the later scan
+        // that reads this Puffin back through `table.file_io()`.
+        let output = table.file_io().new_output(&puffin_path).unwrap();
+
+        let mut writer = PuffinWriter::new(&output, StdHashMap::new(), false)
+            .await
+            .unwrap();
+
+        for (referenced_data_file, position) in deletes {
+            let mut delete_vector = iceberg::delete_vector::DeleteVector::default();
+            delete_vector.insert(*position);
+
+            let blob = delete_vector
+                .to_puffin_blob(StdHashMap::from([
+                    ("cardinality".to_owned(), "1".to_owned()),
+                    (
+                        "referenced-data-file".to_owned(),
+                        referenced_data_file.clone(),
+                    ),
+                ]))
+                .unwrap();
+
+            writer.add(blob, CompressionCodec::None).await.unwrap();
+        }
+
+        let result = writer.close_with_metadata().await.unwrap();
+        assert_eq!(
+            result.blobs_metadata.len(),
+            deletes.len(),
+            "every deletion vector must have landed in the one Puffin file"
+        );
+
+        result
+            .blobs_metadata
+            .iter()
+            .zip(deletes)
+            .map(|(blob, (referenced_data_file, _))| {
+                DataFileBuilder::default()
+                    .content(DataContentType::PositionDeletes)
+                    .file_path(puffin_path.clone())
+                    .file_format(DataFileFormat::Puffin)
+                    .partition(Struct::empty())
+                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .record_count(1)
+                    .file_size_in_bytes(result.file_size_in_bytes)
+                    .referenced_data_file(Some(referenced_data_file.clone()))
+                    .content_offset(Some(blob.offset() as i64))
+                    .content_size_in_bytes(Some(blob.length() as i64))
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Reads the table and returns the surviving `id` values, sorted.
+    async fn surviving_ids(table: &Table) -> Vec<i32> {
+        use futures::TryStreamExt;
+
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column_by_name("id")
+                .expect("the test schema has an id column");
+            let ids_array = column.as_any().downcast_ref::<Int32Array>().unwrap();
+            ids.extend(ids_array.iter().flatten());
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// End-to-end: a deletion vector must survive compaction of a *different* data file that shares
+    /// its Puffin.
+    ///
+    /// This is the shape that separates a correct implementation from a broken one, and it is easy to
+    /// get wrong in a test. Compacting *both* data files proves nothing: both deletion vectors become
+    /// dangling, and dropping both is correct, so such a test passes even against an implementation
+    /// that condemns deletion vectors by Puffin *path*. The discriminating case is one file rewritten
+    /// and the other left alone — then the untouched file's deletion vector must stay live even though
+    /// it sits in the same Puffin as one that is now dangling.
+    ///
+    /// A small file and a large file with a threshold between them is what forces that asymmetry, and
+    /// the test asserts the asymmetry actually held rather than trusting the planner.
+    #[tokio::test]
+    async fn test_v3_compaction_keeps_a_live_deletion_vector_sharing_a_puffin() {
+        let env = create_v3_test_env().await;
+        let batch = create_test_record_batch(&simple_table_schema());
+
+        // Small file: one batch of ids 1, 2, 3 — this one gets compacted.
+        let small_files = write_simple_files(&env.table, &env.warehouse_location, "small", 1).await;
+        assert_eq!(small_files.len(), 1);
+        let small_path = small_files[0].file_path().to_owned();
+
+        // Large file: ten batches — above the threshold, so compaction leaves it alone.
+        let mut large_writer =
+            build_simple_data_writer(&env.table, env.warehouse_location.clone(), "large").await;
+        for _ in 0..10 {
+            large_writer.write(batch.clone()).await.unwrap();
+        }
+        let large_files = large_writer.close().await.unwrap();
+        assert_eq!(large_files.len(), 1);
+        let large_path = large_files[0].file_path().to_owned();
+
+        let small_size = small_files[0].file_size_in_bytes();
+        let large_size = large_files[0].file_size_in_bytes();
+        assert!(
+            small_size < large_size,
+            "fixture must produce genuinely different sizes, got {small_size} and {large_size}"
+        );
+        let small_file_threshold = (small_size + large_size) / 2;
+
+        let mut all_files = small_files;
+        all_files.extend(large_files);
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), all_files).await;
+
+        // One Puffin, two deletion vectors: position 0 of each data file.
+        let delete_files =
+            write_shared_puffin_deletion_vectors(&table, &env.warehouse_location, &[
+                (small_path.clone(), 0),
+                (large_path.clone(), 0),
+            ])
+            .await;
+        assert_eq!(
+            delete_files[0].file_path(),
+            delete_files[1].file_path(),
+            "precondition: both deletion vectors must live in the SAME Puffin, or this proves nothing"
+        );
+
+        let transaction = Transaction::new(&table);
+        let table = transaction
+            .rewrite_files()
+            .add_data_files(delete_files)
+            .apply(transaction)
+            .unwrap()
+            .commit(env.catalog.as_ref())
+            .await
+            .unwrap();
+
+        // 3 rows + 30 rows, less one deleted row from each file.
+        let before = surviving_ids(&table).await;
+        assert_eq!(before.len(), 31, "precondition: one row deleted per file");
+        assert_eq!(
+            before.iter().filter(|id| **id == 1).count(),
+            9,
+            "precondition: id=1 was deleted once from each file, leaving 9 of the 11 written"
+        );
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .planning(CompactionPlanningConfig::SmallFiles(
+                        SmallFilesConfigBuilder::default()
+                            .small_file_threshold_bytes(small_file_threshold)
+                            .build()
+                            .unwrap(),
+                    ))
+                    .build()
+                    .unwrap(),
+            ))
+            .build();
+
+        let result = compaction
+            .compact()
+            .await
+            .unwrap()
+            .expect("compaction must actually run, not decline");
+
+        // The whole point of the fixture: exactly one data file was rewritten, so the other file's
+        // deletion vector is still live while its neighbour in the same Puffin is now dangling.
+        assert_eq!(
+            result.stats.input_data_file_count, 1,
+            "exactly one *data* file must have been compacted, or the shared-Puffin asymmetry this \
+             test depends on never arose; stats {:?}",
+            result.stats
+        );
+        assert_eq!(
+            result.stats.input_position_delete_file_count, 1,
+            "the compacted file's deletion vector must have been consumed; stats {:?}",
+            result.stats
+        );
+
+        let compacted = env.catalog.load_table(&env.table_ident).await.unwrap();
+        let data_file_paths: Vec<String> = load_data_files_from_snapshot(&compacted, MAIN_BRANCH)
+            .await
+            .iter()
+            .map(|file| file.file_path().to_owned())
+            .collect();
+        assert!(
+            data_file_paths.contains(&large_path),
+            "the large file must have been left in place, got {data_file_paths:?}"
+        );
+
+        let after = surviving_ids(&compacted).await;
+        assert_eq!(
+            after.len(),
+            31,
+            "compacting the small file must not resurrect the row deleted from the large file by a \
+             deletion vector sharing the same Puffin"
+        );
+        assert_eq!(
+            after.iter().filter(|id| **id == 1).count(),
+            9,
+            "the large file's deleted id=1 must still be deleted"
+        );
     }
 
     #[tokio::test]
