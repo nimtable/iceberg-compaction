@@ -15,7 +15,7 @@
  */
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -721,40 +721,82 @@ impl Compaction {
     }
 }
 
-/// Loads all data and delete files from a snapshot.
+/// Number of manifests loaded concurrently when resolving rewrite inputs.
+///
+/// Mirrors `iceberg`'s own `DEFAULT_LOAD_CONCURRENCY_LIMIT`, which is crate-private
+/// and therefore cannot be reused here.
+const MANIFEST_LOAD_CONCURRENCY: usize = 16;
+
+/// Resolves the `wanted` data file paths to their `DataFile` records in `snapshot`.
+///
+/// # Performance
+///
+/// Entries are filtered against `wanted` *during* the manifest scan, so the resolved map
+/// is `O(wanted)` rather than `O(files in the table)`. Peak memory is that plus a bounded
+/// manifest working set, not strictly `O(wanted)`: `load_manifest` fully materializes each
+/// manifest, and `buffer_unordered` keeps up to `MANIFEST_LOAD_CONCURRENCY` decoded
+/// manifests in flight at once. The scan stops as soon as every wanted path has been
+/// found.
+///
+/// Deleted entries are skipped. A path can appear both as a live entry and as a tombstone
+/// from an earlier lifecycle, and only the live record is a valid rewrite input; skipping
+/// tombstones is also what makes the early exit safe, since it guarantees a path is only
+/// ever recorded from a live entry.
 ///
 /// # Errors
 ///
 /// Returns error if manifest list or manifest loading fails.
-async fn get_all_files_from_snapshot(
+async fn resolve_data_files_by_path(
     snapshot: &Arc<Snapshot>,
     table: &Table,
-) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
+    wanted: &HashSet<&str>,
+) -> Result<HashMap<String, DataFile>> {
+    use futures::StreamExt;
+
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let manifest_list = table
         .object_cache()
         .get_manifest_list(snapshot, &table.metadata_ref())
         .await?;
 
-    let mut data_file = vec![];
-    let mut delete_file = vec![];
-    for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(table.file_io()).await?;
-        let (entry, _) = a.into_parts();
-        for i in entry {
-            match i.content_type() {
-                iceberg::spec::DataContentType::Data => {
-                    data_file.push(i.data_file().clone());
-                }
-                iceberg::spec::DataContentType::EqualityDeletes => {
-                    delete_file.push(i.data_file().clone());
-                }
-                iceberg::spec::DataContentType::PositionDeletes => {
-                    delete_file.push(i.data_file().clone());
-                }
+    // The manifest futures deliberately own their inputs rather than borrowing. Borrowed
+    // futures inside `buffer_unordered` make the enclosing future's `Send` bound
+    // higher-ranked, which rustc cannot discharge, and that surfaces as a confusing
+    // "`Send` is not general enough" error in downstream callers that spawn compaction.
+    // Cloning is cheap: `FileIO` is a handle, and this list is one entry per manifest, not
+    // per data file.
+    let file_io = table.file_io().clone();
+    let manifest_files = manifest_list.entries().to_vec();
+    let mut manifests = futures::stream::iter(manifest_files)
+        .map(|manifest_file| {
+            let file_io = file_io.clone();
+            async move { manifest_file.load_manifest(&file_io).await }
+        })
+        .buffer_unordered(MANIFEST_LOAD_CONCURRENCY);
+
+    let mut resolved: HashMap<String, DataFile> = HashMap::with_capacity(wanted.len());
+    while let Some(manifest) = manifests.next().await {
+        let manifest = manifest?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() || entry.content_type() != iceberg::spec::DataContentType::Data {
+                continue;
             }
+            let path = entry.data_file().file_path();
+            if !wanted.contains(path) {
+                continue;
+            }
+            resolved.insert(path.to_owned(), entry.data_file().clone());
+        }
+
+        if resolved.len() == wanted.len() {
+            break;
         }
     }
-    Ok((data_file, delete_file))
+
+    Ok(resolved)
 }
 
 /// Configuration for commit retry behavior with exponential backoff.
@@ -872,19 +914,10 @@ impl CommitManager {
             })?;
 
         // --- Batch collect input files from all plans ---
-        use std::collections::HashMap;
 
-        // 1. Load all files from snapshot once
-        let (all_data_files, _all_delete_files) =
-            get_all_files_from_snapshot(snapshot, &table).await?;
-
-        // 2. Build efficient path -> DataFile index (only for data files)
-        let data_file_index: HashMap<&str, &DataFile> =
-            all_data_files.iter().map(|f| (f.file_path(), f)).collect();
-
-        // 3. Collect rewritten data files (to be replaced) from plans using the index
-        // Note: Only data files are collected, delete files are excluded
-        let rewritten_data_files: Vec<DataFile> = rewrite_results
+        // 1. Gather the input paths this batch replaces, in plan order.
+        //    Note: Only data files are collected, delete files are excluded.
+        let input_paths: Vec<&str> = rewrite_results
             .iter()
             .flat_map(|rr| {
                 rr.plan
@@ -893,7 +926,20 @@ impl CommitManager {
                     .iter()
                     .map(|task| task.data_file_path.as_str())
             })
-            .filter_map(|path| data_file_index.get(path).map(|&f| f.clone()))
+            .collect();
+
+        // 2. Resolve just those paths against the snapshot. Scanning for the batch's own
+        //    inputs keeps this `O(batch)`; loading the whole snapshot made commit memory
+        //    scale with total table size and OOM-killed large tables.
+        let resolved =
+            resolve_data_files_by_path(snapshot, &table, &input_paths.iter().copied().collect())
+                .await?;
+
+        // 3. Collect rewritten data files (to be replaced), preserving plan order and
+        //    silently skipping paths that are no longer present in the snapshot.
+        let rewritten_data_files: Vec<DataFile> = input_paths
+            .iter()
+            .filter_map(|path| resolved.get(*path).cloned())
             .collect();
 
         // 4. Collect added data files (newly written) from all plans
@@ -1401,7 +1447,7 @@ impl CompactionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1435,7 +1481,7 @@ mod tests {
     use crate::compaction::{
         CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
     };
-    use crate::compaction::{CompactionBuilder, CompactionPlanner};
+    use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
         SmallFilesConfigBuilder,
@@ -1827,6 +1873,251 @@ mod tests {
 
         let result = compaction.compact().await.unwrap().unwrap();
         assert_compaction_stats(&result.stats, initial_file_count, false);
+    }
+
+    /// Resolution must return exactly the requested paths, gathering them from across
+    /// multiple manifests and ignoring every other file in the snapshot. This is the
+    /// property that keeps commit memory proportional to the batch instead of to the
+    /// whole table.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_returns_only_requested_paths() {
+        let env = create_test_env().await;
+
+        // Two appends, so the snapshot spans more than one manifest.
+        let first = write_simple_files(&env.table, &env.warehouse_location, "first", 2).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), first.clone()).await;
+        let second = write_simple_files(&table, &env.warehouse_location, "second", 2).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), second.clone()).await;
+
+        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+
+        // Guard the premise of this test: the resolver must be crossing manifest boundaries.
+        let manifest_count = table
+            .object_cache()
+            .get_manifest_list(snapshot, &table.metadata_ref())
+            .await
+            .unwrap()
+            .entries()
+            .len();
+        assert!(
+            manifest_count >= 2,
+            "expected the snapshot to span multiple manifests, got {manifest_count}"
+        );
+
+        // One file from each manifest, plus a path that is not in the table at all.
+        let requested = [
+            first[0].file_path().to_owned(),
+            second[0].file_path().to_owned(),
+        ];
+        let mut wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        wanted.insert("s3://nonexistent/file.parquet");
+
+        let resolved = resolve_data_files_by_path(snapshot, &table, &wanted)
+            .await
+            .unwrap();
+
+        // The unknown path is dropped rather than erroring, and the real paths each
+        // resolve to their own record.
+        assert_eq!(resolved.len(), 2);
+        for path in &requested {
+            assert_eq!(resolved.get(path).unwrap().file_path(), path);
+        }
+    }
+
+    /// An empty request must short-circuit *before* reading the manifest list, not merely
+    /// happen to return an empty result because there was nothing to match. Proven with a
+    /// snapshot whose `manifest_list` points at a path that does not exist: scanning a valid
+    /// snapshot with an empty `wanted` set would also return an empty map even without the
+    /// short-circuit, so that alone doesn't distinguish "skipped the read" from "did the read
+    /// and it happened to match nothing". If the short-circuit were removed, this call would
+    /// instead try to read the nonexistent path and return `Err`, so `.unwrap()` only survives
+    /// while the empty-request check runs first.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_short_circuits_on_empty_request() {
+        let env = create_test_env().await;
+
+        let bogus_snapshot = Arc::new(
+            iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(0)
+                .with_manifest_list(format!(
+                    "{}/metadata/does-not-exist-{}.avro",
+                    env.warehouse_location,
+                    Uuid::new_v4()
+                ))
+                .with_summary(iceberg::spec::Summary {
+                    operation: iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build(),
+        );
+
+        let resolved = resolve_data_files_by_path(&bogus_snapshot, &env.table, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert!(resolved.is_empty());
+    }
+
+    /// A live entry and a same-path tombstone from an earlier lifecycle can coexist in one
+    /// manifest list -- deleting a file does not rewrite the *old* manifest that originally
+    /// added it, and, empirically, the snapshot producer stops referencing that manifest once
+    /// none of its entries are live rather than editing it in place. Resolution must return
+    /// the live record and must not let the tombstone shadow it.
+    ///
+    /// Both entries are written into a *single* synthetic manifest, live first then the
+    /// tombstone, deliberately rather than mirroring the two-separate-manifests shape the doc
+    /// comment above describes. Two reasons:
+    ///
+    /// - `resolve_data_files_by_path` only re-checks its `resolved.len() == wanted.len()` early
+    ///   exit *between* manifests, not between entries within one (`core/src/compaction/mod.rs`,
+    ///   the `while let Some(manifest) = manifests.next().await` loop). With one path spread
+    ///   across two manifests loaded concurrently via `buffer_unordered`, whichever manifest
+    ///   happens to be visited first satisfies the exit on its own and the second manifest is
+    ///   never even loaded -- so with a two-manifest layout, whether the tombstone is seen at
+    ///   all (with or without the resolver's `is_alive` check) depends on manifest completion
+    ///   order, which `buffer_unordered` does not guarantee. That made an earlier version of
+    ///   this test pass 20/20 runs with the resolver's `!entry.is_alive()` check deleted, for a
+    ///   different reason than the one below.
+    /// - A single manifest's `entries()` are iterated in a fixed, sequential order with no
+    ///   concurrency involved, so putting the live entry before the tombstone makes the
+    ///   overwrite-if-both-are-inserted order deterministic: if the resolver's live/dead skip
+    ///   is ever removed, the tombstone (inserted second) unconditionally overwrites the live
+    ///   entry (inserted first) in the result map, every single run, not just probabilistically.
+    ///
+    /// The live and tombstone `DataFile`s also carry *different* `record_count`s for the same
+    /// `file_path`, so the final assertion can tell which one the resolver actually returned.
+    /// A real `overwrite_files().delete_files(...)` commit cannot produce that distinction to
+    /// test against: `ReplaceFilesOperation::delete_entries` (`transaction/replace_files.rs`)
+    /// looks up the still-live entry by path and clones *its* `DataFile` verbatim into the
+    /// tombstone (`old_entry.data_file().clone()`), so a genuine tombstone is always
+    /// byte-for-byte identical to the entry it replaces. An earlier version of this test built
+    /// both entries from a real delete commit and asserted only `file_path`, which is identical
+    /// either way regardless of the resolver's correctness. The manifest here is therefore
+    /// built directly with `ManifestWriterBuilder`, independent of any commit, so the two
+    /// entries can be given distinguishable `DataFile`s.
+    #[tokio::test]
+    async fn test_resolve_data_files_by_path_prefers_live_entry_over_tombstone() {
+        let env = create_test_env().await;
+        let table = &env.table;
+        let schema = table.metadata().current_schema().clone();
+        let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+        let shared_path = format!(
+            "{}/data/shadowed-{}.parquet",
+            env.warehouse_location,
+            Uuid::new_v4()
+        );
+        let build_data_file = |record_count: u64| {
+            iceberg::spec::DataFileBuilder::default()
+                .content(iceberg::spec::DataContentType::Data)
+                .file_path(shared_path.clone())
+                .file_format(iceberg::spec::DataFileFormat::Parquet)
+                .partition_spec_id(partition_spec.spec_id())
+                .record_count(record_count)
+                .file_size_in_bytes(1)
+                .build()
+                .unwrap()
+        };
+        // Same path, deliberately different `record_count`s -- see the doc comment above.
+        let live_data_file = build_data_file(1);
+        let tombstone_data_file = build_data_file(999);
+        assert_ne!(
+            live_data_file.record_count(),
+            tombstone_data_file.record_count(),
+            "the live and tombstone records must be distinguishable for this test to \
+             mean anything"
+        );
+
+        let manifest_path = format!(
+            "{}/metadata/shadow-{}.avro",
+            env.warehouse_location,
+            Uuid::new_v4()
+        );
+        let mut manifest_writer = iceberg::spec::ManifestWriterBuilder::new(
+            table.file_io().new_output(&manifest_path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v2_data();
+        // Live first, tombstone second -- see the doc comment above for why the order
+        // matters to this test's determinism.
+        manifest_writer
+            .add_existing_file(live_data_file.clone(), 1, 1, Some(1))
+            .unwrap();
+        manifest_writer
+            .add_delete_file(tombstone_data_file.clone(), 1, Some(1))
+            .unwrap();
+        let mut manifest = manifest_writer.write_manifest_file().await.unwrap();
+        // Real commits assign these at commit time; stamp them explicitly since this
+        // manifest is never actually committed. Must be non-negative or the manifest list
+        // writer below rejects it as "unassigned".
+        manifest.sequence_number = 1;
+        manifest.min_sequence_number = 1;
+
+        let manifest_list_path = format!(
+            "{}/metadata/test-manifest-list-{}.avro",
+            env.warehouse_location,
+            Uuid::new_v4()
+        );
+        let output_file = table.file_io().new_output(&manifest_list_path).unwrap();
+        let file_writer = output_file.writer().await.unwrap();
+        let mut writer = iceberg::spec::ManifestListWriter::v2(file_writer, 1, None, 1);
+        writer.add_manifests(std::iter::once(manifest)).unwrap();
+        writer.close().await.unwrap();
+
+        let snapshot = Arc::new(
+            iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(0)
+                .with_manifest_list(manifest_list_path)
+                .with_summary(iceberg::spec::Summary {
+                    operation: iceberg::spec::Operation::Overwrite,
+                    additional_properties: HashMap::new(),
+                })
+                .build(),
+        );
+
+        // Guard the premise: the manifest must contain both a live entry and a tombstone
+        // for the shared path, in that order, otherwise this test isn't exercising the
+        // shadowing case at all.
+        let manifest_list = table
+            .object_cache()
+            .get_manifest_list(&snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        assert_eq!(manifest_list.entries().len(), 1);
+        let loaded_manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        let statuses: Vec<_> = loaded_manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry.data_file().file_path() == shared_path)
+            .map(|entry| entry.is_alive())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![true, false],
+            "expected exactly one live entry followed by one tombstone for the shared path, \
+             got is_alive()={statuses:?}"
+        );
+
+        let wanted: HashSet<&str> = std::iter::once(shared_path.as_str()).collect();
+        let resolved = resolve_data_files_by_path(&snapshot, table, &wanted)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved.get(&shared_path).unwrap().record_count(),
+            live_data_file.record_count(),
+            "resolver must return the live entry's record, not the tombstone's"
+        );
     }
 
     #[tokio::test]
