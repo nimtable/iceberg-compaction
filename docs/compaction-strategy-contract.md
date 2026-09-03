@@ -17,6 +17,7 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - `file group scope`: the boundary used before applying the grouping strategy; `Partition` keeps groups within one Iceberg partition, while `Table` lets the strategy group all selected files together
 - `group gating`: group-level thresholds used to avoid frequent small rewrites; these thresholds are applied after `file group scope` and `grouping_strategy`
 - `fixed-point rewrite`: for the input files rewritten in the current run, the newly committed snapshot should cause them to leave that strategy's candidate set
+- `sequence bound`: an optional inclusive `max_file_sequence_number` supplied by the caller; only files with `file_sequence_number <= bound` belong to that planning attempt
 
 ## Strategy Model
 
@@ -46,6 +47,21 @@ This document describes the current design boundaries of `Full`, `SmallFiles`, `
 - Explicit `Table` scope is allowed for manual planning, but group gating then evaluates groups across all selected partitions instead of per partition
 - May use `group_filters` for group gating
 - Must be fixed-point: rewritten delete-heavy input files should leave the candidate set in the newly committed snapshot
+
+### Sequence-Bounded Planning
+
+All four planning configurations (`Full`, `SmallFiles`, `FilesWithDeletes`, and
+`Auto`) accept an optional `max_file_sequence_number`. When it is set:
+
+- the planner validates that every scanned data file has a `file_sequence_number`;
+  missing metadata is an explicit planning error
+- the inclusive sequence filter runs before strategy filters, grouping, and group
+  gating
+- `Auto` applies the sequence bound before its `small OR delete-heavy` candidate
+  filter
+
+The planner does not retain round state. Callers that need a retryable compaction
+round should keep the boundary and pass it unchanged on every planning attempt.
 
 ## `Auto`
 

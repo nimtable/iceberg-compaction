@@ -155,6 +155,10 @@ pub struct SmallFilesConfig {
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
 
+    /// Inclusive upper bound for file sequence numbers selected by this planning attempt.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
+
     /// Optional filters to apply after grouping.
     ///
     /// Groups that don't meet these criteria will be excluded from compaction.
@@ -214,6 +218,10 @@ pub struct FullCompactionConfig {
     /// full-table compaction must be planned as one file group.
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
+
+    /// Inclusive upper bound for file sequence numbers selected by this planning attempt.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
 }
 
 impl Default for FullCompactionConfig {
@@ -263,6 +271,10 @@ pub struct FilesWithDeletesConfig {
     /// all selected partitions instead of independently per partition.
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
+
+    /// Inclusive upper bound for file sequence numbers selected by this planning attempt.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
 
     /// Minimum number of delete files required to trigger compaction.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
@@ -325,6 +337,10 @@ pub struct AutoCompactionConfig {
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
 
+    /// Inclusive upper bound for file sequence numbers selected by this planning attempt.
+    #[builder(default)]
+    pub max_file_sequence_number: Option<i64>,
+
     #[builder(default, setter(strip_option))]
     pub group_filters: Option<GroupFilters>,
 }
@@ -358,6 +374,16 @@ pub enum CompactionPlanningConfig {
 }
 
 impl CompactionPlanningConfig {
+    /// Returns the inclusive file sequence bound for this planning attempt.
+    pub fn max_file_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::Auto(c) => c.max_file_sequence_number,
+            Self::SmallFiles(c) => c.max_file_sequence_number,
+            Self::Full(c) => c.max_file_sequence_number,
+            Self::FilesWithDeletes(c) => c.max_file_sequence_number,
+        }
+    }
+
     /// Returns target file size in bytes for the strategy.
     pub fn target_file_size_bytes(&self) -> u64 {
         match self {
@@ -599,21 +625,25 @@ mod tests {
     }
 
     #[test]
-    fn test_planning_configs_default_to_partition_file_group_scope() {
+    fn test_planning_config_defaults() {
         let small_files = SmallFilesConfig::default();
         assert_eq!(small_files.file_group_scope, FileGroupScope::Partition);
+        assert_eq!(small_files.max_file_sequence_number, None);
 
         let full = FullCompactionConfig::default();
         assert_eq!(full.file_group_scope, FileGroupScope::Partition);
+        assert_eq!(full.max_file_sequence_number, None);
 
         let files_with_deletes = FilesWithDeletesConfig::default();
         assert_eq!(
             files_with_deletes.file_group_scope,
             FileGroupScope::Partition
         );
+        assert_eq!(files_with_deletes.max_file_sequence_number, None);
 
         let auto = AutoCompactionConfig::default();
         assert_eq!(auto.file_group_scope, FileGroupScope::Partition);
+        assert_eq!(auto.max_file_sequence_number, None);
     }
 
     #[test]
