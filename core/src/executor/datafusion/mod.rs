@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion_processor::{DataFusionTaskContext, DatafusionProcessor};
 use futures::StreamExt;
 use futures::future::try_join_all;
@@ -36,6 +37,7 @@ use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
 use crate::CompactionError;
+use crate::common::CompactionMetricsRecorder;
 use crate::config::CompactionExecutionConfig;
 use crate::error::Result;
 pub mod datafusion_processor;
@@ -86,8 +88,8 @@ impl CompactionExecutor for DataFusionExecutor {
         let arc_input_schema = Arc::new(input_schema);
         let mut futures = Vec::with_capacity(executor_parallelism);
 
-        // build iceberg writer for each partition
-        for mut batch_stream in batches {
+        // Consume each output partition concurrently.
+        for batch_stream in batches {
             let location_generator = location_generator.clone();
             let schema = arc_input_schema.clone();
             let execution_config = execution_config.clone();
@@ -97,50 +99,21 @@ impl CompactionExecutor for DataFusionExecutor {
 
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
-            > = tokio::spawn(async move {
-                let mut data_file_writer = build_iceberg_data_file_writer(
-                    execution_config.data_file_prefix.clone(),
-                    location_generator,
-                    schema,
-                    file_io,
-                    partition_spec,
-                    sort_order_id,
-                    execution_config,
-                )?;
-
-                // Process each record batch with metrics
-                let mut fetch_batch_start = Instant::now();
-                while let Some(batch_result) = batch_stream.as_mut().next().await {
-                    if let Some(metrics_recorder) = &metrics_recorder {
-                        metrics_recorder.record_datafusion_batch_fetch_duration(
-                            fetch_batch_start.elapsed().as_millis() as f64,
-                        );
-                    }
-
-                    let batch = batch_result?;
-
-                    let record_count = batch.num_rows() as u64;
-                    let batch_bytes = batch.get_array_memory_size() as u64;
-
-                    // Write the batch
-                    let write_start = Instant::now();
-                    data_file_writer.write(batch).await?;
-                    if let Some(metrics_recorder) = &metrics_recorder {
-                        metrics_recorder.record_datafusion_batch_write_duration(
-                            write_start.elapsed().as_millis() as f64,
-                        );
-                    }
-
-                    // Record detailed batch stats
-                    if let Some(metrics_recorder) = &metrics_recorder {
-                        metrics_recorder.record_batch_stats(record_count, batch_bytes);
-                    }
-
-                    fetch_batch_start = Instant::now(); // Reset for next batch
-                }
-
-                Ok(data_file_writer.close().await?)
-            });
+            > = tokio::spawn(write_batch_stream(
+                batch_stream,
+                move || {
+                    build_iceberg_data_file_writer(
+                        execution_config.data_file_prefix.clone(),
+                        location_generator,
+                        schema,
+                        file_io,
+                        partition_spec,
+                        sort_order_id,
+                        execution_config,
+                    )
+                },
+                metrics_recorder,
+            ));
             futures.push(future);
         }
 
@@ -160,6 +133,54 @@ impl CompactionExecutor for DataFusionExecutor {
             stats,
         })
     }
+}
+
+async fn write_batch_stream<F>(
+    mut batch_stream: SendableRecordBatchStream,
+    writer_factory: F,
+    metrics_recorder: Option<CompactionMetricsRecorder>,
+) -> Result<Vec<DataFile>>
+where
+    F: FnOnce() -> Result<Box<dyn IcebergWriter>> + Send + 'static,
+{
+    let fetch_batch_start = Instant::now();
+    let Some(first_batch) = batch_stream.as_mut().next().await else {
+        return Ok(Vec::new());
+    };
+    if let Some(metrics_recorder) = &metrics_recorder {
+        metrics_recorder
+            .record_datafusion_batch_fetch_duration(fetch_batch_start.elapsed().as_millis() as f64);
+    }
+
+    let mut batch = first_batch?;
+    let mut writer = writer_factory()?;
+
+    loop {
+        let record_count = batch.num_rows() as u64;
+        let batch_bytes = batch.get_array_memory_size() as u64;
+
+        let write_start = Instant::now();
+        writer.write(batch).await?;
+        if let Some(metrics_recorder) = &metrics_recorder {
+            metrics_recorder
+                .record_datafusion_batch_write_duration(write_start.elapsed().as_millis() as f64);
+            metrics_recorder.record_batch_stats(record_count, batch_bytes);
+        }
+
+        let fetch_batch_start = Instant::now();
+        let Some(next_batch) = batch_stream.as_mut().next().await else {
+            break;
+        };
+        if let Some(metrics_recorder) = &metrics_recorder {
+            metrics_recorder.record_datafusion_batch_fetch_duration(
+                fetch_batch_start.elapsed().as_millis() as f64,
+            );
+        }
+
+        batch = next_batch?;
+    }
+
+    Ok(writer.close().await?)
 }
 
 pub fn build_iceberg_data_file_writer(
@@ -222,4 +243,31 @@ pub fn build_iceberg_data_file_writer(
     );
 
     Ok(Box::new(iceberg_task_writer))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::Schema as ArrowSchema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_stream_does_not_build_writer() {
+        let batch_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(ArrowSchema::empty()),
+            stream::empty(),
+        ));
+
+        let data_files = write_batch_stream(
+            batch_stream,
+            || unreachable!("empty stream must not build a writer"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(data_files.is_empty());
+    }
 }
