@@ -26,7 +26,8 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::{
     BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
-    CompactionPlanningConfig, GroupFiltersBuilder, GroupingStrategy, SmallFilesConfigBuilder,
+    CompactionPlanningConfig, FilesWithDeletesConfigBuilder, GroupFiltersBuilder, GroupingStrategy,
+    SmallFilesConfigBuilder,
 };
 
 use crate::docker_compose::get_rest_catalog;
@@ -574,6 +575,165 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
     );
 
     // Clean up: try to drop the table and namespace
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+/// Compacts a table whose position-delete `file_path` column exceeds Arrow's 32-bit offsets.
+///
+/// This is the production failure reproduced end to end against a real catalog, real parquet and
+/// real delete files. `libertymutual.consumer_resource_table` carried 33,741,364 position deletes
+/// at ~165 bytes of S3 URI each -- 5.20GiB in one `Utf8` column, 2.6x over `i32::MAX` -- and
+/// `rewrite-data-files` died with `Arrow error: Offset overflow error` before writing a row.
+///
+/// `HashJoinExec` concatenates its whole build side into a single `RecordBatch`, and on the
+/// merge-on-read anti-join that build side is the position-delete table. The limit is therefore
+/// reached by `delete_rows x path_length / build_partitions`, and neither more memory nor a
+/// smaller compaction group avoids it: the group budget sizes the DATA side, while the overflow
+/// is on the DELETE side.
+///
+/// Three things about the setup are load-bearing:
+///
+///  * **`max_input_parallelism` is pinned to 1.** It drives `target_partitions`, which splits the
+///    build side. The crate default is `available_parallelism() * 4`, so on a developer machine
+///    the build side is spread ~40 ways and NEVER approaches the limit -- an earlier version of
+///    this test passed against the unfixed code for exactly that reason. Pinning it also stops the
+///    outcome depending on the host's core count, which would make this test pass or fail by
+///    accident. Production pins this to 2 and still overflows, because its 5.20GiB total exceeds
+///    the limit even halved.
+///  * **The path is made long rather than the row count huge.** The limit is on bytes, so padding
+///    the namespace and table names -- which is what a real warehouse path is mostly made of --
+///    reaches the same byte count with far fewer rows, and far less generation time.
+///  * **The size is asserted from MEASURED values**, not from the parameters above. The generator
+///    emits `data_file_row_count / position_delete_row_count + 1` as a rate, not a count, so the
+///    delete rows produced are not the number asked for. Deriving the assertion from the files
+///    actually generated is what keeps this test honest if those knobs ever change meaning.
+///
+/// Verified to FAIL without the dictionary encoding (`Compaction plan execution failed: ... Arrow
+/// error: Offset overflow error`) and to pass with it.
+///
+/// Heavy by nature -- it must cross 2GiB to mean anything -- so it is `#[ignore]`d. Run with:
+///   `cargo test -p iceberg-compaction-integration-tests position_delete_path_over_i32 -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "generates >2GiB of position-delete paths; run explicitly"]
+async fn test_compaction_survives_position_delete_path_over_i32_offsets() {
+    use iceberg::spec::DataContentType;
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("payload", PrimitiveType::String)
+        .build();
+
+    // Padded so each data-file URI is long. Kept under 255 chars per identifier so catalog
+    // backends storing names in a VARCHAR(255) column do not reject them.
+    let namespace = format!("ns_{}", "x".repeat(240));
+    let table_name = format!("tbl_{}", "y".repeat(240));
+
+    let table = setup_table(catalog.clone(), &namespace, &table_name, &schema, None).await;
+
+    let data_file_num = 20;
+    let data_file_row_count = 500_000;
+
+    let writer_config = WriterConfig::new(&table, None);
+    let file_generator_config = FileGeneratorConfig::new()
+        .with_data_file_num(data_file_num)
+        .with_data_file_row_count(data_file_row_count)
+        // A RATE divisor, not a count -- see the doc comment. Equal to the row count means
+        // "delete every other row".
+        .with_position_delete_row_count(data_file_row_count);
+
+    let mut file_generator = FileGenerator::new(
+        file_generator_config,
+        Arc::new(schema.clone()),
+        table.metadata().default_partition_spec().clone(),
+        writer_config,
+        vec![],
+    )
+    .expect("Failed to create file generator");
+
+    let commit_data_files = file_generator
+        .generate()
+        .await
+        .expect("Failed to generate test data files");
+
+    // Measure what was actually produced, and only then decide whether this test means anything.
+    let delete_rows: u64 = commit_data_files
+        .iter()
+        .filter(|f| f.content_type() == DataContentType::PositionDeletes)
+        .map(|f| f.record_count())
+        .sum();
+    let max_path_len = commit_data_files
+        .iter()
+        .filter(|f| f.content_type() == DataContentType::Data)
+        .map(|f| f.file_path().len())
+        .max()
+        .expect("expected at least one data file");
+    let build_side_bytes = delete_rows as usize * max_path_len;
+
+    println!(
+        "position-delete build side: {delete_rows} rows x {max_path_len}B path = {build_side_bytes} bytes \
+         ({:.2} GiB); i32::MAX = {}",
+        build_side_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        i32::MAX
+    );
+    assert!(
+        build_side_bytes > i32::MAX as usize,
+        "test does not cross i32::MAX ({build_side_bytes} bytes) -- it would pass against the \
+         unfixed code and prove nothing; raise data_file_num or pad the identifiers further"
+    );
+
+    let txn = Transaction::new(&table);
+    let fast_append_action = txn.fast_append().add_data_files(commit_data_files);
+    let _table_with_data = fast_append_action
+        .apply(txn)
+        .expect("Failed to apply transaction")
+        .commit(catalog.as_ref())
+        .await
+        .expect("Failed to commit transaction");
+
+    // Parallelism 1 so a single build partition holds the whole delete side; see the doc comment.
+    let files_with_deletes_config = FilesWithDeletesConfigBuilder::default()
+        .max_input_parallelism(1_usize)
+        .max_output_parallelism(1_usize)
+        // Default is 128 delete files before this strategy will plan at all. This test is sized
+        // by delete BYTES, not delete file count, so without lowering it compaction declines to
+        // plan and returns `Ok(None)` -- which is not the same thing as passing.
+        .min_delete_file_count_threshold(1_usize)
+        .build()
+        .unwrap();
+    let config = CompactionConfigBuilder::default()
+        .planning(CompactionPlanningConfig::FilesWithDeletes(
+            files_with_deletes_config,
+        ))
+        .build()
+        .unwrap();
+
+    let compaction = CompactionBuilder::new(catalog.clone(), table.identifier().clone())
+        .with_config(Arc::new(config))
+        .with_catalog_name("test_catalog_offset_overflow".to_owned())
+        .build();
+
+    // The assertion. Without the dictionary encoding this returns
+    // `Compaction plan execution failed: ... Arrow error: Offset overflow error: 2147...`.
+    let response = compaction
+        .compact()
+        .await
+        .expect("compaction must not overflow Arrow's 32-bit offsets on the delete build side")
+        .expect("compaction should produce a result");
+
+    assert!(
+        response.stats.input_position_delete_file_count > 0,
+        "the delete build side must actually be exercised, got {} delete files",
+        response.stats.input_position_delete_file_count
+    );
+    assert!(
+        response.stats.output_files_count > 0,
+        "compaction should have written output files"
+    );
+
     let _ = catalog.drop_table(table.identifier()).await;
     let _ = catalog.drop_namespace(table.identifier().namespace()).await;
 }

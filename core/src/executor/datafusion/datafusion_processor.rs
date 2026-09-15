@@ -1095,6 +1095,106 @@ mod tests {
         assert_eq!(encoded, schema);
     }
 
+    /// Pins the defect itself: `Utf8` overflows at scale, `Dictionary` does not.
+    ///
+    /// Every other test here asserts semantics -- right rows, right types. None of them
+    /// demonstrates the failure this change exists to remove, because none of them is big enough.
+    /// This one reproduces the exact arrow operation `HashJoinExec` performs on the build side
+    /// (`concat_batches` over the accumulated batches) at a size past `i32::MAX`, and asserts:
+    ///
+    ///   * as `Utf8` it fails with `Offset overflow` -- the production symptom, from first
+    ///     principles rather than from a log; and
+    ///   * as `Dictionary(Int32, Utf8)` carrying the SAME logical values it succeeds, in a
+    ///     fraction of the memory.
+    ///
+    /// Without the first assertion a future "simplification" back to `Utf8` would look harmless:
+    /// the correctness tests would all still pass, and only a production table with tens of
+    /// millions of position deletes would find out.
+    ///
+    /// `#[ignore]` because it allocates over 2GiB by construction -- that is the point of it, and
+    /// not something to charge every CI run for. Run explicitly:
+    ///   `cargo test -p iceberg-compaction-core offset_overflow -- --ignored --nocapture`
+    #[test]
+    #[ignore = "allocates >2GiB to cross i32::MAX; run explicitly"]
+    fn test_offset_overflow_is_reproduced_by_utf8_and_removed_by_dictionary() {
+        use datafusion::arrow::array::{Array, DictionaryArray, Int32Array, StringArray};
+        use datafusion::arrow::compute::concat_batches;
+        use datafusion::arrow::datatypes::Int32Type;
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        // A realistic warehouse URI, padded so fewer rows are needed to cross the limit. The
+        // limit is on total BYTES, so trading length against row count costs nothing in fidelity
+        // and saves a great deal of time.
+        let path = format!(
+            "s3://clutch-prod-us-east-2-tenants/libertymutual/warehouse/libertymutual.db/consumer_resource_table/data/{}.parquet",
+            "0".repeat(3_900)
+        );
+        let path_len = path.len();
+        let rows_per_batch = 8_192;
+        // Enough batches to push the concatenated values buffer just past i32::MAX.
+        let batches_needed = (i32::MAX as usize / (path_len * rows_per_batch)) + 2;
+        let total_bytes = batches_needed * rows_per_batch * path_len;
+        assert!(
+            total_bytes > i32::MAX as usize,
+            "test must cross i32::MAX to be meaningful, got {total_bytes}"
+        );
+
+        // --- Utf8: the shape that fails in production -------------------------------------
+        let utf8_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            SYS_HIDDEN_FILE_PATH,
+            DataType::Utf8,
+            false,
+        )]));
+        let utf8_batches: Vec<RecordBatch> = (0..batches_needed)
+            .map(|_| {
+                RecordBatch::try_new(utf8_schema.clone(), vec![Arc::new(StringArray::from(
+                    vec![path.as_str(); rows_per_batch],
+                ))])
+                .unwrap()
+            })
+            .collect();
+
+        let utf8_result = concat_batches(&utf8_schema, &utf8_batches);
+        let err = utf8_result
+            .expect_err("Utf8 must overflow past i32::MAX -- if this passes, arrow changed and the fix may be unnecessary")
+            .to_string();
+        assert!(
+            err.contains("Offset overflow"),
+            "expected an offset overflow, got: {err}"
+        );
+        drop(utf8_batches);
+
+        // --- Dictionary: same logical values, same row count -------------------------------
+        let dict_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            SYS_HIDDEN_FILE_PATH,
+            hidden_file_path_type(),
+            false,
+        )]));
+        let dict_batches: Vec<RecordBatch> = (0..batches_needed)
+            .map(|_| {
+                let keys = Int32Array::from(vec![0i32; rows_per_batch]);
+                let values = Arc::new(StringArray::from(vec![path.as_str()]));
+                RecordBatch::try_new(dict_schema.clone(), vec![Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(keys, values).unwrap(),
+                )])
+                .unwrap()
+            })
+            .collect();
+
+        let combined = concat_batches(&dict_schema, &dict_batches)
+            .expect("dictionary-encoded path must survive the same concatenation");
+        assert_eq!(combined.num_rows(), batches_needed * rows_per_batch);
+
+        // The whole point: the values buffer no longer scales with row count. Assert it is
+        // orders of magnitude under the limit rather than merely under it, so a regression to
+        // a per-row encoding cannot squeak past.
+        let encoded_bytes = combined.column(0).get_array_memory_size();
+        assert!(
+            encoded_bytes < total_bytes / 100,
+            "dictionary encoding should be <1% of the raw {total_bytes} bytes, got {encoded_bytes}"
+        );
+    }
+
     /// Executes the merge-on-read anti-join with a dictionary-encoded path column.
     ///
     /// Two things have to hold at once, and only one of them is obvious:
