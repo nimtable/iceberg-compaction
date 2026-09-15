@@ -614,6 +614,11 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
 ///
 /// Heavy by nature -- it must cross 2GiB to mean anything -- so it is `#[ignore]`d. Run with:
 ///   `cargo test -p iceberg-compaction-integration-tests position_delete_path_over_i32 -- --ignored --nocapture`
+///
+/// Needs the docker-compose stack, and that stack currently needs a Docker Hub login: the `MinIO`
+/// images it pins are no longer anonymously pullable, so an unauthenticated run dies at startup
+/// with `pull access denied for minio/mc` -- which looks like a broken test and is not one.
+/// `docker login`, or point the compose file at `quay.io/minio/*` (same releases), first.
 #[tokio::test]
 #[ignore = "generates >2GiB of position-delete paths; run explicitly"]
 async fn test_compaction_survives_position_delete_path_over_i32_offsets() {
