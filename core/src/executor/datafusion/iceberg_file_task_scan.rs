@@ -20,9 +20,11 @@ use std::sync::Arc;
 use std::vec;
 
 use async_stream::try_stream;
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::array::{DictionaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Int32Type, Schema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -467,7 +469,12 @@ async fn get_batch_stream(
                         batch
                     }
                     DataContentType::PositionDeletes => {
-                        batch
+                        // The build side of the merge-on-read anti-join. Parquet gives the path
+                        // back as `Utf8`; the provider declares it dictionary-encoded, so encode
+                        // here rather than let DataFusion see a schema mismatch. This is the
+                        // conversion that keeps the concatenated build side under Arrow's 32-bit
+                        // offset limit -- see `dictionary_encode_hidden_file_path`.
+                        dictionary_encode_path_columns(batch)?
                     },
                     DataContentType::EqualityDeletes => {
                         add_seq_num_into_batch(batch, file_context.sequence_number)?
@@ -649,15 +656,60 @@ fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBa
 }
 
 /// Adds a file path and position column to a record batch
+/// Dictionary-encode every `Utf8` column of a position-delete batch.
+///
+/// Targeted by type rather than by name on purpose: the column arrives named as it is spelled in
+/// the delete file, which is not the `sys_hidden_file_path` the registered schema uses, so a
+/// name match would silently do nothing. A position-delete file carries exactly one string column
+/// by spec -- `file_path` -- so "every `Utf8` column" and "the path column" are the same set here,
+/// and a file with none is left untouched.
+fn dictionary_encode_path_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Utf8))
+    {
+        return Ok(batch);
+    }
+
+    let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if matches!(field.data_type(), DataType::Utf8) {
+            fields.push(Arc::new(Field::new(
+                field.name(),
+                dict_type.clone(),
+                field.is_nullable(),
+            )));
+            columns.push(
+                cast(column, &dict_type)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+            );
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
 fn add_file_path_pos_into_batch(
     batch: RecordBatch,
     file_path: &str,
     index_start: i64,
 ) -> DFResult<RecordBatch> {
     let schema = batch.schema();
+    // One dictionary entry for the whole batch: this column is constant per data file, so the
+    // values buffer holds a single URI no matter how many rows the file has. Must match the type
+    // the provider declares (`dictionary_encode_hidden_file_path`) -- the delete side is the same
+    // type, which is what keeps the equijoin from casting both back to `Utf8`.
     let file_path_field = Arc::new(Field::new(
         "file_path",
-        datafusion::arrow::datatypes::DataType::Utf8,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         false,
     ));
     let pos_field = Arc::new(Field::new(
@@ -671,10 +723,12 @@ fn add_file_path_pos_into_batch(
     let new_schema = Arc::new(Schema::new(new_fields));
 
     let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(vec![
-        file_path;
-        batch.num_rows()
-    ])));
+    let file_path_keys = Int32Array::from(vec![0i32; batch.num_rows()]);
+    let file_path_values = Arc::new(StringArray::from(vec![file_path]));
+    columns.push(Arc::new(
+        DictionaryArray::<Int32Type>::try_new(file_path_keys, file_path_values)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+    ));
     columns.push(Arc::new(Int64Array::from_iter(
         (index_start..(index_start + batch.num_rows() as i64)).collect::<Vec<i64>>(),
     )));

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
@@ -451,7 +452,7 @@ impl DatafusionTableRegister {
         need_seq_num: bool,
         need_file_path_and_pos: bool,
     ) -> Result<()> {
-        let schema = schema_to_arrow_schema(schema)?;
+        let schema = dictionary_encode_hidden_file_path(schema_to_arrow_schema(schema)?);
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
             file_scan_tasks,
             file_type,
@@ -469,6 +470,62 @@ impl DatafusionTableRegister {
 
         Ok(())
     }
+}
+
+/// The Arrow type `sys_hidden_file_path` is carried as, on every table this processor registers.
+///
+/// The column holds one data-file URI per row, and every row of a given file repeats the same
+/// value -- ~165 bytes in a real warehouse. On the position-delete side it is the BUILD side of
+/// the merge-on-read anti-join, and `HashJoinExec` concatenates the whole build side into a
+/// single `RecordBatch` ("Merge all batches into a single batch, so we can directly index into
+/// the arrays"). A table with enough delete residue therefore overflows Arrow's 32-bit `Utf8`
+/// offsets and the plan dies with `Offset overflow error` before a single row is written: one
+/// production table reached 33.7M position deletes x 165B = 5.20GiB, 2.6x over `i32::MAX`.
+///
+/// Dictionary-encoding collapses the values buffer to one entry per distinct data file plus a
+/// 4-byte key per row -- ~135MB for that same table, three orders of magnitude under the limit --
+/// and cuts build-side memory with it. The row count no longer bounds the values buffer at all;
+/// only the number of distinct files does, and that is already bounded by the compaction plan.
+///
+/// Sizing the group cannot substitute for this: the group budget governs the DATA side, while the
+/// overflow is on the DELETE side, so no group size makes it safe.
+fn hidden_file_path_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+}
+
+/// Retype `sys_hidden_file_path` to [`hidden_file_path_type`] wherever it appears.
+///
+/// Applied through the single registration funnel so BOTH the data and the position-delete table
+/// declare the same type. That is not incidental: the two are equijoined on this column, and a
+/// type mismatch would make `DataFusion` insert a cast that materialises the strings again and
+/// reinstates the overflow it is meant to avoid.
+///
+/// A no-op for tables that carry no hidden path column, so equality-delete and plain small-file
+/// compaction are untouched.
+fn dictionary_encode_hidden_file_path(schema: ArrowSchema) -> ArrowSchema {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| f.name() == SYS_HIDDEN_FILE_PATH)
+    {
+        return schema;
+    }
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == SYS_HIDDEN_FILE_PATH {
+                Arc::new(Field::new(
+                    f.name(),
+                    hidden_file_path_type(),
+                    f.is_nullable(),
+                ))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    ArrowSchema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// SQL Builder for generating merge-on-read SQL queries
@@ -1122,6 +1179,277 @@ mod tests {
     /// Validates the bounded runtime built by `build_spilling_runtime_env`
     /// actually enforces its memory budget: a sort whose input far exceeds the
     /// pool spills to disk (`spill_count > 0`) and still produces correctly
+    /// The hidden path column is retyped, and nothing else is.
+    #[test]
+    fn test_dictionary_encode_hidden_file_path_retypes_only_that_column() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(SYS_HIDDEN_FILE_PATH, DataType::Utf8, true),
+            Field::new(SYS_HIDDEN_POS, DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let encoded = dictionary_encode_hidden_file_path(schema);
+
+        assert_eq!(
+            encoded
+                .field_with_name(SYS_HIDDEN_FILE_PATH)
+                .unwrap()
+                .data_type(),
+            &hidden_file_path_type(),
+        );
+        // A plain string column must NOT be swept up -- only the hidden path column is the
+        // build-side offender, and retyping user columns would change the compaction output.
+        assert_eq!(
+            encoded.field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8,
+        );
+        assert_eq!(
+            encoded.field_with_name("id").unwrap().data_type(),
+            &DataType::Int32,
+        );
+    }
+
+    /// A table with no hidden path column is returned untouched.
+    #[test]
+    fn test_dictionary_encode_hidden_file_path_is_a_noop_without_the_column() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let encoded = dictionary_encode_hidden_file_path(schema.clone());
+        assert_eq!(encoded, schema);
+    }
+
+    /// Pins the defect itself: `Utf8` overflows at scale, `Dictionary` does not.
+    ///
+    /// Every other test here asserts semantics -- right rows, right types. None of them
+    /// demonstrates the failure this change exists to remove, because none of them is big enough.
+    /// This one reproduces the exact arrow operation `HashJoinExec` performs on the build side
+    /// (`concat_batches` over the accumulated batches) at a size past `i32::MAX`, and asserts:
+    ///
+    ///   * as `Utf8` it fails with `Offset overflow` -- the production symptom, from first
+    ///     principles rather than from a log; and
+    ///   * as `Dictionary(Int32, Utf8)` carrying the SAME logical values it succeeds, in a
+    ///     fraction of the memory.
+    ///
+    /// Without the first assertion a future "simplification" back to `Utf8` would look harmless:
+    /// the correctness tests would all still pass, and only a production table with tens of
+    /// millions of position deletes would find out.
+    ///
+    /// `#[ignore]` because it allocates over 2GiB by construction -- that is the point of it, and
+    /// not something to charge every CI run for. Run explicitly:
+    ///   `cargo test -p iceberg-compaction-core offset_overflow -- --ignored --nocapture`
+    #[test]
+    #[ignore = "allocates >2GiB to cross i32::MAX; run explicitly"]
+    fn test_offset_overflow_is_reproduced_by_utf8_and_removed_by_dictionary() {
+        use datafusion::arrow::array::{Array, DictionaryArray, Int32Array, StringArray};
+        use datafusion::arrow::compute::concat_batches;
+        use datafusion::arrow::datatypes::Int32Type;
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        // A realistic warehouse URI, padded so fewer rows are needed to cross the limit. The
+        // limit is on total BYTES, so trading length against row count costs nothing in fidelity
+        // and saves a great deal of time.
+        let path = format!(
+            "s3://clutch-prod-us-east-2-tenants/libertymutual/warehouse/libertymutual.db/consumer_resource_table/data/{}.parquet",
+            "0".repeat(3_900)
+        );
+        let path_len = path.len();
+        let rows_per_batch = 8_192;
+        // Enough batches to push the concatenated values buffer just past i32::MAX.
+        let batches_needed = (i32::MAX as usize / (path_len * rows_per_batch)) + 2;
+        let total_bytes = batches_needed * rows_per_batch * path_len;
+        assert!(
+            total_bytes > i32::MAX as usize,
+            "test must cross i32::MAX to be meaningful, got {total_bytes}"
+        );
+
+        // --- Utf8: the shape that fails in production -------------------------------------
+        let utf8_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            SYS_HIDDEN_FILE_PATH,
+            DataType::Utf8,
+            false,
+        )]));
+        let utf8_batches: Vec<RecordBatch> = (0..batches_needed)
+            .map(|_| {
+                RecordBatch::try_new(utf8_schema.clone(), vec![Arc::new(StringArray::from(
+                    vec![path.as_str(); rows_per_batch],
+                ))])
+                .unwrap()
+            })
+            .collect();
+
+        let utf8_result = concat_batches(&utf8_schema, &utf8_batches);
+        let err = utf8_result
+            .expect_err("Utf8 must overflow past i32::MAX -- if this passes, arrow changed and the fix may be unnecessary")
+            .to_string();
+        assert!(
+            err.contains("Offset overflow"),
+            "expected an offset overflow, got: {err}"
+        );
+        drop(utf8_batches);
+
+        // --- Dictionary: same logical values, same row count -------------------------------
+        let dict_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            SYS_HIDDEN_FILE_PATH,
+            hidden_file_path_type(),
+            false,
+        )]));
+        let dict_batches: Vec<RecordBatch> = (0..batches_needed)
+            .map(|_| {
+                let keys = Int32Array::from(vec![0i32; rows_per_batch]);
+                let values = Arc::new(StringArray::from(vec![path.as_str()]));
+                RecordBatch::try_new(dict_schema.clone(), vec![Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(keys, values).unwrap(),
+                )])
+                .unwrap()
+            })
+            .collect();
+
+        let combined = concat_batches(&dict_schema, &dict_batches)
+            .expect("dictionary-encoded path must survive the same concatenation");
+        assert_eq!(combined.num_rows(), batches_needed * rows_per_batch);
+
+        // The whole point: the values buffer no longer scales with row count. Assert it is
+        // orders of magnitude under the limit rather than merely under it, so a regression to
+        // a per-row encoding cannot squeak past.
+        let encoded_bytes = combined.column(0).get_array_memory_size();
+        assert!(
+            encoded_bytes < total_bytes / 100,
+            "dictionary encoding should be <1% of the raw {total_bytes} bytes, got {encoded_bytes}"
+        );
+    }
+
+    /// Executes the merge-on-read anti-join with a dictionary-encoded path column.
+    ///
+    /// Two things have to hold at once, and only one of them is obvious:
+    ///
+    /// 1. The join still deletes exactly the right rows. Dictionary keys are compared by their
+    ///    decoded value, but that is an assumption worth pinning -- if it were wrong, compaction
+    ///    would silently resurrect deleted rows, which is far worse than the crash it replaces.
+    /// 2. The join key stays `Dictionary` all the way into the physical plan. `DataFusion` is free
+    ///    to insert a coercion cast on an equijoin; a cast back to `Utf8` would materialise every
+    ///    path again on the build side and quietly reinstate the offset overflow, while every
+    ///    correctness assertion above still passed. That failure would be invisible without this.
+    #[tokio::test]
+    async fn test_anti_join_on_dictionary_path_is_correct_and_stays_encoded() {
+        use datafusion::arrow::array::{DictionaryArray, Int32Array, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::Int32Type;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::joins::HashJoinExec;
+        use datafusion::physical_plan::{ExecutionPlan, collect};
+
+        fn paths(keys: Vec<i32>, values: Vec<&str>) -> DictionaryArray<Int32Type> {
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(StringArray::from(values)),
+            )
+            .unwrap()
+        }
+
+        let ctx = SessionContext::new();
+
+        // Two data files, so the dictionary carries more than one entry and a key of 0 cannot
+        // pass by coincidence.
+        let data_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(SYS_HIDDEN_FILE_PATH, hidden_file_path_type(), false),
+            Field::new(SYS_HIDDEN_POS, DataType::Int64, false),
+        ]));
+        let data = RecordBatch::try_new(data_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 10, 11, 12])),
+            Arc::new(paths(vec![0, 0, 0, 0, 1, 1, 1], vec![
+                "s3://bucket/warehouse/t/data/file-a.parquet",
+                "s3://bucket/warehouse/t/data/file-b.parquet",
+            ])),
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3, 0, 1, 2])),
+        ])
+        .unwrap();
+        ctx.register_table(
+            DATA_FILE_TABLE,
+            Arc::new(MemTable::try_new(data_schema, vec![vec![data]]).unwrap()),
+        )
+        .unwrap();
+
+        // Delete (file-a, 1), (file-a, 3) and (file-b, 1) -> ids 1, 3 and 11 must disappear.
+        let delete_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(SYS_HIDDEN_FILE_PATH, hidden_file_path_type(), false),
+            Field::new(SYS_HIDDEN_POS, DataType::Int64, false),
+        ]));
+        let deletes = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(paths(vec![0, 0, 1], vec![
+                "s3://bucket/warehouse/t/data/file-a.parquet",
+                "s3://bucket/warehouse/t/data/file-b.parquet",
+            ])),
+            Arc::new(Int64Array::from(vec![1, 3, 1])),
+        ])
+        .unwrap();
+        ctx.register_table(
+            POSITION_DELETE_TABLE,
+            Arc::new(MemTable::try_new(delete_schema, vec![vec![deletes]]).unwrap()),
+        )
+        .unwrap();
+
+        // The shape SqlBuilder emits for position deletes.
+        let sql = format!(
+            r#"SELECT "id" FROM (SELECT "id", "{path}", "{pos}" FROM "{del}" RIGHT ANTI JOIN (SELECT "id", "{path}", "{pos}" FROM "{data}") AS "{data}" ON "{data}"."{path}" = "{del}"."{path}" AND "{data}"."{pos}" = "{del}"."{pos}") AS "final_result" ORDER BY "id""#,
+            path = SYS_HIDDEN_FILE_PATH,
+            pos = SYS_HIDDEN_POS,
+            del = POSITION_DELETE_TABLE,
+            data = DATA_FILE_TABLE,
+        );
+
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let results = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+
+        let surviving: Vec<i32> = results
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![0, 2, 10, 12],
+            "anti-join dropped the wrong rows with a dictionary-encoded path key"
+        );
+
+        // Walk to the HashJoinExec and assert the build side never got cast back to Utf8.
+        fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+            if plan.is::<HashJoinExec>() {
+                return Some(plan.clone());
+            }
+            plan.children()
+                .into_iter()
+                .find_map(|c| find_hash_join(&c.clone()))
+        }
+        let join = find_hash_join(&plan).expect("expected a HashJoinExec in the plan");
+        let join = join.downcast_ref::<HashJoinExec>().unwrap();
+        for side in [join.left(), join.right()] {
+            let field = side.schema();
+            let field = field.field_with_name(SYS_HIDDEN_FILE_PATH).unwrap();
+            assert_eq!(
+                field.data_type(),
+                &hidden_file_path_type(),
+                "join input re-materialised the path column as {:?}; the offset overflow is back",
+                field.data_type()
+            );
+        }
+    }
+
     /// ordered output. This is the runtime that `DatafusionProcessor` installs
     /// when `max_memory_bytes` is set, so it exercises the sorted-compaction
     /// spill path end to end.
