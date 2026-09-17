@@ -1429,7 +1429,7 @@ mod tests {
 
         // Walk to the HashJoinExec and assert the build side never got cast back to Utf8.
         fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
-            if plan.as_any().downcast_ref::<HashJoinExec>().is_some() {
+            if plan.is::<HashJoinExec>() {
                 return Some(plan.clone());
             }
             plan.children()
@@ -1437,7 +1437,7 @@ mod tests {
                 .find_map(|c| find_hash_join(&c.clone()))
         }
         let join = find_hash_join(&plan).expect("expected a HashJoinExec in the plan");
-        let join = join.as_any().downcast_ref::<HashJoinExec>().unwrap();
+        let join = join.downcast_ref::<HashJoinExec>().unwrap();
         for side in [join.left(), join.right()] {
             let field = side.schema();
             let field = field.field_with_name(SYS_HIDDEN_FILE_PATH).unwrap();
