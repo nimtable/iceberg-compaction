@@ -23,12 +23,6 @@ use crate::Result;
 pub mod packer;
 pub mod strategy;
 
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotStats {
-    pub total_data_files: usize,
-    pub small_files_count: usize,
-    pub delete_heavy_files_count: usize,
-}
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
@@ -36,6 +30,20 @@ pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 pub struct FileSelector;
 
 impl FileSelector {
+    /// Validates file sequence metadata before bounded planning filters run.
+    pub(crate) fn validate_file_sequence_numbers(data_files: &[FileScanTask]) -> Result<()> {
+        if let Some(task) = data_files
+            .iter()
+            .find(|task| task.file_sequence_number.is_none())
+        {
+            return Err(crate::CompactionError::Config(format!(
+                "bounded compaction requires file_sequence_number for every scanned data file; missing for {}",
+                task.data_file_path
+            )));
+        }
+        Ok(())
+    }
+
     /// Get scan tasks from table with specific snapshot ID and apply filtering strategy
     /// Returns groups of files selected and organized by the given strategy
     pub async fn get_scan_tasks_with_strategy(
@@ -50,26 +58,36 @@ impl FileSelector {
 
     /// Scans and collects all data files from a table snapshot.
     ///
-    /// Filters out non-data files (delete files). Returns raw `FileScanTask`s
-    /// for downstream processing.
+    /// Returns the data-file tasks planned for downstream processing.
+    ///
+    /// Iceberg's current scan API keeps delete files as lightweight descriptors
+    /// nested under each data task, so every top-level task is a data file.
     pub async fn scan_data_files(table: &Table, snapshot_id: i64) -> Result<Vec<FileScanTask>> {
         let scan = table.scan().snapshot_id(snapshot_id).build()?;
 
         let file_scan_stream = scan.plan_files().await?;
 
-        let data_files: Vec<FileScanTask> = file_scan_stream
-            .try_filter_map(|task| {
-                futures::future::ready(Ok(
-                    if matches!(task.data_file_content, iceberg::spec::DataContentType::Data) {
-                        Some(task)
-                    } else {
-                        None
-                    },
-                ))
-            })
-            .try_collect()
-            .await?;
+        let data_files: Vec<FileScanTask> = file_scan_stream.try_collect().await?;
         Ok(data_files)
+    }
+
+    /// Returns the minimum data sequence among files with applicable deletes.
+    ///
+    /// `tasks` must contain every live data-file task from the snapshot's complete,
+    /// unfiltered `plan_files()` result. Each `task.deletes` must conservatively
+    /// include every delete file that may apply; otherwise this threshold could
+    /// retire a delete file that is still needed by an affected data file.
+    ///
+    /// Missing or invalid sequence metadata disables the optimization.
+    pub(crate) fn delete_cleanup_min_data_sequence_number(tasks: &[FileScanTask]) -> Option<i64> {
+        let mut min_sequence = None;
+        for task in tasks.iter().filter(|task| !task.deletes.is_empty()) {
+            let sequence = task
+                .data_sequence_number
+                .filter(|sequence| *sequence >= 0)?;
+            min_sequence = Some(min_sequence.map_or(sequence, |min: i64| min.min(sequence)));
+        }
+        min_sequence
     }
 
     /// Groups pre-scanned tasks using the given strategy, skipping the scan phase.

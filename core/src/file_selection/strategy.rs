@@ -17,7 +17,7 @@
 //! Compaction file selection and grouping strategies.
 //!
 //! Implements a three-stage pipeline:
-//! 1. File filters: Exclude files by size, delete count, or minimum file threshold
+//! 1. File filters: Select files with composable per-file predicates
 //! 2. Grouping: Choose a file-group scope, then combine files using Single
 //!    (all-in-one) or `BinPack` (First-Fit Decreasing)
 //! 3. Group filters: Remove groups below size/count thresholds
@@ -34,8 +34,9 @@ use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
 ///
-/// Delete files are deduplicated by path during construction. Position deletes
-/// have `project_field_ids` cleared; equality deletes use `equality_ids`.
+/// Delete files are deduplicated by physical file/blob identity during construction.
+/// Position deletes use Iceberg's fixed delete schema; equality deletes use their
+/// descriptor's `equality_ids`.
 ///
 /// # Fields
 /// - `total_size`: Sum of `data_files[*].length` (excludes delete file sizes)
@@ -56,31 +57,40 @@ pub struct FileGroup {
 impl FileGroup {
     /// Constructs a `FileGroup` from data files.
     ///
-    /// Deduplicates delete files by `data_file_path`. Position delete files have
-    /// `project_field_ids` reset to empty; equality delete files copy `equality_ids`
-    /// to `project_field_ids`.
+    /// Deduplicates delete files by path plus optional Puffin byte range. Position
+    /// delete files use Iceberg's fixed delete projection; equality delete files
+    /// copy descriptor `equality_ids` to `project_field_ids`.
     ///
     /// Sets `executor_parallelism` and `output_parallelism` to 1.
     pub fn new(data_files: Vec<FileScanTask>) -> Self {
         let total_size = data_files.iter().map(|task| task.length).sum();
         let data_file_count = data_files.len();
 
-        // De-duplicate delete files by path
-        let mut position_delete_map = std::collections::HashMap::new();
-        let mut equality_delete_map = std::collections::HashMap::new();
+        // A Puffin file can contain multiple deletion-vector blobs, so path alone
+        // is not a sufficient identity.
+        let mut position_delete_map = HashMap::new();
+        let mut equality_delete_map = HashMap::new();
 
         for task in &data_files {
             for delete_task in &task.deletes {
-                match &delete_task.data_file_content {
+                let identity = (
+                    delete_task.file_path.clone(),
+                    delete_task.content_offset,
+                    delete_task.content_size_in_bytes,
+                );
+                let mut standalone_task = delete_task.to_file_scan_task(task);
+                match delete_task.file_type {
                     iceberg::spec::DataContentType::PositionDeletes => {
                         position_delete_map
-                            .entry(&delete_task.data_file_path)
-                            .or_insert(delete_task);
+                            .entry(identity)
+                            .or_insert(standalone_task);
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
+                        standalone_task.project_field_ids =
+                            delete_task.equality_ids.clone().unwrap_or_default();
                         equality_delete_map
-                            .entry(&delete_task.data_file_path)
-                            .or_insert(delete_task);
+                            .entry(identity)
+                            .or_insert(standalone_task);
                     }
                     _ => {}
                 }
@@ -89,20 +99,10 @@ impl FileGroup {
 
         let position_delete_files = position_delete_map
             .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = vec![];
-                file
-            })
             .collect::<Vec<FileScanTask>>();
 
         let equality_delete_files = equality_delete_map
             .into_values()
-            .map(|file| {
-                let mut file = file.as_ref().clone();
-                file.project_field_ids = file.equality_ids.clone().unwrap_or_default();
-                file
-            })
             .collect::<Vec<FileScanTask>>();
 
         Self {
@@ -372,13 +372,161 @@ impl FileGroup {
     }
 }
 
-/// File filter applied before grouping.
+/// Per-file predicate applied before grouping.
 ///
-/// Implementations must be `Debug + Display + Sync + Send`. Applied sequentially
-/// by [`PlanStrategy`].
+/// Concrete filters can be composed with [`and`](Self::and) and [`or`](Self::or)
+/// before being type-erased for [`PlanStrategy`]. Use [`AnyFileFilter`] when the
+/// expression shape is chosen at runtime. Filters in [`PlanStrategy`] are still
+/// applied sequentially, so the top-level list has implicit AND semantics.
 pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
-    /// Returns filtered subset of data files.
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask>;
+    /// Returns whether a data file belongs to the candidate set.
+    fn matches(&self, data_file: &FileScanTask) -> bool;
+
+    /// Combines two concrete filters with short-circuiting AND semantics.
+    #[must_use]
+    fn and<R>(self, right: R) -> AndFileFilter<Self, R>
+    where
+        Self: Sized,
+        R: FileFilterStrategy,
+    {
+        AndFileFilter { left: self, right }
+    }
+
+    /// Combines two concrete filters with short-circuiting OR semantics.
+    #[must_use]
+    fn or<R>(self, right: R) -> OrFileFilter<Self, R>
+    where
+        Self: Sized,
+        R: FileFilterStrategy,
+    {
+        OrFileFilter { left: self, right }
+    }
+}
+
+/// Type-erased file filter for runtime AND/OR composition.
+#[derive(Debug)]
+pub struct AnyFileFilter {
+    inner: Box<dyn FileFilterStrategy>,
+}
+
+impl AnyFileFilter {
+    /// Erases the concrete filter type.
+    pub fn new<F>(filter: F) -> Self
+    where F: FileFilterStrategy + 'static {
+        Self {
+            inner: Box::new(filter),
+        }
+    }
+
+    /// Wraps an already type-erased filter.
+    pub fn from_boxed(filter: Box<dyn FileFilterStrategy>) -> Self {
+        Self { inner: filter }
+    }
+
+    /// Returns the identity filter for runtime OR composition.
+    pub fn match_none() -> Self {
+        Self::new(MatchNoneFileFilter)
+    }
+
+    /// Combines this filter with another filter using short-circuiting AND semantics.
+    #[must_use]
+    pub fn and<R>(self, right: R) -> Self
+    where R: FileFilterStrategy + 'static {
+        Self::new(AndFileFilter { left: self, right })
+    }
+
+    /// Combines this filter with another filter using short-circuiting OR semantics.
+    #[must_use]
+    pub fn or<R>(self, right: R) -> Self
+    where R: FileFilterStrategy + 'static {
+        Self::new(OrFileFilter { left: self, right })
+    }
+
+    /// Returns the boxed filter accepted by [`PlanStrategy`].
+    pub fn into_boxed(self) -> Box<dyn FileFilterStrategy> {
+        self.inner
+    }
+}
+
+impl FileFilterStrategy for AnyFileFilter {
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        self.inner.matches(data_file)
+    }
+}
+
+impl std::fmt::Display for AnyFileFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+#[derive(Debug)]
+struct MatchNoneFileFilter;
+
+impl FileFilterStrategy for MatchNoneFileFilter {
+    fn matches(&self, _data_file: &FileScanTask) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Display for MatchNoneFileFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MatchNone")
+    }
+}
+
+/// Two concrete file filters combined with AND semantics.
+#[derive(Debug)]
+pub struct AndFileFilter<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> FileFilterStrategy for AndFileFilter<L, R>
+where
+    L: FileFilterStrategy,
+    R: FileFilterStrategy,
+{
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        self.left.matches(data_file) && self.right.matches(data_file)
+    }
+}
+
+impl<L, R> std::fmt::Display for AndFileFilter<L, R>
+where
+    L: std::fmt::Display,
+    R: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} AND {})", self.left, self.right)
+    }
+}
+
+/// Two concrete file filters combined with OR semantics.
+#[derive(Debug)]
+pub struct OrFileFilter<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> FileFilterStrategy for OrFileFilter<L, R>
+where
+    L: FileFilterStrategy,
+    R: FileFilterStrategy,
+{
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        self.left.matches(data_file) || self.right.matches(data_file)
+    }
+}
+
+impl<L, R> std::fmt::Display for OrFileFilter<L, R>
+where
+    L: std::fmt::Display,
+    R: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} OR {})", self.left, self.right)
+    }
 }
 
 /// Enum dispatching to grouping strategy implementations.
@@ -509,19 +657,14 @@ pub struct SizeFilterStrategy {
 }
 
 impl FileFilterStrategy for SizeFilterStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|task| {
-                let file_size = task.length;
-                match (self.min_size, self.max_size) {
-                    (Some(min), Some(max)) => file_size >= min && file_size < max,
-                    (Some(min), None) => file_size >= min,
-                    (None, Some(max)) => file_size < max,
-                    (None, None) => true,
-                }
-            })
-            .collect()
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        let file_size = data_file.length;
+        match (self.min_size, self.max_size) {
+            (Some(min), Some(max)) => file_size >= min && file_size < max,
+            (Some(min), None) => file_size >= min,
+            (None, Some(max)) => file_size < max,
+            (None, None) => true,
+        }
     }
 }
 
@@ -561,14 +704,8 @@ impl DeleteFileCountFilterStrategy {
 }
 
 impl FileFilterStrategy for DeleteFileCountFilterStrategy {
-    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
-        data_files
-            .into_iter()
-            .filter(|task| {
-                let delete_count = task.deletes.len();
-                delete_count >= self.min_delete_file_count
-            })
-            .collect()
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        data_file.deletes.len() >= self.min_delete_file_count
     }
 }
 
@@ -578,6 +715,38 @@ impl std::fmt::Display for DeleteFileCountFilterStrategy {
             f,
             "DeleteFileCountFilter[>={} deletes]",
             self.min_delete_file_count
+        )
+    }
+}
+
+/// File filter by inclusive file sequence number.
+#[derive(Debug)]
+struct FileSequenceNumberFilterStrategy {
+    max_file_sequence_number: i64,
+}
+
+impl FileSequenceNumberFilterStrategy {
+    pub fn new(max_file_sequence_number: i64) -> Self {
+        Self {
+            max_file_sequence_number,
+        }
+    }
+}
+
+impl FileFilterStrategy for FileSequenceNumberFilterStrategy {
+    fn matches(&self, data_file: &FileScanTask) -> bool {
+        data_file
+            .file_sequence_number
+            .is_some_and(|sequence_number| sequence_number <= self.max_file_sequence_number)
+    }
+}
+
+impl std::fmt::Display for FileSequenceNumberFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FileSequenceNumber[<= {}]",
+            self.max_file_sequence_number
         )
     }
 }
@@ -726,9 +895,13 @@ impl PlanStrategy {
         data_files: Vec<FileScanTask>,
         config: &CompactionPlanningConfig,
     ) -> Result<Vec<FileGroup>> {
+        if config.max_file_sequence_number().is_some() {
+            crate::file_selection::FileSelector::validate_file_sequence_numbers(&data_files)?;
+        }
+
         let mut filtered_files = data_files;
         for filter in &self.file_filters {
-            filtered_files = filter.filter(filtered_files);
+            filtered_files.retain(|data_file| filter.matches(data_file));
         }
 
         let file_groups = self.group_files(filtered_files);
@@ -798,10 +971,16 @@ impl PlanStrategy {
     ///
     /// Adds `SizeFilterStrategy` with `max_size = small_file_threshold_bytes`.
     pub fn from_small_files(config: &crate::config::SmallFilesConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
+        file_filters.push(Box::new(SizeFilterStrategy {
             min_size: None,
             max_size: Some(config.small_file_threshold_bytes),
-        })];
+        }));
 
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
@@ -816,9 +995,14 @@ impl PlanStrategy {
 
     /// Constructs strategy for full compaction.
     ///
-    /// No file filters. No group filters (full compaction processes all groups).
+    /// No strategy-specific file filters. No group filters.
     pub fn from_full(config: &crate::config::FullCompactionConfig) -> Self {
-        let file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
 
         // Full compaction never uses group filters
         let (grouping, group_filters) =
@@ -836,11 +1020,59 @@ impl PlanStrategy {
     pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
+
         if config.min_delete_file_count_threshold > 0 {
             file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
                 config.min_delete_file_count_threshold,
             )));
         }
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(
+            &config.grouping_strategy,
+            config.group_filters.as_ref(),
+        );
+
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope),
+        )
+    }
+
+    /// Constructs the unified Auto candidate pipeline.
+    ///
+    /// A non-zero threshold enables its predicate. When both predicates are
+    /// enabled, they are composed before type erasure so candidate selection is
+    /// `small OR delete-heavy`, followed by one grouping pipeline.
+    pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Self {
+        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(max_file_sequence_number) = config.max_file_sequence_number {
+            file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
+                max_file_sequence_number,
+            )));
+        }
+
+        let size_filter = SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(config.small_file_threshold_bytes),
+        };
+        let delete_filter =
+            DeleteFileCountFilterStrategy::new(config.min_delete_file_count_threshold);
+
+        let candidate_filter: Box<dyn FileFilterStrategy> = match (
+            config.small_file_threshold_bytes > 0,
+            config.min_delete_file_count_threshold > 0,
+        ) {
+            (true, true) => Box::new(size_filter.or(delete_filter)),
+            (true, false) => Box::new(size_filter),
+            (false, true) => Box::new(delete_filter),
+            (false, false) => Box::new(size_filter),
+        };
+        file_filters.push(candidate_filter);
 
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
@@ -889,6 +1121,7 @@ impl PlanStrategy {
 impl From<&CompactionPlanningConfig> for PlanStrategy {
     fn from(config: &CompactionPlanningConfig) -> Self {
         match config {
+            CompactionPlanningConfig::Auto(auto_config) => PlanStrategy::from_auto(auto_config),
             CompactionPlanningConfig::SmallFiles(small_files_config) => {
                 PlanStrategy::from_small_files(small_files_config)
             }
@@ -975,10 +1208,12 @@ mod tests {
     // Lazy static schema to avoid rebuilding it for every test
     use std::sync::{Arc, OnceLock};
 
+    use iceberg::scan::FileScanTaskDeleteFile;
+
     use super::*;
     use crate::config::{
-        CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfigBuilder,
-        SmallFilesConfigBuilder,
+        AutoCompactionConfigBuilder, CompactionPlanningConfig, FileGroupScope,
+        FilesWithDeletesConfigBuilder, FullCompactionConfigBuilder, SmallFilesConfigBuilder,
     };
     static TEST_SCHEMA: OnceLock<Arc<iceberg::spec::Schema>> = OnceLock::new();
 
@@ -997,6 +1232,7 @@ mod tests {
         delete_types: Vec<iceberg::spec::DataContentType>,
         partition: Option<iceberg::spec::Struct>,
         schema: Option<Arc<iceberg::spec::Schema>>,
+        data_sequence_number: Option<i64>,
     }
 
     impl TestFileBuilder {
@@ -1008,6 +1244,7 @@ mod tests {
                 delete_types: vec![],
                 partition: None,
                 schema: None,
+                data_sequence_number: None,
             }
         }
 
@@ -1037,9 +1274,12 @@ mod tests {
             self
         }
 
-        pub fn build(self) -> FileScanTask {
-            use std::sync::Arc;
+        pub fn with_data_sequence_number(mut self, sequence_number: i64) -> Self {
+            self.data_sequence_number = Some(sequence_number);
+            self
+        }
 
+        pub fn build(self) -> FileScanTask {
             use iceberg::spec::{DataContentType, DataFileFormat};
 
             let deletes = if self.has_deletes {
@@ -1047,38 +1287,24 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, delete_type)| {
-                        Arc::new(FileScanTask {
-                            start: 0,
-                            length: 1024,
-                            record_count: Some(10),
-                            data_file_path: format!(
+                        FileScanTaskDeleteFile::builder()
+                            .with_file_path(format!(
                                 "{}_{}_delete.parquet",
                                 self.path.replace(".parquet", ""),
                                 i
-                            ),
-                            referenced_data_file: None,
-                            data_file_content: delete_type,
-                            data_file_format: DataFileFormat::Parquet,
-                            schema: self.schema.clone().unwrap_or(get_test_schema()),
-                            project_field_ids: if delete_type == DataContentType::EqualityDeletes {
-                                vec![1, 2]
-                            } else {
-                                vec![1]
-                            },
-                            predicate: None,
-                            deletes: vec![],
-                            sequence_number: 1,
-                            equality_ids: if delete_type == DataContentType::EqualityDeletes {
+                            ))
+                            .with_file_size_in_bytes(1024)
+                            .with_file_type(delete_type)
+                            .with_partition_spec_id(0)
+                            .with_equality_ids(if delete_type == DataContentType::EqualityDeletes {
                                 Some(vec![1, 2])
                             } else {
                                 None
-                            },
-                            file_size_in_bytes: 1024,
-                            partition: None,
-                            partition_spec: None,
-                            name_mapping: None,
-                            case_sensitive: true,
-                        })
+                            })
+                            .with_file_format(DataFileFormat::Parquet)
+                            .with_record_count(Some(10))
+                            .with_sequence_number(1)
+                            .build()
                     })
                     .collect()
             } else {
@@ -1089,23 +1315,58 @@ mod tests {
                 start: 0,
                 length: self.size,
                 record_count: Some(100),
+                first_row_id: None,
+                data_sequence_number: self.data_sequence_number,
                 data_file_path: self.path,
-                referenced_data_file: None,
-                data_file_content: DataContentType::Data,
                 data_file_format: DataFileFormat::Parquet,
                 schema: self.schema.unwrap_or(get_test_schema()),
                 project_field_ids: vec![1, 2],
                 predicate: None,
                 deletes,
                 sequence_number: 1,
-                equality_ids: None,
+                file_sequence_number: Some(1),
                 file_size_in_bytes: self.size,
                 partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
+                unified_partition_type: None,
                 case_sensitive: true,
+                key_metadata: None,
             }
         }
+    }
+
+    #[test]
+    fn test_delete_cleanup_min_data_sequence_number() {
+        let tasks = vec![
+            TestFileBuilder::new("old-clean.parquet")
+                .with_data_sequence_number(1)
+                .build(),
+            TestFileBuilder::new("newer-affected.parquet")
+                .with_data_sequence_number(10)
+                .with_deletes()
+                .build(),
+            TestFileBuilder::new("oldest-affected.parquet")
+                .with_data_sequence_number(8)
+                .with_deletes()
+                .build(),
+        ];
+        assert_eq!(
+            crate::file_selection::FileSelector::delete_cleanup_min_data_sequence_number(&tasks),
+            Some(8)
+        );
+
+        let missing_sequence = vec![
+            TestFileBuilder::new("unknown.parquet")
+                .with_deletes()
+                .build(),
+        ];
+        assert_eq!(
+            crate::file_selection::FileSelector::delete_cleanup_min_data_sequence_number(
+                &missing_sequence
+            ),
+            None
+        );
     }
 
     /// Helper functions for common test scenarios
@@ -1144,28 +1405,21 @@ mod tests {
         pub fn create_delete_file(
             path: String,
             content_type: iceberg::spec::DataContentType,
-        ) -> Arc<FileScanTask> {
+        ) -> FileScanTaskDeleteFile {
             use iceberg::spec::DataFileFormat;
-            Arc::new(FileScanTask {
-                start: 0,
-                length: 1024,
-                record_count: Some(10),
-                data_file_path: path,
-                referenced_data_file: None,
-                data_file_content: content_type,
-                data_file_format: DataFileFormat::Parquet,
-                schema: get_test_schema(),
-                project_field_ids: vec![1, 2],
-                predicate: None,
-                deletes: vec![],
-                sequence_number: 1,
-                equality_ids: Some(vec![1, 2]),
-                file_size_in_bytes: 1024,
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                case_sensitive: true,
-            })
+            FileScanTaskDeleteFile::builder()
+                .with_file_path(path)
+                .with_file_size_in_bytes(1024)
+                .with_file_type(content_type)
+                .with_partition_spec_id(0)
+                .with_equality_ids(
+                    (content_type == iceberg::spec::DataContentType::EqualityDeletes)
+                        .then_some(vec![1, 2]),
+                )
+                .with_file_format(DataFileFormat::Parquet)
+                .with_record_count(Some(10))
+                .with_sequence_number(1)
+                .build()
         }
 
         /// Add n delete files to a `FileScanTask`
@@ -1179,6 +1433,296 @@ mod tests {
             }
             task
         }
+    }
+
+    fn composite_filter_test_files() -> Vec<FileScanTask> {
+        vec![
+            TestFileBuilder::new("small-clean.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("large-delete-heavy.parquet")
+                    .size(64 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("small-delete-heavy.parquet")
+                    .size(10 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            TestFileBuilder::new("large-clean.parquet")
+                .size(64 * 1024 * 1024)
+                .build(),
+        ]
+    }
+
+    fn small_file_filter() -> SizeFilterStrategy {
+        SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(32 * 1024 * 1024),
+        }
+    }
+
+    fn delete_heavy_filter() -> DeleteFileCountFilterStrategy {
+        DeleteFileCountFilterStrategy::new(2)
+    }
+
+    fn filter_files(
+        filter: &impl FileFilterStrategy,
+        files: Vec<FileScanTask>,
+    ) -> Vec<FileScanTask> {
+        files
+            .into_iter()
+            .filter(|file| filter.matches(file))
+            .collect()
+    }
+
+    #[test]
+    fn test_and_file_filter_requires_both_predicates() {
+        let filter = small_file_filter().and(delete_heavy_filter());
+
+        let result = filter_files(&filter, composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(&["small-delete-heavy.parquet"], &result);
+        assert_eq!(
+            filter.to_string(),
+            "(SizeFilter[<32MB] AND DeleteFileCountFilter[>=2 deletes])"
+        );
+    }
+
+    #[test]
+    fn test_or_file_filter_accepts_either_predicate_without_duplicates() {
+        let filter = small_file_filter().or(delete_heavy_filter());
+
+        let result = filter_files(&filter, composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(
+            &[
+                "small-clean.parquet",
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ],
+            &result,
+        );
+        assert_eq!(
+            filter.to_string(),
+            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes])"
+        );
+    }
+
+    #[test]
+    fn test_file_filter_combinators_can_be_nested() {
+        let candidate_filter = small_file_filter().or(delete_heavy_filter());
+        let large_file_filter = SizeFilterStrategy {
+            min_size: Some(32 * 1024 * 1024),
+            max_size: None,
+        };
+        let filter = candidate_filter.and(large_file_filter);
+
+        let result = filter_files(&filter, composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &result);
+        assert_eq!(
+            filter.to_string(),
+            "((SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) AND SizeFilter[>32MB])"
+        );
+    }
+
+    fn runtime_candidate_filter(include_small: bool, include_delete_heavy: bool) -> AnyFileFilter {
+        let mut filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+
+        if include_small {
+            filters.push(Box::new(small_file_filter()));
+        }
+        if include_delete_heavy {
+            filters.push(Box::new(delete_heavy_filter()));
+        }
+
+        filters
+            .into_iter()
+            .map(AnyFileFilter::from_boxed)
+            .reduce(|left, right| left.or(right))
+            .unwrap_or_else(AnyFileFilter::match_none)
+    }
+
+    #[test]
+    fn test_any_file_filter_accumulates_optional_runtime_filters() {
+        let test_cases = [
+            ((false, false), vec![]),
+            ((true, false), vec![
+                "small-clean.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            ((false, true), vec![
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            ((true, true), vec![
+                "small-clean.parquet",
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+        ];
+
+        for ((include_small, include_delete_heavy), expected) in test_cases {
+            let filter = runtime_candidate_filter(include_small, include_delete_heavy);
+            let result = filter_files(&filter, composite_filter_test_files());
+
+            TestUtils::assert_paths_eq(&expected, &result);
+        }
+    }
+
+    #[test]
+    fn test_any_file_filter_supports_nested_runtime_and_or() {
+        let candidate_filter = runtime_candidate_filter(true, true);
+        let large_file_filter = SizeFilterStrategy {
+            min_size: Some(32 * 1024 * 1024),
+            max_size: None,
+        };
+        let filter = vec![candidate_filter, AnyFileFilter::new(large_file_filter)]
+            .into_iter()
+            .reduce(|left, right| left.and(right))
+            .expect("runtime AND expression must have at least one child");
+        let strategy = PlanStrategy::new(
+            vec![filter.into_boxed()],
+            GroupingStrategyEnum::Single(SingleGroupingStrategy),
+            vec![],
+        );
+
+        let result = TestUtils::execute_strategy_flat(&strategy, composite_filter_test_files());
+
+        TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &result);
+    }
+
+    #[test]
+    fn test_auto_strategy_groups_the_union_of_candidate_files() {
+        let auto_config = AutoCompactionConfigBuilder::default()
+            .small_file_threshold_bytes(32 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(2_usize)
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::Auto(auto_config);
+        let strategy = PlanStrategy::from(&planning_config);
+
+        let groups = strategy
+            .execute(composite_filter_test_files(), &planning_config)
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        TestUtils::assert_paths_eq(
+            &[
+                "small-clean.parquet",
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ],
+            &groups[0].data_files,
+        );
+        assert_eq!(
+            strategy.to_string(),
+            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) -> SingleGrouping -> NoGroupFilters"
+        );
+    }
+
+    #[test]
+    fn test_auto_strategy_zero_threshold_disables_its_predicate() {
+        let cases: [(u64, usize, Vec<&str>); 3] = [
+            (0, 2, vec![
+                "large-delete-heavy.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            (32 * 1024 * 1024, 0, vec![
+                "small-clean.parquet",
+                "small-delete-heavy.parquet",
+            ]),
+            (0, 0, vec![]),
+        ];
+
+        for (small_threshold, delete_threshold, expected_paths) in cases {
+            let auto_config = AutoCompactionConfigBuilder::default()
+                .small_file_threshold_bytes(small_threshold)
+                .min_delete_file_count_threshold(delete_threshold)
+                .build()
+                .unwrap();
+            let planning_config = CompactionPlanningConfig::Auto(auto_config);
+            let strategy = PlanStrategy::from(&planning_config);
+            let files = strategy
+                .execute(composite_filter_test_files(), &planning_config)
+                .unwrap()
+                .into_iter()
+                .flat_map(FileGroup::into_files)
+                .collect::<Vec<_>>();
+
+            TestUtils::assert_paths_eq(&expected_paths, &files);
+        }
+    }
+
+    #[test]
+    fn test_sequence_bound_filters_all_planning_strategies() {
+        let mut old_file = TestFileBuilder::new("old.parquet").with_deletes().build();
+        old_file.file_sequence_number = Some(3);
+        let mut new_file = TestFileBuilder::new("new.parquet").with_deletes().build();
+        new_file.file_sequence_number = Some(4);
+
+        let configs = [
+            CompactionPlanningConfig::SmallFiles(
+                SmallFilesConfigBuilder::default()
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+            CompactionPlanningConfig::Full(
+                FullCompactionConfigBuilder::default()
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+            CompactionPlanningConfig::FilesWithDeletes(
+                FilesWithDeletesConfigBuilder::default()
+                    .min_delete_file_count_threshold(1_usize)
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+            CompactionPlanningConfig::Auto(
+                AutoCompactionConfigBuilder::default()
+                    .min_delete_file_count_threshold(1_usize)
+                    .max_file_sequence_number(3_i64)
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+
+        for config in configs {
+            let files = PlanStrategy::from(&config)
+                .execute(vec![old_file.clone(), new_file.clone()], &config)
+                .unwrap()
+                .into_iter()
+                .flat_map(FileGroup::into_files)
+                .collect::<Vec<_>>();
+            TestUtils::assert_paths_eq(&["old.parquet"], &files);
+        }
+    }
+
+    #[test]
+    fn test_bounded_planning_rejects_missing_file_sequence_number() {
+        let mut missing = TestFileBuilder::new("missing.parquet").build();
+        missing.file_sequence_number = None;
+        let config = CompactionPlanningConfig::Full(
+            FullCompactionConfigBuilder::default()
+                .max_file_sequence_number(3_i64)
+                .build()
+                .unwrap(),
+        );
+
+        let error = PlanStrategy::from(&config)
+            .execute(vec![missing], &config)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: bounded compaction requires file_sequence_number for every scanned data file; missing for missing.parquet"
+        );
     }
 
     #[test]
@@ -1238,7 +1782,7 @@ mod tests {
                 .build(),
         ];
 
-        let result: Vec<FileScanTask> = strategy.filter(test_files);
+        let result = filter_files(&strategy, test_files);
         assert_eq!(result.len(), 3);
         TestUtils::assert_paths_eq(
             &["min_edge.parquet", "medium1.parquet", "medium2.parquet"],
@@ -1265,7 +1809,7 @@ mod tests {
                 .size(11 * 1024 * 1024)
                 .build(),
         ];
-        let result = exact_strategy.filter(test_files);
+        let result = filter_files(&exact_strategy, test_files);
         assert_eq!(result.len(), 0);
 
         // Test min > max (invalid range - should return empty)
@@ -1278,7 +1822,7 @@ mod tests {
                 .size(30 * 1024 * 1024)
                 .build(),
         ];
-        let result = invalid_strategy.filter(test_files);
+        let result = filter_files(&invalid_strategy, test_files);
         assert_eq!(result.len(), 0, "Invalid range should filter out all files");
     }
 
@@ -1932,73 +2476,25 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_extraction() {
         // Test that FileGroup correctly extracts and organizes delete files
-        use std::sync::Arc;
-
-        use iceberg::spec::{DataContentType, DataFileFormat};
+        use iceberg::spec::DataContentType;
 
         // Create a data file with both position and equality delete files
-        let position_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 1024,
-            record_count: Some(10),
-            data_file_path: "pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let position_delete = TestUtils::create_delete_file(
+            "pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        let mut equality_delete = TestUtils::create_delete_file(
+            "eq_delete.parquet".to_owned(),
+            DataContentType::EqualityDeletes,
+        );
+        equality_delete.file_size_in_bytes = 2048;
+        equality_delete.record_count = Some(20);
 
-        let equality_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 2048,
-            record_count: Some(20),
-            data_file_path: "eq_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::EqualityDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: Some(vec![1, 2]),
-            file_size_in_bytes: 2048,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
-
-        let data_file = FileScanTask {
-            start: 0,
-            length: 10 * 1024 * 1024, // 10MB
-            record_count: Some(1000),
-            data_file_path: "data.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![position_delete, equality_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 10 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut data_file = TestFileBuilder::new("data.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        data_file.record_count = Some(1000);
+        data_file.deletes = vec![position_delete, equality_delete];
 
         let group = FileGroup::new(vec![data_file]);
 
@@ -2026,72 +2522,23 @@ mod tests {
     #[test]
     fn test_file_group_delete_files_dedup_and_heuristic_output_parallelism() {
         // Build two data files referencing the same delete file path to ensure dedup
-        use std::sync::Arc;
+        use iceberg::spec::DataContentType;
 
-        use iceberg::spec::{DataContentType, DataFileFormat};
+        let mut shared_pos_delete = TestUtils::create_delete_file(
+            "shared_pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        shared_pos_delete.file_size_in_bytes = 512;
 
-        let shared_pos_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 512,
-            record_count: Some(10),
-            data_file_path: "shared_pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 512,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut f1 = TestFileBuilder::new("d1.parquet")
+            .size(4 * 1024 * 1024)
+            .build();
+        f1.deletes = vec![shared_pos_delete.clone()];
 
-        let f1 = FileScanTask {
-            start: 0,
-            length: 4 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d1.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_pos_delete.clone()],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 4 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
-
-        let f2 = FileScanTask {
-            start: 0,
-            length: 4 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d2.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_pos_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 4 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut f2 = TestFileBuilder::new("d2.parquet")
+            .size(4 * 1024 * 1024)
+            .build();
+        f2.deletes = vec![shared_pos_delete];
 
         let group = FileGroup::new(vec![f1, f2]);
         // Dedup should keep one position delete
@@ -2121,95 +2568,60 @@ mod tests {
     }
 
     #[test]
-    fn test_file_group_delete_files_dedup_mixed_types() {
-        // Test deduplication of equality deletes and mixed delete types
-        use std::sync::Arc;
-
+    fn test_file_group_keeps_distinct_puffin_blobs() {
         use iceberg::spec::{DataContentType, DataFileFormat};
 
-        let shared_eq_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 1024,
-            record_count: Some(5),
-            data_file_path: "shared_eq_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::EqualityDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: Some(vec![1, 2]),
-            file_size_in_bytes: 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut first = TestUtils::create_delete_file(
+            "shared-dv.puffin".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        first.file_format = DataFileFormat::Puffin;
+        first.content_offset = Some(10);
+        first.content_size_in_bytes = Some(20);
 
-        let pos_delete = Arc::new(FileScanTask {
-            start: 0,
-            length: 512,
-            record_count: Some(3),
-            data_file_path: "pos_delete.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 512,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        });
+        let mut second = first.clone();
+        second.content_offset = Some(40);
+        second.content_size_in_bytes = Some(30);
 
-        let f1 = FileScanTask {
-            start: 0,
-            length: 5 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d1.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_eq_delete.clone(), pos_delete.clone()],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 5 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut data_file = TestFileBuilder::new("data.parquet").build();
+        data_file.deletes = vec![first, second];
 
-        let f2 = FileScanTask {
-            start: 0,
-            length: 5 * 1024 * 1024,
-            record_count: Some(100),
-            data_file_path: "d2.parquet".to_owned(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: get_test_schema(),
-            project_field_ids: vec![1, 2],
-            predicate: None,
-            deletes: vec![shared_eq_delete, pos_delete],
-            sequence_number: 1,
-            equality_ids: None,
-            file_size_in_bytes: 5 * 1024 * 1024,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let mut ranges = FileGroup::new(vec![data_file])
+            .position_delete_files
+            .into_iter()
+            .map(|task| (task.start, task.length))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+
+        assert_eq!(ranges, vec![(10, 20), (40, 30)]);
+    }
+
+    #[test]
+    fn test_file_group_delete_files_dedup_mixed_types() {
+        // Test deduplication of equality deletes and mixed delete types
+        use iceberg::spec::DataContentType;
+
+        let mut shared_eq_delete = TestUtils::create_delete_file(
+            "shared_eq_delete.parquet".to_owned(),
+            DataContentType::EqualityDeletes,
+        );
+        shared_eq_delete.record_count = Some(5);
+        let mut pos_delete = TestUtils::create_delete_file(
+            "pos_delete.parquet".to_owned(),
+            DataContentType::PositionDeletes,
+        );
+        pos_delete.file_size_in_bytes = 512;
+        pos_delete.record_count = Some(3);
+
+        let mut f1 = TestFileBuilder::new("d1.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+        f1.deletes = vec![shared_eq_delete.clone(), pos_delete.clone()];
+
+        let mut f2 = TestFileBuilder::new("d2.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+        f2.deletes = vec![shared_eq_delete, pos_delete];
 
         let group = FileGroup::new(vec![f1, f2]);
 
@@ -2364,7 +2776,7 @@ mod tests {
             ),
         ];
 
-        let result = strategy.filter(test_files);
+        let result = filter_files(&strategy, test_files);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].data_file_path, "three_deletes.parquet");
         assert_eq!(result[1].data_file_path, "five_deletes.parquet");
@@ -2388,7 +2800,7 @@ mod tests {
                     .with_deletes()
                     .build(),
             ];
-            let result = strategy.filter(test_files);
+            let result = filter_files(&strategy, test_files);
             assert_eq!(result.len(), expected_count);
         }
     }

@@ -29,6 +29,7 @@ iceberg-catalog-rest = { workspace = true }
 # Main library
 iceberg-compaction-core = { path = "../core" }
 iceberg-datafusion = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +25,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
+use iceberg::spec::DataContentType;
 
 use super::iceberg_file_task_scan::IcebergFileTaskScan;
 
@@ -33,6 +33,7 @@ use super::iceberg_file_task_scan::IcebergFileTaskScan;
 #[derive(Debug, Clone)]
 pub struct IcebergFileScanTaskTableProvider {
     file_scan_tasks: Vec<FileScanTask>,
+    file_type: DataContentType,
     schema: ArrowSchemaRef,
     file_io: FileIO,
     need_seq_num: bool,
@@ -45,6 +46,7 @@ impl IcebergFileScanTaskTableProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_scan_tasks: Vec<FileScanTask>,
+        file_type: DataContentType,
         schema: ArrowSchemaRef,
         file_io: FileIO,
         need_seq_num: bool,
@@ -55,6 +57,7 @@ impl IcebergFileScanTaskTableProvider {
     ) -> Self {
         Self {
             file_scan_tasks,
+            file_type,
             schema,
             file_io,
             need_seq_num,
@@ -67,10 +70,6 @@ impl IcebergFileScanTaskTableProvider {
 }
 #[async_trait]
 impl TableProvider for IcebergFileScanTaskTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -92,6 +91,7 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(IcebergFileTaskScan::new(
             self.file_scan_tasks.clone(),
+            self.file_type,
             self.schema.clone(),
             projection,
             filters,
