@@ -1451,11 +1451,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::record_batch::RecordBatch;
+    use futures::TryStreamExt;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-    use iceberg::spec::{DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+    };
+    use iceberg::spec::{
+        DataFile, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, PrimitiveType, Schema, Type,
+    };
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -1472,6 +1481,7 @@ mod tests {
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
@@ -2144,6 +2154,400 @@ mod tests {
             .snapshot_for_ref(MAIN_BRANCH)
             .unwrap();
         assert_ne!(snapshot_before.snapshot_id(), snapshot_after.snapshot_id());
+    }
+
+    async fn configure_v3_lineage_table<C: Catalog>(
+        table: &Table,
+        catalog: &C,
+        sorted: bool,
+    ) -> Table {
+        let transaction = Transaction::new(table);
+        let upgrade = transaction
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3);
+        let transaction = upgrade.apply(transaction).unwrap();
+        let transaction = if sorted {
+            let replace_sort_order = transaction.replace_sort_order().asc("id", NullOrder::First);
+            replace_sort_order.apply(transaction).unwrap()
+        } else {
+            transaction
+        };
+        transaction.commit(catalog).await.unwrap()
+    }
+
+    async fn assert_v3_row_lineage_preserved(sorted: bool) {
+        let env = create_test_env().await;
+        let table = configure_v3_lineage_table(&env.table, env.catalog.as_ref(), sorted).await;
+
+        let first_files =
+            write_simple_files(&table, &env.warehouse_location, "lineage_first", 2).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), first_files).await;
+        let second_files =
+            write_simple_files(&table, &env.warehouse_location, "lineage_second", 1).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), second_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let plans = compaction.plan_compaction().await.unwrap();
+        assert_eq!(plans.len(), 1);
+
+        let mut expected_lineage = plans[0]
+            .file_group
+            .data_files
+            .iter()
+            .flat_map(|task| {
+                let first_row_id = task
+                    .first_row_id
+                    .expect("V3 data file must have first_row_id");
+                let data_sequence_number = task
+                    .data_sequence_number
+                    .expect("V3 data file must have a data sequence number");
+                [1, 2, 3].into_iter().enumerate().map(move |(pos, id)| {
+                    (
+                        id,
+                        first_row_id + i64::try_from(pos).unwrap(),
+                        data_sequence_number,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        expected_lineage.sort_unstable();
+        assert_eq!(expected_lineage.len(), 9);
+        assert_eq!(
+            expected_lineage
+                .iter()
+                .map(|(_, _, sequence_number)| *sequence_number)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert_eq!(result.data_files.len(), 1);
+
+        let mut actual_lineage = Vec::new();
+        for output_file in &result.data_files {
+            let input = table.file_io().new_input(output_file.file_path()).unwrap();
+            let content = input.read().await.unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+            let schema = builder.schema();
+            let id_index = schema.index_of("id").unwrap();
+            let row_id_index = schema.index_of(RESERVED_COL_NAME_ROW_ID).unwrap();
+            let sequence_number_index = schema
+                .index_of(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+                .unwrap();
+            assert_eq!(
+                schema.field(row_id_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                RESERVED_FIELD_ID_ROW_ID.to_string()
+            );
+            assert_eq!(
+                schema.field(sequence_number_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string()
+            );
+
+            for batch in builder.build().unwrap() {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column(id_index)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(row_id_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sequence_numbers = batch
+                    .column(sequence_number_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                actual_lineage.extend((0..batch.num_rows()).map(|row| {
+                    (
+                        ids.value(row),
+                        row_ids.value(row),
+                        sequence_numbers.value(row),
+                    )
+                }));
+            }
+        }
+
+        if sorted {
+            assert_eq!(
+                actual_lineage
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<_>>(),
+                vec![1, 1, 1, 2, 2, 2, 3, 3, 3]
+            );
+        }
+        actual_lineage.sort_unstable();
+        assert_eq!(actual_lineage, expected_lineage);
+
+        let final_table = result.table.as_ref().unwrap();
+        let batches = final_table
+            .scan()
+            .select([
+                "id",
+                RESERVED_COL_NAME_ROW_ID,
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+            ])
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut scanned_lineage = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sequence_numbers = cast(batch.column(2), &DataType::Int64).unwrap();
+                let sequence_numbers = sequence_numbers
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            ids.value(row),
+                            row_ids.value(row),
+                            sequence_numbers.value(row),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        scanned_lineage.sort_unstable();
+        assert_eq!(scanned_lineage, expected_lineage);
+    }
+
+    #[tokio::test]
+    async fn test_binpack_compaction_preserves_v3_row_lineage() {
+        assert_v3_row_lineage_preserved(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_sorted_compaction_preserves_v3_row_lineage() {
+        assert_v3_row_lineage_preserved(true).await;
+    }
+
+    /// Schema for a table with a genuine user-defined column literally named
+    /// `_row_id`: field id 3, a real schema field rather than the reserved
+    /// sentinel (`RESERVED_FIELD_ID_ROW_ID`) that V3 row lineage uses for the
+    /// same name. The column is `String`, not `Int64`, so a match on name alone
+    /// would attempt an invalid cast.
+    fn schema_with_colliding_row_id_column() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(
+                    3,
+                    RESERVED_COL_NAME_ROW_ID,
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn create_test_record_batch_with_colliding_row_id(iceberg_schema: &Schema) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        // A genuine user-defined `_row_id` value, unrelated to row lineage.
+        let user_row_id_array = StringArray::from(vec!["user-a", "user-b", "user-c"]);
+
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(user_row_id_array),
+        ])
+        .unwrap()
+    }
+
+    async fn create_test_env_with_colliding_row_id_column() -> TestEnv {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        let _ = catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(schema_with_colliding_row_id_column())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        TestEnv {
+            temp_dir,
+            warehouse_location,
+            catalog,
+            table_ident,
+            table,
+        }
+    }
+
+    async fn write_colliding_row_id_files(
+        table: &Table,
+        warehouse_location: &str,
+        suffix_prefix: &str,
+        count: usize,
+    ) -> Vec<DataFile> {
+        let mut all = Vec::new();
+        for i in 0..count {
+            let mut writer = build_simple_data_writer(
+                table,
+                warehouse_location.to_owned(),
+                &format!("{suffix_prefix}_{i}"),
+            )
+            .await;
+            let batch = create_test_record_batch_with_colliding_row_id(
+                &schema_with_colliding_row_id_column(),
+            );
+            writer.write(batch).await.unwrap();
+            let files = writer.close().await.unwrap();
+            all.extend(files);
+        }
+        all
+    }
+
+    /// A V2 table with a genuine user-defined column literally named `_row_id`
+    /// (field id 3, type `String`) must compact normally: the projection-field-id
+    /// mapping in `IcebergFileTaskScan::new` must resolve `_row_id` via the
+    /// table's real schema (field id 3), not the reserved V3 metadata sentinel,
+    /// and `normalize_row_lineage_columns` must not try to cast it to `Int64`.
+    #[tokio::test]
+    async fn test_v2_compaction_preserves_user_defined_row_id_column() {
+        let env = create_test_env_with_colliding_row_id_column().await;
+
+        let data_files =
+            write_colliding_row_id_files(&env.table, &env.warehouse_location, "collide", 2).await;
+        let initial_file_count = data_files.len();
+        let _table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert_compaction_stats(&result.stats, initial_file_count, false);
+
+        let final_table = result.table.as_ref().unwrap();
+
+        // Read the compacted output files directly rather than through
+        // `Table::scan()`: `TableScan::select` resolves `_row_id` by name to the
+        // reserved metadata column regardless of the table's actual schema, which
+        // is separate upstream `iceberg-rust` behavior. Reading the raw file
+        // isolates what the writer here controls: the field id assigned to the
+        // column and the type it round-trips.
+        let mut rows = Vec::new();
+        for output_file in &result.data_files {
+            let input = final_table
+                .file_io()
+                .new_input(output_file.file_path())
+                .unwrap();
+            let content = input.read().await.unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+            let schema = builder.schema();
+            let id_index = schema.index_of("id").unwrap();
+            let row_id_index = schema.index_of(RESERVED_COL_NAME_ROW_ID).unwrap();
+            assert_eq!(
+                schema.field(row_id_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                "3",
+                "user-defined _row_id column must keep its real field id, not the reserved \
+                 V3 row-lineage sentinel"
+            );
+            assert_eq!(
+                schema.field(row_id_index).data_type(),
+                &DataType::Utf8,
+                "user-defined _row_id column must keep its real type"
+            );
+
+            for batch in builder.build().unwrap() {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column(id_index)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(row_id_index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                rows.extend(
+                    (0..batch.num_rows())
+                        .map(|row| (ids.value(row), row_ids.value(row).to_owned())),
+                );
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![
+            (1, "user-a".to_owned()),
+            (1, "user-a".to_owned()),
+            (2, "user-b".to_owned()),
+            (2, "user-b".to_owned()),
+            (3, "user-c".to_owned()),
+            (3, "user-c".to_owned()),
+        ]);
+    }
+
+    /// A V3 table whose schema collides a genuine user-defined column with the
+    /// reserved `_row_id` lineage column name must fail compaction with a clear
+    /// error naming the collision, not a confusing internal error or silent data
+    /// corruption.
+    #[tokio::test]
+    async fn test_v3_compaction_errors_on_colliding_row_id_column() {
+        let env = create_test_env_with_colliding_row_id_column().await;
+
+        let data_files =
+            write_colliding_row_id_files(&env.table, &env.warehouse_location, "collide", 2).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+        let _table = configure_v3_lineage_table(&table, env.catalog.as_ref(), false).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let message = match compaction.compact().await {
+            Err(err) => err.to_string(),
+            Ok(result) => panic!(
+                "compaction must reject a V3 table with a colliding _row_id column, got: {:?}",
+                result.map(|r| r.stats)
+            ),
+        };
+        assert!(
+            message.contains("_row_id") && message.contains("multiple fields"),
+            "error must clearly name the _row_id collision, got: {message}"
+        );
     }
 
     #[tokio::test]
