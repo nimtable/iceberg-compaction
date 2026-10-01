@@ -21,8 +21,8 @@ use std::vec;
 
 use async_stream::try_stream;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
-use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -36,12 +36,15 @@ use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::io::FileIO;
 use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
 };
 use iceberg::scan::FileScanTask;
 use iceberg::spec::DataContentType;
 use iceberg_datafusion::physical_plan::convert_filters_to_predicate;
 use iceberg_datafusion::to_datafusion_error;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::datafusion_processor::{SYS_HIDDEN_FILE_PATH, SYS_HIDDEN_POS, SYS_HIDDEN_SEQ_NUM};
 
@@ -169,6 +172,7 @@ impl IcebergFileTaskScan {
         file_io: &FileIO,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
+        is_v3_format: bool,
         executor_parallelism: usize,
         max_record_batch_rows: usize,
         prefetch_enabled: bool,
@@ -184,16 +188,36 @@ impl IcebergFileTaskScan {
                 .map(|mut task| {
                     let project_field_ids = projection
                         .iter()
-                        .filter_map(|name| match (file_type, name.as_str()) {
+                        .map(|name| match (file_type, name.as_str()) {
                             (DataContentType::PositionDeletes, SYS_HIDDEN_FILE_PATH) => {
-                                Some(RESERVED_FIELD_ID_DELETE_FILE_PATH)
+                                Ok(Some(RESERVED_FIELD_ID_DELETE_FILE_PATH))
                             }
                             (DataContentType::PositionDeletes, SYS_HIDDEN_POS) => {
-                                Some(RESERVED_FIELD_ID_DELETE_FILE_POS)
+                                Ok(Some(RESERVED_FIELD_ID_DELETE_FILE_POS))
                             }
-                            _ => task.schema().field_id_by_name(name),
+                            (DataContentType::Data, RESERVED_COL_NAME_ROW_ID) if is_v3_format => {
+                                resolve_reserved_lineage_field_id(
+                                    &task,
+                                    name,
+                                    RESERVED_FIELD_ID_ROW_ID,
+                                )
+                            }
+                            (
+                                DataContentType::Data,
+                                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                            ) if is_v3_format => resolve_reserved_lineage_field_id(
+                                &task,
+                                name,
+                                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                            ),
+                            _ => Ok(task.schema().field_id_by_name(name)),
                         })
+                        .collect::<Result<Vec<_>, DataFusionError>>()?
+                        .into_iter()
+                        .flatten()
                         .collect::<Vec<_>>();
+                    // Metadata IDs are intentionally absent from the table schema. ArrowReader
+                    // resolves them through iceberg::metadata_columns while processing the task.
                     let new_schema = iceberg::spec::Schema::builder()
                         .with_fields(
                             project_field_ids
@@ -455,6 +479,7 @@ async fn get_batch_stream(
                 let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match file_context.data_file_content {
                     DataContentType::Data => {
+                        batch = normalize_row_lineage_columns(batch)?;
                         // add sequence number if needed
                         if need_seq_num {
                             batch = add_seq_num_into_batch(batch, file_context.sequence_number)?;
@@ -490,6 +515,87 @@ async fn get_batch_stream(
     };
 
     Ok(Box::pin(stream))
+}
+
+/// Resolves a projected column name that collides with a reserved V3 row-lineage
+/// metadata column name (`_row_id` / `_last_updated_sequence_number`) to a field id.
+///
+/// The table schema intentionally omits these names -- `ArrowReader` resolves them
+/// through `iceberg::metadata_columns` while processing the task -- so under normal
+/// V3 operation `task.schema().field_id_by_name(name)` returns `None` for them and
+/// the reserved id is used unambiguously. If the task's schema *does* define a real
+/// field with one of these names (e.g. a data file predating a V3 upgrade whose
+/// schema happens to have a user-defined column literally named `_row_id`), the
+/// projection is genuinely ambiguous between the user's field and the reserved
+/// metadata column. Erroring here is deliberate: silently preferring either
+/// interpretation would either corrupt the user's column (by reinterpreting it as
+/// row lineage) or silently drop lineage tracking, and both are worse than a clear
+/// failure naming the collision.
+fn resolve_reserved_lineage_field_id(
+    task: &FileScanTask,
+    name: &str,
+    reserved_field_id: i32,
+) -> Result<Option<i32>, DataFusionError> {
+    match task.schema().field_id_by_name(name) {
+        None => Ok(Some(reserved_field_id)),
+        Some(user_field_id) => Err(DataFusionError::Execution(format!(
+            "table has multiple fields for name '{name}': a user-defined field (field id \
+             {user_field_id}) collides with the reserved V3 row-lineage metadata column \
+             (field id {reserved_field_id}); rename the user-defined field to compact this table"
+        ))),
+    }
+}
+
+/// Normalizes the Arrow type of the reserved V3 row-lineage metadata columns
+/// (`_row_id` / `_last_updated_sequence_number`) to plain `Int64`.
+///
+/// The upstream reader returns these as run-end-encoded arrays (an optimization for
+/// repeated constant values), while `DataFusion` and the Parquet writer expect plain
+/// `Int64`. Columns are matched by the reserved field id (via the Parquet field-id
+/// Arrow metadata the reader attaches), not by name: a V2 table (or a V3 table's
+/// pre-upgrade data file) can have a genuine user-defined column literally named
+/// `_row_id` of any type, and that column must pass through unchanged.
+fn normalize_row_lineage_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    let is_lineage_column = |field: &Field| {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+            .is_some_and(|id| {
+                id == RESERVED_FIELD_ID_ROW_ID
+                    || id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+            })
+    };
+    let needs_normalization = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .any(|(field, column)| is_lineage_column(field) && column.data_type() != &DataType::Int64);
+
+    if !needs_normalization {
+        return Ok(batch);
+    }
+
+    let normalized = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if is_lineage_column(field) && column.data_type() != &DataType::Int64 {
+                Ok((
+                    Arc::new(field.as_ref().clone().with_data_type(DataType::Int64)),
+                    cast(column, &DataType::Int64)?,
+                ))
+            } else {
+                Ok((field.clone(), column.clone()))
+            }
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let (fields, columns): (Vec<_>, Vec<_>) = normalized.into_iter().unzip();
+    let normalized_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+
+    RecordBatch::try_new(normalized_schema, columns).map_err(Into::into)
 }
 
 /// Holds metadata about a file scan task that needs to be preserved
