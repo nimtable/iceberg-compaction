@@ -49,7 +49,11 @@ services:
       - "8181:8181"
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2024-03-07T00-43-48Z
+    build:
+      context: .
+      dockerfile: minio.Dockerfile
+    image: iceberg-compaction-test-minio:2024-03-07
+    pull_policy: build
     environment:
       - MINIO_ROOT_USER=admin
       - MINIO_ROOT_PASSWORD=password
@@ -64,7 +68,11 @@ services:
   mc:
     depends_on:
       - minio
-    image: quay.io/minio/mc:RELEASE.2024-03-07T00-31-49Z
+    build:
+      context: .
+      dockerfile: minio.Dockerfile
+    image: iceberg-compaction-test-minio:2024-03-07
+    pull_policy: build
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
