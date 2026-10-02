@@ -111,6 +111,7 @@ impl DataFusionExecutor {
         let runtime_env = datafusion_processor::build_spilling_runtime_env(
             max_memory_bytes,
             execution_config.spill_dir.as_deref(),
+            execution_config.max_disk_spill_bytes,
         )?;
         // Can only fail if another thread set it between our check and here,
         // which `build_lock` rules out.
