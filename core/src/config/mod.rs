@@ -566,6 +566,37 @@ pub struct CompactionExecutionConfig {
     /// volume with enough free space, or away from a small/`noexec` `/tmp`.
     #[builder(default)]
     pub spill_dir: Option<std::path::PathBuf>,
+
+    /// Sets the compression strategy for on-disk spill files.
+    ///
+    /// The data spilled is Arrow IPC data, which can be many times larger than
+    /// the Parquet input it came from. Compression can reduce the disk space
+    /// used.
+    #[builder(default)]
+    pub spill_compression: SpillCompression,
+
+    /// Upper bound (in bytes) on total spill-file disk usage, shared by every
+    /// plan on this executor. Exceeding it fails the plan with `DataFusion`
+    /// `ResourcesExhausted` instead of filling the disk.
+    ///
+    /// Only takes effect together with `max_memory_bytes`; ignored otherwise.
+    /// `None` (default) uses `DataFusion`'s default (100 GB).
+    #[builder(default)]
+    pub max_disk_spill_bytes: Option<u64>,
+}
+
+/// Compression codec for on-disk spill files.
+///
+/// Mirrors `DataFusion`'s `SpillCompression` so the public config does not
+/// expose `DataFusion` types.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCompression {
+    #[default]
+    Uncompressed,
+    /// Faster (de)compression, larger files.
+    Lz4Frame,
+    /// Smaller files, more CPU.
+    Zstd,
 }
 
 impl Default for CompactionExecutionConfig {
