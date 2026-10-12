@@ -276,27 +276,29 @@ async fn assert_sorted_compaction_spills_within_budget(
     let consumers = observed_pool.consumer_peaks();
     let peak_reserved = observed_pool.peak_reserved.load(Ordering::Relaxed);
     let peak_spilled = observed_pool.peak_spilled_bytes.load(Ordering::Relaxed);
-    eprintln!(
-        "parallelism {parallelism}, decoded input {decoded_input_bytes} B, budget {memory_budget_bytes} B, peak reserved \
-         {peak_reserved} B, peak spill {peak_spilled} B, consumers (name, can_spill, peak B): \
-         {consumers:?}"
+    let stats = format!(
+        "parallelism {parallelism}, decoded input {decoded_input_bytes} B, budget \
+         {memory_budget_bytes} B, peak reserved {peak_reserved} B, peak spill {peak_spilled} B, \
+         consumers (name, can_spill, peak B): {consumers:?}"
     );
-    assert!(peak_reserved <= memory_budget_bytes);
+    assert!(peak_reserved <= memory_budget_bytes, "{stats}");
     assert!(
         peak_spilled > 0,
-        "the sort must spill when its input exceeds the budget"
+        "the sort must spill when its input exceeds the budget: {stats}"
     );
     // The anti joins against the delete files hold their build side in the same
     // pool, as unspillable reservations next to the sorter.
     assert!(
         consumers
             .iter()
-            .any(|(name, can_spill, _)| name.starts_with("HashJoinInput") && !can_spill)
+            .any(|(name, can_spill, _)| name.starts_with("HashJoinInput") && !can_spill),
+        "{stats}"
     );
     assert!(
         consumers
             .iter()
-            .any(|(name, can_spill, _)| name.starts_with("ExternalSorter[") && *can_spill)
+            .any(|(name, can_spill, _)| name.starts_with("ExternalSorter[") && *can_spill),
+        "{stats}"
     );
 }
 
