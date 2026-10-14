@@ -16,14 +16,14 @@
 
 //! Trustworthy per-file delete benefit for candidate planning.
 
-use iceberg::scan::FileScanTask;
+use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 use iceberg::spec::{DataContentType, DataFileFormat};
 
 use super::strategy::{DeleteFileCountFilterStrategy, FileFilterStrategy};
 use crate::config::DeleteSelection;
 use crate::{CompactionError, Result};
 
-/// Selects files by the inclusive percentage of physical rows deleted.
+/// Selects files by deleted-row percentage, skipping non-exact delete layouts.
 #[derive(Debug, Clone, Copy)]
 pub struct DeletedRowRatioFilterStrategy {
     min_percent: u32,
@@ -41,51 +41,67 @@ impl DeletedRowRatioFilterStrategy {
     }
 }
 
+/// Returns physical and deleted-row counts for a validated file-scoped position delete.
+/// Returns `None` for other valid delete layouts, which are skipped with a warning.
+/// Returns an error for invalid delete layouts, which are not eligible for selection.
+fn position_delete_counts(
+    task: &FileScanTask,
+    delete: &FileScanTaskDeleteFile,
+) -> Result<Option<(u64, u64)>> {
+    let unavailable = |reason: &str| CompactionError::DeleteStatistics {
+        data_file_path: task.data_file_path.clone(),
+        reason: reason.to_owned(),
+    };
+    match delete.file_type {
+        DataContentType::PositionDeletes => {}
+        DataContentType::EqualityDeletes => return Ok(None),
+        _ => return Err(unavailable("invalid delete content type or format")),
+    }
+    match delete.referenced_data_file.as_deref() {
+        None if delete.file_format == DataFileFormat::Parquet => return Ok(None),
+        Some(path) if path == task.data_file_path => {}
+        _ => return Err(unavailable("invalid file-scoped position-delete reference")),
+    }
+
+    let records = task
+        .record_count
+        .ok_or_else(|| unavailable("missing physical record count"))?;
+    let deleted = delete
+        .record_count
+        .ok_or_else(|| unavailable("missing position-delete record count"))?;
+    if deleted > records {
+        return Err(unavailable(
+            "deleted-row count exceeds physical record count",
+        ));
+    }
+    Ok(Some((records, deleted)))
+}
+
 impl FileFilterStrategy for DeletedRowRatioFilterStrategy {
-    /// Evaluates delete benefit, failing when the selected metric cannot be determined.
+    /// Uses one file-scoped Puffin or Parquet position delete for exact statistics.
     ///
-    /// Ratio selection validates all eligible data files, including clean files.
+    /// Other valid layouts are skipped with a warning.
     /// A zero ratio still requires at least one deleted row.
     fn matches(&self, task: &FileScanTask) -> Result<bool> {
-        let unavailable = |reason: &str| CompactionError::DeleteStatistics {
-            data_file_path: task.data_file_path.clone(),
-            reason: reason.to_owned(),
-        };
-        if task.start != 0 || task.length != task.file_size_in_bytes {
-            return Err(unavailable(
-                "ratio selection requires a complete data-file task",
-            ));
-        }
-        let records = task
-            .record_count
-            .ok_or_else(|| unavailable("missing physical record count"))?;
-        let deleted = match task.deletes.as_slice() {
-            [] => 0,
-            [delete]
-                if delete.file_type == DataContentType::PositionDeletes
-                    && delete.file_format == DataFileFormat::Puffin
-                    && delete.referenced_data_file.as_deref()
-                        == Some(task.data_file_path.as_str())
-                    && delete.content_offset.is_some_and(|offset| offset >= 0)
-                    && delete.content_size_in_bytes.is_some_and(|size| size > 0) =>
-            {
-                delete
-                    .record_count
-                    .ok_or_else(|| unavailable("missing deletion-vector cardinality"))?
+        let reason = match task.deletes.as_slice() {
+            [] => return Ok(false),
+            [delete] => {
+                if let Some((records, deleted)) = position_delete_counts(task, delete)? {
+                    return Ok(deleted > 0
+                        && u128::from(deleted) * 100
+                            >= u128::from(records) * u128::from(self.min_percent));
+                }
+                "delete descriptor is not a supported file-scoped position delete"
             }
-            _ => {
-                return Err(unavailable(
-                    "expected one file-scoped Puffin deletion vector; shared, equality, Parquet or multiple deletes do not provide an exact deleted-row count",
-                ));
-            }
+            _ => "multiple delete descriptors do not provide an exact deleted-row count",
         };
-        if deleted > records {
-            return Err(unavailable(
-                "deleted-row count exceeds physical record count",
-            ));
-        }
-        Ok(deleted > 0
-            && u128::from(deleted) * 100 >= u128::from(records) * u128::from(self.min_percent))
+        tracing::warn!(
+            data_file_path = %task.data_file_path,
+            delete_file_count = task.deletes.len(),
+            reason,
+            "Skipping ratio-based delete selection because the delete layout has no exact deleted-row ratio; small-file merge eligibility is unchanged"
+        );
+        Ok(false)
     }
 }
 
@@ -98,6 +114,9 @@ impl std::fmt::Display for DeletedRowRatioFilterStrategy {
 impl DeleteSelection {
     pub(crate) fn into_filter(self) -> Result<Box<dyn FileFilterStrategy>> {
         match self {
+            Self::FileCount(0) => Err(CompactionError::Config(
+                "delete-file count must be greater than zero".to_owned(),
+            )),
             Self::FileCount(count) => Ok(Box::new(DeleteFileCountFilterStrategy::new(count))),
             Self::DeletedRowRatioPercent(percent) => {
                 Ok(Box::new(DeletedRowRatioFilterStrategy::new(percent)?))
@@ -110,8 +129,7 @@ impl DeleteSelection {
 mod tests {
     use std::sync::Arc;
 
-    use iceberg::scan::FileScanTaskDeleteFile;
-    use iceberg::spec::{Literal, Schema, Struct};
+    use iceberg::spec::{DataFileFormat, Literal, Schema, Struct};
 
     use super::*;
     use crate::config::{
@@ -158,6 +176,15 @@ mod tests {
         task
     }
 
+    fn parquet_file(path: &str, bytes: u64, records: u64, deleted: u64) -> FileScanTask {
+        let mut task = file(path, bytes, records, Some(deleted));
+        task.deletes[0].file_path = format!("{path}.pos.parquet");
+        task.deletes[0].file_format = DataFileFormat::Parquet;
+        task.deletes[0].content_offset = None;
+        task.deletes[0].content_size_in_bytes = None;
+        task
+    }
+
     fn auto() -> AutoCompactionConfig {
         AutoCompactionConfig {
             small_file_threshold_bytes: 32,
@@ -199,13 +226,18 @@ mod tests {
             (u64::MAX, u64::MAX / 2, 50, false),
             (u64::MAX, u64::MAX / 2 + 1, 50, true),
         ] {
-            assert_eq!(
-                DeletedRowRatioFilterStrategy::new(percent)
-                    .unwrap()
-                    .matches(&file("data", 10, records, Some(deleted)))
-                    .unwrap(),
-                expected
-            );
+            for task in [
+                file("data", 10, records, Some(deleted)),
+                parquet_file("data", 10, records, deleted),
+            ] {
+                assert_eq!(
+                    DeletedRowRatioFilterStrategy::new(percent)
+                        .unwrap()
+                        .matches(&task)
+                        .unwrap(),
+                    expected
+                );
+            }
         }
         assert!(
             !DeletedRowRatioFilterStrategy::new(0)
@@ -213,6 +245,255 @@ mod tests {
                 .matches(&file("clean", 10, 100, None))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn parquet_ratio_supports_auto_and_delete_plans_with_newer_deletes() {
+        let configs = [
+            CompactionPlanningConfig::Auto(AutoCompactionConfig {
+                max_file_sequence_number: Some(1),
+                ..auto()
+            }),
+            CompactionPlanningConfig::FilesWithDeletes(FilesWithDeletesConfig {
+                delete_selection: Some(DeleteSelection::DeletedRowRatioPercent(20)),
+                max_file_sequence_number: Some(1),
+                ..Default::default()
+            }),
+        ];
+        for config in configs {
+            let mut newer = parquet_file("newer", 100, 100, 20);
+            newer.file_sequence_number = Some(2);
+            newer.record_count = None;
+            let result = groups(config.clone(), vec![
+                parquet_file("heavy", 100, 100, 20),
+                parquet_file("below-ratio", 100, 100, 19),
+                file("healthy", 100, 100, None),
+                newer,
+            ]);
+            assert_eq!(paths(&result), vec!["heavy"]);
+            assert_eq!(result[0].position_delete_files.len(), 1);
+            let delete = &result[0].position_delete_files[0];
+            assert_eq!(delete.data_file_format, DataFileFormat::Parquet);
+            assert_eq!((delete.start, delete.length), (0, 100));
+            assert_eq!(delete.record_count, Some(20));
+            assert_eq!(delete.sequence_number, 10);
+            assert_eq!(
+                paths(&groups(config, vec![file("rewritten", 100, 100, None)])),
+                Vec::<&str>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn parquet_ratio_rejects_invalid_file_scoped_statistics() {
+        let good = parquet_file("data", 100, 100, 20);
+        let mut cases = Vec::new();
+        let mut task = good.clone();
+        task.record_count = None;
+        cases.push(task);
+        let mut task = good.clone();
+        task.deletes[0].record_count = None;
+        cases.push(task);
+        let mut task = good.clone();
+        task.deletes[0].record_count = Some(101);
+        cases.push(task);
+        let mut task = good;
+        task.deletes[0].referenced_data_file = Some("other".to_owned());
+        cases.push(task);
+        for task in cases {
+            assert!(matches!(
+                DeletedRowRatioFilterStrategy::new(20)
+                    .unwrap()
+                    .matches(&task)
+                    .unwrap_err(),
+                CompactionError::DeleteStatistics { ref data_file_path, .. } if data_file_path == "data"
+            ));
+            let mut multiple = task.clone();
+            multiple
+                .deletes
+                .push(parquet_file("data", 100, 100, 20).deletes.remove(0));
+            let mut mixed = task.clone();
+            let mut equality = task.deletes[0].clone();
+            equality.file_type = DataContentType::EqualityDeletes;
+            mixed.deletes.push(equality);
+            let mut mixed_reversed = mixed.clone();
+            mixed_reversed.deletes.reverse();
+            for task in [multiple, mixed, mixed_reversed] {
+                assert!(
+                    !DeletedRowRatioFilterStrategy::new(20)
+                        .unwrap()
+                        .matches(&task)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_skips_non_exact_layouts_without_blocking_other_plans() {
+        let good = file("legacy", 100, 100, Some(20));
+        let mut equality = good.clone();
+        equality.deletes[0].file_type = DataContentType::EqualityDeletes;
+        equality.deletes[0].file_format = DataFileFormat::Parquet;
+        equality.deletes[0].referenced_data_file = None;
+        equality.deletes[0].record_count = None;
+        equality.record_count = None;
+        let mut position = equality.clone();
+        position.deletes[0].file_type = DataContentType::PositionDeletes;
+        position.record_count = Some(100);
+        position.deletes[0].record_count = Some(100);
+        let mut position_without_counts = position.clone();
+        position_without_counts.record_count = None;
+        position_without_counts.deletes[0].record_count = None;
+        let mut multiple_unsupported = equality.clone();
+        multiple_unsupported
+            .deletes
+            .push(position_without_counts.deletes[0].clone());
+        let mut multiple = good.clone();
+        let mut second = multiple.deletes[0].clone();
+        second.content_offset = Some(40);
+        multiple.deletes.push(second);
+        let mut mixed = good.clone();
+        mixed.deletes.push(equality.deletes[0].clone());
+        let mut mixed_reversed = mixed.clone();
+        mixed_reversed.deletes.reverse();
+        let mut multiple_parquet = parquet_file("legacy", 100, 100, 20);
+        let mut second = multiple_parquet.deletes[0].clone();
+        second.file_path = "legacy.second.pos.parquet".to_owned();
+        multiple_parquet.deletes.push(second);
+        let mut mixed_position = good.clone();
+        mixed_position
+            .deletes
+            .push(parquet_file("legacy", 100, 100, 20).deletes.remove(0));
+
+        for legacy in [
+            equality,
+            position,
+            position_without_counts,
+            multiple_unsupported,
+            multiple,
+            mixed,
+            mixed_reversed,
+            multiple_parquet,
+            mixed_position,
+        ] {
+            let result = groups(CompactionPlanningConfig::Auto(auto()), vec![
+                file("a", 10, 100, None),
+                file("b", 10, 100, None),
+                file("below-ratio", 100, 100, Some(19)),
+                file("healthy", 100, 100, None),
+                legacy.clone(),
+            ]);
+            assert_eq!(result.len(), 1);
+            assert_eq!(paths(&result), vec!["a", "b"]);
+
+            let mut small = legacy.clone();
+            small.file_size_in_bytes = 10;
+            small.length = 10;
+            let result = groups(CompactionPlanningConfig::Auto(auto()), vec![
+                file("a", 10, 100, None),
+                small.clone(),
+            ]);
+            assert_eq!(result.len(), 1);
+            assert_eq!(paths(&result), vec!["a", "legacy"]);
+            let result = groups(
+                CompactionPlanningConfig::Auto(AutoCompactionConfig {
+                    group_filters: Some(GroupFilters {
+                        min_group_file_count: Some(10),
+                        ..Default::default()
+                    }),
+                    ..auto()
+                }),
+                vec![file("a", 10, 100, None), small],
+            );
+            assert_eq!(paths(&result), Vec::<&str>::new());
+
+            let config = CompactionPlanningConfig::FilesWithDeletes(FilesWithDeletesConfig {
+                delete_selection: Some(DeleteSelection::DeletedRowRatioPercent(20)),
+                ..Default::default()
+            });
+            assert_eq!(
+                paths(&groups(config.clone(), vec![
+                    legacy,
+                    file("below-ratio", 100, 100, Some(19)),
+                    file("heavy", 100, 100, Some(20)),
+                    file("healthy", 100, 100, None),
+                ])),
+                vec!["heavy"]
+            );
+            assert_eq!(
+                paths(&groups(config, vec![file("rewritten", 100, 100, None)])),
+                Vec::<&str>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_zero_count_is_rejected_without_changing_legacy_zero_behavior() {
+        for config in [
+            CompactionPlanningConfig::Auto(AutoCompactionConfig {
+                delete_selection: Some(DeleteSelection::FileCount(0)),
+                ..Default::default()
+            }),
+            CompactionPlanningConfig::FilesWithDeletes(FilesWithDeletesConfig {
+                delete_selection: Some(DeleteSelection::FileCount(0)),
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(
+                PlanStrategy::try_from(&config).unwrap_err().to_string(),
+                "Invalid configuration: delete-file count must be greater than zero"
+            );
+        }
+        let result = groups(
+            CompactionPlanningConfig::Auto(AutoCompactionConfig {
+                small_file_threshold_bytes: 0,
+                min_delete_file_count_threshold: 0,
+                ..Default::default()
+            }),
+            vec![
+                file("clean", 100, 100, None),
+                file("heavy", 100, 100, Some(20)),
+            ],
+        );
+        assert_eq!(paths(&result), Vec::<&str>::new());
+        let result = groups(
+            CompactionPlanningConfig::FilesWithDeletes(FilesWithDeletesConfig {
+                min_delete_file_count_threshold: 0,
+                ..Default::default()
+            }),
+            vec![file("clean", 100, 100, None)],
+        );
+        assert_eq!(paths(&result), vec!["clean"]);
+    }
+
+    #[test]
+    fn explicit_positive_count_does_not_select_clean_or_rewritten_files() {
+        for config in [
+            CompactionPlanningConfig::Auto(AutoCompactionConfig {
+                small_file_threshold_bytes: 0,
+                min_delete_file_count_threshold: 0,
+                delete_selection: Some(DeleteSelection::FileCount(1)),
+                ..Default::default()
+            }),
+            CompactionPlanningConfig::FilesWithDeletes(FilesWithDeletesConfig {
+                min_delete_file_count_threshold: 0,
+                delete_selection: Some(DeleteSelection::FileCount(1)),
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(
+                paths(&groups(config.clone(), vec![
+                    file("clean", 100, 100, None),
+                    file("heavy", 100, 100, Some(20)),
+                ])),
+                vec!["heavy"]
+            );
+            assert_eq!(
+                paths(&groups(config, vec![file("rewritten", 100, 100, None)])),
+                Vec::<&str>::new()
+            );
+        }
     }
 
     #[test]
@@ -229,33 +510,13 @@ mod tests {
         task.deletes[0].record_count = Some(101);
         cases.push(task);
         let mut task = good.clone();
-        task.deletes[0].file_type = DataContentType::EqualityDeletes;
-        cases.push(task);
-        let mut task = good.clone();
-        task.deletes[0].file_format = DataFileFormat::Parquet;
+        task.deletes[0].file_type = DataContentType::Data;
         cases.push(task);
         let mut task = good.clone();
         task.deletes[0].referenced_data_file = None;
         cases.push(task);
         let mut task = good.clone();
         task.deletes[0].referenced_data_file = Some("other".to_owned());
-        cases.push(task);
-        let mut task = good.clone();
-        task.deletes.push(task.deletes[0].clone());
-        cases.push(task);
-        let mut task = good.clone();
-        let mut second = task.deletes[0].clone();
-        second.content_offset = Some(40);
-        task.deletes.push(second);
-        cases.push(task);
-        let mut task = good.clone();
-        task.deletes[0].content_offset = Some(-1);
-        cases.push(task);
-        let mut task = good.clone();
-        task.deletes[0].content_size_in_bytes = Some(0);
-        cases.push(task);
-        let mut task = good;
-        task.length -= 1;
         cases.push(task);
 
         for task in cases {
@@ -267,14 +528,33 @@ mod tests {
                 error,
                 CompactionError::DeleteStatistics { ref data_file_path, .. } if data_file_path == "data"
             ));
+            let mut mixed = task.clone();
+            let mut legacy = task.deletes[0].clone();
+            legacy.file_type = DataContentType::PositionDeletes;
+            legacy.file_format = DataFileFormat::Parquet;
+            mixed.deletes.push(legacy);
+            let mut multiple = task.clone();
+            multiple
+                .deletes
+                .push(file("data", 10, 100, Some(20)).deletes.remove(0));
+            let mut mixed_reversed = mixed.clone();
+            mixed_reversed.deletes.reverse();
+            for task in [mixed, mixed_reversed, multiple] {
+                assert!(
+                    !DeletedRowRatioFilterStrategy::new(20)
+                        .unwrap()
+                        .matches(&task)
+                        .unwrap()
+                );
+            }
         }
     }
 
     #[test]
-    fn auto_validates_ratio_even_for_small_or_non_candidate_files() {
+    fn auto_validates_single_position_delete_counts_even_for_small_files() {
         let config = CompactionPlanningConfig::Auto(auto());
         for bytes in [10, 100] {
-            let mut task = file("missing", bytes, 100, None);
+            let mut task = file("missing", bytes, 100, Some(20));
             task.record_count = None;
             let error = PlanStrategy::try_from(&config)
                 .unwrap()
@@ -537,7 +817,7 @@ mod tests {
 
     #[test]
     fn filter_combinators_propagate_errors_and_short_circuit() {
-        let mut missing = file("missing", 10, 100, None);
+        let mut missing = file("missing", 10, 100, Some(20));
         missing.record_count = None;
         let ratio = DeletedRowRatioFilterStrategy::new(20).unwrap();
         let all = || SizeFilterStrategy {

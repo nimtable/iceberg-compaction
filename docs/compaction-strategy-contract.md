@@ -101,9 +101,9 @@ evaluated predicates. The trait has no configuration-validation method.
 `0..=100`; its percentage field is private, so a constructed ratio filter always
 has valid configuration. `matches()` only checks per-file statistics.
 
-`PlanStrategy::try_from(&config)` constructs these filters and propagates an
-invalid ratio before snapshot scanning. The `Auto` and `FilesWithDeletes`
-strategy factories therefore return `Result<PlanStrategy>`. Other filters,
+`PlanStrategy::try_from(&config)` constructs these filters and rejects an
+invalid ratio or explicit `FileCount(0)` before snapshot scanning. The `Auto`
+and `FilesWithDeletes` strategy factories therefore return `Result<PlanStrategy>`. Other filters,
 combinators and explicit strategy constructors remain infallible.
 
 `PlanStrategyOptions` separates common eligibility filters from merge and delete
@@ -122,27 +122,47 @@ the previous boolean `matches()` API must now return `Result<bool>`.
 `Auto` and `FilesWithDeletes` accept an optional `delete_selection`:
 
 - `DeleteSelection::FileCount(n)` uses the applicable delete-descriptor count.
+  `n` must be greater than zero; an explicit zero is a configuration error.
 - `DeleteSelection::DeletedRowRatioPercent(p)` uses the inclusive percentage of
   physical data rows deleted. `p` must be in `0..=100`. Zero still requires a
-  positive deleted-row count.
+  positive deleted-row count. Other valid delete layouts do not match this predicate.
 
 Explicit selection overrides the legacy count threshold, including Auto's
-zero-disable behavior. Without it, the count-based candidate predicate is unchanged.
+zero-disable behavior. Without it, the count-based candidate predicate is unchanged:
+Auto's legacy zero disables delete selection, while `FilesWithDeletes`' legacy
+zero still selects every eligible file. The latter is retained for compatibility
+and is not fixed-point; use `Full` for intentional full-table rewrites.
 
-Ratio selection requires a complete data-file task with a physical record
-count. A clean file has zero deleted rows. A file with deletes must have exactly
-one file-scoped Puffin position-delete descriptor referencing that data file,
-with a valid blob range and an exact cardinality not exceeding the physical
-record count.
+Clean files do not match ratio selection and do not require record counts.
+Exact ratio evaluation uses exactly one file-scoped position-delete descriptor
+with `referenced_data_file` matching that data file and an exact deleted-row count
+not exceeding its physical record count:
 
-Shared position-delete files, equality deletes, Parquet position deletes and
+- Puffin deletion vectors use the descriptor's cardinality.
+- Parquet position deletes use the descriptor's record count. The writer must
+  write distinct positions for that data file, so the count equals deleted rows.
+
+Ratio selection does not validate blob offsets, sizes or scan ranges; it uses
+the file-level reference and row counts.
+
+Shared Parquet position-delete files without a file-scoped reference, equality deletes and
 multiple descriptors cannot establish an exact per-file deleted-row count.
 Their record counts must not be added: positions may overlap, and equality or
-shared deletes need not remove every row from this data file.
+shared deletes need not remove every row from this data file. Instead, ratio-based
+delete selection skips these files with a warning, without blocking planning for
+other files. They remain eligible for small-file merging; large files with these
+layouts require count-based selection or `Full` for delete cleanup. Unsupported
+layouts without file-scoped position deletes do not require exact record counts.
+There is no implicit count fallback or unconditional delete rewrite.
 
-Unsupported layouts and missing statistics return
-`CompactionError::DeleteStatistics`, not an empty plan. Statistics are checked
-for every sequence-eligible file, even if it is small or not a candidate.
+For a single file-scoped position delete, a mismatched reference, missing record
+counts or a deleted-row count exceeding the physical count still returns
+`CompactionError::DeleteStatistics`. These counts are checked even if the file
+also qualifies for a small-file merge.
+
+Multiple delete descriptors produce a warning and do not match the ratio
+predicate, without validating their references or statistics. Their record
+counts are never summed.
 The data-file sequence bound never filters newer applicable deletes.
 `Full` and count-based selection do not require these statistics.
 

@@ -1092,12 +1092,13 @@ impl PlanStrategy {
         let (grouping, group_filters) =
             Self::build_grouping_and_filters(&config.grouping_strategy, None);
 
-        let delete_filter = config
-            .delete_selection
-            .unwrap_or(DeleteSelection::FileCount(
+        let delete_filter: Box<dyn FileFilterStrategy> = match config.delete_selection {
+            Some(selection) => selection.into_filter()?,
+            // Preserve the historical zero-threshold behavior only for the legacy field.
+            None => Box::new(DeleteFileCountFilterStrategy::new(
                 config.min_delete_file_count_threshold,
-            ))
-            .into_filter()?;
+            )),
+        };
 
         Ok(Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)

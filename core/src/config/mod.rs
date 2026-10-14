@@ -102,11 +102,14 @@ pub enum FileGroupScope {
 /// Predicate used to select delete-heavy data files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteSelection {
+    /// Inclusive delete-descriptor count; zero is rejected during strategy construction.
     FileCount(usize),
-    /// Inclusive percentage of physical rows deleted by one file-scoped deletion vector.
+    /// Inclusive percentage of physical rows deleted by one file-scoped position delete.
     ///
-    /// Requires exact data-file counts and a single Puffin position-delete descriptor
-    /// referencing the data file. Other delete layouts produce a statistics error.
+    /// Supports Puffin deletion vectors and Parquet position deletes with distinct
+    /// positions and `referenced_data_file` set. Other valid delete layouts are skipped
+    /// with a warning but remain eligible for small-file merging. Invalid references
+    /// and counts for a single file-scoped position delete remain errors.
     DeletedRowRatioPercent(u32),
 }
 
