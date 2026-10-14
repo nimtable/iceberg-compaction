@@ -82,6 +82,18 @@ impl std::fmt::Debug for DataFusionExecutor {
 }
 
 impl DataFusionExecutor {
+    /// Builds an executor whose budgeted plans run on `runtime_env`, so tests
+    /// can observe the memory pool and disk manager of a real rewrite.
+    #[cfg(test)]
+    pub(crate) fn with_shared_runtime(runtime_env: Arc<RuntimeEnv>) -> Self {
+        let executor = Self::default();
+        executor
+            .shared_runtime
+            .set(runtime_env)
+            .expect("a new executor has no shared runtime");
+        executor
+    }
+
     /// Returns the shared bounded runtime for this executor, building it once on
     /// first use, or `None` when no memory budget is configured (unbounded,
     /// per-call behavior preserved).

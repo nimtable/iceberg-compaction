@@ -80,7 +80,18 @@ impl RecordBatchBuffer {
             buffer: vec![],
             current_rows: 0,
             max_record_batch_rows,
-            reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]").register(memory_pool),
+            // The buffer never spills, but it registers as spillable so that a
+            // `FairSpillPool` guarantees it a fair share of the pool. An
+            // unspillable consumer only gets what spillable consumers leave, and
+            // a co-resident `SortExec` keeps its whole share until its own next
+            // grow fails, so every following batch would fail with
+            // `ResourcesExhausted`. The buffer holds at most one coalesced batch,
+            // which fits as long as a fair share holds a few batches. The cost is
+            // that each scan partition dilutes the share of the spilling
+            // operators, so a sort spills smaller runs.
+            reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]")
+                .with_can_spill(true)
+                .register(memory_pool),
         }
     }
 

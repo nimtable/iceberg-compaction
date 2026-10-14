@@ -1499,6 +1499,7 @@ mod tests {
     use crate::executor::{ExecutorType, RewriteFilesStat};
 
     mod file_group_scope;
+    mod sorted_spill;
 
     // ----------------------
     // Test helpers to reduce duplication
