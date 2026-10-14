@@ -24,7 +24,7 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
@@ -374,6 +374,21 @@ impl FileGroup {
     }
 }
 
+/// Warnings collected while evaluating one data file.
+#[derive(Debug, Default)]
+pub struct FileFilterDiagnostics {
+    warnings: HashSet<&'static str>,
+}
+
+impl FileFilterDiagnostics {
+    /// Records a warning once for this file.
+    ///
+    /// Use a stable message so planning can aggregate it across files.
+    pub fn warn(&mut self, message: &'static str) {
+        self.warnings.insert(message);
+    }
+}
+
 /// Per-file predicate applied before grouping.
 ///
 /// Concrete filters can be composed with [`and`](Self::and) and [`or`](Self::or)
@@ -384,6 +399,15 @@ pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send 
     /// Returns whether a data file belongs to the candidate set.
     /// Propagates errors when the predicate cannot be evaluated.
     fn matches(&self, data_file: &FileScanTask) -> Result<bool>;
+
+    /// Evaluates the predicate and records warnings for this file.
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        _diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        self.matches(data_file)
+    }
 
     /// Combines two concrete filters with short-circuiting AND semantics.
     #[must_use]
@@ -455,6 +479,14 @@ impl FileFilterStrategy for AnyFileFilter {
     fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
         self.inner.matches(data_file)
     }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        self.inner.matches_with_diagnostics(data_file, diagnostics)
+    }
 }
 
 impl std::fmt::Display for AnyFileFilter {
@@ -493,6 +525,17 @@ where
     fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
         Ok(self.left.matches(data_file)? && self.right.matches(data_file)?)
     }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        Ok(self.left.matches_with_diagnostics(data_file, diagnostics)?
+            && self
+                .right
+                .matches_with_diagnostics(data_file, diagnostics)?)
+    }
 }
 
 impl<L, R> std::fmt::Display for AndFileFilter<L, R>
@@ -519,6 +562,17 @@ where
 {
     fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
         Ok(self.left.matches(data_file)? || self.right.matches(data_file)?)
+    }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        Ok(self.left.matches_with_diagnostics(data_file, diagnostics)?
+            || self
+                .right
+                .matches_with_diagnostics(data_file, diagnostics)?)
     }
 }
 
@@ -930,14 +984,15 @@ impl PlanStrategy {
 
         let mut merge_candidates = Vec::new();
         let mut delete_candidates = Vec::new();
+        let mut diagnostics = FileFilterDiagnostics::default();
         for file in data_files {
-            if !Self::matches_filters(&self.file_filters, &file)? {
-                continue;
-            }
-            let merge = Self::matches_filters(&self.merge_filters, &file)?;
+            let eligible = Self::matches_filters(&self.file_filters, &file, &mut diagnostics)?;
+            let merge =
+                eligible && Self::matches_filters(&self.merge_filters, &file, &mut diagnostics)?;
             // Delete statistics must be evaluated even when the merge predicate matches.
-            let delete = !self.delete_filters.is_empty()
-                && Self::matches_filters(&self.delete_filters, &file)?;
+            let delete = eligible
+                && !self.delete_filters.is_empty()
+                && Self::matches_filters(&self.delete_filters, &file, &mut diagnostics)?;
             match (merge, delete) {
                 (true, true) => {
                     delete_candidates.push(file.clone());
@@ -947,6 +1002,9 @@ impl PlanStrategy {
                 (false, true) => delete_candidates.push(file),
                 (false, false) => {}
             }
+        }
+        for warning in &diagnostics.warnings {
+            tracing::warn!(warning, "File selection reported a warning");
         }
         let mut file_groups = self.group_files(merge_candidates);
         for filter in &self.group_filters {
@@ -972,9 +1030,10 @@ impl PlanStrategy {
     fn matches_filters(
         filters: &[Box<dyn FileFilterStrategy>],
         file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
     ) -> Result<bool> {
         for filter in filters {
-            if !filter.matches(file)? {
+            if !filter.matches_with_diagnostics(file, diagnostics)? {
                 return Ok(false);
             }
         }

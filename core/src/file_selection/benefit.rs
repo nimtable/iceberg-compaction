@@ -19,7 +19,7 @@
 use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 use iceberg::spec::{DataContentType, DataFileFormat};
 
-use super::strategy::{DeleteFileCountFilterStrategy, FileFilterStrategy};
+use super::strategy::{DeleteFileCountFilterStrategy, FileFilterDiagnostics, FileFilterStrategy};
 use crate::config::DeleteSelection;
 use crate::{CompactionError, Result};
 
@@ -42,7 +42,7 @@ impl DeletedRowRatioFilterStrategy {
 }
 
 /// Returns physical and deleted-row counts for a validated file-scoped position delete.
-/// Returns `None` for other valid delete layouts, which are skipped with a warning.
+/// Returns `None` for other valid delete layouts.
 /// Returns an error for invalid delete layouts, which are not eligible for selection.
 fn position_delete_counts(
     task: &FileScanTask,
@@ -80,10 +80,18 @@ fn position_delete_counts(
 impl FileFilterStrategy for DeletedRowRatioFilterStrategy {
     /// Uses one file-scoped Puffin or Parquet position delete for exact statistics.
     ///
-    /// Other valid layouts are skipped with a warning.
+    /// Other valid layouts are skipped.
     /// A zero ratio still requires at least one deleted row.
     fn matches(&self, task: &FileScanTask) -> Result<bool> {
-        let reason = match task.deletes.as_slice() {
+        self.matches_with_diagnostics(task, &mut FileFilterDiagnostics::default())
+    }
+
+    fn matches_with_diagnostics(
+        &self,
+        task: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        match task.deletes.as_slice() {
             [] => return Ok(false),
             [delete] => {
                 if let Some((records, deleted)) = position_delete_counts(task, delete)? {
@@ -91,15 +99,11 @@ impl FileFilterStrategy for DeletedRowRatioFilterStrategy {
                         && u128::from(deleted) * 100
                             >= u128::from(records) * u128::from(self.min_percent));
                 }
-                "delete descriptor is not a supported file-scoped position delete"
             }
-            _ => "multiple delete descriptors do not provide an exact deleted-row count",
-        };
-        tracing::warn!(
-            data_file_path = %task.data_file_path,
-            delete_file_count = task.deletes.len(),
-            reason,
-            "Skipping ratio-based delete selection because the delete layout has no exact deleted-row ratio; small-file merge eligibility is unchanged"
+            _ => {}
+        }
+        diagnostics.warn(
+            "Skipping ratio-based delete selection because the delete layout has no exact deleted-row ratio",
         );
         Ok(false)
     }
@@ -831,21 +835,26 @@ mod tests {
             AnyFileFilter::new(ratio).and(all()),
             AnyFileFilter::new(ratio).or(all()),
         ] {
-            assert_eq!(
-                filter.matches(&missing).unwrap_err().to_string(),
-                "Delete statistics unavailable for missing: missing physical record count"
-            );
+            for result in [
+                filter.matches(&missing),
+                filter.matches_with_diagnostics(&missing, &mut FileFilterDiagnostics::default()),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "Delete statistics unavailable for missing: missing physical record count"
+                );
+            }
         }
         assert!(
             !AnyFileFilter::match_none()
                 .and(ratio)
-                .matches(&missing)
+                .matches_with_diagnostics(&missing, &mut FileFilterDiagnostics::default())
                 .unwrap()
         );
         assert!(
             AnyFileFilter::new(all())
                 .or(ratio)
-                .matches(&missing)
+                .matches_with_diagnostics(&missing, &mut FileFilterDiagnostics::default())
                 .unwrap()
         );
     }
