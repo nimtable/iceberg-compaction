@@ -1437,7 +1437,7 @@ impl CompactionPlanner {
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
-        let strategy = PlanStrategy::from(&self.config);
+        let strategy = PlanStrategy::try_from(&self.config)?;
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
         let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;

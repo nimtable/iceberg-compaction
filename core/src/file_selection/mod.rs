@@ -20,9 +20,11 @@ use iceberg::table::Table;
 
 use crate::Result;
 
+mod benefit;
 pub mod packer;
 pub mod strategy;
 
+pub use benefit::DeletedRowRatioFilterStrategy;
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 

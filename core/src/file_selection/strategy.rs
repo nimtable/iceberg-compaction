@@ -17,19 +17,21 @@
 //! Compaction file selection and grouping strategies.
 //!
 //! Implements a three-stage pipeline:
-//! 1. File filters: Select files with composable per-file predicates
-//! 2. Grouping: Choose a file-group scope, then combine files using Single
+//! 1. File selection: Apply composable filters, then evaluate configured candidate benefit
+//! 2. Grouping: Choose a file-group scope, then combine each candidate set using Single
 //!    (all-in-one) or `BinPack` (First-Fit Decreasing)
-//! 3. Group filters: Remove groups below size/count thresholds
+//! 3. Group filters: Apply size/count thresholds to merge groups, not delete candidates
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
 use super::packer::ListPacker;
-use crate::config::{CompactionPlanningConfig, FileGroupScope, GroupingStrategy, SPLIT_OVERHEAD};
+use crate::config::{
+    CompactionPlanningConfig, DeleteSelection, FileGroupScope, GroupingStrategy, SPLIT_OVERHEAD,
+};
 use crate::{CompactionError, Result};
 
 /// Bundle of data files and associated delete files for compaction.
@@ -372,15 +374,40 @@ impl FileGroup {
     }
 }
 
+/// Warnings collected while evaluating one data file.
+#[derive(Debug, Default)]
+pub struct FileFilterDiagnostics {
+    warnings: HashSet<&'static str>,
+}
+
+impl FileFilterDiagnostics {
+    /// Records a warning once for this file.
+    ///
+    /// Use a stable message so planning can aggregate it across files.
+    pub fn warn(&mut self, message: &'static str) {
+        self.warnings.insert(message);
+    }
+}
+
 /// Per-file predicate applied before grouping.
 ///
 /// Concrete filters can be composed with [`and`](Self::and) and [`or`](Self::or)
 /// before being type-erased for [`PlanStrategy`]. Use [`AnyFileFilter`] when the
-/// expression shape is chosen at runtime. Filters in [`PlanStrategy`] are still
-/// applied sequentially, so the top-level list has implicit AND semantics.
+/// expression shape is chosen at runtime. Each filter list in [`PlanStrategy`]
+/// is applied sequentially with implicit AND semantics.
 pub trait FileFilterStrategy: std::fmt::Debug + std::fmt::Display + Sync + Send {
     /// Returns whether a data file belongs to the candidate set.
-    fn matches(&self, data_file: &FileScanTask) -> bool;
+    /// Propagates errors when the predicate cannot be evaluated.
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool>;
+
+    /// Evaluates the predicate and records warnings for this file.
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        _diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        self.matches(data_file)
+    }
 
     /// Combines two concrete filters with short-circuiting AND semantics.
     #[must_use]
@@ -449,8 +476,16 @@ impl AnyFileFilter {
 }
 
 impl FileFilterStrategy for AnyFileFilter {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
         self.inner.matches(data_file)
+    }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        self.inner.matches_with_diagnostics(data_file, diagnostics)
     }
 }
 
@@ -464,8 +499,8 @@ impl std::fmt::Display for AnyFileFilter {
 struct MatchNoneFileFilter;
 
 impl FileFilterStrategy for MatchNoneFileFilter {
-    fn matches(&self, _data_file: &FileScanTask) -> bool {
-        false
+    fn matches(&self, _data_file: &FileScanTask) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -487,8 +522,19 @@ where
     L: FileFilterStrategy,
     R: FileFilterStrategy,
 {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
-        self.left.matches(data_file) && self.right.matches(data_file)
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
+        Ok(self.left.matches(data_file)? && self.right.matches(data_file)?)
+    }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        Ok(self.left.matches_with_diagnostics(data_file, diagnostics)?
+            && self
+                .right
+                .matches_with_diagnostics(data_file, diagnostics)?)
     }
 }
 
@@ -514,8 +560,19 @@ where
     L: FileFilterStrategy,
     R: FileFilterStrategy,
 {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
-        self.left.matches(data_file) || self.right.matches(data_file)
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
+        Ok(self.left.matches(data_file)? || self.right.matches(data_file)?)
+    }
+
+    fn matches_with_diagnostics(
+        &self,
+        data_file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        Ok(self.left.matches_with_diagnostics(data_file, diagnostics)?
+            || self
+                .right
+                .matches_with_diagnostics(data_file, diagnostics)?)
     }
 }
 
@@ -657,14 +714,14 @@ pub struct SizeFilterStrategy {
 }
 
 impl FileFilterStrategy for SizeFilterStrategy {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
         let file_size = data_file.length;
-        match (self.min_size, self.max_size) {
+        Ok(match (self.min_size, self.max_size) {
             (Some(min), Some(max)) => file_size >= min && file_size < max,
             (Some(min), None) => file_size >= min,
             (None, Some(max)) => file_size < max,
             (None, None) => true,
-        }
+        })
     }
 }
 
@@ -704,8 +761,8 @@ impl DeleteFileCountFilterStrategy {
 }
 
 impl FileFilterStrategy for DeleteFileCountFilterStrategy {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
-        data_file.deletes.len() >= self.min_delete_file_count
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
+        Ok(data_file.deletes.len() >= self.min_delete_file_count)
     }
 }
 
@@ -734,10 +791,10 @@ impl FileSequenceNumberFilterStrategy {
 }
 
 impl FileFilterStrategy for FileSequenceNumberFilterStrategy {
-    fn matches(&self, data_file: &FileScanTask) -> bool {
-        data_file
+    fn matches(&self, data_file: &FileScanTask) -> Result<bool> {
+        Ok(data_file
             .file_sequence_number
-            .is_some_and(|sequence_number| sequence_number <= self.max_file_sequence_number)
+            .is_some_and(|sequence_number| sequence_number <= self.max_file_sequence_number))
     }
 }
 
@@ -808,6 +865,8 @@ impl std::fmt::Display for MinGroupFileCountStrategy {
 #[derive(Debug)]
 pub struct PlanStrategyOptions {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
+    merge_filters: Vec<Box<dyn FileFilterStrategy>>,
+    delete_filters: Vec<Box<dyn FileFilterStrategy>>,
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
@@ -815,6 +874,9 @@ pub struct PlanStrategyOptions {
 
 impl PlanStrategyOptions {
     /// Creates options from the explicit file-selection pipeline stages.
+    ///
+    /// `file_filters` constrain both paths. Eligible files enter the merge path
+    /// by default; the delete path is disabled until delete filters are configured.
     ///
     /// The file group scope defaults to [`FileGroupScope::Partition`]. Use
     /// [`with_file_group_scope`](Self::with_file_group_scope) to opt into
@@ -827,6 +889,8 @@ impl PlanStrategyOptions {
     ) -> Self {
         Self {
             file_filters,
+            merge_filters: Vec::new(),
+            delete_filters: Vec::new(),
             grouping,
             file_group_scope: FileGroupScope::Partition,
             group_filters,
@@ -839,14 +903,31 @@ impl PlanStrategyOptions {
         self.file_group_scope = file_group_scope;
         self
     }
+
+    /// Sets merge predicates, combined with AND. An empty list selects every eligible file.
+    #[must_use]
+    pub fn with_merge_filters(mut self, filters: Vec<Box<dyn FileFilterStrategy>>) -> Self {
+        self.merge_filters = filters;
+        self
+    }
+
+    /// Sets delete predicates, combined with AND. An empty list disables the delete path.
+    #[must_use]
+    pub fn with_delete_filters(mut self, filters: Vec<Box<dyn FileFilterStrategy>>) -> Self {
+        self.delete_filters = filters;
+        self
+    }
 }
 
-/// Three-stage pipeline: file filters → grouping → group filters → parallelism calculation.
+/// Shared planning pipeline for merge and delete candidates.
 ///
-/// Filters and group filters are applied sequentially. See [`execute`](Self::execute) for details.
+/// Group filters gate merges only. Both paths use the configured scope and grouping
+/// implementation, with overlapping candidates rewritten once.
 #[derive(Debug)]
 pub struct PlanStrategy {
     file_filters: Vec<Box<dyn FileFilterStrategy>>,
+    merge_filters: Vec<Box<dyn FileFilterStrategy>>,
+    delete_filters: Vec<Box<dyn FileFilterStrategy>>,
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
@@ -876,6 +957,8 @@ impl PlanStrategy {
     pub fn new_with_options(options: PlanStrategyOptions) -> Self {
         Self {
             file_filters: options.file_filters,
+            merge_filters: options.merge_filters,
+            delete_filters: options.delete_filters,
             grouping: options.grouping,
             file_group_scope: options.file_group_scope,
             group_filters: options.group_filters,
@@ -883,13 +966,13 @@ impl PlanStrategy {
     }
 
     /// Executes the pipeline:
-    /// 1. Apply each file filter sequentially
-    /// 2. Group files using the configured file-group scope and grouping strategy
-    /// 3. Apply each group filter sequentially
+    /// 1. Apply common file filters, then independently evaluate merge and delete predicates
+    /// 2. Group merge candidates and apply each group filter sequentially
+    /// 3. Group delete candidates not already covered by a merge, using the same scope and grouping
     /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
     /// # Errors
-    /// Propagates errors from parallelism calculation (fails if group has 0 bytes).
+    /// Propagates invalid configuration, unavailable delete statistics and parallelism errors.
     pub fn execute(
         &self,
         data_files: Vec<FileScanTask>,
@@ -899,22 +982,62 @@ impl PlanStrategy {
             crate::file_selection::FileSelector::validate_file_sequence_numbers(&data_files)?;
         }
 
-        let mut filtered_files = data_files;
-        for filter in &self.file_filters {
-            filtered_files.retain(|data_file| filter.matches(data_file));
+        let mut merge_candidates = Vec::new();
+        let mut delete_candidates = Vec::new();
+        let mut diagnostics = FileFilterDiagnostics::default();
+        for file in data_files {
+            let eligible = Self::matches_filters(&self.file_filters, &file, &mut diagnostics)?;
+            let merge =
+                eligible && Self::matches_filters(&self.merge_filters, &file, &mut diagnostics)?;
+            // Delete statistics must be evaluated even when the merge predicate matches.
+            let delete = eligible
+                && !self.delete_filters.is_empty()
+                && Self::matches_filters(&self.delete_filters, &file, &mut diagnostics)?;
+            match (merge, delete) {
+                (true, true) => {
+                    delete_candidates.push(file.clone());
+                    merge_candidates.push(file);
+                }
+                (true, false) => merge_candidates.push(file),
+                (false, true) => delete_candidates.push(file),
+                (false, false) => {}
+            }
         }
-
-        let file_groups = self.group_files(filtered_files);
-
-        let mut file_groups = file_groups;
+        for warning in &diagnostics.warnings {
+            tracing::warn!(warning, "File selection reported a warning");
+        }
+        let mut file_groups = self.group_files(merge_candidates);
         for filter in &self.group_filters {
             file_groups = filter.filter_groups(file_groups);
+        }
+
+        if !delete_candidates.is_empty() {
+            let covered = file_groups
+                .iter()
+                .flat_map(|group| &group.data_files)
+                .map(|file| file.data_file_path.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            delete_candidates.retain(|file| !covered.contains(file.data_file_path.as_str()));
+            file_groups.extend(self.group_files(delete_candidates));
         }
 
         file_groups
             .into_iter()
             .map(|group| group.with_calculated_parallelism(config))
             .collect()
+    }
+
+    fn matches_filters(
+        filters: &[Box<dyn FileFilterStrategy>],
+        file: &FileScanTask,
+        diagnostics: &mut FileFilterDiagnostics,
+    ) -> Result<bool> {
+        for filter in filters {
+            if !filter.matches_with_diagnostics(file, diagnostics)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn group_files(&self, data_files: Vec<FileScanTask>) -> Vec<FileGroup> {
@@ -977,11 +1100,6 @@ impl PlanStrategy {
                 max_file_sequence_number,
             )));
         }
-        file_filters.push(Box::new(SizeFilterStrategy {
-            min_size: None,
-            max_size: Some(config.small_file_threshold_bytes),
-        }));
-
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
             config.group_filters.as_ref(),
@@ -989,7 +1107,11 @@ impl PlanStrategy {
 
         Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
+                .with_file_group_scope(config.file_group_scope)
+                .with_merge_filters(vec![Box::new(SizeFilterStrategy {
+                    min_size: None,
+                    max_size: Some(config.small_file_threshold_bytes),
+                })]),
         )
     }
 
@@ -1016,8 +1138,8 @@ impl PlanStrategy {
 
     /// Constructs strategy for files with delete files.
     ///
-    /// Adds `DeleteFileCountFilterStrategy` if `min_delete_file_count_threshold > 0`.
-    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
+    /// Uses the explicit delete selection, or the legacy delete-file count threshold.
+    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Result<Self> {
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
         if let Some(max_file_sequence_number) = config.max_file_sequence_number {
@@ -1026,29 +1148,39 @@ impl PlanStrategy {
             )));
         }
 
-        if config.min_delete_file_count_threshold > 0 {
-            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+        let (grouping, group_filters) =
+            Self::build_grouping_and_filters(&config.grouping_strategy, None);
+
+        let delete_filter: Box<dyn FileFilterStrategy> = match config.delete_selection {
+            Some(selection) => selection.into_filter()?,
+            // Preserve the historical zero-threshold behavior only for the legacy field.
+            None => Box::new(DeleteFileCountFilterStrategy::new(
                 config.min_delete_file_count_threshold,
-            )));
-        }
+            )),
+        };
 
-        let (grouping, group_filters) = Self::build_grouping_and_filters(
-            &config.grouping_strategy,
-            config.group_filters.as_ref(),
-        );
-
-        Self::new_with_options(
+        Ok(Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
+                .with_file_group_scope(config.file_group_scope)
+                .with_merge_filters(vec![Box::new(MatchNoneFileFilter)])
+                .with_delete_filters(vec![delete_filter]),
+        ))
     }
 
-    /// Constructs the unified Auto candidate pipeline.
+    /// Constructs the shared Auto candidate pipeline.
     ///
-    /// A non-zero threshold enables its predicate. When both predicates are
-    /// enabled, they are composed before type erasure so candidate selection is
-    /// `small OR delete-heavy`, followed by one grouping pipeline.
-    pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Self {
+    /// Merge and delete candidates use the same grouping logic. Group filters only gate merges.
+    /// Explicit delete selection overrides the legacy count threshold.
+    pub fn from_auto(config: &crate::config::AutoCompactionConfig) -> Result<Self> {
+        let mut delete_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
+        if let Some(selection) = config.delete_selection.or_else(|| {
+            (config.min_delete_file_count_threshold > 0).then_some(DeleteSelection::FileCount(
+                config.min_delete_file_count_threshold,
+            ))
+        }) {
+            delete_filters.push(selection.into_filter()?);
+        }
+
         let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = Vec::new();
         if let Some(max_file_sequence_number) = config.max_file_sequence_number {
             file_filters.push(Box::new(FileSequenceNumberFilterStrategy::new(
@@ -1056,33 +1188,20 @@ impl PlanStrategy {
             )));
         }
 
-        let size_filter = SizeFilterStrategy {
-            min_size: None,
-            max_size: Some(config.small_file_threshold_bytes),
-        };
-        let delete_filter =
-            DeleteFileCountFilterStrategy::new(config.min_delete_file_count_threshold);
-
-        let candidate_filter: Box<dyn FileFilterStrategy> = match (
-            config.small_file_threshold_bytes > 0,
-            config.min_delete_file_count_threshold > 0,
-        ) {
-            (true, true) => Box::new(size_filter.or(delete_filter)),
-            (true, false) => Box::new(size_filter),
-            (false, true) => Box::new(delete_filter),
-            (false, false) => Box::new(size_filter),
-        };
-        file_filters.push(candidate_filter);
-
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
             config.group_filters.as_ref(),
         );
 
-        Self::new_with_options(
+        Ok(Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
-        )
+                .with_file_group_scope(config.file_group_scope)
+                .with_merge_filters(vec![Box::new(SizeFilterStrategy {
+                    min_size: None,
+                    max_size: Some(config.small_file_threshold_bytes),
+                })])
+                .with_delete_filters(delete_filters),
+        ))
     }
 
     /// Test-only builder accepting raw filter parameters.
@@ -1118,14 +1237,16 @@ impl PlanStrategy {
     }
 }
 
-impl From<&CompactionPlanningConfig> for PlanStrategy {
-    fn from(config: &CompactionPlanningConfig) -> Self {
+impl TryFrom<&CompactionPlanningConfig> for PlanStrategy {
+    type Error = CompactionError;
+
+    fn try_from(config: &CompactionPlanningConfig) -> Result<Self> {
         match config {
             CompactionPlanningConfig::Auto(auto_config) => PlanStrategy::from_auto(auto_config),
             CompactionPlanningConfig::SmallFiles(small_files_config) => {
-                PlanStrategy::from_small_files(small_files_config)
+                Ok(PlanStrategy::from_small_files(small_files_config))
             }
-            CompactionPlanningConfig::Full(full_config) => PlanStrategy::from_full(full_config),
+            CompactionPlanningConfig::Full(full_config) => Ok(PlanStrategy::from_full(full_config)),
 
             CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
                 PlanStrategy::from_files_with_deletes(deletes_config)
@@ -1136,14 +1257,33 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
 
 impl std::fmt::Display for PlanStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let file_filter_desc = if self.file_filters.is_empty() {
+        let mut descriptions = self
+            .file_filters
+            .iter()
+            .map(|filter| filter.to_string())
+            .collect::<Vec<_>>();
+        if !self.merge_filters.is_empty() || !self.delete_filters.is_empty() {
+            let describe = |filters: &[Box<dyn FileFilterStrategy>], empty: &str| {
+                if filters.is_empty() {
+                    empty.to_owned()
+                } else {
+                    filters
+                        .iter()
+                        .map(|filter| filter.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                }
+            };
+            descriptions.push(format!(
+                "Merge[{}] OR Delete[{}]",
+                describe(&self.merge_filters, "All"),
+                describe(&self.delete_filters, "Disabled"),
+            ));
+        }
+        let file_filter_desc = if descriptions.is_empty() {
             "NoFileFilters".to_owned()
         } else {
-            self.file_filters
-                .iter()
-                .map(|filter| filter.to_string())
-                .collect::<Vec<_>>()
-                .join(" -> ")
+            descriptions.join(" -> ")
         };
 
         let group_filter_desc = if self.group_filters.is_empty() {
@@ -1475,7 +1615,7 @@ mod tests {
     ) -> Vec<FileScanTask> {
         files
             .into_iter()
-            .filter(|file| filter.matches(file))
+            .filter(|file| filter.matches(file).unwrap())
             .collect()
     }
 
@@ -1597,31 +1737,28 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_strategy_groups_the_union_of_candidate_files() {
+    fn test_auto_strategy_combines_candidate_plans_without_duplicates() {
         let auto_config = AutoCompactionConfigBuilder::default()
             .small_file_threshold_bytes(32 * 1024 * 1024_u64)
             .min_delete_file_count_threshold(2_usize)
             .build()
             .unwrap();
         let planning_config = CompactionPlanningConfig::Auto(auto_config);
-        let strategy = PlanStrategy::from(&planning_config);
+        let strategy = PlanStrategy::try_from(&planning_config).unwrap();
 
         let groups = strategy
             .execute(composite_filter_test_files(), &planning_config)
             .unwrap();
 
-        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.len(), 2);
         TestUtils::assert_paths_eq(
-            &[
-                "small-clean.parquet",
-                "large-delete-heavy.parquet",
-                "small-delete-heavy.parquet",
-            ],
+            &["small-clean.parquet", "small-delete-heavy.parquet"],
             &groups[0].data_files,
         );
+        TestUtils::assert_paths_eq(&["large-delete-heavy.parquet"], &groups[1].data_files);
         assert_eq!(
             strategy.to_string(),
-            "(SizeFilter[<32MB] OR DeleteFileCountFilter[>=2 deletes]) -> SingleGrouping -> NoGroupFilters"
+            "Merge[SizeFilter[<32MB]] OR Delete[DeleteFileCountFilter[>=2 deletes]] -> SingleGrouping -> NoGroupFilters"
         );
     }
 
@@ -1646,7 +1783,7 @@ mod tests {
                 .build()
                 .unwrap();
             let planning_config = CompactionPlanningConfig::Auto(auto_config);
-            let strategy = PlanStrategy::from(&planning_config);
+            let strategy = PlanStrategy::try_from(&planning_config).unwrap();
             let files = strategy
                 .execute(composite_filter_test_files(), &planning_config)
                 .unwrap()
@@ -1695,7 +1832,8 @@ mod tests {
         ];
 
         for config in configs {
-            let files = PlanStrategy::from(&config)
+            let files = PlanStrategy::try_from(&config)
+                .unwrap()
                 .execute(vec![old_file.clone(), new_file.clone()], &config)
                 .unwrap()
                 .into_iter()
@@ -1716,7 +1854,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let error = PlanStrategy::from(&config)
+        let error = PlanStrategy::try_from(&config)
+            .unwrap()
             .execute(vec![missing], &config)
             .unwrap_err();
         assert_eq!(
@@ -1831,7 +1970,7 @@ mod tests {
         let small_files_config =
             CompactionPlanningConfig::SmallFiles(crate::config::SmallFilesConfig::default());
 
-        let small_files_strategy = PlanStrategy::from(&small_files_config);
+        let small_files_strategy = PlanStrategy::try_from(&small_files_config).unwrap();
         let small_files_desc = small_files_strategy.to_string();
         assert!(small_files_desc.contains("SizeFilter"));
         assert!(
@@ -1841,7 +1980,7 @@ mod tests {
 
         let full_config =
             CompactionPlanningConfig::Full(crate::config::FullCompactionConfig::default());
-        let routed_full = PlanStrategy::from(&full_config);
+        let routed_full = PlanStrategy::try_from(&full_config).unwrap();
 
         let full_desc = routed_full.to_string();
         assert!(!full_desc.is_empty());
@@ -1857,7 +1996,7 @@ mod tests {
         let deletes_config = CompactionPlanningConfig::FilesWithDeletes(
             crate::config::FilesWithDeletesConfig::default(),
         );
-        let deletes_strategy = PlanStrategy::from(&deletes_config);
+        let deletes_strategy = PlanStrategy::try_from(&deletes_config).unwrap();
         let deletes_desc = deletes_strategy.to_string();
 
         // Should have different description than the other two
@@ -1997,7 +2136,7 @@ mod tests {
             .unwrap();
         let config = CompactionPlanningConfig::SmallFiles(small_files_config);
 
-        let strategy = PlanStrategy::from(&config);
+        let strategy = PlanStrategy::try_from(&config).unwrap();
 
         // Description should reflect core filters
         let desc = strategy.to_string();
@@ -2049,7 +2188,7 @@ mod tests {
             .build()
             .unwrap();
         let min_count_config = CompactionPlanningConfig::SmallFiles(min_count_small_files_config);
-        let min_count_strategy = PlanStrategy::from(&min_count_config);
+        let min_count_strategy = PlanStrategy::try_from(&min_count_config).unwrap();
 
         let insufficient_files = vec![
             TestFileBuilder::new("small1.parquet")
@@ -2096,7 +2235,7 @@ mod tests {
             _ => panic!("Expected small files config"),
         }
 
-        let default_strategy = PlanStrategy::from(&default_config);
+        let default_strategy = PlanStrategy::try_from(&default_config).unwrap();
 
         let single_file = vec![
             TestFileBuilder::new("single.parquet")
@@ -2658,7 +2797,7 @@ mod tests {
             .unwrap();
         let config = CompactionPlanningConfig::Full(full_config);
 
-        let strategy = PlanStrategy::from(&config);
+        let strategy = PlanStrategy::try_from(&config).unwrap();
 
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")
@@ -2814,7 +2953,7 @@ mod tests {
             .build()
             .unwrap();
         let config = CompactionPlanningConfig::FilesWithDeletes(files_with_deletes_config);
-        let strategy = PlanStrategy::from(&config);
+        let strategy = PlanStrategy::try_from(&config).unwrap();
 
         assert!(strategy.to_string().contains("DeleteFileCountFilter"));
 
@@ -2851,7 +2990,7 @@ mod tests {
             .unwrap();
         let config = CompactionPlanningConfig::Full(full_config);
 
-        let strategy = PlanStrategy::from(&config);
+        let strategy = PlanStrategy::try_from(&config).unwrap();
 
         let test_files = vec![
             TestFileBuilder::new("file1.parquet")
@@ -3332,34 +3471,33 @@ mod tests {
     }
 
     #[test]
-    fn test_files_with_deletes_table_scope_applies_group_filter_across_partitions() {
+    fn test_files_with_deletes_respects_group_scope() {
         let files = vec![
             delete_heavy_partitioned_file("p0_file1.parquet", 0),
             delete_heavy_partitioned_file("p1_file1.parquet", 1),
             delete_heavy_partitioned_file("p2_file1.parquet", 2),
         ];
-        let group_filters = min_file_count_filter(3);
         let table_scope_config = FilesWithDeletesConfigBuilder::default()
             .grouping_strategy(GroupingStrategy::Single)
             .file_group_scope(FileGroupScope::Table)
             .min_delete_file_count_threshold(1_usize)
-            .group_filters(group_filters.clone())
             .build()
             .unwrap();
         let partition_scope_config = FilesWithDeletesConfigBuilder::default()
             .grouping_strategy(GroupingStrategy::Single)
             .min_delete_file_count_threshold(1_usize)
-            .group_filters(group_filters)
             .build()
             .unwrap();
 
         let table_scope_groups = PlanStrategy::from_files_with_deletes(&table_scope_config)
+            .unwrap()
             .execute(
                 files.clone(),
                 &CompactionPlanningConfig::FilesWithDeletes(table_scope_config),
             )
             .unwrap();
         let partition_scope_groups = PlanStrategy::from_files_with_deletes(&partition_scope_config)
+            .unwrap()
             .execute(
                 files,
                 &CompactionPlanningConfig::FilesWithDeletes(partition_scope_config),
@@ -3368,7 +3506,14 @@ mod tests {
 
         assert_eq!(table_scope_groups.len(), 1);
         assert_eq!(table_scope_groups[0].data_file_count, 3);
-        assert_eq!(partition_scope_groups.len(), 0);
+        assert_eq!(partition_scope_groups.len(), 3);
+        assert_eq!(
+            partition_scope_groups
+                .iter()
+                .map(|group| group.data_file_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1],
+        );
     }
 
     #[test]
