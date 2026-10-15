@@ -1049,20 +1049,20 @@ impl CommitManager {
 
                 let txn = Transaction::new(&table);
 
+                // Custom snapshot properties (e.g. a writer's commit watermark) come from the real
+                // parent, which iceberg-rust re-reads when a retry rebases onto a newer head.
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
                 let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        let mut action = txn
-                            .rewrite_files()
+                        txn.rewrite_files()
                             .set_enable_delete_filter_manager(true)
                             .add_data_files(data_files)
                             .delete_files(delete_files)
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
-                            .set_check_file_existence(true);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
-                        action
+                            .set_check_file_existence(true)
+                            .set_inherit_parent_snapshot_properties(true)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -1072,17 +1072,13 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    let mut action = txn
-                        .rewrite_files()
+                    txn.rewrite_files()
                         .set_enable_delete_filter_manager(true)
                         .add_data_files(data_files)
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
-                        .set_check_file_existence(true);
-                    if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
-                    }
-                    action
+                        .set_check_file_existence(true)
+                        .set_inherit_parent_snapshot_properties(true)
                 };
 
                 if let Some(sequence_number) = delete_cleanup_min_data_sequence_number {
@@ -1489,7 +1485,8 @@ mod tests {
 
     // Additional imports for new tests
     use crate::compaction::{
-        CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
+        CommitConsistencyParams, CommitManagerRetryConfig, CompactionPlan, RewriteResult,
+        UNASSIGNED_SNAPSHOT_ID,
     };
     use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
     use crate::config::{
@@ -3354,6 +3351,65 @@ mod tests {
             snapshot_after.summary().operation,
             iceberg::spec::Operation::Replace,
             "Compaction snapshot operation should be 'replace'"
+        );
+    }
+
+    /// A rewrite planned at one snapshot that commits after a newer append carries the
+    /// append's custom properties: the append is its parent and its data is part of the result.
+    #[tokio::test]
+    async fn test_rewrite_files_inherits_properties_from_rebased_parent() {
+        let env = create_test_env().await;
+        let watermark =
+            |value: &str| HashMap::from([("custom.watermark".to_owned(), value.to_owned())]);
+
+        let planned_files =
+            write_simple_files(&env.table, &env.warehouse_location, "planned", 2).await;
+        let planned_table = append_and_commit_with_properties(
+            &env.table,
+            env.catalog.as_ref(),
+            planned_files.clone(),
+            watermark("41"),
+        )
+        .await;
+        let planned_snapshot_id = planned_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap()
+            .snapshot_id();
+
+        // A writer commits after the rewrite was planned.
+        let appended_files =
+            write_simple_files(&planned_table, &env.warehouse_location, "appended", 1).await;
+        append_and_commit_with_properties(
+            &planned_table,
+            env.catalog.as_ref(),
+            appended_files,
+            watermark("42"),
+        )
+        .await;
+
+        let compacted_files =
+            write_simple_files(&planned_table, &env.warehouse_location, "compacted", 1).await;
+        let commit_manager =
+            create_default_compaction(env.catalog.clone(), env.table_ident.clone())
+                .build_commit_manager(CommitConsistencyParams {
+                    starting_snapshot_id: planned_snapshot_id,
+                    use_starting_sequence_number: true,
+                    basic_schema_id: planned_table.metadata().current_schema().schema_id(),
+                });
+        let table = commit_manager
+            .rewrite_files(compacted_files, planned_files, MAIN_BRANCH)
+            .await
+            .unwrap();
+
+        let head = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(head.summary().operation, iceberg::spec::Operation::Replace);
+        assert_eq!(
+            head.summary()
+                .additional_properties
+                .get("custom.watermark")
+                .map(String::as_str),
+            Some("42")
         );
     }
 
