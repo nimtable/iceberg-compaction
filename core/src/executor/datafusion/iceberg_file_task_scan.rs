@@ -54,23 +54,23 @@ struct RecordBatchBuffer {
 
     max_record_batch_rows: usize,
 
-    /// Live reservation for the decoded batches currently retained in `buffer`,
-    /// charged against the `DataFusion` memory pool. The reservation tracks its
-    /// own allocated size, so it is the single source of truth for how many
-    /// bytes we still hold.
+    /// Bytes of the batches currently retained in `buffer`.
+    retained_bytes: usize,
+
+    /// Pool charge for decode output: the most bytes this stream has held at once.
     ///
-    /// Charging the scan's retained decode output to the pool gives the
-    /// compaction memory budget (`max_memory_bytes` -> `FairSpillPool`) teeth on
-    /// the unsorted-table path, which has no `SortExec` to reserve from the pool
-    /// and therefore otherwise never surfaces its decode footprint. Under a
-    /// bounded pool an over-budget batch fails fast with `ResourcesExhausted`
-    /// (a clean, retriable error) instead of the process being OOM-killed; with
-    /// the default unbounded pool `try_grow` always succeeds, so behavior is
-    /// unchanged.
+    /// Charging the scan's decode output to the pool gives the compaction memory
+    /// budget (`max_memory_bytes` -> `FairSpillPool`) teeth on the unsorted-table
+    /// path, which has no `SortExec` to reserve from the pool and therefore
+    /// otherwise never surfaces its decode footprint. Under a bounded pool an
+    /// over-budget batch fails fast with `ResourcesExhausted` (a clean, retriable
+    /// error) instead of the process being OOM-killed; with the default unbounded
+    /// pool every resize succeeds, so behavior is unchanged.
     ///
-    /// The reservation only ever reflects bytes we still hold: it is released as
-    /// batches are flushed or yielded downstream (and fully on drop), so it does
-    /// not over-reserve against a co-resident `SortExec` on the sorted path.
+    /// Only grows until the stream finishes: a spillable `SortExec` grows into
+    /// any free memory, so releasing bytes would fail the next batch that needs
+    /// them before the sort spills. The cost is up to one batch per scan
+    /// partition, held for one plan.
     reservation: MemoryReservation,
 }
 
@@ -80,25 +80,20 @@ impl RecordBatchBuffer {
             buffer: vec![],
             current_rows: 0,
             max_record_batch_rows,
+            retained_bytes: 0,
             reservation: MemoryConsumer::new("IcebergFileTaskScan[decode]").register(memory_pool),
         }
     }
 
     fn add(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>, DataFusionError> {
-        // Measure the freshly decoded batch. Each case below charges it against
-        // the pool with `try_grow` before retaining or forwarding it, so when the
-        // bounded budget is exceeded by the aggregate in-flight decode output
-        // across concurrently-executing scan partitions we fail fast with
-        // `ResourcesExhausted` instead of OOM-killing.
+        // Each case charges the batch before retaining or yielding it, so an
+        // over-budget decode fails fast instead of OOM-killing. A failed grow
+        // leaves the reservation unchanged.
         let batch_bytes = batch.get_array_memory_size();
 
         // Case 1: New batch itself is large enough and buffer is empty or too small to be significant
         if batch.num_rows() >= self.max_record_batch_rows && self.buffer.is_empty() {
-            // Validate the batch against the budget so an over-budget decode
-            // still fails fast, then release the charge immediately: the batch
-            // leaves our control on yield, so we retain nothing.
-            self.reservation.try_grow(batch_bytes)?;
-            self.reservation.free();
+            self.charge_at_least(batch_bytes)?;
             return Ok(Some(batch));
         }
 
@@ -106,22 +101,28 @@ impl RecordBatchBuffer {
         if !self.buffer.is_empty()
             && (self.current_rows + batch.num_rows() > self.max_record_batch_rows)
         {
-            // Flush the retained buffer first (releasing its whole charge), then
-            // charge and retain the new batch. Flushing before growing keeps the
-            // reservation equal to the bytes we still hold, so `finish_internal`
-            // can release exactly the retained batches via `free`.
-            let combined = self.finish_internal()?; // Drain and combine buffer (releases the retained charge)
-            self.reservation.try_grow(batch_bytes)?;
+            self.charge_at_least(batch_bytes)?;
+            let combined = self.finish_internal()?; // Drain and combine buffer
             self.current_rows = batch.num_rows();
+            self.retained_bytes = batch_bytes;
             self.buffer.push(batch); // Add current batch to now-empty buffer
             return Ok(combined); // Return the combined batch from buffer
         }
 
         // Case 3: Buffer has space
-        self.reservation.try_grow(batch_bytes)?;
+        self.charge_at_least(self.retained_bytes + batch_bytes)?;
         self.current_rows += batch.num_rows();
+        self.retained_bytes += batch_bytes;
         self.buffer.push(batch);
         Ok(None)
+    }
+
+    fn charge_at_least(&self, bytes: usize) -> Result<(), DataFusionError> {
+        let held = self.reservation.size();
+        if bytes > held {
+            self.reservation.try_grow(bytes - held)?;
+        }
+        Ok(())
     }
 
     // Helper to drain and combine buffer, used by add and finish
@@ -133,16 +134,15 @@ impl RecordBatchBuffer {
         let batches_to_combine: Vec<_> = self.buffer.drain(..).collect();
         let combined = concat_batches(&schema_to_use, &batches_to_combine)?;
         self.current_rows = 0;
-        // The retained input batches are dropped here and the combined batch
-        // leaves our control on yield, so release the whole charge we held for
-        // them. Callers grow the reservation for any replacement batch only
-        // after this returns, so `free` never releases bytes we still need.
-        self.reservation.free();
+        self.retained_bytes = 0;
         Ok(Some(combined))
     }
 
+    /// Flushes the buffer and releases the charge; the stream is done.
     fn finish(mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        self.finish_internal()
+        let combined = self.finish_internal();
+        self.reservation.free();
+        combined
     }
 }
 
@@ -949,7 +949,9 @@ mod tests {
     }
 
     use datafusion::arrow::array::Int32Array;
-    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use datafusion::execution::memory_pool::{
+        FairSpillPool, GreedyMemoryPool, UnboundedMemoryPool,
+    };
 
     // Helper: build a RecordBatchBuffer backed by an unbounded pool for tests
     // that only exercise the coalescing logic (not the memory accounting).
@@ -1000,32 +1002,89 @@ mod tests {
         let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
         let mut buffer = RecordBatchBuffer::new(100, &memory_pool);
 
-        // Case 1: a batch that fills the buffer is yielded directly; its charge
-        // must be released immediately.
-        assert!(buffer.add(create_test_batch(100, None)).unwrap().is_some());
+        // Case 1: a directly yielded batch stays charged.
+        let yielded = create_test_batch(100, None);
+        let yielded_bytes = yielded.get_array_memory_size();
+        assert!(buffer.add(yielded).unwrap().is_some());
         assert_eq!(
             memory_pool.reserved(),
-            0,
-            "direct-yield must release its charge"
+            yielded_bytes,
+            "direct-yield must stay charged"
         );
-        assert_eq!(buffer.reservation.size(), 0);
 
-        // Retained (buffered) batches keep their exact bytes charged to the pool.
+        // Smaller retained batches keep the peak charge.
         let b1 = create_test_batch(30, None);
         let b2 = create_test_batch(40, None);
         let retained_bytes = b1.get_array_memory_size() + b2.get_array_memory_size();
+        assert!(retained_bytes < yielded_bytes);
         assert!(buffer.add(b1).unwrap().is_none());
         assert!(buffer.add(b2).unwrap().is_none());
         assert_eq!(
             memory_pool.reserved(),
-            retained_bytes,
-            "retained batches must be charged their exact size"
+            yielded_bytes,
+            "smaller batches must not shrink the charge"
         );
-        assert_eq!(buffer.reservation.size(), retained_bytes);
 
         // finish() flushes the buffer and releases everything.
         assert!(buffer.finish().unwrap().is_some());
         assert_eq!(memory_pool.reserved(), 0, "finish must release all charge");
+    }
+
+    const FAIR_POOL_SIZE: usize = 1 << 20;
+
+    /// A buffer sharing a `FairSpillPool` with a spillable stand-in for `SortExec`.
+    fn buffer_with_spillable_peer(
+        max_record_batch_rows: usize,
+    ) -> (RecordBatchBuffer, MemoryReservation, Arc<dyn MemoryPool>) {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(FAIR_POOL_SIZE));
+        let buffer = RecordBatchBuffer::new(max_record_batch_rows, &memory_pool);
+        let sorter = MemoryConsumer::new("sorter")
+            .with_can_spill(true)
+            .register(&memory_pool);
+        (buffer, sorter, memory_pool)
+    }
+
+    /// Grows the peer into every free byte, as a buffering sort does.
+    fn claim_all_free(sorter: &MemoryReservation, memory_pool: &Arc<dyn MemoryPool>) {
+        sorter
+            .try_grow(FAIR_POOL_SIZE - memory_pool.reserved())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_record_batch_buffer_keeps_headroom_from_spillable_peer() {
+        // Regression: releasing charge between batches let the peer take the
+        // headroom the next batch needed. Covers repeated full batches and a
+        // file's short tail batch followed by a full one.
+        let (mut buffer, sorter, memory_pool) = buffer_with_spillable_peer(100);
+        assert!(buffer.add(create_test_batch(100, None)).unwrap().is_some());
+
+        for rows in [100, 100, 10, 100, 100] {
+            claim_all_free(&sorter, &memory_pool);
+            buffer.add(create_test_batch(rows, None)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_record_batch_buffer_new_peak_can_lose_headroom_to_spillable_peer() {
+        // Known gap: a batch larger than any before it must grow the charge,
+        // which fails if the peer took the difference.
+        let (mut buffer, sorter, memory_pool) = buffer_with_spillable_peer(100);
+        let first = create_test_batch(100, None);
+        let peak_bytes = first.get_array_memory_size();
+        assert!(buffer.add(first).unwrap().is_some());
+
+        claim_all_free(&sorter, &memory_pool);
+        let err = buffer.add(create_test_batch(200, None)).unwrap_err();
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "expected ResourcesExhausted, got: {err}"
+        );
+        assert_eq!(
+            buffer.reservation.size(),
+            peak_bytes,
+            "a failed grow must leave the charge unchanged"
+        );
     }
 
     #[test]
