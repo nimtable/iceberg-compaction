@@ -32,7 +32,7 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, TaskWriter};
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
@@ -170,9 +170,11 @@ impl CompactionExecutor for DataFusionExecutor {
             let partition_spec = partition_spec.clone();
             let metrics_recorder = metrics_recorder.clone();
 
-            let future: JoinHandle<
+            // Abort on drop: if one partition fails (try_join_all drops the rest) or this
+            // call is cancelled, the other writers stop instead of writing orphan files.
+            let future: AbortOnDropHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
-            > = tokio::spawn(async move {
+            > = AbortOnDropHandle::new(tokio::spawn(async move {
                 let mut data_file_writer = build_iceberg_data_file_writer(
                     execution_config.data_file_prefix.clone(),
                     location_generator,
@@ -215,7 +217,7 @@ impl CompactionExecutor for DataFusionExecutor {
                 }
 
                 Ok(data_file_writer.close().await?)
-            });
+            }));
             futures.push(future);
         }
 
