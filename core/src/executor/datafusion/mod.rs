@@ -32,7 +32,7 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, TaskWriter};
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
@@ -170,9 +170,11 @@ impl CompactionExecutor for DataFusionExecutor {
             let partition_spec = partition_spec.clone();
             let metrics_recorder = metrics_recorder.clone();
 
-            let future: JoinHandle<
+            // Abort on drop: if one partition fails (try_join_all drops the rest) or this
+            // call is cancelled, the other writers stop early, leaving fewer orphan files.
+            let future: AbortOnDropHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
-            > = tokio::spawn(async move {
+            > = AbortOnDropHandle::new(tokio::spawn(async move {
                 let mut data_file_writer = build_iceberg_data_file_writer(
                     execution_config.data_file_prefix.clone(),
                     location_generator,
@@ -215,18 +217,21 @@ impl CompactionExecutor for DataFusionExecutor {
                 }
 
                 Ok(data_file_writer.close().await?)
-            });
+            }));
             futures.push(future);
         }
 
         // collect all data files from all partitions
-        let output_data_files: Vec<DataFile> = try_join_all(futures)
-            .await
-            .map_err(|e| CompactionError::Execution(e.to_string()))?
+        let output_data_files: Vec<DataFile> =
+            try_join_all(futures.into_iter().map(|handle| async move {
+                handle
+                    .await
+                    .map_err(|e| CompactionError::Execution(e.to_string()))?
+            }))
+            .await?
             .into_iter()
-            .map(|res| res.map(|v| v.into_iter()))
-            .collect::<Result<Vec<_>>>()
-            .map(|iters| iters.into_iter().flatten().collect())?;
+            .flatten()
+            .collect();
 
         stats.record_output(&output_data_files);
 
