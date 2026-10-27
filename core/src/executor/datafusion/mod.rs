@@ -171,7 +171,7 @@ impl CompactionExecutor for DataFusionExecutor {
             let metrics_recorder = metrics_recorder.clone();
 
             // Abort on drop: if one partition fails (try_join_all drops the rest) or this
-            // call is cancelled, the other writers stop instead of writing orphan files.
+            // call is cancelled, the other writers stop early, leaving fewer orphan files.
             let future: AbortOnDropHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
             > = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -222,13 +222,16 @@ impl CompactionExecutor for DataFusionExecutor {
         }
 
         // collect all data files from all partitions
-        let output_data_files: Vec<DataFile> = try_join_all(futures)
-            .await
-            .map_err(|e| CompactionError::Execution(e.to_string()))?
+        let output_data_files: Vec<DataFile> =
+            try_join_all(futures.into_iter().map(|handle| async move {
+                handle
+                    .await
+                    .map_err(|e| CompactionError::Execution(e.to_string()))?
+            }))
+            .await?
             .into_iter()
-            .map(|res| res.map(|v| v.into_iter()))
-            .collect::<Result<Vec<_>>>()
-            .map(|iters| iters.into_iter().flatten().collect())?;
+            .flatten()
+            .collect();
 
         stats.record_output(&output_data_files);
 
