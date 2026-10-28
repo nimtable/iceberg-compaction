@@ -2167,6 +2167,64 @@ mod tests {
         assert_compaction_stats(&result.stats, initial_file_count, false);
     }
 
+    #[tokio::test]
+    async fn test_compaction_heals_duplicate_file_references_from_streaming_appends() {
+        let env = create_test_env().await;
+        let files = write_simple_files(&env.table, &env.warehouse_location, "batch", 2).await;
+        // Streaming engine (Arroyo) appends by spec without cross-snapshot duplicate checking;
+        // retried commits can add the exact same files across snapshots.
+        let tx1 = Transaction::new(&env.table);
+        let action1 = tx1
+            .fast_append()
+            .set_check_duplicate(false)
+            .add_data_files(files.clone());
+        let tx1 = action1.apply(tx1).unwrap();
+        let table = tx1.commit(env.catalog.as_ref()).await.unwrap();
+
+        let tx2 = Transaction::new(&table);
+        let action2 = tx2
+            .fast_append()
+            .set_check_duplicate(false)
+            .add_data_files(files);
+        let tx2 = action2.apply(tx2).unwrap();
+        let table = tx2.commit(env.catalog.as_ref()).await.unwrap();
+
+        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-data-files"),
+            Some(&"4".to_owned())
+        );
+
+        let execution_config = CompactionExecutionConfigBuilder::default()
+            .enable_validate_compaction(true)
+            .build()
+            .unwrap();
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .execution(execution_config)
+                    .build()
+                    .unwrap(),
+            ))
+            .build();
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert!(result.stats.input_files_count >= 2);
+
+        let reloaded = env.catalog.load_table(&env.table_ident).await.unwrap();
+        let compacted_snapshot = reloaded.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(
+            compacted_snapshot
+                .summary()
+                .additional_properties
+                .get("total-data-files"),
+            Some(&"1".to_owned())
+        );
+    }
+
     /// Resolution must return exactly the requested paths, gathering them from across
     /// multiple manifests and ignoring every other file in the snapshot. This is the
     /// property that keeps commit memory proportional to the batch instead of to the
