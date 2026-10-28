@@ -2104,33 +2104,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcp_auth"
-version = "0.12.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d27dbcc645b60b8e7f6e2868a9d7102ece97d1bb49c1288b5321fcc67f7260"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2205,25 +2178,6 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "h2"
-version = "0.4.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
-dependencies = [
- "atomic-waker",
- "bytes",
- "fnv",
- "futures-core",
- "futures-sink",
- "http",
- "indexmap 2.14.2",
- "slab",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -2355,7 +2309,6 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
- "h2",
  "http",
  "http-body",
  "httparse",
@@ -2376,7 +2329,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2432,7 +2384,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=60438a156fa9846fb692bb47c4da42ff3653c8e2#60438a156fa9846fb692bb47c4da42ff3653c8e2"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e36da86ef81e197ffe822fdef321927c42349e03#e36da86ef81e197ffe822fdef321927c42349e03"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2491,12 +2443,11 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=60438a156fa9846fb692bb47c4da42ff3653c8e2#60438a156fa9846fb692bb47c4da42ff3653c8e2"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e36da86ef81e197ffe822fdef321927c42349e03#e36da86ef81e197ffe822fdef321927c42349e03"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "gcp_auth",
  "http",
  "iceberg",
  "itertools 0.13.0",
@@ -2578,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=60438a156fa9846fb692bb47c4da42ff3653c8e2#60438a156fa9846fb692bb47c4da42ff3653c8e2"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e36da86ef81e197ffe822fdef321927c42349e03#e36da86ef81e197ffe822fdef321927c42349e03"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2594,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=60438a156fa9846fb692bb47c4da42ff3653c8e2#60438a156fa9846fb692bb47c4da42ff3653c8e2"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=e36da86ef81e197ffe822fdef321927c42349e03#e36da86ef81e197ffe822fdef321927c42349e03"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4195,7 +4146,6 @@ checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4876,7 +4826,6 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
- "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -4956,16 +4905,6 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
-]
-
-[[package]]
-name = "tracing-futures"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
-dependencies = [
- "pin-project",
- "tracing",
 ]
 
 [[package]]
