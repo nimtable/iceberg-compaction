@@ -24,11 +24,11 @@ use futures::StreamExt;
 use futures::future::try_join_all;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, PartitionSpec, Schema};
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, Schema};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, TaskWriter};
@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use super::{CompactionExecutor, RewriteFilesStat};
 use crate::CompactionError;
-use crate::config::CompactionExecutionConfig;
+use crate::config::{CompactionExecutionConfig, DataFileNaming};
 use crate::error::Result;
 pub mod datafusion_processor;
 use super::{RewriteFilesRequest, RewriteFilesResponse};
@@ -259,30 +259,62 @@ pub fn build_iceberg_data_file_writer(
             ))
         })?;
 
-    let data_file_builder = {
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            execution_config.write_parquet_properties.clone(),
-            schema.clone(),
-        );
-
-        let unique_uuid_suffix = Uuid::now_v7();
-        let file_name_generator = DefaultFileNameGenerator::new(
-            data_file_prefix,
-            Some(unique_uuid_suffix.to_string()),
-            iceberg::spec::DataFileFormat::Parquet,
-        );
-
-        let rolling_writer_builder = RollingFileWriterBuilder::new(
-            parquet_writer_builder,
+    match execution_config.data_file_naming {
+        DataFileNaming::Default => {
+            let file_name_generator = DefaultFileNameGenerator::new(
+                data_file_prefix,
+                Some(Uuid::now_v7().to_string()),
+                DataFileFormat::Parquet,
+            );
+            build_task_writer(
+                location_generator,
+                file_name_generator,
+                target_file_size,
+                schema,
+                file_io,
+                partition_spec,
+                sort_order_id,
+                &execution_config,
+            )
+        }
+        DataFileNaming::FlatUuid => build_task_writer(
+            FlatLocationGenerator(location_generator),
+            UuidFileNameGenerator,
             target_file_size,
+            schema,
             file_io,
-            location_generator,
-            file_name_generator,
-        )
-        .with_max_concurrent_closes(execution_config.max_concurrent_closes);
+            partition_spec,
+            sort_order_id,
+            &execution_config,
+        ),
+    }
+}
 
-        DataFileWriterBuilder::new(rolling_writer_builder).sort_order_id(sort_order_id)
-    };
+#[allow(clippy::too_many_arguments)]
+fn build_task_writer<L: LocationGenerator, F: FileNameGenerator>(
+    location_generator: L,
+    file_name_generator: F,
+    target_file_size: usize,
+    schema: Arc<Schema>,
+    file_io: FileIO,
+    partition_spec: Arc<PartitionSpec>,
+    sort_order_id: Option<i32>,
+    execution_config: &CompactionExecutionConfig,
+) -> Result<Box<dyn IcebergWriter>> {
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        execution_config.write_parquet_properties.clone(),
+        schema.clone(),
+    );
+    let rolling_writer_builder = RollingFileWriterBuilder::new(
+        parquet_writer_builder,
+        target_file_size,
+        file_io,
+        location_generator,
+        file_name_generator,
+    )
+    .with_max_concurrent_closes(execution_config.max_concurrent_closes);
+    let data_file_builder =
+        DataFileWriterBuilder::new(rolling_writer_builder).sort_order_id(sort_order_id);
 
     let partition_splitter = if partition_spec.is_unpartitioned() {
         None
@@ -302,4 +334,103 @@ pub fn build_iceberg_data_file_writer(
     );
 
     Ok(Box::new(iceberg_task_writer))
+}
+
+/// Places every file directly under the data location, ignoring the partition key.
+#[derive(Clone, Debug)]
+struct FlatLocationGenerator(DefaultLocationGenerator);
+
+impl LocationGenerator for FlatLocationGenerator {
+    fn generate_location(&self, _partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        self.0.generate_location(None, file_name)
+    }
+}
+
+/// Names each file `{uuid}.parquet` with a fresh UUID v7.
+#[derive(Clone, Debug)]
+struct UuidFileNameGenerator;
+
+impl FileNameGenerator for UuidFileNameGenerator {
+    fn generate_file_name(&self) -> String {
+        format!("{}.{}", Uuid::now_v7(), DataFileFormat::Parquet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::spec::{NestedField, PrimitiveType, Transform, Type};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::CompactionExecutionConfigBuilder;
+
+    #[tokio::test]
+    async fn test_flat_uuid_naming_ignores_partition_path() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "part", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("part", "part", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let temp_dir = TempDir::new().unwrap();
+        let data_location = format!("{}/data", temp_dir.path().to_str().unwrap());
+        let execution_config = Arc::new(
+            CompactionExecutionConfigBuilder::default()
+                .data_file_naming(DataFileNaming::FlatUuid)
+                .build()
+                .unwrap(),
+        );
+
+        let mut writer = build_iceberg_data_file_writer(
+            "ignored-prefix".to_owned(),
+            DefaultLocationGenerator::with_data_location(data_location.clone()),
+            schema.clone(),
+            FileIO::new_with_fs(),
+            partition_spec,
+            None,
+            execution_config,
+        )
+        .unwrap();
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&schema).unwrap()),
+            vec![
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(datafusion::arrow::array::Int32Array::from(vec![10, 20, 10])),
+            ],
+        )
+        .unwrap();
+        writer.write(batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        // One file per partition value, all directly under the data location.
+        assert_eq!(data_files.len(), 2);
+        let mut uuids = HashSet::new();
+        for data_file in &data_files {
+            let file_name = data_file
+                .file_path()
+                .strip_prefix(&format!("{data_location}/"))
+                .unwrap();
+            let uuid = Uuid::parse_str(file_name.strip_suffix(".parquet").unwrap()).unwrap();
+            assert_eq!(uuid.get_version_num(), 7);
+            assert_eq!(
+                data_file.file_path(),
+                format!("{data_location}/{}.parquet", uuid.hyphenated())
+            );
+            uuids.insert(uuid);
+        }
+        assert_eq!(uuids.len(), 2);
+    }
 }
