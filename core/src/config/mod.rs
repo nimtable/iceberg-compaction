@@ -601,6 +601,24 @@ pub struct CompactionExecutionConfig {
     /// `None` (default) uses `DataFusion`'s default (100 GB).
     #[builder(default)]
     pub max_disk_spill_bytes: Option<u64>,
+
+    /// How output data files are named. Defaults to [`DataFileNaming::Default`].
+    #[builder(default)]
+    pub data_file_naming: DataFileNaming,
+}
+
+/// How compaction names the data files it writes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DataFileNaming {
+    /// `{data_location}/{partition_path}/{data_file_prefix}-{n:05}-{uuid}.parquet`.
+    #[default]
+    Default,
+    /// `{data_location}/{uuid}.parquet`, with a fresh UUID v7 per file and no partition
+    /// directory. `data_file_prefix` is ignored.
+    ///
+    /// Callers can rebuild such a path from the table data location and the UUID alone, so they
+    /// can reference a data file by its 16 UUID bytes instead of the full path.
+    FlatUuid,
 }
 
 /// Compression codec for on-disk spill files.
