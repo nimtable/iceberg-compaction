@@ -132,7 +132,7 @@ Use `CompactionBuilder::with_to_branch()` to target a branch (default: `main`), 
 
 Compaction commits replacement data files and updates table metadata. It does **not** immediately delete the old data objects from storage: retained snapshots may still reference them. Snapshot expiration and orphan-file cleanup require separate maintenance through the catalog/Iceberg APIs or the embedding service.
 
-This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate. Table-sort-order rewriting is supported with the identity-transform limitation above.
+This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate, except `needs_manifest_rewrite()`, which reports whether a branch's data manifests would change if rewritten. Table-sort-order rewriting is supported with the identity-transform limitation above.
 
 ## Benchmarking and development
 
