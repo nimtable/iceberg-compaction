@@ -10,7 +10,7 @@ use super::classify::is_cross_snapshot_duplicate;
 use crate::{CompactionError, Result};
 
 /// Cluster key of a loaded entry's partition: its first `clustered_fields` values.
-fn cluster_key(partition: &Struct, clustered_fields: usize) -> String {
+pub(super) fn cluster_key(partition: &Struct, clustered_fields: usize) -> String {
     let fields = partition.fields();
     format!("{:?}", &fields[..fields.len().min(clustered_fields)])
 }
