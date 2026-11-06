@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use iceberg::spec::{Manifest, ManifestContentType, ManifestFile, ManifestWriter, TableProperties};
 use iceberg::table::Table;
 use iceberg::transaction::{
@@ -17,6 +19,7 @@ use super::loading::cluster_key;
 use super::types::{
     BatchedRewriteManifestsConfig, ManifestBatch, ManifestRewritePlan, RewrittenManifestBatch,
 };
+use crate::common::available_parallelism;
 use crate::{CompactionError, Result};
 
 /// Rewrites one batch of `plan`: loads its input manifests and writes the live entries in
@@ -33,7 +36,9 @@ use crate::{CompactionError, Result};
 /// outputs, never overwrites a manifest another run wrote. A failed or repeated batch may
 /// leave unreferenced manifest files behind.
 ///
-/// At most `config.load_concurrency` inputs are loaded at once, on spawned tasks.
+/// At most `config.load_concurrency` inputs are loaded at once, and at most one output
+/// per available core is written at once, on spawned tasks. Outputs are returned in the
+/// order their writes finish.
 ///
 /// Encrypted tables are not supported: the manifests would be written in plaintext. A
 /// table counts as encrypted if it has the `encryption.key-id` property, an encryption
@@ -53,6 +58,17 @@ pub async fn rewrite_manifest_batch(
     plan: &ManifestRewritePlan,
     batch: &ManifestBatch,
     config: &BatchedRewriteManifestsConfig,
+) -> Result<RewrittenManifestBatch> {
+    rewrite_batch(table, plan, batch, config, available_parallelism().get()).await
+}
+
+/// [`rewrite_manifest_batch`] with at most `write_concurrency` outputs written at once.
+async fn rewrite_batch(
+    table: &Table,
+    plan: &ManifestRewritePlan,
+    batch: &ManifestBatch,
+    config: &BatchedRewriteManifestsConfig,
+    write_concurrency: usize,
 ) -> Result<RewrittenManifestBatch> {
     let start = Instant::now();
     config.validate()?;
@@ -109,6 +125,8 @@ pub async fn rewrite_manifest_batch(
 
     let mut writers: BTreeMap<String, ManifestWriter> = BTreeMap::new();
     let mut manifests = Vec::new();
+    let write_concurrency = write_concurrency.max(1);
+    let mut writes_in_flight = FuturesUnordered::new();
     let mut inputs_read = 0;
     let mut entries_written = 0;
     while let Some((input, manifest)) = loads.next().await? {
@@ -165,12 +183,27 @@ pub async fn rewrite_manifest_batch(
 
             if writer.estimated_manifest_size() >= target_size {
                 let sealed = writers.remove(&key).expect("writer is in the map");
-                manifests.push(sealed.write_manifest_file().await?);
+                spawn_bounded_write(
+                    sealed,
+                    &mut writes_in_flight,
+                    write_concurrency,
+                    &mut manifests,
+                )
+                .await?;
             }
         }
     }
     for writer in std::mem::take(&mut writers).into_values() {
-        manifests.push(writer.write_manifest_file().await?);
+        spawn_bounded_write(
+            writer,
+            &mut writes_in_flight,
+            write_concurrency,
+            &mut manifests,
+        )
+        .await?;
+    }
+    while let Some(written) = writes_in_flight.next().await {
+        manifests.push(join_write(written)?);
     }
 
     Ok(RewrittenManifestBatch {
@@ -240,6 +273,37 @@ impl OrderedLoads {
             .map_err(CompactionError::Iceberg)?;
         Ok(Some((input, manifest)))
     }
+}
+
+/// A spawned manifest write; aborted if dropped.
+type WriteHandle = AbortOnDropHandle<iceberg::Result<ManifestFile>>;
+
+/// Spawns `writer`'s encode and upload, first waiting for one in-flight write to finish
+/// if `write_concurrency` are already running. Writes abort on drop, so an early error
+/// doesn't keep uploading orphan manifests.
+async fn spawn_bounded_write(
+    writer: ManifestWriter,
+    writes_in_flight: &mut FuturesUnordered<WriteHandle>,
+    write_concurrency: usize,
+    written: &mut Vec<ManifestFile>,
+) -> Result<()> {
+    if writes_in_flight.len() >= write_concurrency
+        && let Some(done) = writes_in_flight.next().await
+    {
+        written.push(join_write(done)?);
+    }
+    writes_in_flight.push(AbortOnDropHandle::new(tokio::spawn(
+        writer.write_manifest_file(),
+    )));
+    Ok(())
+}
+
+fn join_write(
+    joined: std::result::Result<iceberg::Result<ManifestFile>, tokio::task::JoinError>,
+) -> Result<ManifestFile> {
+    joined
+        .map_err(|err| CompactionError::Execution(format!("Manifest write task failed: {err}")))?
+        .map_err(CompactionError::Iceberg)
 }
 
 #[cfg(test)]
@@ -431,17 +495,7 @@ mod tests {
         )
         .await;
         let plan = plan_of(&table, 100).await;
-        let rewritten =
-            rewrite_manifest_batch(&table, &plan, &plan.batches()[0], &batch_config(100))
-                .await
-                .unwrap();
 
-        let mut per_manifest = Vec::new();
-        for manifest in rewritten.manifests() {
-            let keys = first_field_keys(&table, manifest).await;
-            per_manifest.push((keys, manifest.existing_files_count));
-        }
-        per_manifest.sort();
         let expected_counts = [
             (1, 2),
             (2, 2),
@@ -452,26 +506,109 @@ mod tests {
             (6, 1),
             (7, 1),
         ];
-        assert_eq!(
-            per_manifest,
-            expected_counts
-                .iter()
-                .map(|&(id, count)| (BTreeSet::from([key(id)]), Some(count)))
-                .collect::<Vec<_>>()
+        let expected: Vec<_> = expected_counts
+            .iter()
+            .map(|&(id, count)| (BTreeSet::from([key(id)]), Some(count)))
+            .collect();
+        // One write at a time, fewer than the 8 outputs, and more than the outputs.
+        for write_concurrency in [1, 3, 16] {
+            let rewritten = rewrite_batch(
+                &table,
+                &plan,
+                &plan.batches()[0],
+                &batch_config(100),
+                write_concurrency,
+            )
+            .await
+            .unwrap();
+
+            // Outputs come back in write-completion order.
+            let mut per_manifest = Vec::new();
+            for manifest in rewritten.manifests() {
+                let keys = first_field_keys(&table, manifest).await;
+                per_manifest.push((keys, manifest.existing_files_count));
+            }
+            per_manifest.sort();
+            assert_eq!(
+                per_manifest, expected,
+                "write_concurrency={write_concurrency}"
+            );
+            assert_eq!(
+                rewritten
+                    .manifests()
+                    .iter()
+                    .map(|m| &m.manifest_path)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                8
+            );
+            assert_eq!(
+                live_entries_of(&table, rewritten.manifests()).await,
+                live_entries(&table).await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifest_batch_fails_when_an_output_cannot_be_written() {
+        let (_env, table) = table_with_existing_and_added_entries().await;
+        let plan = plan_of(&table, 100).await;
+
+        // The test catalog's storage is in memory, which never fails a write. Copy the
+        // inputs to the local filesystem at the same paths and read them from there.
+        for input in plan.batches()[0].inputs() {
+            let bytes = table
+                .file_io()
+                .new_input(&input.manifest_path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let path = std::path::Path::new(&input.manifest_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        // Outputs go under `write.metadata.path`; a directory can't be created under a
+        // regular file, so every write fails while the inputs still load.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+        let mut properties = table.metadata().properties().clone();
+        properties.insert(
+            TableProperties::PROPERTY_WRITE_METADATA_PATH.to_owned(),
+            blocker.join("metadata").to_str().unwrap().to_owned(),
         );
-        assert_eq!(
-            rewritten
-                .manifests()
-                .iter()
-                .map(|m| &m.manifest_path)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            8
-        );
-        assert_eq!(
-            live_entries_of(&table, rewritten.manifests()).await,
-            live_entries(&table).await
-        );
+        let metadata =
+            iceberg::spec::TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+                .set_properties(properties)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+        let unwritable = Table::builder()
+            .metadata(metadata)
+            .identifier(table.identifier().clone())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata_location(table.metadata_location().unwrap())
+            .runtime(iceberg::Runtime::current())
+            .build()
+            .unwrap();
+
+        for write_concurrency in [1, 16] {
+            let err = rewrite_batch(
+                &unwritable,
+                &plan,
+                &plan.batches()[0],
+                &batch_config(100),
+                write_concurrency,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, CompactionError::Iceberg(e) if e.to_string().contains("Failed to create directory")),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]

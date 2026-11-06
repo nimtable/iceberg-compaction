@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use iceberg::Catalog;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, ErrorKind};
 use tracing::{info, warn};
 
 use super::types::{
@@ -47,9 +47,10 @@ use crate::{CompactionError, Result};
 /// The commit uses the plan's snapshot id on its branch, writes its manifest list under a
 /// fresh commit UUID, so commits of the same plan never overwrite each other's, and relies on the
 /// transaction's retries. A retry reloads the table, so manifests appended to the branch
-/// since the plan was made are kept. But if a concurrent commit removed an input manifest
-/// of a committed batch, such as another rewrite, the commit fails instead of
-/// retrying.
+/// since the plan was made are kept. If a concurrent commit removed an input manifest of a
+/// batch, such as another rewrite, that batch's group counts as dropped and the other
+/// groups are committed in a new transaction. If every remaining group lost an input, the
+/// commit fails with the action's error.
 ///
 /// # Errors
 ///
@@ -116,69 +117,134 @@ pub async fn commit_manifest_batches(
     let batches_failed = (0..batches.len())
         .filter(|&i| errored[i] || miscounted[i])
         .count();
-    let batches_dropped = dropped.iter().filter(|&&dropped| dropped).count() - batches_failed;
-    let batches_committed = batches.len() - batches_failed - batches_dropped;
 
     for (position, result) in results.iter().enumerate() {
         if let Err(err) = result {
             warn!(batch = position, error = %err, "Manifest rewrite batch failed; dropping its group");
         }
     }
-    if batches_committed == 0 {
-        info!(
-            batches = batches.len(),
-            batches_failed, "No manifest rewrite batch to commit"
-        );
-        return Ok(CommittedManifestRewrite {
-            table: table.clone(),
-            batches_committed,
-            batches_failed,
-            batches_dropped,
-        });
-    }
 
-    let transaction = Transaction::new(table);
-    let mut action = transaction
-        .rewrite_manifests()
-        .set_snapshot_id(plan.snapshot_id())
-        .set_target_branch(plan.branch().to_owned());
-    let mut deleted_paths = HashSet::new();
-    for ((batch, result), dropped) in batches.iter().zip(results).zip(&dropped) {
-        let Ok(rewritten) = result else { continue };
-        if *dropped {
-            continue;
+    loop {
+        let batches_dropped = dropped.iter().filter(|&&dropped| dropped).count() - batches_failed;
+        let batches_committed = batches.len() - batches_failed - batches_dropped;
+        if batches_committed == 0 {
+            info!(
+                batches = batches.len(),
+                batches_failed, "No manifest rewrite batch to commit"
+            );
+            return Ok(CommittedManifestRewrite {
+                table: table.clone(),
+                batches_committed,
+                batches_failed,
+                batches_dropped,
+            });
         }
-        for input in batch.inputs() {
-            if deleted_paths.insert(input.manifest_path.as_str()) {
-                action = action.delete_manifest(input.clone());
+
+        let transaction = Transaction::new(table);
+        let mut action = transaction
+            .rewrite_manifests()
+            .set_snapshot_id(plan.snapshot_id())
+            .set_target_branch(plan.branch().to_owned());
+        let mut deleted_paths = HashSet::new();
+        for ((batch, result), dropped) in batches.iter().zip(&results).zip(&dropped) {
+            let Ok(rewritten) = result else { continue };
+            if *dropped {
+                continue;
+            }
+            for input in batch.inputs() {
+                if deleted_paths.insert(input.manifest_path.as_str()) {
+                    action = action.delete_manifest(input.clone());
+                }
+            }
+            for output in &rewritten.manifests {
+                action = action.add_manifest(output.clone());
             }
         }
-        for output in rewritten.manifests {
-            action = action.add_manifest(output);
+
+        let mut properties = snapshot_properties.clone();
+        properties.insert("rewrite-batches".to_owned(), batches_committed.to_string());
+        properties.insert(
+            "rewrite-batches-failed".to_owned(),
+            batches_failed.to_string(),
+        );
+        properties.insert(
+            "rewrite-batches-dropped".to_owned(),
+            batches_dropped.to_string(),
+        );
+        let transaction = action
+            .set_snapshot_properties(properties)
+            .apply(transaction)?;
+        let err = match transaction.commit(catalog).await {
+            Ok(committed) => {
+                return Ok(CommittedManifestRewrite {
+                    table: committed,
+                    batches_committed,
+                    batches_failed,
+                    batches_dropped,
+                });
+            }
+            Err(err) => err,
+        };
+
+        // The action rejects an input that a concurrent commit removed from the branch
+        // as `DataInvalid`, which the transaction doesn't retry. Drop the groups that read
+        // a removed input and commit the rest; if no surviving group did, or every one
+        // did, the error is not ours to recover from.
+        if err.kind() != ErrorKind::DataInvalid {
+            return Err(err.into());
+        }
+        let current = current_manifest_paths(catalog, table, plan.branch()).await?;
+        let conflicted: HashSet<usize> = (0..batches.len())
+            .filter(|&i| {
+                !dropped[i]
+                    && batches[i]
+                        .inputs()
+                        .iter()
+                        .any(|input| !current.contains(input.manifest_path.as_str()))
+            })
+            .map(|i| groups[i])
+            .collect();
+        let conflicted_members: Vec<usize> = (0..batches.len())
+            .filter(|&i| conflicted.contains(&groups[i]))
+            .collect();
+        if conflicted_members.is_empty()
+            || (0..batches.len()).all(|i| dropped[i] || conflicted.contains(&groups[i]))
+        {
+            return Err(err.into());
+        }
+        warn!(
+            batches = ?conflicted_members,
+            error = %err,
+            "A concurrent commit removed input manifests of manifest rewrite batches; \
+             dropping their groups and committing the rest"
+        );
+        for member in conflicted_members {
+            dropped[member] = true;
         }
     }
+}
 
-    let mut properties = snapshot_properties;
-    properties.insert("rewrite-batches".to_owned(), batches_committed.to_string());
-    properties.insert(
-        "rewrite-batches-failed".to_owned(),
-        batches_failed.to_string(),
-    );
-    properties.insert(
-        "rewrite-batches-dropped".to_owned(),
-        batches_dropped.to_string(),
-    );
-    let transaction = action
-        .set_snapshot_properties(properties)
-        .apply(transaction)?;
-    let committed = transaction.commit(catalog).await?;
-
-    Ok(CommittedManifestRewrite {
-        table: committed,
-        batches_committed,
-        batches_failed,
-        batches_dropped,
-    })
+/// The paths of the manifests `branch` of the catalog's current `table` lists; empty if
+/// the branch is gone.
+async fn current_manifest_paths(
+    catalog: &dyn Catalog,
+    table: &Table,
+    branch: &str,
+) -> Result<HashSet<String>> {
+    let current = catalog.load_table(table.identifier()).await?;
+    let metadata = current.metadata_ref();
+    let Some(snapshot) = metadata.snapshot_for_ref(branch) else {
+        return Ok(HashSet::new());
+    };
+    let manifest_list = current
+        .object_cache()
+        .get_manifest_list(snapshot, &metadata)
+        .await?;
+    Ok(manifest_list
+        .entries()
+        .iter()
+        .map(|manifest| manifest.manifest_path.clone())
+        .collect())
 }
 
 /// For each batch, the representative of its group: batches linked by shared input
@@ -860,6 +926,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_manifest_batches_drops_groups_whose_inputs_a_concurrent_commit_removed() {
+        let env = create_env(
+            test_schema(),
+            identity_spec(&[(1, "id")]),
+            FormatVersion::V2,
+            &[],
+        )
+        .await;
+        // Batches never mix specs, so each spec's batches form their own groups.
+        let mut table = register_evolved(&env, &env.table, "two_specs", |builder| {
+            builder.add_partition_spec(identity_spec(&[(2, "name")]))
+        })
+        .await;
+        for (suffix, (ids, names)) in [(vec![1, 2], vec!["a", "b"]), (vec![2, 3], vec!["b", "c"])]
+            .into_iter()
+            .enumerate()
+        {
+            let mut files: Vec<DataFile> = ids
+                .iter()
+                .map(|id| {
+                    file(
+                        0,
+                        vec![Some(Literal::int(*id))],
+                        &format!("id-{id}-{suffix}"),
+                    )
+                })
+                .collect();
+            files.extend(names.iter().map(|name| {
+                file(
+                    1,
+                    vec![Some(Literal::string(*name))],
+                    &format!("name-{name}-{suffix}"),
+                )
+            }));
+            table = append_files(&env, &table, MAIN_BRANCH, files).await;
+        }
+        let plan = plan_of(&table, 100).await;
+        let specs: Vec<i32> = plan
+            .batches()
+            .iter()
+            .map(|b| b.partition_spec_id())
+            .collect();
+        assert_eq!(specs, vec![0, 1]);
+        let rewritten = rewrite_all(&table, &plan, &batch_config(100)).await;
+
+        // Another writer rewrites spec 1's manifests after the plan was made.
+        let transaction = Transaction::new(&table);
+        let concurrent = transaction
+            .rewrite_manifests()
+            .rewrite_if(Box::new(|m| m.partition_spec_id == 1))
+            .cluster_by(Box::new(|file| {
+                format!("{:?}", file.partition().fields()[0])
+            }))
+            .apply(transaction)
+            .unwrap()
+            .commit(env.catalog.as_ref())
+            .await
+            .unwrap();
+        let spec_1_after_concurrent: BTreeSet<String> = data_manifests(&concurrent)
+            .await
+            .into_iter()
+            .filter(|m| m.partition_spec_id == 1)
+            .map(|m| m.manifest_path)
+            .collect();
+
+        let committed = commit_manifest_batches(
+            env.catalog.as_ref(),
+            &table,
+            &plan,
+            ok(rewritten.clone()),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (
+                committed.batches_committed,
+                committed.batches_failed,
+                committed.batches_dropped
+            ),
+            (1, 0, 1)
+        );
+        let after = committed.table;
+        assert_summary(&after, &[
+            ("rewrite-batches", "1"),
+            ("rewrite-batches-dropped", "1"),
+        ]);
+        let manifests = data_manifests(&after).await;
+        // Spec 0 now holds the batch's outputs; spec 1 the concurrent rewrite's.
+        let spec_0: BTreeSet<String> = manifests
+            .iter()
+            .filter(|m| m.partition_spec_id == 0)
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        let outputs: BTreeSet<String> = rewritten[0]
+            .manifests()
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        assert_eq!(spec_0, outputs);
+        let spec_1: BTreeSet<String> = manifests
+            .iter()
+            .filter(|m| m.partition_spec_id == 1)
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        assert_eq!(spec_1, spec_1_after_concurrent);
+        assert_eq!(live_entries(&after).await, live_entries(&concurrent).await);
+    }
+
+    #[tokio::test]
     async fn commit_manifest_batches_rejects_results_that_do_not_match_the_plan() {
         let (env, table) = table_with_existing_and_added_entries().await;
         let plan = plan_of(&table, 2).await;
@@ -1154,6 +1331,96 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(per_spec, expected);
+    }
+
+    #[tokio::test]
+    async fn batched_rewrite_drops_empty_manifests_of_specs_with_nothing_else_to_rewrite() {
+        let build = || async {
+            let env = create_env(
+                test_schema(),
+                identity_spec(&[(1, "id")]),
+                FormatVersion::V2,
+                &[],
+            )
+            .await;
+            let table = register_evolved(&env, &env.table, "two_specs", |builder| {
+                builder.add_partition_spec(identity_spec(&[(2, "name")]))
+            })
+            .await;
+            let by_id = |id: i32, suffix: usize| {
+                file(
+                    0,
+                    vec![Some(Literal::int(id))],
+                    &format!("id-{id}-{suffix}"),
+                )
+            };
+            let by_name = file(1, vec![Some(Literal::string("a"))], "name-a");
+            let table = append_files(&env, &table, MAIN_BRANCH, vec![
+                by_id(1, 0),
+                by_id(2, 0),
+                by_name.clone(),
+            ])
+            .await;
+            // Key 2 again from another snapshot, so spec 0 needs rewriting.
+            let table =
+                append_files(&env, &table, MAIN_BRANCH, vec![by_id(2, 1), by_id(3, 1)]).await;
+            // Leaves spec 1 with only a manifest without live entries.
+            let transaction = Transaction::new(&table);
+            let table = transaction
+                .overwrite_files()
+                .delete_files(vec![by_name])
+                .apply(transaction)
+                .unwrap()
+                .commit(env.catalog.as_ref())
+                .await
+                .unwrap();
+            (env, table)
+        };
+        let (env, table) = build().await;
+        let (global_env, global_table) = build().await;
+        let empty: Vec<String> = data_manifests(&table)
+            .await
+            .into_iter()
+            .filter(|m| m.partition_spec_id == 1)
+            .inspect(|m| {
+                assert_eq!(
+                    (m.added_files_count, m.existing_files_count),
+                    (Some(0), Some(0))
+                )
+            })
+            .map(|m| m.manifest_path)
+            .collect();
+        assert_eq!(empty.len(), 1);
+
+        let (plan, batched) = batched_rewrite(&env, &table, MAIN_BRANCH, 100).await;
+        let global = global_rewrite(&global_env, &global_table).await;
+
+        let spec_1_batch = plan.batches().last().unwrap();
+        assert_eq!(
+            (
+                spec_1_batch.partition_spec_id(),
+                spec_1_batch.range(),
+                spec_1_batch
+                    .inputs()
+                    .iter()
+                    .map(|m| m.manifest_path.clone())
+                    .collect::<Vec<_>>()
+            ),
+            (1, &FirstFieldRange::All, empty)
+        );
+        let specs = |table: Table| async move {
+            let mut specs: Vec<i32> = data_manifests(&table)
+                .await
+                .iter()
+                .map(|m| m.partition_spec_id)
+                .collect();
+            specs.sort();
+            specs
+        };
+        // Like the global rewrite, one manifest per key of spec 0 and none of spec 1.
+        assert_eq!(specs(batched.clone()).await, vec![0, 0, 0]);
+        assert_eq!(specs(global).await, vec![0, 0, 0]);
+        assert_eq!(live_entries(&batched).await, live_entries(&table).await);
     }
 
     #[tokio::test]

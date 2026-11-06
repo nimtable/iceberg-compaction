@@ -68,9 +68,8 @@ impl BatchedRewriteManifestsConfig {
 /// [`max_batch_entries`](BatchedRewriteManifestsConfig::max_batch_entries) entries to
 /// write. These are targets, not caps:
 ///
-/// - A manifest weighs its added plus existing file count, or `max_batch_entries` if a
-///   count is unknown. Only the share of it a range is estimated to hold counts towards
-///   that range: if the first field has a numeric scale (integers, dates, times,
+/// - A manifest weighs its added plus existing file count. Only the share of it a range
+///   is estimated to hold counts towards that range: if the first field has a numeric scale (integers, dates, times,
 ///   timestamps, decimals, floating point), its weight is spread evenly over its
 ///   first-field bounds; otherwise it all counts where the manifest starts. Entries that
 ///   cluster in part of a manifest's bounds can put a batch over the target.
@@ -79,7 +78,8 @@ impl BatchedRewriteManifestsConfig {
 /// - A manifest without usable first-field bounds is read by every batch of its spec and
 ///   doesn't count, since splitting can't reduce it.
 /// - Manifests without live entries are added to one batch of their spec so the commit
-///   drops them, without counting either.
+///   drops them, without counting either. A spec with nothing else to rewrite gets a
+///   batch of only those, unless the plan has no other batches.
 /// - A single manifest over the targets, or a run of manifests with the same lower bound,
 ///   which no cut can separate, forms a batch of its own.
 ///
@@ -98,6 +98,9 @@ impl BatchedRewriteManifestsConfig {
 /// - a partition spec with manifests to rewrite has a first field whose type can't be
 ///   resolved against the table's current schema, for example because its source column
 ///   was dropped. The batches' writers need that type, so every such batch would fail;
+/// - a data manifest doesn't list its added or existing file count, as some V1 manifest
+///   lists don't. The commit verifies each batch against those counts, so every batch
+///   reading the manifest would be dropped;
 /// - the table is encrypted, by the `encryption.key-id` table property or by a manifest
 ///   with key metadata, which batches can't write (see [`rewrite_manifest_batch`](super::rewrite_manifest_batch));
 /// - the batches would read more manifests than
@@ -232,23 +235,29 @@ pub(super) fn plan_batches(
         return None;
     }
 
-    let mut no_live: Vec<usize> = Vec::new();
+    let mut no_live: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
     let mut live: Vec<(Candidate, SummaryClass)> = Vec::new();
     for (index, manifest) in manifests.iter().enumerate() {
         if manifest.content != ManifestContentType::Data {
             continue;
         }
+        // The commit checks each group's written entries against these counts.
+        let (Some(added), Some(existing)) =
+            (manifest.added_files_count, manifest.existing_files_count)
+        else {
+            return None;
+        };
         match classify_from_summary(manifest, clustered_fields) {
-            SummaryClass::NoLiveEntries => no_live.push(index),
+            SummaryClass::NoLiveEntries => no_live
+                .entry(manifest.partition_spec_id)
+                .or_default()
+                .push(index),
             class => {
                 let extent = match first_fields.get(&manifest.partition_spec_id) {
                     Some(FirstField::Typed(ty)) => decode_extent(manifest, ty),
                     _ => Extent::Wide,
                 };
-                let weight = match (manifest.added_files_count, manifest.existing_files_count) {
-                    (Some(added), Some(existing)) => u64::from(added) + u64::from(existing),
-                    _ => config.max_batch_entries,
-                };
+                let weight = u64::from(added) + u64::from(existing);
                 live.push((
                     Candidate {
                         index,
@@ -322,10 +331,7 @@ pub(super) fn plan_batches(
         let mut ranges = split_spec(&dirty, config);
         distinct_reads += dirty.len();
         reads += ranges.iter().map(|(_, inputs)| inputs.len()).sum::<usize>();
-        for &index in &no_live {
-            if manifests[index].partition_spec_id != spec_id {
-                continue;
-            }
+        for index in no_live.remove(&spec_id).unwrap_or_default() {
             if let Some((_, inputs)) = ranges.iter_mut().min_by_key(|(_, inputs)| inputs.len()) {
                 inputs.push(index);
             }
@@ -339,6 +345,20 @@ pub(super) fn plan_batches(
                 inputs: inputs.into_iter().map(|i| manifests[i].clone()).collect(),
             });
         }
+    }
+    // Like a global rewrite, a rewrite drops every manifest without live entries, including
+    // those of specs with nothing else to rewrite. Such a batch writes nothing, so it needs
+    // no writer and no resolvable first-field type.
+    if batches.is_empty() {
+        no_live.clear();
+    }
+    for (spec_id, inputs) in no_live {
+        batches.push(ManifestBatch {
+            index: batches.len(),
+            partition_spec_id: spec_id,
+            range: FirstFieldRange::All,
+            inputs: inputs.into_iter().map(|i| manifests[i].clone()).collect(),
+        });
     }
     if config
         .max_read_amplification
@@ -943,6 +963,37 @@ mod tests {
             None,
             "no key to cluster by"
         );
+
+        // A clean manifest without a count blocks the plan too, and a delete manifest
+        // without one doesn't.
+        let unknown_existing = ManifestFile {
+            existing_files_count: None,
+            ..span("unknown-existing", 7, 7)
+        };
+        let delete_without_count = ManifestFile {
+            content: ManifestContentType::Deletes,
+            added_files_count: None,
+            ..span("delete", 1, 9)
+        };
+        for (name, unknown) in [
+            ("unknown added count", weighted(span("unknown", 3, 4), None)),
+            ("unknown existing count", unknown_existing),
+        ] {
+            let mut manifests = splittable.to_vec();
+            manifests.push(unknown);
+            assert_eq!(
+                plan_batches(&manifests, &int_field(), 1, &roomy()).map(|b| b.len()),
+                None,
+                "{name}"
+            );
+        }
+        let mut manifests = splittable.to_vec();
+        manifests.push(delete_without_count);
+        assert_eq!(
+            plan_batches(&manifests, &int_field(), 1, &roomy()).map(|b| b.len()),
+            Some(1),
+            "delete manifest without a count"
+        );
     }
 
     #[test]
@@ -1310,11 +1361,6 @@ mod tests {
             weighted(span("big", 3, 4), Some(1000)),
             span("small-2", 5, 6),
         ];
-        let unknown_count = vec![
-            span("small-1", 1, 2),
-            weighted(span("unknown", 3, 4), None),
-            span("small-2", 5, 6),
-        ];
         let cases: Vec<(
             &str,
             Vec<ManifestFile>,
@@ -1357,16 +1403,6 @@ mod tests {
                     expect(0, "[5,+inf)", &["small-2"]),
                 ],
             ),
-            (
-                "an unknown file count weighs a whole batch",
-                unknown_count,
-                config(50, 100),
-                vec![
-                    expect(0, "(-inf,3)", &["small-1"]),
-                    expect(0, "[3,5)", &["unknown"]),
-                    expect(0, "[5,+inf)", &["small-2"]),
-                ],
-            ),
         ];
         for (name, manifests, config, expected) in cases {
             let batches = plan(&manifests, &config).unwrap();
@@ -1376,8 +1412,10 @@ mod tests {
 
     #[test]
     fn plan_attaches_manifests_without_live_entries_to_batches() {
-        let mut other_spec_empty = no_live("other-spec-empty");
-        other_spec_empty.partition_spec_id = 5;
+        let in_spec = |spec: i32, manifest: ManifestFile| ManifestFile {
+            partition_spec_id: spec,
+            ..manifest
+        };
         let delete = ManifestFile {
             content: ManifestContentType::Deletes,
             ..span("delete", 1, 9)
@@ -1388,15 +1426,32 @@ mod tests {
             no_live("empty-2"),
             span("b", 3, 4),
             no_live("empty-3"),
-            other_spec_empty,
+            in_spec(5, no_live("spec-5-empty-1")),
+            // A clean manifest, so spec 5 has nothing else to rewrite.
+            in_spec(5, span("spec-5-clean", 7, 7)),
+            in_spec(5, no_live("spec-5-empty-2")),
+            in_spec(6, no_live("spec-6-empty")),
             delete,
         ];
         let batches = plan(&manifests, &config(1_000_000, 1)).unwrap();
-        // Each goes to the batch with the fewest inputs, the first on ties.
+        // Each goes to the batch of its spec with the fewest inputs, the first on ties.
         assert_eq!(layout(&batches), vec![
             expect(0, "(-inf,3)", &["a", "empty-1", "empty-3"]),
             expect(0, "[3,+inf)", &["empty-2", "b"]),
+            expect(5, "all", &["spec-5-empty-1", "spec-5-empty-2"]),
+            expect(6, "all", &["spec-6-empty"]),
         ]);
+
+        // With nothing else to rewrite, empty manifests alone don't make a plan do work.
+        let clean = [
+            span("a", 1, 1),
+            in_spec(5, span("spec-5-clean", 7, 7)),
+            in_spec(5, no_live("spec-5-empty")),
+        ];
+        assert_eq!(
+            layout(&plan(&clean, &config(1_000_000, 1)).unwrap()),
+            vec![]
+        );
     }
 
     #[test]
