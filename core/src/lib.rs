@@ -20,6 +20,7 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod file_selection;
+pub mod rewrite_manifests;
 
 pub use config::{AutoCompactionConfig, CompactionConfig};
 pub use error::{CompactionError, Result};

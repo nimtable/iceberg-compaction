@@ -18,13 +18,14 @@ datafusion = "54.1"
 
 # Local workspace members
 futures = "0.3.17"
-# branch dev_rebase_main_20260807
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", default-features = false }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", default-features = false }
+# risingwavelabs/iceberg-rust branch dev_rebase_main_20260807 at 6e974ce, plus one commit
+# making `ManifestWriter::estimated_manifest_size` public, until it is upstreamed.
+iceberg = { git = "https://github.com/dsfhdshdjtsb/iceberg-rust.git", rev = "f624026a8cd41679776fea0002b146d8021a42c9", default-features = false }
+iceberg-catalog-memory = { git = "https://github.com/dsfhdshdjtsb/iceberg-rust.git", rev = "f624026a8cd41679776fea0002b146d8021a42c9" }
+iceberg-catalog-rest = { git = "https://github.com/dsfhdshdjtsb/iceberg-rust.git", rev = "f624026a8cd41679776fea0002b146d8021a42c9", default-features = false }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4" }
-iceberg-storage-opendal = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", features = [
+iceberg-datafusion = { git = "https://github.com/dsfhdshdjtsb/iceberg-rust.git", rev = "f624026a8cd41679776fea0002b146d8021a42c9" }
+iceberg-storage-opendal = { git = "https://github.com/dsfhdshdjtsb/iceberg-rust.git", rev = "f624026a8cd41679776fea0002b146d8021a42c9", features = [
     "opendal-s3",
 ] }
 

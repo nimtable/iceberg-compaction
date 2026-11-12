@@ -16,11 +16,15 @@
 
 //! Integration tests that require Docker containers
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use iceberg::spec::{PrimitiveLiteral, PrimitiveType, Schema, UnboundPartitionSpec};
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+    ManifestContentType, ManifestFile, PrimitiveLiteral, PrimitiveType, Schema, Struct,
+    UnboundPartitionSpec,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg_compaction_core::compaction::CompactionBuilder;
@@ -28,6 +32,12 @@ use iceberg_compaction_core::config::{
     BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
     CompactionPlanningConfig, GroupFiltersBuilder, GroupingStrategy, SmallFilesConfigBuilder,
 };
+use iceberg_compaction_core::rewrite_manifests::{
+    BatchedRewriteManifestsConfig, commit_manifest_batches, needs_manifest_rewrite,
+    plan_manifest_batches, rewrite_manifest_batch,
+};
+use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::docker_compose::get_rest_catalog;
 use crate::test_utils::generator::{FileGenerator, FileGeneratorConfig, WriterConfig};
@@ -369,7 +379,11 @@ async fn write_data_to_table(
     data_files: usize,
     row_count: usize,
 ) {
-    let writer_config = WriterConfig::new(table, None);
+    // File names must be unique across calls: the name generator's counter restarts at 0 for
+    // every `FileGenerator`, and a table is appended to more than once.
+    let mut writer_config = WriterConfig::new(table, None);
+    writer_config.data_file_prefix =
+        format!("{}-{}", writer_config.data_file_prefix, Uuid::now_v7());
     let file_generator_config = FileGeneratorConfig::new()
         .with_data_file_num(data_files)
         .with_data_file_row_count(row_count)
@@ -571,6 +585,207 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
     assert!(
         output_files_per_partition.values().all(|count| *count == 3),
         "Compaction should produce exactly 3 files per partition with upstream rolling: {output_files_per_partition:?}"
+    );
+
+    // Clean up: try to drop the table and namespace
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+/// The live data files of the main branch's data manifests, by path, with their record
+/// counts, and the first-field (an `int`) keys of each data manifest, in manifest-list order.
+async fn live_data_files(table: &Table) -> (BTreeMap<String, u64>, Vec<BTreeSet<i32>>) {
+    let metadata = table.metadata_ref();
+    let snapshot = metadata.snapshot_for_ref(MAIN_BRANCH).unwrap();
+    let manifest_list = table
+        .object_cache()
+        .get_manifest_list(snapshot, &metadata)
+        .await
+        .unwrap();
+
+    let mut files = BTreeMap::new();
+    let mut keys_per_manifest = Vec::new();
+    for manifest_file in manifest_list
+        .entries()
+        .iter()
+        .filter(|m| m.content == ManifestContentType::Data)
+    {
+        keys_per_manifest.push(manifest_keys(table, manifest_file, &mut files).await);
+    }
+    (files, keys_per_manifest)
+}
+
+/// The first-field keys of the live entries of `manifest_file`, which are also recorded in
+/// `files`.
+async fn manifest_keys(
+    table: &Table,
+    manifest_file: &ManifestFile,
+    files: &mut BTreeMap<String, u64>,
+) -> BTreeSet<i32> {
+    let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+    let mut keys = BTreeSet::new();
+    for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+        files.insert(entry.file_path().to_owned(), entry.record_count());
+        let Some(Literal::Primitive(PrimitiveLiteral::Int(key))) =
+            entry.data_file().partition().fields()[0].clone()
+        else {
+            panic!("expected an int first field: {entry:?}");
+        };
+        keys.insert(key);
+    }
+    keys
+}
+
+/// A data file of `table`'s only partition spec, identity-partitioned by `id`. Manifest
+/// rewrites never read data files, so it doesn't exist in storage.
+fn data_file_for_key(table: &Table, id: i32, append: usize) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!(
+            "{}/data/id={id}/append-{append}.parquet",
+            table.metadata().location()
+        ))
+        .file_format(DataFileFormat::Parquet)
+        .partition(Struct::from_iter([Some(Literal::int(id))]))
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .record_count(100 + id as u64)
+        .file_size_in_bytes(1024)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_batched_rewrite_manifests_clusters_manifests_by_partition() {
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Int)
+        .add_field("num", PrimitiveType::Long)
+        .build();
+    let partition_spec = UnboundPartitionSpec::builder()
+        .add_partition_field(1, "id", iceberg::spec::Transform::Identity)
+        .expect("could not add partition field")
+        .build();
+    let table = setup_table(
+        catalog.clone(),
+        "rewrite_manifests_namespace",
+        "rewrite_manifests_table",
+        &schema,
+        Some(partition_spec),
+    )
+    .await;
+
+    // Each append adds one manifest. The first four hold disjoint runs of keys, so they can
+    // be cut apart; the last holds keys 3 to 7, straddling any cut between 4 and 7.
+    let appends: [&[i32]; 5] = [&[1, 2, 3], &[4, 5, 6], &[7, 8, 9], &[10, 11, 12], &[
+        3, 5, 7,
+    ]];
+    let mut table = table;
+    for (append, keys) in appends.iter().enumerate() {
+        let files = keys
+            .iter()
+            .map(|id| data_file_for_key(&table, *id, append))
+            .collect::<Vec<_>>();
+        let txn = Transaction::new(&table);
+        table = txn
+            .fast_append()
+            .add_data_files(files)
+            .apply(txn)
+            .expect("Failed to apply transaction")
+            .commit(catalog.as_ref())
+            .await
+            .expect("Failed to commit transaction");
+    }
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    let (files_before, keys_before) = live_data_files(&table).await;
+    assert_eq!(files_before.len(), 15);
+    assert_eq!(
+        keys_before,
+        appends
+            .iter()
+            .map(|keys| keys.iter().copied().collect::<BTreeSet<_>>())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        needs_manifest_rewrite(&table, MAIN_BRANCH, 1, 4)
+            .await
+            .unwrap()
+    );
+
+    let config = BatchedRewriteManifestsConfig {
+        max_batch_entries: 1_000_000,
+        max_batch_manifests: 2,
+        load_concurrency: 4,
+        max_read_amplification: None,
+    };
+    let plan = plan_manifest_batches(&table, MAIN_BRANCH, 1, &config)
+        .await
+        .expect("planning should succeed")
+        .expect("a partitioned table with several keys can be split");
+
+    // The keys of each batch's input manifests. Two manifests start in each of the ranges
+    // (-inf, 4) and [4, 10); the straddling manifest is read by both, the others by one.
+    let mut batch_inputs = Vec::new();
+    for batch in plan.batches() {
+        let mut inputs = Vec::new();
+        for input in batch.inputs() {
+            inputs.push(manifest_keys(&table, input, &mut BTreeMap::new()).await);
+        }
+        batch_inputs.push(inputs);
+    }
+    let keys = |ids: &[i32]| ids.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(batch_inputs, vec![
+        vec![keys(&[1, 2, 3]), keys(&[3, 5, 7])],
+        vec![keys(&[4, 5, 6]), keys(&[7, 8, 9]), keys(&[3, 5, 7])],
+        vec![keys(&[10, 11, 12])],
+    ]);
+
+    let mut tasks = JoinSet::new();
+    for batch in plan.batches() {
+        let (table, plan, batch, config) =
+            (table.clone(), plan.clone(), batch.clone(), config.clone());
+        tasks.spawn(async move {
+            let rewritten = rewrite_manifest_batch(&table, &plan, &batch, &config).await;
+            (batch.index(), rewritten)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        results.push(joined.expect("batch task should not panic"));
+    }
+    results.sort_by_key(|(index, _)| *index);
+    let results: Vec<_> = results.into_iter().map(|(_, result)| result).collect();
+    // Each batch writes only the entries in its range: 3+1 and 3+3+2 of the straddler's
+    // 3 entries, and 3.
+    let written: Vec<u64> = results
+        .iter()
+        .map(|result| result.as_ref().unwrap().entries_written())
+        .collect();
+    assert_eq!(written, vec![4, 8, 3]);
+
+    let committed =
+        commit_manifest_batches(catalog.as_ref(), &table, &plan, results, HashMap::new())
+            .await
+            .expect("commit should succeed");
+    assert_eq!(committed.batches_committed, 3);
+    assert_eq!(committed.batches_failed, 0);
+    assert_eq!(committed.batches_dropped, 0);
+
+    // The same data files, now with one manifest per key.
+    let after = catalog.load_table(table.identifier()).await.unwrap();
+    let (files_after, keys_after) = live_data_files(&after).await;
+    assert_eq!(files_after, files_before);
+    let mut keys_after_sorted = keys_after.clone();
+    keys_after_sorted.sort();
+    assert_eq!(
+        keys_after_sorted,
+        (1..=12).map(|id| keys(&[id])).collect::<Vec<_>>()
+    );
+    assert!(
+        !needs_manifest_rewrite(&after, MAIN_BRANCH, 1, 4)
+            .await
+            .unwrap()
     );
 
     // Clean up: try to drop the table and namespace

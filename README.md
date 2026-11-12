@@ -16,7 +16,7 @@
 - **Execution controls:** configure read/write parallelism, concurrent plans, target file size, Parquet writer properties, and an optional shared DataFusion memory budget with disk spilling.
 - **Commit and visibility:** commit replacement files in one Iceberg transaction, target a branch, retry supported commit failures with exponential backoff, and collect file/byte statistics and metrics.
 
-The core crate is [`iceberg-compaction-core`](./core/). Catalog and storage access use the pinned [RisingWave fork of `iceberg-rust`](https://github.com/risingwavelabs/iceberg-rust); the repository includes local-filesystem and REST-catalog/S3 examples. See [Cargo.toml](./Cargo.toml) for the exact dependency revisions and enabled storage features.
+The core crate is [`iceberg-compaction-core`](./core/). Catalog and storage access use a [pinned fork of `iceberg-rust`](https://github.com/dsfhdshdjtsb/iceberg-rust) at upstream RisingWave `6e974ce` plus two commits exposing `ManifestWriter::estimated_manifest_size` and `TableMetadata::refs`, until those changes are upstreamed; the repository includes local-filesystem and REST-catalog/S3 examples. See [Cargo.toml](./Cargo.toml) for the exact dependency revisions and enabled storage features.
 
 ## Quick start
 
@@ -132,7 +132,7 @@ Use `CompactionBuilder::with_to_branch()` to target a branch (default: `main`), 
 
 Compaction commits replacement data files and updates table metadata. It does **not** immediately delete the old data objects from storage: retained snapshots may still reference them. Snapshot expiration and orphan-file cleanup require separate maintenance through the catalog/Iceberg APIs or the embedding service.
 
-This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate. Table-sort-order rewriting is supported with the identity-transform limitation above.
+This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate, except `needs_manifest_rewrite()`, which reports whether a branch's data manifests would change if rewritten, and `plan_manifest_batches()`, `rewrite_manifest_batch()` and `commit_manifest_batches()`, which split such a rewrite into independent batches by first-partition-field range, rewrite them (in parallel, if the caller wishes), and commit them in one snapshot. The batched rewrite leaves the manifests of dropped or failed batches unreferenced in storage (cleaning them up is out of scope) and does not support encrypted tables, for which `plan_manifest_batches()` returns `None`. Table-sort-order rewriting is supported with the identity-transform limitation above.
 
 ## Benchmarking and development
 
