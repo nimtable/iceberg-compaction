@@ -251,7 +251,7 @@ fn first_field(partition: &Struct) -> Result<Option<&Literal>> {
 
 /// Compares an entry's first-field value with a range bound using [`order`], widening
 /// the value first if the bound is a `long` or `double` and the value an `int` or `float`.
-fn compare(value: &PrimitiveLiteral, bound: &Datum) -> Result<Ordering> {
+pub(super) fn compare(value: &PrimitiveLiteral, bound: &Datum) -> Result<Ordering> {
     let widened = match (value, bound.data_type()) {
         (PrimitiveLiteral::Int(v), PrimitiveType::Long) => Some(Datum::long(i64::from(*v))),
         (PrimitiveLiteral::Float(v), PrimitiveType::Double) => Some(Datum::double(f64::from(v.0))),

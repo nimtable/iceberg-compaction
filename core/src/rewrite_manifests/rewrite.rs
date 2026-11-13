@@ -7,17 +7,23 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use iceberg::spec::{Manifest, ManifestContentType, ManifestFile, ManifestWriter, TableProperties};
+use iceberg::spec::{
+    Datum, Literal, Manifest, ManifestContentType, ManifestFile, ManifestWriter, PrimitiveLiteral,
+    PrimitiveType, TableProperties, Type,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{
     MANIFEST_TARGET_SIZE_BYTES, MANIFEST_TARGET_SIZE_BYTES_DEFAULT, ManifestWriterContext,
 };
+use tokio::sync::Semaphore;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
 use super::loading::cluster_key;
+use super::sweep::{Extent, decode_extent};
 use super::types::{
     BatchedRewriteManifestsConfig, ManifestBatch, ManifestRewritePlan, RewrittenManifestBatch,
+    compare, order,
 };
 use crate::common::available_parallelism;
 use crate::{CompactionError, Result};
@@ -28,6 +34,18 @@ use crate::{CompactionError, Result};
 /// Entries keep their original snapshot id and sequence numbers. A key's manifest is
 /// rolled over once it reaches the table's `commit.manifest.target-size-bytes` (8 MiB if
 /// unset or malformed), like the global rewrite.
+///
+/// Inputs are read in ascending order of the first-field lower bound in their
+/// manifest-list summary, those without a usable bound first. A key's manifest is written
+/// as soon as no remaining input can hold the key, which is once every unread input's
+/// lower bound is above the key's first-field value. So the manifests open in memory are
+/// those of the keys that remaining inputs can still hold, not those of every key of the
+/// batch. Keys whose first-field value is null stay open until the last input.
+///
+/// The lower bounds only decide when a manifest is written. If an input holds an entry
+/// below its recorded lower bound, the entry's key may already have been written, and the
+/// entry then starts another manifest for that key. Every entry is still written exactly
+/// once, and every manifest still holds a single key.
 ///
 /// The manifests are written but not committed; pass the result of every batch to
 /// [`commit_manifest_batches`](super::commit_manifest_batches). Batches are independent,
@@ -59,7 +77,40 @@ pub async fn rewrite_manifest_batch(
     batch: &ManifestBatch,
     config: &BatchedRewriteManifestsConfig,
 ) -> Result<RewrittenManifestBatch> {
-    rewrite_batch(table, plan, batch, config, available_parallelism().get()).await
+    config.validate()?;
+    let load_permits = Arc::new(Semaphore::new(config.load_concurrency));
+    rewrite_manifest_batch_sharing_loads(table, plan, batch, config, load_permits).await
+}
+
+/// [`rewrite_manifest_batch`] with the manifest loads limited by `load_permits` instead
+/// of `config.load_concurrency`: a load holds one permit while it reads and decodes.
+///
+/// Callers that run several batches at once can give them all the same semaphore. The
+/// batches then share its permits, so a batch that is writing its outputs, or has
+/// finished, leaves its share of the loads to the others, which a fixed
+/// `load_concurrency` per batch can't do. `config.load_concurrency` still bounds how many
+/// loads one batch requests at once, and so how many loaded manifests it holds.
+///
+/// # Errors
+///
+/// As [`rewrite_manifest_batch`], and [`CompactionError::Execution`] if `load_permits`
+/// is closed.
+pub async fn rewrite_manifest_batch_sharing_loads(
+    table: &Table,
+    plan: &ManifestRewritePlan,
+    batch: &ManifestBatch,
+    config: &BatchedRewriteManifestsConfig,
+    load_permits: Arc<Semaphore>,
+) -> Result<RewrittenManifestBatch> {
+    rewrite_batch(
+        table,
+        plan,
+        batch,
+        config,
+        load_permits,
+        available_parallelism().get(),
+    )
+    .await
 }
 
 /// [`rewrite_manifest_batch`] with at most `write_concurrency` outputs written at once.
@@ -68,6 +119,7 @@ async fn rewrite_batch(
     plan: &ManifestRewritePlan,
     batch: &ManifestBatch,
     config: &BatchedRewriteManifestsConfig,
+    load_permits: Arc<Semaphore>,
     write_concurrency: usize,
 ) -> Result<RewrittenManifestBatch> {
     let start = Instant::now();
@@ -121,9 +173,22 @@ async fn rewrite_batch(
         None,
     );
 
-    let mut loads = OrderedLoads::new(table, batch.inputs().to_vec(), config.load_concurrency);
+    // Read the inputs in ascending order of their smallest first-field value. Once the
+    // next input starts at `v`, no later input holds a key below `v`, so the writers of
+    // those keys are complete and can be written out while the reads continue.
+    let first_field = match partition_spec
+        .partition_type(metadata.current_schema())
+        .ok()
+        .and_then(|ty| ty.fields().first().map(|f| f.field_type.as_ref().clone()))
+    {
+        Some(Type::Primitive(ty)) => Some(ty),
+        _ => None,
+    };
+    let (inputs, mut frontiers) = read_order(batch.inputs(), first_field.as_ref());
+    let mut loads = OrderedLoads::new(table, inputs, config.load_concurrency, load_permits);
 
-    let mut writers: BTreeMap<String, ManifestWriter> = BTreeMap::new();
+    // Each writer with its key's first-field value (`None` if null or not a primitive).
+    let mut writers: BTreeMap<String, (Option<PrimitiveLiteral>, ManifestWriter)> = BTreeMap::new();
     let mut manifests = Vec::new();
     let write_concurrency = write_concurrency.max(1);
     let mut writes_in_flight = FuturesUnordered::new();
@@ -150,17 +215,26 @@ async fn rewrite_batch(
             }
 
             let key = cluster_key(data_file.partition(), plan.clustered_fields());
+            // A key written out early gets a new writer, and so another manifest, if an
+            // input's lower bound was wrong and it still holds entries of the key.
             if !writers.contains_key(&key) {
+                let first_value = match data_file.partition().fields().first() {
+                    Some(Some(Literal::Primitive(value))) => Some(value.clone()),
+                    _ => None,
+                };
                 writers.insert(
                     key.clone(),
-                    writer_context.new_manifest_writer(
-                        ManifestContentType::Data,
-                        metadata.current_schema(),
-                        partition_spec,
-                    )?,
+                    (
+                        first_value,
+                        writer_context.new_manifest_writer(
+                            ManifestContentType::Data,
+                            metadata.current_schema(),
+                            partition_spec,
+                        )?,
+                    ),
                 );
             }
-            let writer = writers.get_mut(&key).expect("writer was just inserted");
+            let (_, writer) = writers.get_mut(&key).expect("writer was just inserted");
 
             // Loading fills in inherited values of added entries; what is still missing
             // would be invalid in an existing entry.
@@ -182,7 +256,30 @@ async fn rewrite_batch(
             entries_written += 1;
 
             if writer.estimated_manifest_size() >= target_size {
-                let sealed = writers.remove(&key).expect("writer is in the map");
+                let (_, sealed) = writers.remove(&key).expect("writer is in the map");
+                spawn_bounded_write(
+                    sealed,
+                    &mut writes_in_flight,
+                    write_concurrency,
+                    &mut manifests,
+                )
+                .await?;
+            }
+        }
+        // `frontiers` yields, after each input, the smallest value a later input can hold,
+        // only when it has grown.
+        if let Some(Some(frontier)) = frontiers.next() {
+            let complete: Vec<String> = writers
+                .iter()
+                .filter(|(_, (value, _))| {
+                    value.as_ref().is_some_and(|value| {
+                        matches!(compare(value, &frontier), Ok(std::cmp::Ordering::Less))
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in complete {
+                let (_, sealed) = writers.remove(&key).expect("writer is in the map");
                 spawn_bounded_write(
                     sealed,
                     &mut writes_in_flight,
@@ -193,7 +290,7 @@ async fn rewrite_batch(
             }
         }
     }
-    for writer in std::mem::take(&mut writers).into_values() {
+    for (_, writer) in std::mem::take(&mut writers).into_values() {
         spawn_bounded_write(
             writer,
             &mut writes_in_flight,
@@ -228,49 +325,122 @@ pub(super) fn is_encrypted(table: &Table, manifests: &[ManifestFile]) -> bool {
             .any(|manifest| manifest.key_metadata.is_some())
 }
 
-/// Loads manifests on spawned tasks, at most `concurrency` ahead of the consumer, and
-/// yields them in input order so output is deterministic. Dropping it aborts the loads
-/// still in flight.
+/// The order a batch reads `inputs` in, and what that order proves after each input.
+///
+/// Inputs are sorted by the smallest first-field value their summary allows, keeping
+/// manifest-list order between equals; inputs whose summary gives no such value (no
+/// usable bounds, only nulls, or `first_field` is `None`) come first. The iterator yields
+/// one item per input: `Some(v)` if every later input only holds non-null first-field
+/// values of at least `v` and `v` is above what the earlier items proved, else `None`.
+fn read_order(
+    inputs: &[ManifestFile],
+    first_field: Option<&PrimitiveType>,
+) -> (Vec<ManifestFile>, std::vec::IntoIter<Option<Datum>>) {
+    let mut ordered: Vec<(Option<Datum>, &ManifestFile)> = inputs
+        .iter()
+        .map(|input| {
+            let lower = first_field.and_then(|ty| match decode_extent(input, ty) {
+                Extent::Known {
+                    values: Some((lower, _)),
+                    ..
+                } => Some(lower),
+                _ => None,
+            });
+            (lower, input)
+        })
+        .collect();
+    ordered.sort_by(|(a, _), (b, _)| match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => order(a.literal(), b.literal()),
+    });
+
+    let mut frontiers = Vec::with_capacity(ordered.len());
+    let mut proved: Option<&Datum> = None;
+    for position in 0..ordered.len() {
+        let next = ordered
+            .get(position + 1)
+            .and_then(|(next, _)| next.as_ref());
+        let grown = match (next, proved) {
+            (Some(next), Some(proved)) => order(next.literal(), proved.literal()).is_gt(),
+            // The first input with a known lower bound ends the unordered prefix.
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if grown {
+            proved = next;
+            frontiers.push(next.cloned());
+        } else {
+            frontiers.push(None);
+        }
+    }
+    (
+        ordered
+            .into_iter()
+            .map(|(_, input)| input.clone())
+            .collect(),
+        frontiers.into_iter(),
+    )
+}
+
+/// Loads manifests on spawned tasks and yields them in the order given so output is
+/// deterministic. At most `window` manifests are requested ahead of the consumer, which
+/// bounds the loaded manifests held in memory, and each load holds a permit of `permits`
+/// while it runs. Dropping it aborts the loads still in flight.
 struct OrderedLoads {
     file_io: iceberg::io::FileIO,
     pending: std::vec::IntoIter<ManifestFile>,
-    in_flight: VecDeque<(ManifestFile, AbortOnDropHandle<iceberg::Result<Manifest>>)>,
-    concurrency: usize,
+    in_flight: VecDeque<(ManifestFile, AbortOnDropHandle<Result<Manifest>>)>,
+    window: usize,
+    permits: Arc<Semaphore>,
 }
 
 impl OrderedLoads {
-    fn new(table: &Table, inputs: Vec<ManifestFile>, concurrency: usize) -> Self {
+    fn new(
+        table: &Table,
+        inputs: Vec<ManifestFile>,
+        window: usize,
+        permits: Arc<Semaphore>,
+    ) -> Self {
         Self {
             file_io: table.file_io().clone(),
             pending: inputs.into_iter(),
             in_flight: VecDeque::new(),
-            concurrency,
+            window,
+            permits,
         }
     }
 
     async fn next(&mut self) -> Result<Option<(ManifestFile, Manifest)>> {
-        while self.in_flight.len() < self.concurrency {
+        while self.in_flight.len() < self.window {
             let Some(input) = self.pending.next() else {
                 break;
             };
             let file_io = self.file_io.clone();
             let to_load = input.clone();
-            let handle = tokio::spawn(async move { to_load.load_manifest(&file_io).await });
+            let permits = Arc::clone(&self.permits);
+            let handle = tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await.map_err(|_| {
+                    CompactionError::Execution("The manifest load permits were closed".to_owned())
+                })?;
+                to_load
+                    .load_manifest(&file_io)
+                    .await
+                    .map_err(CompactionError::Iceberg)
+            });
             self.in_flight
                 .push_back((input, AbortOnDropHandle::new(handle)));
         }
         let Some((input, handle)) = self.in_flight.pop_front() else {
             return Ok(None);
         };
-        let manifest = handle
-            .await
-            .map_err(|err| {
-                CompactionError::Execution(format!(
-                    "Manifest load task for {} failed: {err}",
-                    input.manifest_path
-                ))
-            })?
-            .map_err(CompactionError::Iceberg)?;
+        let manifest = handle.await.map_err(|err| {
+            CompactionError::Execution(format!(
+                "Manifest load task for {} failed: {err}",
+                input.manifest_path
+            ))
+        })??;
         Ok(Some((input, manifest)))
     }
 }
@@ -517,6 +687,7 @@ mod tests {
                 &plan,
                 &plan.batches()[0],
                 &batch_config(100),
+                Arc::new(Semaphore::new(100)),
                 write_concurrency,
             )
             .await
@@ -600,6 +771,7 @@ mod tests {
                 &plan,
                 &plan.batches()[0],
                 &batch_config(100),
+                Arc::new(Semaphore::new(100)),
                 write_concurrency,
             )
             .await

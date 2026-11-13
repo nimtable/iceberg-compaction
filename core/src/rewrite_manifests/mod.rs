@@ -48,7 +48,7 @@ use classify::{SummaryDecision, decide_from_summaries};
 pub use commit::commit_manifest_batches;
 use loading::needs_rewrite_by_loading;
 pub use planner::plan_manifest_batches;
-pub use rewrite::rewrite_manifest_batch;
+pub use rewrite::{rewrite_manifest_batch, rewrite_manifest_batch_sharing_loads};
 pub use types::{
     BatchedRewriteManifestsConfig, CommittedManifestRewrite, FirstFieldRange, ManifestBatch,
     ManifestRewritePlan, RewrittenManifestBatch,
