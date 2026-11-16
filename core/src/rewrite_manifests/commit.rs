@@ -1,6 +1,6 @@
 //! Commits rewritten batches in one snapshot.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -52,14 +52,14 @@ use crate::{CompactionError, Result};
 /// since the plan was made are kept. If a concurrent commit removed an input manifest of a
 /// batch, such as another rewrite, that batch's group is
 /// [`BatchOutcome::DroppedConcurrentCommit`] and the other
-/// groups are committed in a new transaction. If every remaining group lost an input, the
-/// commit fails with the action's error.
+/// groups are committed in a new transaction.
 ///
 /// # Errors
 ///
-/// Returns [`CompactionError::Execution`] if `results` doesn't match `plan`, and
-/// [`CompactionError::Iceberg`] if the commit fails. A commit error doesn't mean the
-/// snapshot wasn't committed: the catalog may have applied it and then failed to respond,
+/// Returns [`CompactionError::Execution`] if `results` doesn't match `plan`,
+/// [`CompactionError::ConcurrentManifestRemoval`] if every remaining group lost an input
+/// to a concurrent commit, and [`CompactionError::Iceberg`] if the commit fails otherwise.
+/// A commit error doesn't mean the snapshot wasn't committed: the catalog may have applied it and then failed to respond,
 /// such as on a REST timeout or 5xx, for which the commit state is unknown. Outputs are
 /// left in storage either way.
 pub async fn commit_manifest_batches(
@@ -191,30 +191,39 @@ pub async fn commit_manifest_batches(
 
         // The action rejects an input that a concurrent commit removed from the branch
         // as `DataInvalid`, which the transaction doesn't retry. Drop the groups that read
-        // a removed input and commit the rest; if no surviving group did, or every one
-        // did, the error is not ours to recover from.
+        // a removed input and commit the rest.
         if err.kind() != ErrorKind::DataInvalid {
             return Err(err.into());
         }
         let current = current_manifest_paths(catalog, table, plan.branch()).await?;
+        let removed: BTreeSet<&str> = (0..batches.len())
+            .filter(|&i| status[i] == Status::Pending)
+            .flat_map(|i| batches[i].inputs())
+            .map(|input| input.manifest_path.as_str())
+            .filter(|path| !current.contains(*path))
+            .collect();
+        if removed.is_empty() {
+            return Err(err.into());
+        }
         let conflicted: HashSet<usize> = (0..batches.len())
             .filter(|&i| {
                 status[i] == Status::Pending
                     && batches[i]
                         .inputs()
                         .iter()
-                        .any(|input| !current.contains(input.manifest_path.as_str()))
+                        .any(|input| removed.contains(input.manifest_path.as_str()))
             })
             .map(|i| groups[i])
             .collect();
         let conflicted_members: Vec<usize> = (0..batches.len())
             .filter(|&i| conflicted.contains(&groups[i]))
             .collect();
-        if conflicted_members.is_empty()
-            || (0..batches.len())
-                .all(|i| status[i] != Status::Pending || conflicted.contains(&groups[i]))
+        if (0..batches.len())
+            .all(|i| status[i] != Status::Pending || conflicted.contains(&groups[i]))
         {
-            return Err(err.into());
+            return Err(CompactionError::ConcurrentManifestRemoval {
+                removed: removed.into_iter().map(str::to_owned).collect(),
+            });
         }
         warn!(
             batches = ?conflicted_members,
@@ -945,6 +954,11 @@ mod tests {
         let (env, table) = table_with_existing_and_added_entries().await;
         let plan = plan_of(&table, 2).await;
         let rewritten = rewrite_all(&table, &plan, &batch_config(2)).await;
+        let inputs: BTreeSet<String> = plan
+            .batches()
+            .iter()
+            .flat_map(|batch| batch.inputs().iter().map(|m| m.manifest_path.clone()))
+            .collect();
         let concurrent = global_rewrite(&env, &table).await;
         let err = commit_manifest_batches(
             env.catalog.as_ref(),
@@ -955,12 +969,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, CompactionError::Iceberg(_)), "{err:?}");
-        assert!(
-            err.to_string()
-                .contains("Deleted manifest does not exist in the current snapshot"),
-            "{err}"
-        );
+        let CompactionError::ConcurrentManifestRemoval { removed } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(removed.into_iter().collect::<BTreeSet<_>>(), inputs);
         assert_eq!(
             env.catalog
                 .load_table(table.identifier())
