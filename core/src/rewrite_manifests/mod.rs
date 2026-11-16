@@ -12,9 +12,10 @@
 //!    manifests and entries, which are not hard caps: manifests straddling a cut, with
 //!    unusable bounds or without live entries are added on top, and a manifest over a
 //!    target, or a run of identical lower bounds, forms a batch of its own. It returns
-//!    `None` if the table can't be split or batched safely (unpartitioned, a single
-//!    first-field value, an unresolvable first-field type, or encrypted), and the caller
-//!    should use a global rewrite.
+//!    [`PlanOutcome::Unsplittable`] if the table can't be split or batched safely (see
+//!    [`UnsplittableReason`]), and [`PlanOutcome::ReadAmplificationTooHigh`] if the
+//!    batches would read too many manifests; in both cases the caller should use a global
+//!    rewrite.
 //! 2. [`rewrite_manifest_batch`] writes the new manifests of one batch. The caller owns
 //!    concurrency: plans, batches and results are owned and `Send`, so each batch can run
 //!    on a spawned task.

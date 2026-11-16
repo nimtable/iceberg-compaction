@@ -61,7 +61,7 @@ use crate::{CompactionError, Result};
 /// Encrypted tables are not supported: the manifests would be written in plaintext. A
 /// table counts as encrypted if it has the `encryption.key-id` property, an encryption
 /// manager, or an input with key metadata. [`plan_manifest_batches`](super::plan_manifest_batches)
-/// returns `None` for such tables.
+/// returns [`PlanOutcome::Unsplittable`](super::PlanOutcome::Unsplittable) for such tables.
 ///
 /// # Errors
 ///
@@ -256,7 +256,9 @@ async fn rewrite_batch(
             entries_written += 1;
 
             if writer.estimated_manifest_size() >= target_size {
-                let (_, sealed) = writers.remove(&key).expect("writer is in the map");
+                let (_, sealed) = writers
+                    .remove(&key)
+                    .expect("writer over the target size is in the map");
                 spawn_bounded_write(
                     sealed,
                     &mut writes_in_flight,
@@ -279,7 +281,9 @@ async fn rewrite_batch(
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in complete {
-                let (_, sealed) = writers.remove(&key).expect("writer is in the map");
+                let (_, sealed) = writers
+                    .remove(&key)
+                    .expect("writer below the frontier is in the map");
                 spawn_bounded_write(
                     sealed,
                     &mut writes_in_flight,
@@ -891,6 +895,176 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CompactionError::Iceberg(_)), "{err:?}");
+    }
+
+    /// The first-field lower bound in `input`'s summary, as an `i32`.
+    fn int_lower_bound(input: &ManifestFile) -> Option<i32> {
+        match decode_extent(input, &PrimitiveType::Int) {
+            Extent::Known {
+                values: Some((lower, _)),
+                ..
+            } => match lower.literal() {
+                PrimitiveLiteral::Int(value) => Some(*value),
+                other => panic!("unexpected lower bound {other:?}"),
+            },
+            _ => None,
+        }
+    }
+
+    /// Sets the first-field lower bound in `input`'s summary to `lower`.
+    fn set_int_lower_bound(input: &mut ManifestFile, lower: i32) {
+        let summary = &mut input.partitions.as_mut().unwrap()[0];
+        summary.lower_bound = Some(iceberg::spec::ByteBuf::from(lower.to_le_bytes().to_vec()));
+    }
+
+    #[tokio::test]
+    async fn read_order_sorts_by_lower_bound_and_yields_growing_frontiers() {
+        let (_env, table) = table_with_existing_and_added_entries().await;
+        let plan = plan_of(&table, 100).await;
+        let mut inputs = plan.batches()[0].inputs().to_vec();
+        // The global rewrite wrote keys 1, 2, 3 and 5; the appends wrote 1, 4, 6 and 4, 7.
+        let mut lower_bounds: Vec<_> = inputs.iter().map(int_lower_bound).collect();
+        lower_bounds.sort();
+        assert_eq!(lower_bounds, [1, 1, 2, 3, 4, 5].map(Some));
+
+        // An input without a usable bound comes first.
+        let key_5 = inputs
+            .iter()
+            .position(|input| int_lower_bound(input) == Some(5))
+            .unwrap();
+        inputs[key_5].partitions = None;
+        let unbounded = inputs[key_5].manifest_path.clone();
+        let list_position = |path: &str| {
+            inputs
+                .iter()
+                .position(|input| input.manifest_path == path)
+                .unwrap()
+        };
+
+        let (ordered, frontiers) = read_order(&inputs, Some(&PrimitiveType::Int));
+        assert_eq!(ordered[0].manifest_path, unbounded);
+        assert_eq!(
+            ordered.iter().map(int_lower_bound).collect::<Vec<_>>(),
+            vec![None, Some(1), Some(1), Some(2), Some(3), Some(4)]
+        );
+        // The two inputs starting at 1 keep their manifest-list order.
+        assert!(
+            list_position(&ordered[1].manifest_path) < list_position(&ordered[2].manifest_path)
+        );
+        // A frontier is yielded only when the next input's lower bound grows.
+        assert_eq!(frontiers.collect::<Vec<_>>(), vec![
+            Some(Datum::int(1)),
+            None,
+            Some(Datum::int(2)),
+            Some(Datum::int(3)),
+            Some(Datum::int(4)),
+            None,
+        ]);
+
+        // Without a first-field type nothing is known: manifest-list order, no frontier.
+        let (ordered, frontiers) = read_order(&inputs, None);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|input| &input.manifest_path)
+                .collect::<Vec<_>>(),
+            inputs
+                .iter()
+                .map(|input| &input.manifest_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(frontiers.collect::<Vec<_>>(), vec![None; inputs.len()]);
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifest_batch_writes_keys_once_past_the_frontier() {
+        let (_env, table) = table_with_existing_and_added_entries().await;
+        let mut plan = plan_of(&table, 100).await;
+        // Claim that the append holding keys 4 and 7 starts at 6. It is then read last, and
+        // key 4 of the other append is written out once the frontier reaches 6, so the
+        // append's key-4 entry starts a second manifest for that key.
+        let append = plan.batches[0]
+            .inputs
+            .iter_mut()
+            .find(|input| int_lower_bound(input) == Some(4))
+            .unwrap();
+        set_int_lower_bound(append, 6);
+
+        let rewritten =
+            rewrite_manifest_batch(&table, &plan, &plan.batches()[0], &batch_config(100))
+                .await
+                .unwrap();
+        let mut per_manifest = Vec::new();
+        for manifest in rewritten.manifests() {
+            let keys = first_field_keys(&table, manifest).await;
+            per_manifest.push((keys, manifest.existing_files_count));
+        }
+        per_manifest.sort();
+        let expected: Vec<_> = [
+            (1, 2),
+            (2, 2),
+            (3, 3),
+            (4, 1),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+        ]
+        .iter()
+        .map(|&(id, count)| (BTreeSet::from([key(id)]), Some(count)))
+        .collect();
+        assert_eq!(per_manifest, expected);
+        assert_eq!(
+            live_entries_of(&table, rewritten.manifests()).await,
+            live_entries(&table).await
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifest_batch_sharing_loads_draws_on_the_given_permits() {
+        let (_env, table) = table_with_existing_and_added_entries().await;
+        let config = batch_config(2);
+        let plan = plan_of(&table, 2).await;
+
+        // Concurrent batches sharing one permit all finish and give the permit back.
+        let permits = Arc::new(Semaphore::new(1));
+        let mut tasks = JoinSet::new();
+        for batch in plan.batches() {
+            let (table, plan, batch, config, permits) = (
+                table.clone(),
+                plan.clone(),
+                batch.clone(),
+                config.clone(),
+                Arc::clone(&permits),
+            );
+            tasks.spawn(async move {
+                rewrite_manifest_batch_sharing_loads(&table, &plan, &batch, &config, permits).await
+            });
+        }
+        let mut entries = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let rewritten = joined.unwrap().unwrap();
+            entries.push((rewritten.batch_index(), rewritten.entries_written()));
+        }
+        entries.sort();
+        assert_eq!(entries, vec![(0, 2), (1, 5), (2, 5)]);
+        assert_eq!(permits.available_permits(), 1);
+
+        // Loads wait on the given permits, so closed permits fail the batch.
+        permits.close();
+        let err = rewrite_manifest_batch_sharing_loads(
+            &table,
+            &plan,
+            &plan.batches()[0],
+            &config,
+            permits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Execution failed: The manifest load permits were closed"
+        );
     }
 
     #[tokio::test]

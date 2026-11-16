@@ -32,8 +32,9 @@ pub struct BatchedRewriteManifestsConfig {
     /// Maximum manifests loaded at once by each
     /// [`rewrite_manifest_batch`](super::rewrite_manifest_batch) call. Must be at least 1.
     pub load_concurrency: usize,
-    /// If set, [`plan_manifest_batches`](super::plan_manifest_batches) returns `None`, so
-    /// the caller falls back to a global rewrite, when the batches would read more than
+    /// If set, [`plan_manifest_batches`](super::plan_manifest_batches) returns
+    /// [`PlanOutcome::ReadAmplificationTooHigh`], so the caller falls back to a global
+    /// rewrite, when the batches would read more than
     /// this many times as many manifests as a global rewrite: the inputs of all batches,
     /// counted once per batch, over the distinct inputs. Manifests without live entries
     /// aren't read and don't count. Must be at least 1. `None` never falls back.

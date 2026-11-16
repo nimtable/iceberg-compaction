@@ -29,3 +29,5 @@ pub use executor::CompactionExecutor;
 pub use iceberg;
 // pub use iceberg_catalog_memory;
 pub use iceberg_catalog_rest;
+// Re-export tokio, whose `Semaphore` is part of the rewrite_manifests API.
+pub use tokio;

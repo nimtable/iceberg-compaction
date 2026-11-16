@@ -17,6 +17,7 @@ core/src/
 ├── error/         # Error types
 ├── executor/      # Execution engine (DataFusion integration)
 ├── file_selection/# File selection strategies (analyzer, packer, strategy)
+├── rewrite_manifests/ # Manifest rewrite: needs-rewrite check, batched plan/rewrite/commit
 └── common/        # Shared utilities (metrics)
 ```
 

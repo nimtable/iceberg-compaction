@@ -282,7 +282,9 @@ fn outcomes(results: Vec<Result<RewrittenManifestBatch>>, status: &[Status]) -> 
             (Ok(_), Status::Miscounted) => BatchOutcome::Miscounted,
             (Ok(_), Status::DroppedWithFailed) => BatchOutcome::DroppedWithFailed,
             (Ok(_), Status::DroppedConcurrentCommit) => BatchOutcome::DroppedConcurrentCommit,
-            (Ok(_), Status::Failed) => unreachable!("a failed batch has an error"),
+            (Ok(_), Status::Failed) => {
+                unreachable!("Status::Failed is only assigned to batches whose result is an error")
+            }
         })
         .collect()
 }
