@@ -722,6 +722,7 @@ async fn test_batched_rewrite_manifests_clusters_manifests_by_partition() {
     let plan = plan_manifest_batches(&table, MAIN_BRANCH, 1, &config)
         .await
         .expect("planning should succeed")
+        .into_plan()
         .expect("a partitioned table with several keys can be split");
 
     // The keys of each batch's input manifests. Two manifests start in each of the ranges
@@ -768,9 +769,9 @@ async fn test_batched_rewrite_manifests_clusters_manifests_by_partition() {
         commit_manifest_batches(catalog.as_ref(), &table, &plan, results, HashMap::new())
             .await
             .expect("commit should succeed");
-    assert_eq!(committed.batches_committed, 3);
-    assert_eq!(committed.batches_failed, 0);
-    assert_eq!(committed.batches_dropped, 0);
+    assert_eq!(committed.batches_committed(), 3);
+    assert_eq!(committed.batches_failed(), 0);
+    assert_eq!(committed.batches_dropped(), 0);
 
     // The same data files, now with one manifest per key.
     let after = catalog.load_table(table.identifier()).await.unwrap();

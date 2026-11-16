@@ -50,8 +50,8 @@ use loading::needs_rewrite_by_loading;
 pub use planner::plan_manifest_batches;
 pub use rewrite::{rewrite_manifest_batch, rewrite_manifest_batch_sharing_loads};
 pub use types::{
-    BatchedRewriteManifestsConfig, CommittedManifestRewrite, FirstFieldRange, ManifestBatch,
-    ManifestRewritePlan, RewrittenManifestBatch,
+    BatchOutcome, BatchedRewriteManifestsConfig, CommittedManifestRewrite, FirstFieldRange,
+    ManifestBatch, ManifestRewritePlan, PlanOutcome, RewrittenManifestBatch, UnsplittableReason,
 };
 
 /// Checks whether rewriting the data manifests of `branch` would change their clustering.
@@ -625,6 +625,7 @@ mod tests {
         let plan = assert_send(plan_manifest_batches(&table, MAIN_BRANCH, 1, &config))
             .await
             .unwrap()
+            .into_plan()
             .unwrap();
         let mixed = manifest_of_snapshot(&table, 0).await;
         let overlapped = manifest_of_snapshot(&table, 2).await;
@@ -650,10 +651,12 @@ mod tests {
         });
         // The clean manifest of snapshot 1 is skipped; the inputs are the exact list entries.
         assert_eq!(batches[0].inputs(), [mixed, overlapped]);
+        assert_eq!(plan.read_amplification(), Some(1.0));
 
         let other = plan_manifest_batches(&table, MAIN_BRANCH, 1, &batch_config(100))
             .await
             .unwrap()
+            .into_plan()
             .unwrap();
         assert_ne!(other.snapshot_id(), plan.snapshot_id());
     }
@@ -670,6 +673,7 @@ mod tests {
         let plan = plan_manifest_batches(&table, MAIN_BRANCH, 1, &batch_config(2))
             .await
             .unwrap()
+            .into_plan()
             .unwrap();
         let ranges: Vec<_> = plan
             .batches()
@@ -711,27 +715,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_manifest_batches_returns_none_when_a_global_rewrite_is_needed() {
+    async fn plan_manifest_batches_is_unsplittable_when_a_global_rewrite_is_needed() {
         let empty = create_partitioned_env().await;
         let (_env, one_value) = table_with_snapshots(&[&[(1, "a")], &[(1, "a")]]).await;
         let (_env2, two_values) = table_with_snapshots(&[&[(1, "a")], &[(2, "a")]]).await;
 
-        let none = |table: &Table, branch: &str| {
+        let plan = |table: &Table, branch: &str| {
             let table = table.clone();
             let branch = branch.to_owned();
             async move {
-                plan_manifest_batches(&table, &branch, 1, &batch_config(100))
+                match plan_manifest_batches(&table, &branch, 1, &batch_config(100))
                     .await
                     .unwrap()
-                    .map(|plan| plan.batches().len())
+                {
+                    PlanOutcome::Planned(plan) => Ok(plan.batches().len()),
+                    PlanOutcome::Unsplittable(reason) => Err(reason),
+                    other => panic!("{other:?}"),
+                }
             }
         };
-        assert_eq!(none(&empty.table, MAIN_BRANCH).await, None, "no snapshot");
-        assert_eq!(none(&one_value, "missing").await, None, "no such branch");
-        assert_eq!(none(&one_value, MAIN_BRANCH).await, None, "one value");
         assert_eq!(
-            none(&two_values, MAIN_BRANCH).await,
-            Some(0),
+            plan(&empty.table, MAIN_BRANCH).await,
+            Err(UnsplittableReason::NoSnapshot),
+            "no snapshot"
+        );
+        assert_eq!(
+            plan(&one_value, "missing").await,
+            Err(UnsplittableReason::NoSnapshot),
+            "no such branch"
+        );
+        assert_eq!(
+            plan(&one_value, MAIN_BRANCH).await,
+            Err(UnsplittableReason::SingleFirstFieldValue),
+            "one value"
+        );
+        assert_eq!(
+            plan(&two_values, MAIN_BRANCH).await,
+            Ok(0),
             "two values, nothing to rewrite"
         );
     }
@@ -762,6 +782,7 @@ mod tests {
         let plan = plan_manifest_batches(&tagged, MAIN_BRANCH, 1, &batch_config(100))
             .await
             .unwrap()
+            .into_plan()
             .unwrap();
         assert_eq!(plan.base_snapshot_id(), snapshot_id);
     }
@@ -784,7 +805,13 @@ mod tests {
         let planned = plan_manifest_batches(&encrypted, MAIN_BRANCH, 1, &batch_config(100))
             .await
             .unwrap();
-        assert_eq!(planned.map(|plan| plan.batches().len()), None);
+        assert!(
+            matches!(
+                planned,
+                PlanOutcome::Unsplittable(UnsplittableReason::Encrypted)
+            ),
+            "{planned:?}"
+        );
 
         let mut with_key_metadata = plan.clone();
         with_key_metadata.batches[0].inputs[0].key_metadata = Some(vec![1, 2, 3]);
@@ -896,6 +923,7 @@ mod tests {
         plan_manifest_batches(table, MAIN_BRANCH, 1, &batch_config(max_batch_manifests))
             .await
             .unwrap()
+            .into_plan()
             .unwrap()
     }
 

@@ -8,7 +8,8 @@ use iceberg::{Catalog, ErrorKind};
 use tracing::{info, warn};
 
 use super::types::{
-    CommittedManifestRewrite, ManifestBatch, ManifestRewritePlan, RewrittenManifestBatch,
+    BatchOutcome, CommittedManifestRewrite, ManifestBatch, ManifestRewritePlan,
+    RewrittenManifestBatch,
 };
 use crate::{CompactionError, Result};
 
@@ -23,7 +24,7 @@ use crate::{CompactionError, Result};
 /// A batch can only be committed together with every batch that shares an input manifest
 /// with it, directly or through other batches, because a manifest that straddles two
 /// batches is replaced as a whole. These batches form a group. A failed batch drops its
-/// whole group: the group's other batches count as dropped.
+/// whole group: the group's other batches are [`BatchOutcome::DroppedWithFailed`].
 ///
 /// Each group that is still standing is also verified before it is committed: the entries
 /// its batches wrote must add up to the live entries its input manifests list, that is
@@ -31,8 +32,8 @@ use crate::{CompactionError, Result};
 /// means some entry was lost or written twice, for example because a manifest's partition
 /// summary didn't describe its entries. A group whose count can't be checked because an
 /// input lists no file counts is dropped the same way. All batches of a group that fails
-/// verification count as failed, since each rewrote without error and the group's outputs
-/// can't be trusted.
+/// verification are [`BatchOutcome::Miscounted`], which counts as failed, since each
+/// rewrote without error and the group's outputs can't be trusted.
 ///
 /// Dropped and failed batches' outputs are not referenced by the snapshot, and their
 /// inputs stay in it. Nothing is deleted from storage.
@@ -42,13 +43,15 @@ use crate::{CompactionError, Result};
 /// `snapshot_properties` plus `rewrite-batches`, `rewrite-batches-failed` and
 /// `rewrite-batches-dropped` with the counts of
 /// [`CommittedManifestRewrite`], on top of the summary of a manifest rewrite
-/// (`manifests-created`, `manifests-replaced`, ...).
+/// (`manifests-created`, `manifests-replaced`, ...). The result holds a
+/// [`BatchOutcome`] for each batch, with the errors of failed batches.
 ///
 /// The commit uses the plan's snapshot id on its branch, writes its manifest list under a
 /// fresh commit UUID, so commits of the same plan never overwrite each other's, and relies on the
 /// transaction's retries. A retry reloads the table, so manifests appended to the branch
 /// since the plan was made are kept. If a concurrent commit removed an input manifest of a
-/// batch, such as another rewrite, that batch's group counts as dropped and the other
+/// batch, such as another rewrite, that batch's group is
+/// [`BatchOutcome::DroppedConcurrentCommit`] and the other
 /// groups are committed in a new transaction. If every remaining group lost an input, the
 /// commit fails with the action's error.
 ///
@@ -94,12 +97,18 @@ pub async fn commit_manifest_batches(
         }
     }
 
-    let groups = batch_groups(batches);
+    let groups = plan.batch_groups();
     let errored: Vec<bool> = results.iter().map(Result::is_err).collect();
-    let mut dropped = group_flags(&groups, &errored);
-    let mut miscounted = vec![false; batches.len()];
-    for members in group_members(&groups).values() {
-        if dropped[members[0]] {
+    let with_failed = group_flags(groups, &errored);
+    let mut status: Vec<Status> = (0..batches.len())
+        .map(|i| match (errored[i], with_failed[i]) {
+            (true, _) => Status::Failed,
+            (false, true) => Status::DroppedWithFailed,
+            (false, false) => Status::Pending,
+        })
+        .collect();
+    for members in group_members(groups).values() {
+        if status[members[0]] != Status::Pending {
             continue;
         }
         if let Err(reason) = verify_group(batches, &results, members) {
@@ -109,14 +118,10 @@ pub async fn commit_manifest_batches(
                 "Manifest rewrite batches wrote an unexpected number of entries; dropping their group"
             );
             for &member in members {
-                miscounted[member] = true;
-                dropped[member] = true;
+                status[member] = Status::Miscounted;
             }
         }
     }
-    let batches_failed = (0..batches.len())
-        .filter(|&i| errored[i] || miscounted[i])
-        .count();
 
     for (position, result) in results.iter().enumerate() {
         if let Err(err) = result {
@@ -125,8 +130,10 @@ pub async fn commit_manifest_batches(
     }
 
     loop {
-        let batches_dropped = dropped.iter().filter(|&&dropped| dropped).count() - batches_failed;
-        let batches_committed = batches.len() - batches_failed - batches_dropped;
+        let count = |wanted: &[Status]| status.iter().filter(|s| wanted.contains(s)).count();
+        let batches_committed = count(&[Status::Pending]);
+        let batches_failed = count(&[Status::Failed, Status::Miscounted]);
+        let batches_dropped = count(&[Status::DroppedWithFailed, Status::DroppedConcurrentCommit]);
         if batches_committed == 0 {
             info!(
                 batches = batches.len(),
@@ -134,9 +141,7 @@ pub async fn commit_manifest_batches(
             );
             return Ok(CommittedManifestRewrite {
                 table: table.clone(),
-                batches_committed,
-                batches_failed,
-                batches_dropped,
+                batches: outcomes(results, &status),
             });
         }
 
@@ -146,9 +151,9 @@ pub async fn commit_manifest_batches(
             .set_snapshot_id(plan.snapshot_id())
             .set_target_branch(plan.branch().to_owned());
         let mut deleted_paths = HashSet::new();
-        for ((batch, result), dropped) in batches.iter().zip(&results).zip(&dropped) {
+        for ((batch, result), status) in batches.iter().zip(&results).zip(&status) {
             let Ok(rewritten) = result else { continue };
-            if *dropped {
+            if *status != Status::Pending {
                 continue;
             }
             for input in batch.inputs() {
@@ -178,9 +183,7 @@ pub async fn commit_manifest_batches(
             Ok(committed) => {
                 return Ok(CommittedManifestRewrite {
                     table: committed,
-                    batches_committed,
-                    batches_failed,
-                    batches_dropped,
+                    batches: outcomes(results, &status),
                 });
             }
             Err(err) => err,
@@ -196,7 +199,7 @@ pub async fn commit_manifest_batches(
         let current = current_manifest_paths(catalog, table, plan.branch()).await?;
         let conflicted: HashSet<usize> = (0..batches.len())
             .filter(|&i| {
-                !dropped[i]
+                status[i] == Status::Pending
                     && batches[i]
                         .inputs()
                         .iter()
@@ -208,7 +211,8 @@ pub async fn commit_manifest_batches(
             .filter(|&i| conflicted.contains(&groups[i]))
             .collect();
         if conflicted_members.is_empty()
-            || (0..batches.len()).all(|i| dropped[i] || conflicted.contains(&groups[i]))
+            || (0..batches.len())
+                .all(|i| status[i] != Status::Pending || conflicted.contains(&groups[i]))
         {
             return Err(err.into());
         }
@@ -219,7 +223,7 @@ pub async fn commit_manifest_batches(
              dropping their groups and committing the rest"
         );
         for member in conflicted_members {
-            dropped[member] = true;
+            status[member] = Status::DroppedConcurrentCommit;
         }
     }
 }
@@ -247,30 +251,30 @@ async fn current_manifest_paths(
         .collect())
 }
 
-/// For each batch, the representative of its group: batches linked by shared input
-/// manifests, directly or through other batches, have the same representative.
-fn batch_groups(batches: &[ManifestBatch]) -> Vec<usize> {
-    fn root(parent: &mut [usize], mut node: usize) -> usize {
-        while parent[node] != node {
-            parent[node] = parent[parent[node]];
-            node = parent[node];
-        }
-        node
-    }
+/// What the commit is doing with a batch; [`BatchOutcome`] without the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    /// Committed if the commit succeeds.
+    Pending,
+    Failed,
+    Miscounted,
+    DroppedWithFailed,
+    DroppedConcurrentCommit,
+}
 
-    let mut parent: Vec<usize> = (0..batches.len()).collect();
-    let mut first_reader: HashMap<&str, usize> = HashMap::new();
-    for (index, batch) in batches.iter().enumerate() {
-        for input in batch.inputs() {
-            let other = *first_reader
-                .entry(input.manifest_path.as_str())
-                .or_insert(index);
-            let (a, b) = (root(&mut parent, index), root(&mut parent, other));
-            parent[a] = b;
-        }
-    }
-    (0..batches.len())
-        .map(|index| root(&mut parent, index))
+/// The outcome of each batch, taking the errors of failed batches out of `results`.
+fn outcomes(results: Vec<Result<RewrittenManifestBatch>>, status: &[Status]) -> Vec<BatchOutcome> {
+    results
+        .into_iter()
+        .zip(status)
+        .map(|(result, status)| match (result, status) {
+            (Err(err), _) => BatchOutcome::Failed(err),
+            (Ok(_), Status::Pending) => BatchOutcome::Committed,
+            (Ok(_), Status::Miscounted) => BatchOutcome::Miscounted,
+            (Ok(_), Status::DroppedWithFailed) => BatchOutcome::DroppedWithFailed,
+            (Ok(_), Status::DroppedConcurrentCommit) => BatchOutcome::DroppedConcurrentCommit,
+            (Ok(_), Status::Failed) => unreachable!("a failed batch has an error"),
+        })
         .collect()
 }
 
@@ -288,7 +292,7 @@ fn group_flags(groups: &[usize], flagged: &[bool]) -> Vec<bool> {
         .collect()
 }
 
-/// The batch indexes of each group, ascending, keyed by group representative.
+/// The batch indexes of each group, ascending, keyed by group.
 fn group_members(groups: &[usize]) -> BTreeMap<usize, Vec<usize>> {
     let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, group) in groups.iter().enumerate() {
@@ -344,6 +348,7 @@ mod tests {
         Operation,
     };
 
+    use super::super::planner::batch_groups;
     use super::super::tests::{
         LOAD_CONCURRENCY, LiveEntry, TestEnv, append_files, append_keys, append_keys_to,
         batch_config, create_env, create_partitioned_env, data_manifests, file, first_field_keys,
@@ -361,6 +366,21 @@ mod tests {
 
     fn boom() -> CompactionError {
         CompactionError::Execution("boom".to_owned())
+    }
+
+    /// The outcome of each batch, with a failed batch's error message.
+    fn outcomes_of(committed: &CommittedManifestRewrite) -> Vec<String> {
+        committed
+            .batches
+            .iter()
+            .map(|outcome| match outcome {
+                BatchOutcome::Committed => "committed".to_owned(),
+                BatchOutcome::Failed(err) => format!("failed: {err}"),
+                BatchOutcome::Miscounted => "miscounted".to_owned(),
+                BatchOutcome::DroppedWithFailed => "dropped with failed".to_owned(),
+                BatchOutcome::DroppedConcurrentCommit => "dropped concurrent commit".to_owned(),
+            })
+            .collect()
     }
 
     async fn manifest_paths(table: &Table) -> BTreeSet<String> {
@@ -430,9 +450,9 @@ mod tests {
 
         assert_eq!(
             (
-                committed.batches_committed,
-                committed.batches_failed,
-                committed.batches_dropped
+                committed.batches_committed(),
+                committed.batches_failed(),
+                committed.batches_dropped()
             ),
             (3, 0, 0)
         );
@@ -516,17 +536,33 @@ mod tests {
 
     #[tokio::test]
     async fn commit_manifest_batches_drops_groups_with_a_failed_batch() {
-        // (failed batch, (committed, failed, dropped), manifests (created, kept, replaced)).
+        // (failed batch, outcomes, (committed, failed, dropped),
+        //  manifests (created, kept, replaced)).
         // Batches 0 and 1 share the first manifest, so they stand or fall together.
+        let failed = "failed: Execution failed: boom";
         let cases = [
-            (0, (1, 1, 1), (2, 3, 2)),
-            (1, (1, 1, 1), (2, 3, 2)),
-            (2, (2, 1, 0), (4, 2, 3)),
+            (
+                0,
+                [failed, "dropped with failed", "committed"],
+                (1, 1, 1),
+                (2, 3, 2),
+            ),
+            (
+                1,
+                ["dropped with failed", failed, "committed"],
+                (1, 1, 1),
+                (2, 3, 2),
+            ),
+            (2, ["committed", "committed", failed], (2, 1, 0), (4, 2, 3)),
         ];
-        for (failed, counts, manifests) in cases {
+        for (failed, outcomes, counts, manifests) in cases {
             let (env, table) = table_with_two_groups_of_batches().await;
             let plan = plan_of(&table, 2).await;
             assert_eq!(plan.batches().len(), 3);
+            assert_eq!(
+                (plan.batch_groups(), plan.group_count()),
+                (&[0, 0, 1][..], 2)
+            );
             let mut results = ok(rewrite_all(&table, &plan, &batch_config(2)).await);
             results[failed] = Err(boom());
             let before = live_entries(&table).await;
@@ -543,11 +579,12 @@ mod tests {
             .unwrap();
 
             let name = format!("failed batch {failed}");
+            assert_eq!(outcomes_of(&committed), outcomes, "{name}");
             assert_eq!(
                 (
-                    committed.batches_committed,
-                    committed.batches_failed,
-                    committed.batches_dropped
+                    committed.batches_committed(),
+                    committed.batches_failed(),
+                    committed.batches_dropped()
                 ),
                 counts,
                 "{name}"
@@ -573,45 +610,53 @@ mod tests {
     async fn commit_manifest_batches_fails_groups_whose_entry_counts_do_not_add_up() {
         type Tamper = fn(&mut ManifestRewritePlan, &mut [Result<RewrittenManifestBatch>]);
         type Counts = (usize, usize, usize);
+        const SINGLE: [&str; 3] = ["committed", "committed", "miscounted"];
+        const STRADDLING: [&str; 3] = ["miscounted", "miscounted", "committed"];
         fn written(results: &mut [Result<RewrittenManifestBatch>], batch: usize) -> &mut u64 {
             &mut results[batch].as_mut().unwrap().entries_written
         }
         // Batches 0 and 1 form one group, batch 2 another; a group's batches all fail
         // together, and nothing else is affected.
-        // (name, tamper, (committed, failed, dropped), manifests (created, kept, replaced)).
-        let cases: [(&str, Tamper, Counts, Counts); 5] = [
+        // (name, tamper, outcomes, (committed, failed, dropped),
+        //  manifests (created, kept, replaced)).
+        let cases: [(&str, Tamper, [&str; 3], Counts, Counts); 5] = [
             (
                 "an entry too many in the single-batch group",
                 |_, results| *written(results, 2) += 1,
+                SINGLE,
                 (2, 1, 0),
                 (4, 2, 3),
             ),
             (
                 "an entry lost in the straddling group",
                 |_, results| *written(results, 0) -= 1,
+                STRADDLING,
                 (1, 2, 0),
                 (2, 3, 2),
             ),
             (
                 "an entry written twice by the straddling group",
                 |_, results| *written(results, 1) += 1,
+                STRADDLING,
                 (1, 2, 0),
                 (2, 3, 2),
             ),
             (
                 "an unknown count in the straddling group",
                 |plan, _| plan.batches[0].inputs[0].existing_files_count = None,
+                STRADDLING,
                 (1, 2, 0),
                 (2, 3, 2),
             ),
             (
                 "an unknown count in the single-batch group",
                 |plan, _| plan.batches[2].inputs[0].added_files_count = None,
+                SINGLE,
                 (2, 1, 0),
                 (4, 2, 3),
             ),
         ];
-        for (name, tamper, counts, manifests) in cases {
+        for (name, tamper, outcomes, counts, manifests) in cases {
             let (env, table) = table_with_two_groups_of_batches().await;
             let mut plan = plan_of(&table, 2).await;
             assert_eq!(plan.batches().len(), 3);
@@ -629,11 +674,12 @@ mod tests {
             .await
             .unwrap();
 
+            assert_eq!(outcomes_of(&committed), outcomes, "{name}");
             assert_eq!(
                 (
-                    committed.batches_committed,
-                    committed.batches_failed,
-                    committed.batches_dropped
+                    committed.batches_committed(),
+                    committed.batches_failed(),
+                    committed.batches_dropped()
                 ),
                 counts,
                 "{name}"
@@ -760,7 +806,7 @@ mod tests {
                     batch(3, &["m5"]),
                 ],
                 2,
-                vec![0, 0, 0, 3],
+                vec![0, 0, 0, 1],
                 vec![true, true, true, false],
             ),
             (
@@ -773,7 +819,7 @@ mod tests {
                     batch(3, &["m1", "m2"]),
                 ],
                 0,
-                vec![1, 1, 2, 1],
+                vec![0, 0, 1, 0],
                 vec![true, true, false, true],
             ),
         ];
@@ -834,9 +880,9 @@ mod tests {
 
             assert_eq!(
                 (
-                    committed.batches_committed,
-                    committed.batches_failed,
-                    committed.batches_dropped
+                    committed.batches_committed(),
+                    committed.batches_failed(),
+                    committed.batches_dropped()
                 ),
                 (0, failed, dropped),
                 "{name}"
@@ -1001,11 +1047,16 @@ mod tests {
         .await
         .unwrap();
 
+        // Batch 1 is spec 1's.
+        assert_eq!(outcomes_of(&committed), [
+            "committed",
+            "dropped concurrent commit"
+        ]);
         assert_eq!(
             (
-                committed.batches_committed,
-                committed.batches_failed,
-                committed.batches_dropped
+                committed.batches_committed(),
+                committed.batches_failed(),
+                committed.batches_dropped()
             ),
             (1, 0, 1)
         );
@@ -1104,6 +1155,7 @@ mod tests {
         let plan = plan_manifest_batches(table, branch, 1, &config)
             .await
             .unwrap()
+            .into_plan()
             .unwrap();
         let rewritten = rewrite_all(table, &plan, &config).await;
         let committed = commit_manifest_batches(
@@ -1116,7 +1168,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            (committed.batches_failed, committed.batches_dropped),
+            (committed.batches_failed(), committed.batches_dropped()),
             (0, 0)
         );
         (plan, committed.table)

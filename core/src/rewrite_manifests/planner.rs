@@ -18,7 +18,8 @@ use super::classify::{
 use super::rewrite::is_encrypted;
 use super::sweep::{Extent, Limits, OverlapIndex, ValueExtent, choose_cuts, decode_extent};
 use super::types::{
-    BatchedRewriteManifestsConfig, FirstFieldRange, ManifestBatch, ManifestRewritePlan, order,
+    BatchedRewriteManifestsConfig, FirstFieldRange, ManifestBatch, ManifestRewritePlan,
+    PlanOutcome, UnsplittableReason, order,
 };
 use crate::{CompactionError, Result};
 
@@ -87,25 +88,12 @@ impl BatchedRewriteManifestsConfig {
 ///
 /// The plan reserves the snapshot id of the rewrite's commit.
 ///
-/// Returns `None` if the rewrite can't usefully or safely be split, so callers should fall
-/// back to a global rewrite:
-///
-/// - the branch has no snapshot (a global rewrite then does nothing);
-/// - `clustered_fields` is `0`;
-/// - the live manifests together show at most one first-field value, as in an
-///   unpartitioned table, or one whose first field is always null. Nulls count as a value,
-///   and so do all manifests of a spec whose bounds are unusable;
-/// - a partition spec with manifests to rewrite has a first field whose type can't be
-///   resolved against the table's current schema, for example because its source column
-///   was dropped. The batches' writers need that type, so every such batch would fail;
-/// - a data manifest doesn't list its added or existing file count, as some V1 manifest
-///   lists don't. The commit verifies each batch against those counts, so every batch
-///   reading the manifest would be dropped;
-/// - the table is encrypted, by the `encryption.key-id` table property or by a manifest
-///   with key metadata, which batches can't write (see [`rewrite_manifest_batch`](super::rewrite_manifest_batch));
-/// - the batches would read more manifests than
-///   [`max_read_amplification`](BatchedRewriteManifestsConfig::max_read_amplification)
-///   allows, as when most manifests span most of the first field's values.
+/// Returns [`PlanOutcome::Unsplittable`] if the rewrite can't usefully or safely be split,
+/// with the [`UnsplittableReason`], and [`PlanOutcome::ReadAmplificationTooHigh`] if the
+/// batches would read more manifests than
+/// [`max_read_amplification`](BatchedRewriteManifestsConfig::max_read_amplification)
+/// allows, as when most manifests span most of the first field's values. Callers should
+/// then fall back to a global rewrite.
 ///
 /// If nothing needs rewriting the plan has no batches; call
 /// [`needs_manifest_rewrite`](super::needs_manifest_rewrite) first to avoid planning.
@@ -120,12 +108,12 @@ pub async fn plan_manifest_batches(
     branch: &str,
     clustered_fields: usize,
     config: &BatchedRewriteManifestsConfig,
-) -> Result<Option<ManifestRewritePlan>> {
+) -> Result<PlanOutcome> {
     config.validate()?;
 
     let metadata = table.metadata_ref();
     let Some(snapshot) = metadata.snapshot_for_ref(branch) else {
-        return Ok(None);
+        return Ok(PlanOutcome::Unsplittable(UnsplittableReason::NoSnapshot));
     };
     if metadata
         .refs()
@@ -141,7 +129,7 @@ pub async fn plan_manifest_batches(
         .get_manifest_list(snapshot, &metadata)
         .await?;
     if is_encrypted(table, manifest_list.entries()) {
-        return Ok(None);
+        return Ok(PlanOutcome::Unsplittable(UnsplittableReason::Encrypted));
     }
 
     let first_fields = metadata
@@ -163,23 +151,64 @@ pub async fn plan_manifest_batches(
         })
         .collect();
 
-    let Some(batches) = plan_batches(
+    let split = match plan_batches(
         manifest_list.entries(),
         &first_fields,
         clustered_fields,
         config,
-    ) else {
-        return Ok(None);
+    ) {
+        Ok(split) => split,
+        Err(Fallback::Unsplittable(reason)) => return Ok(PlanOutcome::Unsplittable(reason)),
+        Err(Fallback::ReadAmplificationTooHigh { ratio, max }) => {
+            return Ok(PlanOutcome::ReadAmplificationTooHigh { ratio, max });
+        }
     };
-    Ok(Some(ManifestRewritePlan {
+    let batch_groups = batch_groups(&split.batches);
+    Ok(PlanOutcome::Planned(ManifestRewritePlan {
         branch: branch.to_owned(),
         base_snapshot_id: snapshot.snapshot_id(),
         clustered_fields,
         snapshot_id: generate_unique_snapshot_id(|id| {
             metadata.snapshots().any(|s| s.snapshot_id() == id)
         }),
-        batches,
+        batches: split.batches,
+        batch_groups,
+        read_amplification: split.read_amplification,
     }))
+}
+
+/// For each batch, its group: batches linked by shared input manifests, directly or
+/// through other batches, are in the same group. Groups are numbered from 0 in order of
+/// their first batch.
+pub(super) fn batch_groups(batches: &[ManifestBatch]) -> Vec<usize> {
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+
+    let mut parent: Vec<usize> = (0..batches.len()).collect();
+    let mut first_reader: HashMap<&str, usize> = HashMap::new();
+    for (index, batch) in batches.iter().enumerate() {
+        for input in batch.inputs() {
+            let other = *first_reader
+                .entry(input.manifest_path.as_str())
+                .or_insert(index);
+            let (a, b) = (root(&mut parent, index), root(&mut parent, other));
+            parent[a] = b;
+        }
+    }
+    let mut group_of_root: HashMap<usize, usize> = HashMap::new();
+    (0..batches.len())
+        .map(|index| {
+            let next = group_of_root.len();
+            *group_of_root
+                .entry(root(&mut parent, index))
+                .or_insert(next)
+        })
+        .collect()
 }
 
 /// A random non-negative id for which `is_taken` is false, like iceberg-rust's
@@ -224,15 +253,30 @@ enum Point {
     Value(PrimitiveLiteral),
 }
 
-/// The pure core of [`plan_manifest_batches`]; `None` if the manifests can't be split.
+/// Batches planned by [`plan_batches`].
+#[derive(Debug)]
+pub(super) struct Split {
+    pub(super) batches: Vec<ManifestBatch>,
+    /// See [`ManifestRewritePlan::read_amplification`].
+    pub(super) read_amplification: Option<f64>,
+}
+
+/// Why [`plan_batches`] didn't split the manifests; [`PlanOutcome`] without a plan.
+#[derive(Debug, PartialEq)]
+pub(super) enum Fallback {
+    Unsplittable(UnsplittableReason),
+    ReadAmplificationTooHigh { ratio: f64, max: f64 },
+}
+
+/// The pure core of [`plan_manifest_batches`].
 pub(super) fn plan_batches(
     manifests: &[ManifestFile],
     first_fields: &HashMap<i32, FirstField>,
     clustered_fields: usize,
     config: &BatchedRewriteManifestsConfig,
-) -> Option<Vec<ManifestBatch>> {
+) -> std::result::Result<Split, Fallback> {
     if clustered_fields == 0 {
-        return None;
+        return Err(Fallback::Unsplittable(UnsplittableReason::NoClusterKey));
     }
 
     let mut no_live: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
@@ -245,7 +289,9 @@ pub(super) fn plan_batches(
         let (Some(added), Some(existing)) =
             (manifest.added_files_count, manifest.existing_files_count)
         else {
-            return None;
+            return Err(Fallback::Unsplittable(
+                UnsplittableReason::MissingFileCounts,
+            ));
         };
         match classify_from_summary(manifest, clustered_fields) {
             SummaryClass::NoLiveEntries => no_live
@@ -271,7 +317,9 @@ pub(super) fn plan_batches(
     }
 
     if distinct_points(manifests, &live) <= 1 {
-        return None;
+        return Err(Fallback::Unsplittable(
+            UnsplittableReason::SingleFirstFieldValue,
+        ));
     }
 
     // A key shared across snapshots makes all of its manifests dirty, not just the later ones.
@@ -319,7 +367,9 @@ pub(super) fn plan_batches(
             first_fields.get(&spec_id),
             Some(FirstField::Unpartitioned | FirstField::Typed(_))
         ) {
-            return None;
+            return Err(Fallback::Unsplittable(
+                UnsplittableReason::UnresolvableFirstField,
+            ));
         }
         let dirty_extents = OverlapIndex::new(dirty.iter().map(|d| &d.extent));
         let overlapped: Vec<Candidate> = clean
@@ -360,13 +410,16 @@ pub(super) fn plan_batches(
             inputs: inputs.into_iter().map(|i| manifests[i].clone()).collect(),
         });
     }
-    if config
-        .max_read_amplification
-        .is_some_and(|max| reads as f64 > max * distinct_reads as f64)
+    let read_amplification = (distinct_reads > 0).then(|| reads as f64 / distinct_reads as f64);
+    if let (Some(ratio), Some(max)) = (read_amplification, config.max_read_amplification)
+        && ratio > max
     {
-        return None;
+        return Err(Fallback::ReadAmplificationTooHigh { ratio, max });
     }
-    Some(batches)
+    Ok(Split {
+        batches,
+        read_amplification,
+    })
 }
 
 fn distinct_points(manifests: &[ManifestFile], live: &[(Candidate, SummaryClass)]) -> usize {
@@ -696,10 +749,14 @@ mod tests {
     fn plan(
         manifests: &[ManifestFile],
         config: &BatchedRewriteManifestsConfig,
-    ) -> Option<Vec<ManifestBatch>> {
-        let batches = plan_batches(manifests, &int_field(), 1, config)?;
+    ) -> std::result::Result<Vec<ManifestBatch>, Fallback> {
+        let batches = plan_batches(manifests, &int_field(), 1, config)?.batches;
         assert_coverage(&batches);
-        Some(batches)
+        Ok(batches)
+    }
+
+    fn unsplittable(reason: UnsplittableReason) -> std::result::Result<usize, Fallback> {
+        Err(Fallback::Unsplittable(reason))
     }
 
     #[test]
@@ -776,10 +833,18 @@ mod tests {
         ]);
 
         // 22 reads of 8 live manifests.
+        let split = plan_batches(&manifests, &int_field(), 1, &config).unwrap();
+        assert_eq!(split.read_amplification, Some(2.75));
         config.max_read_amplification = Some(2.75);
-        assert_eq!(plan(&manifests, &config).map(|b| b.len()), Some(6));
+        assert_eq!(plan(&manifests, &config).map(|b| b.len()), Ok(6));
         config.max_read_amplification = Some(2.7);
-        assert_eq!(plan(&manifests, &config).map(|b| b.len()), None);
+        assert_eq!(
+            plan(&manifests, &config).map(|b| b.len()),
+            Err(Fallback::ReadAmplificationTooHigh {
+                ratio: 2.75,
+                max: 2.7
+            })
+        );
     }
 
     #[test]
@@ -878,7 +943,9 @@ mod tests {
             // Same value under another spec is another key, so it stays clean.
             in_spec(0, key("clean", 4, 3), 3),
         ];
-        let batches = plan_batches(&manifests, &first_fields, 1, &roomy()).unwrap();
+        let batches = plan_batches(&manifests, &first_fields, 1, &roomy())
+            .unwrap()
+            .batches;
         assert_coverage(&batches);
         assert_eq!(layout(&batches), vec![
             expect(0, "(-inf,+inf)", &["typed"]),
@@ -888,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_returns_none_when_the_table_cannot_be_split() {
+    fn plan_is_unsplittable_when_the_table_cannot_be_split() {
         let dup = |path: &str, snapshot: i64| ManifestFile {
             added_snapshot_id: snapshot,
             ..manifest(path, Some(vec![]))
@@ -951,16 +1018,16 @@ mod tests {
         for (name, manifests, first_field) in cases {
             let first_fields = HashMap::from([(0, first_field)]);
             assert_eq!(
-                plan_batches(&manifests, &first_fields, 1, &roomy()).map(|b| b.len()),
-                None,
+                plan_batches(&manifests, &first_fields, 1, &roomy()).map(|s| s.batches.len()),
+                unsplittable(UnsplittableReason::SingleFirstFieldValue),
                 "{name}"
             );
         }
 
         let splittable = [span("a", 1, 3), span("b", 4, 6)];
         assert_eq!(
-            plan_batches(&splittable, &int_field(), 0, &roomy()).map(|b| b.len()),
-            None,
+            plan_batches(&splittable, &int_field(), 0, &roomy()).map(|s| s.batches.len()),
+            unsplittable(UnsplittableReason::NoClusterKey),
             "no key to cluster by"
         );
 
@@ -982,22 +1049,22 @@ mod tests {
             let mut manifests = splittable.to_vec();
             manifests.push(unknown);
             assert_eq!(
-                plan_batches(&manifests, &int_field(), 1, &roomy()).map(|b| b.len()),
-                None,
+                plan_batches(&manifests, &int_field(), 1, &roomy()).map(|s| s.batches.len()),
+                unsplittable(UnsplittableReason::MissingFileCounts),
                 "{name}"
             );
         }
         let mut manifests = splittable.to_vec();
         manifests.push(delete_without_count);
         assert_eq!(
-            plan_batches(&manifests, &int_field(), 1, &roomy()).map(|b| b.len()),
-            Some(1),
+            plan_batches(&manifests, &int_field(), 1, &roomy()).map(|s| s.batches.len()),
+            Ok(1),
             "delete manifest without a count"
         );
     }
 
     #[test]
-    fn plan_returns_none_when_a_spec_to_rewrite_has_an_unresolvable_first_field() {
+    fn plan_is_unsplittable_when_a_spec_to_rewrite_has_an_unresolvable_first_field() {
         let in_spec = |spec_id: i32, mut m: ManifestFile, snapshot: i64| {
             m.partition_spec_id = spec_id;
             m.added_snapshot_id = snapshot;
@@ -1013,15 +1080,17 @@ mod tests {
         let mut manifests = split_spec_0.to_vec();
         manifests.push(in_spec(1, span("c", 1, 5), 1));
         assert_eq!(
-            plan_batches(&manifests, &first_fields, 1, &roomy()).map(|b| b.len()),
-            None,
+            plan_batches(&manifests, &first_fields, 1, &roomy()).map(|s| s.batches.len()),
+            unsplittable(UnsplittableReason::UnresolvableFirstField),
             "unresolvable spec with a mixed manifest"
         );
         // A spec that has nothing to rewrite doesn't matter.
         let mut manifests = split_spec_0.to_vec();
         manifests.push(in_spec(1, key("c", 1, 1), 1));
         manifests.push(in_spec(1, key("d", 2, 2), 2));
-        let batches = plan_batches(&manifests, &first_fields, 1, &roomy()).unwrap();
+        let batches = plan_batches(&manifests, &first_fields, 1, &roomy())
+            .unwrap()
+            .batches;
         assert_eq!(layout(&batches), vec![expect(0, "(-inf,+inf)", &[
             "a", "b"
         ])]);
@@ -1029,8 +1098,8 @@ mod tests {
         let mut manifests = split_spec_0.to_vec();
         manifests.push(in_spec(9, span("c", 1, 5), 1));
         assert_eq!(
-            plan_batches(&manifests, &first_fields, 1, &roomy()).map(|b| b.len()),
-            None,
+            plan_batches(&manifests, &first_fields, 1, &roomy()).map(|s| s.batches.len()),
+            unsplittable(UnsplittableReason::UnresolvableFirstField),
             "unknown spec"
         );
     }
@@ -1064,7 +1133,7 @@ mod tests {
                 })
                 .collect();
             let config = config(next(200) + 1, next(6) as usize + 1);
-            if plan(&manifests, &config).is_some() {
+            if plan(&manifests, &config).is_ok() {
                 planned += 1;
             }
         }
@@ -1242,7 +1311,8 @@ mod tests {
                 .collect();
             let first_fields = HashMap::from([(0, FirstField::Typed(ty))]);
             let batches = plan_batches(&manifests, &first_fields, 1, &config(1_000_000, 1))
-                .unwrap_or_else(|| panic!("{name}: planned"));
+                .unwrap_or_else(|fallback| panic!("{name}: {fallback:?}"))
+                .batches;
             assert_eq!(batches.len(), expected_batches, "{name}");
 
             let partition_of = |entry: &Option<Datum>| {
@@ -1293,7 +1363,9 @@ mod tests {
         .collect();
         let first_fields = HashMap::from([(0, FirstField::Typed(PrimitiveType::Float))]);
 
-        let batches = plan_batches(&manifests, &first_fields, 1, &config(1_000_000, 1)).unwrap();
+        let batches = plan_batches(&manifests, &first_fields, 1, &config(1_000_000, 1))
+            .unwrap()
+            .batches;
         let inputs: Vec<Vec<&str>> = batches
             .iter()
             .map(|b| {
@@ -1337,13 +1409,17 @@ mod tests {
         mixed_second.manifest_path = "mixed-second".to_owned();
         let manifests = [mixed_second, key("other", 7, 2)];
 
-        let batches = plan_batches(&manifests, &int_field(), 1, &roomy()).unwrap();
+        let batches = plan_batches(&manifests, &int_field(), 1, &roomy())
+            .unwrap()
+            .batches;
         assert_eq!(
             layout(&batches),
             Layout::new(),
             "the second field's mix is ignored when clustering by the first"
         );
-        let batches = plan_batches(&manifests, &int_field(), 2, &roomy()).unwrap();
+        let batches = plan_batches(&manifests, &int_field(), 2, &roomy())
+            .unwrap()
+            .batches;
         assert_eq!(layout(&batches), vec![expect(0, "(-inf,+inf)", &[
             "mixed-second"
         ])]);

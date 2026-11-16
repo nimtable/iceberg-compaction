@@ -52,6 +52,8 @@ pub struct ManifestRewritePlan {
     pub(super) clustered_fields: usize,
     pub(super) snapshot_id: i64,
     pub(super) batches: Vec<ManifestBatch>,
+    pub(super) batch_groups: Vec<usize>,
+    pub(super) read_amplification: Option<f64>,
 }
 
 impl ManifestRewritePlan {
@@ -80,6 +82,82 @@ impl ManifestRewritePlan {
     pub fn batches(&self) -> &[ManifestBatch] {
         &self.batches
     }
+
+    /// The group of each batch, in batch order. Batches linked by shared input manifests,
+    /// directly or through other batches, are in the same group, which
+    /// [`commit_manifest_batches`](super::commit_manifest_batches) commits or drops as a
+    /// whole. Groups are numbered from 0 in order of their first batch.
+    pub fn batch_groups(&self) -> &[usize] {
+        &self.batch_groups
+    }
+
+    /// Number of distinct groups in [`batch_groups`](Self::batch_groups).
+    pub fn group_count(&self) -> usize {
+        self.batch_groups.iter().max().map_or(0, |&group| group + 1)
+    }
+
+    /// Manifests the batches read, counted once per batch, over the distinct manifests
+    /// they read: the ratio
+    /// [`max_read_amplification`](BatchedRewriteManifestsConfig::max_read_amplification)
+    /// limits. Manifests without live entries aren't read and don't count. `None` if the
+    /// batches read no manifest.
+    pub fn read_amplification(&self) -> Option<f64> {
+        self.read_amplification
+    }
+}
+
+/// The result of [`plan_manifest_batches`](super::plan_manifest_batches).
+#[derive(Debug, Clone)]
+pub enum PlanOutcome {
+    /// The batches to rewrite; none if nothing needs rewriting.
+    Planned(ManifestRewritePlan),
+    /// The rewrite can't usefully or safely be split; rewrite globally instead.
+    Unsplittable(UnsplittableReason),
+    /// The batches would read more manifests than
+    /// [`max_read_amplification`](BatchedRewriteManifestsConfig::max_read_amplification)
+    /// allows; rewrite globally instead.
+    ReadAmplificationTooHigh {
+        /// The plan's [`read_amplification`](ManifestRewritePlan::read_amplification).
+        ratio: f64,
+        /// The configured limit.
+        max: f64,
+    },
+}
+
+impl PlanOutcome {
+    /// The plan, if the outcome is [`Planned`](Self::Planned).
+    pub fn into_plan(self) -> Option<ManifestRewritePlan> {
+        match self {
+            Self::Planned(plan) => Some(plan),
+            Self::Unsplittable(_) | Self::ReadAmplificationTooHigh { .. } => None,
+        }
+    }
+}
+
+/// Why [`plan_manifest_batches`](super::plan_manifest_batches) returned
+/// [`PlanOutcome::Unsplittable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsplittableReason {
+    /// The branch has no snapshot, so a global rewrite does nothing.
+    NoSnapshot,
+    /// `clustered_fields` is `0`, so there is no key to split by.
+    NoClusterKey,
+    /// The live manifests together show at most one first-field value, as in an
+    /// unpartitioned table, or one whose first field is always null. Nulls count as a
+    /// value, and so do all manifests of a spec whose bounds are unusable.
+    SingleFirstFieldValue,
+    /// A partition spec with manifests to rewrite has a first field whose type can't be
+    /// resolved against the table's current schema, for example because its source column
+    /// was dropped. The batches' writers need that type, so every such batch would fail.
+    UnresolvableFirstField,
+    /// A data manifest doesn't list its added or existing file count, as some V1 manifest
+    /// lists don't. The commit verifies each batch against those counts, so every batch
+    /// reading the manifest would be dropped.
+    MissingFileCounts,
+    /// The table is encrypted, by the `encryption.key-id` table property or by a manifest
+    /// with key metadata, which batches can't write.
+    Encrypted,
 }
 
 /// The manifests one rewrite task reads and the entries it writes.
@@ -159,23 +237,75 @@ impl RewrittenManifestBatch {
     }
 }
 
+/// What [`commit_manifest_batches`](super::commit_manifest_batches) did with one batch.
+#[derive(Debug)]
+pub enum BatchOutcome {
+    /// The batch's outputs replaced its inputs in the new snapshot.
+    Committed,
+    /// The batch's rewrite returned this error.
+    Failed(CompactionError),
+    /// The batch rewrote without error, but the entries its group wrote didn't add up to
+    /// the live entries its group's inputs list, or an input lists no file counts.
+    Miscounted,
+    /// The batch rewrote without error, but its group has a [`Failed`](Self::Failed) batch.
+    DroppedWithFailed,
+    /// The batch rewrote without error, but a concurrent commit removed an input of its
+    /// group.
+    DroppedConcurrentCommit,
+}
+
+impl BatchOutcome {
+    /// Whether the batch is [`Failed`](Self::Failed) or [`Miscounted`](Self::Miscounted).
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::Miscounted)
+    }
+
+    /// Whether the batch is [`DroppedWithFailed`](Self::DroppedWithFailed) or
+    /// [`DroppedConcurrentCommit`](Self::DroppedConcurrentCommit).
+    pub fn is_dropped(&self) -> bool {
+        matches!(
+            self,
+            Self::DroppedWithFailed | Self::DroppedConcurrentCommit
+        )
+    }
+}
+
 /// The outcome of [`commit_manifest_batches`](super::commit_manifest_batches).
 ///
-/// `batches_committed + batches_failed + batches_dropped` is the number of batches in the
-/// plan. Nothing was committed if `batches_committed` is `0`.
-#[derive(Debug, Clone)]
+/// Nothing was committed if no batch is [`BatchOutcome::Committed`].
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct CommittedManifestRewrite {
     /// The table after the commit, or the table passed in if nothing was committed.
     pub table: Table,
+    /// The outcome of each batch, in the order of [`ManifestRewritePlan::batches`].
+    pub batches: Vec<BatchOutcome>,
+}
+
+impl CommittedManifestRewrite {
     /// Batches whose outputs replaced their inputs in the new snapshot.
-    pub batches_committed: usize,
-    /// Batches whose rewrite returned an error, plus all batches of a group whose written
-    /// entry count didn't match its inputs' file counts.
-    pub batches_failed: usize,
-    /// Batches that were rewritten successfully but not committed because they share an
-    /// input manifest, directly or through other batches, with a failed batch.
-    pub batches_dropped: usize,
+    pub fn batches_committed(&self) -> usize {
+        self.batches
+            .iter()
+            .filter(|outcome| matches!(outcome, BatchOutcome::Committed))
+            .count()
+    }
+
+    /// Batches that are [`failed`](BatchOutcome::is_failed).
+    pub fn batches_failed(&self) -> usize {
+        self.batches
+            .iter()
+            .filter(|outcome| outcome.is_failed())
+            .count()
+    }
+
+    /// Batches that are [`dropped`](BatchOutcome::is_dropped).
+    pub fn batches_dropped(&self) -> usize {
+        self.batches
+            .iter()
+            .filter(|outcome| outcome.is_dropped())
+            .count()
+    }
 }
 
 /// The entries of a batch's partition spec that a batch is responsible for, as a range of
