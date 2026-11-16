@@ -16,7 +16,7 @@
 - **Execution controls:** configure read/write parallelism, concurrent plans, target file size, Parquet writer properties, and an optional shared DataFusion memory budget with disk spilling.
 - **Commit and visibility:** commit replacement files in one Iceberg transaction, target a branch, retry supported commit failures with exponential backoff, and collect file/byte statistics and metrics.
 
-The core crate is [`iceberg-compaction-core`](./core/). Catalog and storage access use the pinned [RisingWave fork of `iceberg-rust`](https://github.com/risingwavelabs/iceberg-rust); the repository includes local-filesystem and REST-catalog/S3 examples. See [Cargo.toml](./Cargo.toml) for the exact dependency revisions and enabled storage features.
+The core crate is [`iceberg-compaction-core`](./core/). Catalog and storage access use a [pinned fork of `iceberg-rust`](https://github.com/dsfhdshdjtsb/iceberg-rust) at upstream RisingWave `6e974ce` plus two commits exposing `ManifestWriter::estimated_manifest_size` and `TableMetadata::refs`, until those changes are upstreamed; the repository includes local-filesystem and REST-catalog/S3 examples. See [Cargo.toml](./Cargo.toml) for the exact dependency revisions and enabled storage features.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ Set `CompactionConfig.planning` to one of these [`CompactionPlanningConfig`](./c
 | `Full` (default) | All data files eligible for the planning run. Group filters are not applied. |
 | `SmallFiles` | Data files smaller than `small_file_threshold_bytes` (default: 32 MiB). |
 | `FilesWithDeletes` | Data files with at least `min_delete_file_count_threshold` associated delete files (default: 128). Set it to `1` to select files with any deletes; `0` disables this filter. |
-| `Auto` | The union of small files and files meeting the delete-file threshold, grouped together once. A zero threshold disables that predicate; setting both to zero selects nothing. |
+| `Auto` | The union of small files and files meeting the delete-file threshold. Small-file merge candidates are grouped first; delete candidates not already in a merge group are then grouped separately with the same scope and grouping strategy. A zero threshold disables that predicate; setting both to zero selects nothing. |
 
 The delete threshold counts **delete files associated with a data file**, not deleted rows or a deletion ratio. All strategies support an optional inclusive `max_file_sequence_number` bound to exclude newer files from a planning run.
 
@@ -96,7 +96,7 @@ Grouping is independent of candidate selection:
 
 - `FileGroupScope::Partition` (default) groups each partition separately; `Table` groups the selected files across partitions. Output still follows the table's partition spec.
 - `GroupingStrategy::Single` (default) makes one group per scope. `BinPack(BinPackConfig)` splits candidates into groups with a configurable target size (default: 100 GiB).
-- `GroupFilters` can require a minimum group size or number of data files for `SmallFiles`, `FilesWithDeletes`, and `Auto`.
+- `GroupFilters` can require a minimum group size or number of data files for `SmallFiles` and `Auto`. In `Auto` they gate only the small-file merge groups, not delete candidates. `FilesWithDeletes` has no group filters.
 
 ### Execution and resource settings
 
@@ -111,6 +111,7 @@ Configure these fields in [`CompactionExecutionConfig`](./core/src/config/mod.rs
 | `write_parquet_properties` | ZSTD; 128 MiB row groups | Parquet writer settings. |
 | `enable_validate_compaction` | `false` | Additional result validation after the managed workflow commits. |
 | `enable_prefetch` | `false` | Experimental whole-file prefetch; files carrying deletes bypass this path. |
+| `data_file_naming` | `DataFileNaming::Default` | Output file naming. `Default` writes `{partition_path}/{data_file_prefix}-{n:05}-{uuid}.parquet` under the data location; `FlatUuid` writes `{uuid}.parquet` (UUID v7) directly under it, with no partition directory. |
 
 Read/write parallelism is configured in the planning strategy (`max_input_parallelism`, `max_output_parallelism`, and `enable_heuristic_output_parallelism`).
 
@@ -132,7 +133,7 @@ Use `CompactionBuilder::with_to_branch()` to target a branch (default: `main`), 
 
 Compaction commits replacement data files and updates table metadata. It does **not** immediately delete the old data objects from storage: retained snapshots may still reference them. Snapshot expiration and orphan-file cleanup require separate maintenance through the catalog/Iceberg APIs or the embedding service.
 
-This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate. Table-sort-order rewriting is supported with the identity-transform limitation above.
+This crate provides compaction primitives, not a persistent scheduler or resumable job service. Z-order clustering and standalone snapshot-expiration, manifest-rewrite, and orphan-cleanup APIs are not exposed by this crate, except `needs_manifest_rewrite()`, which reports whether a branch's data manifests would change if rewritten, and `plan_manifest_batches()`, `rewrite_manifest_batch()` and `commit_manifest_batches()`, which split such a rewrite into independent batches by first-partition-field range, rewrite them (in parallel, if the caller wishes), and commit them in one snapshot. The batched rewrite leaves the manifests of dropped or failed batches unreferenced in storage (cleaning them up is out of scope) and does not support encrypted tables, for which `plan_manifest_batches()` returns `PlanOutcome::Unsplittable`. When it returns `Unsplittable` or `ReadAmplificationTooHigh`, use a global manifest rewrite instead. Table-sort-order rewriting is supported with the identity-transform limitation above.
 
 ## Benchmarking and development
 

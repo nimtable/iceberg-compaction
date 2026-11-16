@@ -47,6 +47,9 @@ pub enum CompactionError {
 
     #[error("Compaction unexpected failed: {0}")]
     Unexpected(String),
+
+    #[error("A concurrent commit removed {} input manifests of the rewrite", removed.len())]
+    ConcurrentManifestRemoval { removed: Vec<String> },
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

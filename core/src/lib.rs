@@ -20,6 +20,7 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod file_selection;
+pub mod rewrite_manifests;
 
 pub use config::{AutoCompactionConfig, CompactionConfig};
 pub use error::{CompactionError, Result};
@@ -28,3 +29,5 @@ pub use executor::CompactionExecutor;
 pub use iceberg;
 // pub use iceberg_catalog_memory;
 pub use iceberg_catalog_rest;
+// Re-export tokio, whose `Semaphore` is part of the rewrite_manifests API.
+pub use tokio;
