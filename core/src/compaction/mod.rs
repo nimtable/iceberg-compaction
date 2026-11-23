@@ -1049,11 +1049,12 @@ impl CommitManager {
 
                 let txn = Transaction::new(&table);
 
-                // The rewrite materialized the deletes that were visible at
-                // `starting_snapshot_id`. If another writer has added deletes for one of the data
-                // files being replaced since then, those deletes are not in the new files, and
-                // removing the old data file would retire them as dangling — resurrecting the rows
-                // they deleted. `validate_from_snapshot_id` turns that into a failed commit.
+                // Custom snapshot properties (e.g. a writer's commit watermark) come from the real
+                // parent, which iceberg-rust re-reads when a retry rebases onto a newer head.
+                // The rewrite materialized the deletes that were visible at `starting_snapshot_id`.
+                // `validate_from_snapshot_id` rejects the commit, on every attempt, when a delete
+                // added after that snapshot applies to a replaced data file but not to the added
+                // files: committing would bring the deleted rows back.
                 let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
@@ -1075,13 +1076,8 @@ impl CommitManager {
                         ));
                     }
                 } else {
-                    // No `validate_from_snapshot_id` here on purpose. This path deliberately does
-                    // *not* preserve the starting snapshot's sequence number, and that is precisely
-                    // what keeps pre-existing equality deletes applicable to the replacement files.
-                    // The validation refuses to promise anything without it rather than offer a
-                    // guarantee that only holds for position deletes, so requesting it here would
-                    // simply fail the commit. Concurrent-delete protection therefore requires
-                    // `use_starting_sequence_number`.
+                    // The added files get a new data sequence number here, so any new equality
+                    // delete that can match a replaced file is a conflict (as in Java).
                     txn.rewrite_files()
                         .set_enable_delete_filter_manager(true)
                         .add_data_files(data_files)
@@ -1089,6 +1085,7 @@ impl CommitManager {
                         .set_target_branch(to_branch.to_owned())
                         .set_check_file_existence(true)
                         .set_inherit_parent_snapshot_properties(true)
+                        .validate_from_snapshot_id(starting_snapshot_id)
                 };
 
                 if let Some(sequence_number) = delete_cleanup_min_data_sequence_number {
@@ -1493,6 +1490,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use crate::CompactionError;
     // Additional imports for new tests
     use crate::compaction::{
         CommitConsistencyParams, CommitManagerRetryConfig, CompactionPlan, RewriteResult,
@@ -3817,5 +3815,61 @@ mod tests {
             !custom.contains_key("partitions.date=2024-01-01"),
             "Partition keys must be filtered out"
         );
+    }
+
+    /// A deletion vector committed after planning for a rewritten input fails the commit on both
+    /// commit paths, and the table keeps the delete.
+    #[tokio::test]
+    async fn test_commit_rejects_new_deletes_for_rewritten_inputs() {
+        for use_starting_sequence_number in [true, false] {
+            let env = create_v3_test_env().await;
+            let files = write_simple_files(&env.table, &env.warehouse_location, "input", 2).await;
+            let hit_path = files[1].file_path().to_owned();
+            let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+            let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default().build().unwrap(),
+                ))
+                .build();
+            let plans = compaction.plan_compaction().await.unwrap();
+            assert_eq!(plans.len(), 1);
+            let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
+            let result = compaction
+                .rewrite_plan(plans[0].clone(), &execution_config, &table)
+                .await
+                .unwrap();
+
+            // Another writer deletes the first row of a planned input after planning.
+            let deletes =
+                write_shared_puffin_deletion_vectors(&table, &env.warehouse_location, &[(
+                    hit_path.clone(),
+                    0,
+                )])
+                .await;
+            let after_delete = append_and_commit(&table, env.catalog.as_ref(), deletes).await;
+            let ids_after_delete = surviving_ids(&after_delete).await;
+
+            let err = compaction
+                .build_commit_manager(CommitConsistencyParams {
+                    starting_snapshot_id: plans[0].snapshot_id,
+                    use_starting_sequence_number,
+                    basic_schema_id: table.metadata().current_schema().schema_id(),
+                })
+                .rewrite_files_from_results(vec![result], MAIN_BRANCH)
+                .await
+                .expect_err("the commit must reject the rewrite of a file with a new delete");
+            assert!(
+                matches!(&err, CompactionError::Iceberg(err) if err.kind() == iceberg::ErrorKind::PreconditionFailed),
+                "use_starting_sequence_number={use_starting_sequence_number}: {err:?}"
+            );
+
+            let reloaded = env.catalog.load_table(&env.table_ident).await.unwrap();
+            assert_eq!(
+                reloaded.metadata().current_snapshot_id(),
+                after_delete.metadata().current_snapshot_id()
+            );
+            assert_eq!(surviving_ids(&reloaded).await, ids_after_delete);
+        }
     }
 }
