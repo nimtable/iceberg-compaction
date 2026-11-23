@@ -1057,17 +1057,15 @@ impl CommitManager {
                 let mut rewrite_action = if use_starting_sequence_number {
                     // TODO: avoid retry if the snapshot_id is not found
                     if let Some(snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) {
-                        let mut action = txn
-                            .rewrite_files()
+                        txn.rewrite_files()
                             .set_enable_delete_filter_manager(true)
                             .add_data_files(data_files)
                             .delete_files(delete_files)
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
                             .set_check_file_existence(true)
-                            .validate_from_snapshot_id(starting_snapshot_id);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
-                        action
+                            .set_inherit_parent_snapshot_properties(true)
+                            .validate_from_snapshot_id(starting_snapshot_id)
                     } else {
                         return Err(iceberg::Error::new(
                             ErrorKind::Unexpected,
@@ -1084,17 +1082,13 @@ impl CommitManager {
                     // guarantee that only holds for position deletes, so requesting it here would
                     // simply fail the commit. Concurrent-delete protection therefore requires
                     // `use_starting_sequence_number`.
-                    let mut action = txn
-                        .rewrite_files()
+                    txn.rewrite_files()
                         .set_enable_delete_filter_manager(true)
                         .add_data_files(data_files)
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
-                        .set_check_file_existence(true);
-                    if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
-                    }
-                    action
+                        .set_check_file_existence(true)
+                        .set_inherit_parent_snapshot_properties(true)
                 };
 
                 if let Some(sequence_number) = delete_cleanup_min_data_sequence_number {
@@ -1449,7 +1443,7 @@ impl CompactionPlanner {
     ) -> Result<(Vec<FileGroup>, Option<i64>)> {
         use crate::file_selection::PlanStrategy;
 
-        let strategy = PlanStrategy::from(&self.config);
+        let strategy = PlanStrategy::try_from(&self.config)?;
         let tasks = FileSelector::scan_data_files(table, snapshot_id).await?;
         let min_sequence = FileSelector::delete_cleanup_min_data_sequence_number(&tasks);
         let file_groups = FileSelector::group_tasks_with_strategy(tasks, strategy, &self.config)?;
@@ -1463,11 +1457,20 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::record_batch::RecordBatch;
+    use futures::TryStreamExt;
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-    use iceberg::spec::{DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+    };
+    use iceberg::spec::{
+        DataFile, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, PrimitiveType, Schema, Type,
+    };
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -1484,6 +1487,7 @@ mod tests {
     use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
@@ -1491,7 +1495,8 @@ mod tests {
 
     // Additional imports for new tests
     use crate::compaction::{
-        CommitManagerRetryConfig, CompactionPlan, RewriteResult, UNASSIGNED_SNAPSHOT_ID,
+        CommitConsistencyParams, CommitManagerRetryConfig, CompactionPlan, RewriteResult,
+        UNASSIGNED_SNAPSHOT_ID,
     };
     use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
     use crate::config::{
@@ -1898,11 +1903,6 @@ mod tests {
         use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 
         let puffin_path = format!("{warehouse_location}/data/shared-deletes.puffin");
-        // Must go through the table's own `file_io`, not a freestanding
-        // `LocalFsStorageFactory`-backed one: `MemoryCatalog`'s `file_io` is a separate virtual
-        // store keyed by path string, not real disk, so a write through any other `FileIO`
-        // instance -- even to the same-looking absolute path -- is invisible to the later scan
-        // that reads this Puffin back through `table.file_io()`.
         let output = table.file_io().new_output(&puffin_path).unwrap();
 
         let mut writer = PuffinWriter::new(&output, StdHashMap::new(), false)
@@ -2174,6 +2174,64 @@ mod tests {
         assert_compaction_stats(&result.stats, initial_file_count, false);
     }
 
+    #[tokio::test]
+    async fn test_compaction_heals_duplicate_file_references_from_streaming_appends() {
+        let env = create_test_env().await;
+        let files = write_simple_files(&env.table, &env.warehouse_location, "batch", 2).await;
+        // Streaming engine (Arroyo) appends by spec without cross-snapshot duplicate checking;
+        // retried commits can add the exact same files across snapshots.
+        let tx1 = Transaction::new(&env.table);
+        let action1 = tx1
+            .fast_append()
+            .set_check_duplicate(false)
+            .add_data_files(files.clone());
+        let tx1 = action1.apply(tx1).unwrap();
+        let table = tx1.commit(env.catalog.as_ref()).await.unwrap();
+
+        let tx2 = Transaction::new(&table);
+        let action2 = tx2
+            .fast_append()
+            .set_check_duplicate(false)
+            .add_data_files(files);
+        let tx2 = action2.apply(tx2).unwrap();
+        let table = tx2.commit(env.catalog.as_ref()).await.unwrap();
+
+        let snapshot = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-data-files"),
+            Some(&"4".to_owned())
+        );
+
+        let execution_config = CompactionExecutionConfigBuilder::default()
+            .enable_validate_compaction(true)
+            .build()
+            .unwrap();
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .execution(execution_config)
+                    .build()
+                    .unwrap(),
+            ))
+            .build();
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert!(result.stats.input_files_count >= 2);
+
+        let reloaded = env.catalog.load_table(&env.table_ident).await.unwrap();
+        let compacted_snapshot = reloaded.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(
+            compacted_snapshot
+                .summary()
+                .additional_properties
+                .get("total-data-files"),
+            Some(&"1".to_owned())
+        );
+    }
+
     /// Resolution must return exactly the requested paths, gathering them from across
     /// multiple manifests and ignoring every other file in the snapshot. This is the
     /// property that keeps commit memory proportional to the batch instead of to the
@@ -2443,6 +2501,400 @@ mod tests {
             .snapshot_for_ref(MAIN_BRANCH)
             .unwrap();
         assert_ne!(snapshot_before.snapshot_id(), snapshot_after.snapshot_id());
+    }
+
+    async fn configure_v3_lineage_table<C: Catalog>(
+        table: &Table,
+        catalog: &C,
+        sorted: bool,
+    ) -> Table {
+        let transaction = Transaction::new(table);
+        let upgrade = transaction
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3);
+        let transaction = upgrade.apply(transaction).unwrap();
+        let transaction = if sorted {
+            let replace_sort_order = transaction.replace_sort_order().asc("id", NullOrder::First);
+            replace_sort_order.apply(transaction).unwrap()
+        } else {
+            transaction
+        };
+        transaction.commit(catalog).await.unwrap()
+    }
+
+    async fn assert_v3_row_lineage_preserved(sorted: bool) {
+        let env = create_test_env().await;
+        let table = configure_v3_lineage_table(&env.table, env.catalog.as_ref(), sorted).await;
+
+        let first_files =
+            write_simple_files(&table, &env.warehouse_location, "lineage_first", 2).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), first_files).await;
+        let second_files =
+            write_simple_files(&table, &env.warehouse_location, "lineage_second", 1).await;
+        let table = append_and_commit(&table, env.catalog.as_ref(), second_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let plans = compaction.plan_compaction().await.unwrap();
+        assert_eq!(plans.len(), 1);
+
+        let mut expected_lineage = plans[0]
+            .file_group
+            .data_files
+            .iter()
+            .flat_map(|task| {
+                let first_row_id = task
+                    .first_row_id
+                    .expect("V3 data file must have first_row_id");
+                let data_sequence_number = task
+                    .data_sequence_number
+                    .expect("V3 data file must have a data sequence number");
+                [1, 2, 3].into_iter().enumerate().map(move |(pos, id)| {
+                    (
+                        id,
+                        first_row_id + i64::try_from(pos).unwrap(),
+                        data_sequence_number,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        expected_lineage.sort_unstable();
+        assert_eq!(expected_lineage.len(), 9);
+        assert_eq!(
+            expected_lineage
+                .iter()
+                .map(|(_, _, sequence_number)| *sequence_number)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert_eq!(result.data_files.len(), 1);
+
+        let mut actual_lineage = Vec::new();
+        for output_file in &result.data_files {
+            let input = table.file_io().new_input(output_file.file_path()).unwrap();
+            let content = input.read().await.unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+            let schema = builder.schema();
+            let id_index = schema.index_of("id").unwrap();
+            let row_id_index = schema.index_of(RESERVED_COL_NAME_ROW_ID).unwrap();
+            let sequence_number_index = schema
+                .index_of(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+                .unwrap();
+            assert_eq!(
+                schema.field(row_id_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                RESERVED_FIELD_ID_ROW_ID.to_string()
+            );
+            assert_eq!(
+                schema.field(sequence_number_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string()
+            );
+
+            for batch in builder.build().unwrap() {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column(id_index)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(row_id_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sequence_numbers = batch
+                    .column(sequence_number_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                actual_lineage.extend((0..batch.num_rows()).map(|row| {
+                    (
+                        ids.value(row),
+                        row_ids.value(row),
+                        sequence_numbers.value(row),
+                    )
+                }));
+            }
+        }
+
+        if sorted {
+            assert_eq!(
+                actual_lineage
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<_>>(),
+                vec![1, 1, 1, 2, 2, 2, 3, 3, 3]
+            );
+        }
+        actual_lineage.sort_unstable();
+        assert_eq!(actual_lineage, expected_lineage);
+
+        let final_table = result.table.as_ref().unwrap();
+        let batches = final_table
+            .scan()
+            .select([
+                "id",
+                RESERVED_COL_NAME_ROW_ID,
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+            ])
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut scanned_lineage = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let sequence_numbers = cast(batch.column(2), &DataType::Int64).unwrap();
+                let sequence_numbers = sequence_numbers
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            ids.value(row),
+                            row_ids.value(row),
+                            sequence_numbers.value(row),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        scanned_lineage.sort_unstable();
+        assert_eq!(scanned_lineage, expected_lineage);
+    }
+
+    #[tokio::test]
+    async fn test_binpack_compaction_preserves_v3_row_lineage() {
+        assert_v3_row_lineage_preserved(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_sorted_compaction_preserves_v3_row_lineage() {
+        assert_v3_row_lineage_preserved(true).await;
+    }
+
+    /// Schema for a table with a genuine user-defined column literally named
+    /// `_row_id`: field id 3, a real schema field rather than the reserved
+    /// sentinel (`RESERVED_FIELD_ID_ROW_ID`) that V3 row lineage uses for the
+    /// same name. The column is `String`, not `Int64`, so a match on name alone
+    /// would attempt an invalid cast.
+    fn schema_with_colliding_row_id_column() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(
+                    3,
+                    RESERVED_COL_NAME_ROW_ID,
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn create_test_record_batch_with_colliding_row_id(iceberg_schema: &Schema) -> RecordBatch {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        // A genuine user-defined `_row_id` value, unrelated to row lineage.
+        let user_row_id_array = StringArray::from(vec!["user-a", "user-b", "user-c"]);
+
+        let arrow_schema = schema_to_arrow_schema(iceberg_schema).unwrap();
+
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(user_row_id_array),
+        ])
+        .unwrap()
+    }
+
+    async fn create_test_env_with_colliding_row_id_column() -> TestEnv {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        create_namespace(catalog.as_ref(), &namespace_ident).await;
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        let _ = catalog
+            .create_table(
+                &table_ident.namespace,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(schema_with_colliding_row_id_column())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        TestEnv {
+            temp_dir,
+            warehouse_location,
+            catalog,
+            table_ident,
+            table,
+        }
+    }
+
+    async fn write_colliding_row_id_files(
+        table: &Table,
+        warehouse_location: &str,
+        suffix_prefix: &str,
+        count: usize,
+    ) -> Vec<DataFile> {
+        let mut all = Vec::new();
+        for i in 0..count {
+            let mut writer = build_simple_data_writer(
+                table,
+                warehouse_location.to_owned(),
+                &format!("{suffix_prefix}_{i}"),
+            )
+            .await;
+            let batch = create_test_record_batch_with_colliding_row_id(
+                &schema_with_colliding_row_id_column(),
+            );
+            writer.write(batch).await.unwrap();
+            let files = writer.close().await.unwrap();
+            all.extend(files);
+        }
+        all
+    }
+
+    /// A V2 table with a genuine user-defined column literally named `_row_id`
+    /// (field id 3, type `String`) must compact normally: the projection-field-id
+    /// mapping in `IcebergFileTaskScan::new` must resolve `_row_id` via the
+    /// table's real schema (field id 3), not the reserved V3 metadata sentinel,
+    /// and `normalize_row_lineage_columns` must not try to cast it to `Int64`.
+    #[tokio::test]
+    async fn test_v2_compaction_preserves_user_defined_row_id_column() {
+        let env = create_test_env_with_colliding_row_id_column().await;
+
+        let data_files =
+            write_colliding_row_id_files(&env.table, &env.warehouse_location, "collide", 2).await;
+        let initial_file_count = data_files.len();
+        let _table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let result = compaction.compact().await.unwrap().unwrap();
+        assert_compaction_stats(&result.stats, initial_file_count, false);
+
+        let final_table = result.table.as_ref().unwrap();
+
+        // Read the compacted output files directly rather than through
+        // `Table::scan()`: `TableScan::select` resolves `_row_id` by name to the
+        // reserved metadata column regardless of the table's actual schema, which
+        // is separate upstream `iceberg-rust` behavior. Reading the raw file
+        // isolates what the writer here controls: the field id assigned to the
+        // column and the type it round-trips.
+        let mut rows = Vec::new();
+        for output_file in &result.data_files {
+            let input = final_table
+                .file_io()
+                .new_input(output_file.file_path())
+                .unwrap();
+            let content = input.read().await.unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(content).unwrap();
+            let schema = builder.schema();
+            let id_index = schema.index_of("id").unwrap();
+            let row_id_index = schema.index_of(RESERVED_COL_NAME_ROW_ID).unwrap();
+            assert_eq!(
+                schema.field(row_id_index).metadata()[PARQUET_FIELD_ID_META_KEY],
+                "3",
+                "user-defined _row_id column must keep its real field id, not the reserved \
+                 V3 row-lineage sentinel"
+            );
+            assert_eq!(
+                schema.field(row_id_index).data_type(),
+                &DataType::Utf8,
+                "user-defined _row_id column must keep its real type"
+            );
+
+            for batch in builder.build().unwrap() {
+                let batch = batch.unwrap();
+                let ids = batch
+                    .column(id_index)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let row_ids = batch
+                    .column(row_id_index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                rows.extend(
+                    (0..batch.num_rows())
+                        .map(|row| (ids.value(row), row_ids.value(row).to_owned())),
+                );
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![
+            (1, "user-a".to_owned()),
+            (1, "user-a".to_owned()),
+            (2, "user-b".to_owned()),
+            (2, "user-b".to_owned()),
+            (3, "user-c".to_owned()),
+            (3, "user-c".to_owned()),
+        ]);
+    }
+
+    /// A V3 table whose schema collides a genuine user-defined column with the
+    /// reserved `_row_id` lineage column name must fail compaction with a clear
+    /// error naming the collision, not a confusing internal error or silent data
+    /// corruption.
+    #[tokio::test]
+    async fn test_v3_compaction_errors_on_colliding_row_id_column() {
+        let env = create_test_env_with_colliding_row_id_column().await;
+
+        let data_files =
+            write_colliding_row_id_files(&env.table, &env.warehouse_location, "collide", 2).await;
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+        let _table = configure_v3_lineage_table(&table, env.catalog.as_ref(), false).await;
+
+        let compaction = create_default_compaction(env.catalog.clone(), env.table_ident.clone());
+        let message = match compaction.compact().await {
+            Err(err) => err.to_string(),
+            Ok(result) => panic!(
+                "compaction must reject a V3 table with a colliding _row_id column, got: {:?}",
+                result.map(|r| r.stats)
+            ),
+        };
+        assert!(
+            message.contains("_row_id") && message.contains("multiple fields"),
+            "error must clearly name the _row_id collision, got: {message}"
+        );
     }
 
     #[tokio::test]
@@ -3249,6 +3701,65 @@ mod tests {
             snapshot_after.summary().operation,
             iceberg::spec::Operation::Replace,
             "Compaction snapshot operation should be 'replace'"
+        );
+    }
+
+    /// A rewrite planned at one snapshot that commits after a newer append carries the
+    /// append's custom properties: the append is its parent and its data is part of the result.
+    #[tokio::test]
+    async fn test_rewrite_files_inherits_properties_from_rebased_parent() {
+        let env = create_test_env().await;
+        let watermark =
+            |value: &str| HashMap::from([("custom.watermark".to_owned(), value.to_owned())]);
+
+        let planned_files =
+            write_simple_files(&env.table, &env.warehouse_location, "planned", 2).await;
+        let planned_table = append_and_commit_with_properties(
+            &env.table,
+            env.catalog.as_ref(),
+            planned_files.clone(),
+            watermark("41"),
+        )
+        .await;
+        let planned_snapshot_id = planned_table
+            .metadata()
+            .snapshot_for_ref(MAIN_BRANCH)
+            .unwrap()
+            .snapshot_id();
+
+        // A writer commits after the rewrite was planned.
+        let appended_files =
+            write_simple_files(&planned_table, &env.warehouse_location, "appended", 1).await;
+        append_and_commit_with_properties(
+            &planned_table,
+            env.catalog.as_ref(),
+            appended_files,
+            watermark("42"),
+        )
+        .await;
+
+        let compacted_files =
+            write_simple_files(&planned_table, &env.warehouse_location, "compacted", 1).await;
+        let commit_manager =
+            create_default_compaction(env.catalog.clone(), env.table_ident.clone())
+                .build_commit_manager(CommitConsistencyParams {
+                    starting_snapshot_id: planned_snapshot_id,
+                    use_starting_sequence_number: true,
+                    basic_schema_id: planned_table.metadata().current_schema().schema_id(),
+                });
+        let table = commit_manager
+            .rewrite_files(compacted_files, planned_files, MAIN_BRANCH)
+            .await
+            .unwrap();
+
+        let head = table.metadata().snapshot_for_ref(MAIN_BRANCH).unwrap();
+        assert_eq!(head.summary().operation, iceberg::spec::Operation::Replace);
+        assert_eq!(
+            head.summary()
+                .additional_properties
+                .get("custom.watermark")
+                .map(String::as_str),
+            Some("42")
         );
     }
 

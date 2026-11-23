@@ -32,6 +32,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
+use iceberg::metadata_columns::{last_updated_sequence_number_field, row_id_field};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
     DataContentType, FormatVersion, NestedField, PartitionSpecRef, PrimitiveType, Schema,
@@ -62,33 +63,47 @@ impl DatafusionProcessor {
         execution_config: Arc<CompactionExecutionConfig>,
         executor_parallelism: usize,
         file_io: FileIO,
+        shared_runtime: Option<Arc<RuntimeEnv>>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(executor_parallelism)
             .with_batch_size(execution_config.max_record_batch_rows)
+            .with_spill_compression(to_datafusion_spill_compression(
+                execution_config.spill_compression,
+            ))
             .set_bool(
                 "datafusion.sql_parser.enable_ident_normalization",
                 execution_config.enable_normalized_column_identifiers,
             );
 
-        // When a memory budget is configured, run DataFusion with a bounded
-        // `FairSpillPool` and an OS-backed `DiskManager` so blocking operators
-        // (notably `SortExec` for sorted-table compaction) spill to disk once
-        // they exceed the budget, instead of buffering all decoded Arrow data
-        // in memory and OOM-killing the process. With no budget we keep the
-        // previous behavior: an unbounded pool and no spilling.
-        let ctx = match execution_config.max_memory_bytes {
-            Some(max_memory_bytes) if max_memory_bytes > 0 => {
-                let runtime_env = build_spilling_runtime_env(
-                    max_memory_bytes,
-                    execution_config.spill_dir.as_deref(),
-                )?;
-                Arc::new(SessionContext::new_with_config_rt(
-                    session_config,
-                    runtime_env,
-                ))
-            }
-            _ => Arc::new(SessionContext::new_with_config(session_config)),
+        // Memory-pool selection, in priority order:
+        // 1. `shared_runtime` (built once and shared across all concurrent
+        //    `rewrite_files` calls on a single executor) — makes `max_memory_bytes`
+        //    a *pod-wide* ceiling instead of a per-plan one. See
+        //    `DataFusionExecutor::shared_runtime_env`.
+        // 2. else a per-call bounded `FairSpillPool` + OS `DiskManager` when a
+        //    budget is configured, so blocking operators (notably `SortExec`) spill
+        //    to disk once they exceed the budget instead of OOM-killing the process.
+        // 3. else the previous behavior: an unbounded pool and no spilling.
+        let ctx = match shared_runtime {
+            Some(runtime_env) => Arc::new(SessionContext::new_with_config_rt(
+                session_config,
+                runtime_env,
+            )),
+            None => match execution_config.max_memory_bytes {
+                Some(max_memory_bytes) if max_memory_bytes > 0 => {
+                    let runtime_env = build_spilling_runtime_env(
+                        max_memory_bytes,
+                        execution_config.spill_dir.as_deref(),
+                        execution_config.max_disk_spill_bytes,
+                    )?;
+                    Arc::new(SessionContext::new_with_config_rt(
+                        session_config,
+                        runtime_env,
+                    ))
+                }
+                _ => Arc::new(SessionContext::new_with_config(session_config)),
+            },
         };
 
         let table_register = DatafusionTableRegister::new(
@@ -117,6 +132,7 @@ impl DatafusionProcessor {
                 &datafusion_task_ctx.data_file_table_name(),
                 datafusion_task_ctx.need_seq_num(),
                 datafusion_task_ctx.need_file_path_and_pos(),
+                datafusion_task_ctx.format_version >= FormatVersion::V3,
             )?;
         }
 
@@ -221,6 +237,19 @@ impl DatafusionProcessor {
     }
 }
 
+fn to_datafusion_spill_compression(
+    value: crate::config::SpillCompression,
+) -> datafusion::common::config::SpillCompression {
+    use datafusion::common::config::SpillCompression as Df;
+
+    use crate::config::SpillCompression;
+    match value {
+        SpillCompression::Uncompressed => Df::Uncompressed,
+        SpillCompression::Lz4Frame => Df::Lz4Frame,
+        SpillCompression::Zstd => Df::Zstd,
+    }
+}
+
 /// Chooses how rows are distributed across the output writer streams.
 ///
 /// For partitioned tables spanning multiple partitions, hash by the complete
@@ -316,19 +345,26 @@ fn repartition_output_plan(
 /// `max_memory_bytes` plus a `DiskManager`. Blocking operators (notably
 /// `SortExec`) spill to disk once they exceed the pool instead of buffering
 /// unbounded in memory. Spill files go to `spill_dir` when provided, otherwise
-/// the OS temp directory.
-fn build_spilling_runtime_env(
+/// the OS temp directory. `max_disk_spill_bytes` caps total spill-file usage
+/// (`DataFusion`'s default when `None`).
+pub(crate) fn build_spilling_runtime_env(
     max_memory_bytes: usize,
     spill_dir: Option<&std::path::Path>,
+    max_disk_spill_bytes: Option<u64>,
 ) -> Result<Arc<RuntimeEnv>> {
     let memory_pool = Arc::new(FairSpillPool::new(max_memory_bytes)) as Arc<dyn MemoryPool>;
     let disk_manager_mode = match spill_dir {
         Some(dir) => DiskManagerMode::Directories(vec![dir.to_path_buf()]),
         None => DiskManagerMode::OsTmpDirectory,
     };
+    let mut disk_manager_builder = DiskManagerBuilder::default().with_mode(disk_manager_mode);
+    if let Some(max_disk_spill_bytes) = max_disk_spill_bytes {
+        disk_manager_builder =
+            disk_manager_builder.with_max_temp_directory_size(max_disk_spill_bytes);
+    }
     let runtime_env = RuntimeEnvBuilder::new()
         .with_memory_pool(memory_pool)
-        .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(disk_manager_mode))
+        .with_disk_manager_builder(disk_manager_builder)
         .build_arc()?;
     Ok(runtime_env)
 }
@@ -404,6 +440,7 @@ impl DatafusionTableRegister {
         table_name: &str,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
+        is_v3_format: bool,
     ) -> Result<()> {
         self.register_table_provider_impl(
             schema,
@@ -412,6 +449,7 @@ impl DatafusionTableRegister {
             DataContentType::Data,
             need_seq_num,
             need_file_path_and_pos,
+            is_v3_format,
         )
     }
 
@@ -422,6 +460,8 @@ impl DatafusionTableRegister {
         table_name: &str,
         file_type: DataContentType,
     ) -> Result<()> {
+        // The reserved-lineage-column special-casing in `IcebergFileTaskScan` only
+        // triggers for `DataContentType::Data`, so `is_v3_format` is irrelevant here.
         self.register_table_provider_impl(
             schema,
             file_scan_tasks,
@@ -429,9 +469,11 @@ impl DatafusionTableRegister {
             file_type,
             false,
             false,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_table_provider_impl(
         &self,
         schema: &Schema,
@@ -440,6 +482,7 @@ impl DatafusionTableRegister {
         file_type: DataContentType,
         need_seq_num: bool,
         need_file_path_and_pos: bool,
+        is_v3_format: bool,
     ) -> Result<()> {
         let schema = schema_to_arrow_schema(schema)?;
         let data_file_table_provider = IcebergFileScanTaskTableProvider::new(
@@ -449,6 +492,7 @@ impl DatafusionTableRegister {
             self.file_io.clone(),
             need_seq_num,
             need_file_path_and_pos,
+            is_v3_format,
             self.executor_parallelism,
             self.max_record_batch_rows,
             self.is_prefetch_enabled,
@@ -702,6 +746,7 @@ pub struct DataFusionTaskContext {
     pub(crate) table_prefix: String,
     pub(crate) sort_order: Option<TableSortOrder>,
     pub(crate) partition_spec: Option<PartitionSpecRef>,
+    pub(crate) format_version: FormatVersion,
 }
 
 pub struct DataFusionTaskContextBuilder {
@@ -847,11 +892,20 @@ impl DataFusionTaskContextBuilder {
         let need_seq_num = !equality_delete_metadatas.is_empty();
 
         // Build schema for data file, old schema + seq_num + file_path + pos
+        let row_lineage_fields = if ge_v3_format {
+            vec![
+                row_id_field().clone(),
+                last_updated_sequence_number_field().clone(),
+            ]
+        } else {
+            Vec::new()
+        };
         let project_names: Vec<_> = self
             .schema
             .as_struct()
             .fields()
             .iter()
+            .chain(row_lineage_fields.iter())
             .map(|i| i.name.clone())
             .collect();
         let highest_field_id = self.schema.highest_field_id();
@@ -886,10 +940,16 @@ impl DataFusionTaskContextBuilder {
             .as_ref()
             .clone()
             .into_builder()
-            .with_fields(add_schema_fields)
+            .with_fields(row_lineage_fields.iter().cloned().chain(add_schema_fields))
             .build()?;
-        // input schema is old schema. used for data file writer
-        let input_schema = self.schema.as_ref().clone();
+        // This schema is passed to the data file writer, which stores lineage for V3 rewrites.
+        let input_schema = self
+            .schema
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields(row_lineage_fields)
+            .build()?;
 
         let sql_builder = SqlBuilder::new(
             &project_names,
@@ -935,6 +995,7 @@ impl DataFusionTaskContextBuilder {
             table_prefix: self.table_prefix,
             sort_order: self.sort_order,
             partition_spec: self.partition_spec,
+            format_version: self.format_version,
         })
     }
 
@@ -1068,6 +1129,7 @@ mod table_name {
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::common::DataFusionError;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
@@ -1091,7 +1153,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DatafusionProcessor::new(bounded, 1, file_io.clone()).is_ok());
+        assert!(DatafusionProcessor::new(bounded, 1, file_io.clone(), None).is_ok());
 
         // A configured spill directory is honored by the disk manager.
         let bounded_with_spill_dir = Arc::new(
@@ -1101,12 +1163,12 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        assert!(DatafusionProcessor::new(bounded_with_spill_dir, 1, file_io.clone()).is_ok());
+        assert!(DatafusionProcessor::new(bounded_with_spill_dir, 1, file_io.clone(), None).is_ok());
 
         let unbounded = Arc::new(CompactionExecutionConfigBuilder::default().build().unwrap());
         assert!(unbounded.max_memory_bytes.is_none());
         assert!(unbounded.spill_dir.is_none());
-        assert!(DatafusionProcessor::new(unbounded, 1, file_io).is_ok());
+        assert!(DatafusionProcessor::new(unbounded, 1, file_io, None).is_ok());
     }
 
     /// Validates the bounded runtime built by `build_spilling_runtime_env`
@@ -1118,56 +1180,16 @@ mod tests {
     #[tokio::test]
     async fn test_bounded_runtime_spills_large_sort() {
         use datafusion::arrow::array::Int32Array;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use datafusion::arrow::record_batch::RecordBatch;
-        use datafusion::datasource::MemTable;
-        use datafusion::physical_plan::collect;
 
         // 4 MiB budget vs a ~16 MiB sort input -> SortExec must spill.
-        let runtime_env = build_spilling_runtime_env(4 * 1024 * 1024, None).unwrap();
-        // target_partitions=1 keeps the plan root a single SortExec so its
-        // spill_count metric is directly observable. The merge-phase reservation
-        // is lowered so it fits inside the small pool (the default reservation
-        // alone exceeds 4 MiB); the sort still spills its buffered input.
-        let session_config = SessionConfig::new()
-            .with_target_partitions(1)
-            .with_sort_spill_reservation_bytes(1024 * 1024);
-        let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-
-        // ~4M i32 rows (~16 MiB) in descending order, split into batches so the
-        // pool fills across multiple batches and spills.
-        let total_rows: i32 = 4_000_000;
-        let batch_rows: i32 = 100_000;
-        let mut batches = Vec::new();
-        let mut start = 0;
-        while start < total_rows {
-            let end = (start + batch_rows).min(total_rows);
-            let values: Int32Array = (start..end).map(|i| total_rows - 1 - i).collect();
-            batches
-                .push(RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(values)]).unwrap());
-            start = end;
-        }
-        let table = MemTable::try_new(arrow_schema.clone(), vec![batches]).unwrap();
-        ctx.register_table("t", Arc::new(table)).unwrap();
-
-        let plan = ctx
-            .sql("SELECT id FROM t ORDER BY id ASC")
-            .await
-            .unwrap()
-            .create_physical_plan()
+        let runtime_env = build_spilling_runtime_env(4 * 1024 * 1024, None, None).unwrap();
+        let (plan, results) = run_large_sort(SessionConfig::new(), runtime_env)
             .await
             .unwrap();
-        let results = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
 
         // Correct global ordering despite the tight budget.
         let total_out: usize = results.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_out as i32, total_rows);
+        assert_eq!(total_out, LARGE_SORT_ROWS as usize);
         let first = results[0]
             .column(0)
             .as_any()
@@ -1182,6 +1204,130 @@ mod tests {
             spill_count > 0,
             "expected SortExec to spill under the 4 MiB budget, got spill_count={spill_count}"
         );
+    }
+
+    /// Spill compression and the disk cap configured on
+    /// `CompactionExecutionConfig` reach the processor's session and runtime,
+    /// and zstd shrinks the bytes a spilling sort writes to disk.
+    #[tokio::test]
+    async fn test_processor_applies_spill_compression_and_disk_cap() {
+        use datafusion::common::config::SpillCompression as DfSpillCompression;
+
+        use crate::config::{CompactionExecutionConfigBuilder, SpillCompression};
+
+        let processor_ctx = |compression| {
+            let config = CompactionExecutionConfigBuilder::default()
+                .max_memory_bytes(Some(4 * 1024 * 1024))
+                .max_disk_spill_bytes(Some(1024 * 1024 * 1024))
+                .spill_compression(compression)
+                .build()
+                .unwrap();
+            DatafusionProcessor::new(Arc::new(config), 1, FileIO::new_with_memory(), None)
+                .unwrap()
+                .ctx
+        };
+
+        let zstd = processor_ctx(SpillCompression::Zstd);
+        assert_eq!(
+            zstd.copied_config().spill_compression(),
+            DfSpillCompression::Zstd
+        );
+        assert_eq!(
+            zstd.runtime_env().disk_manager.max_temp_directory_size(),
+            1024 * 1024 * 1024
+        );
+
+        let spilled_bytes = |ctx: Arc<SessionContext>| async move {
+            let (plan, _) = run_large_sort(ctx.copied_config(), ctx.runtime_env())
+                .await
+                .unwrap();
+            plan.metrics().and_then(|m| m.spilled_bytes()).unwrap_or(0)
+        };
+        let uncompressed = spilled_bytes(processor_ctx(SpillCompression::Uncompressed)).await;
+        let compressed = spilled_bytes(zstd).await;
+        assert!(uncompressed > 0, "expected the sort to spill");
+        assert!(
+            compressed < uncompressed,
+            "zstd spill ({compressed} B) should be smaller than uncompressed ({uncompressed} B)"
+        );
+    }
+
+    /// Exceeding `max_disk_spill_bytes` fails the sort with a typed
+    /// `ResourcesExhausted` error instead of filling the disk.
+    #[tokio::test]
+    async fn test_disk_spill_cap_returns_resources_exhausted() {
+        let runtime_env = build_spilling_runtime_env(4 * 1024 * 1024, None, Some(1024)).unwrap();
+        let err = run_large_sort(SessionConfig::new(), runtime_env)
+            .await
+            .unwrap_err();
+
+        match err.find_root() {
+            DataFusionError::ResourcesExhausted(msg) => assert!(
+                msg.contains("used disk space during the spilling process"),
+                "unexpected ResourcesExhausted message: {msg}"
+            ),
+            other => panic!("expected ResourcesExhausted, got {other:?}"),
+        }
+    }
+
+    const LARGE_SORT_ROWS: i32 = 4_000_000;
+
+    /// Sorts ~16 MiB of descending `Int32` rows (`LARGE_SORT_ROWS`) on the given
+    /// runtime, returning the executed plan (for its metrics) and the output.
+    async fn run_large_sort(
+        session_config: SessionConfig,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> std::result::Result<
+        (
+            Arc<dyn ExecutionPlan>,
+            Vec<datafusion::arrow::record_batch::RecordBatch>,
+        ),
+        DataFusionError,
+    > {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::collect;
+
+        // target_partitions=1 keeps the plan root a single SortExec so its
+        // spill metrics are directly observable. The merge-phase reservation
+        // is lowered so it fits inside a small pool (the default reservation
+        // alone exceeds 4 MiB); the sort still spills its buffered input.
+        let session_config = session_config
+            .with_target_partitions(1)
+            .with_sort_spill_reservation_bytes(1024 * 1024);
+        let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Descending order, split into batches so the pool fills across
+        // multiple batches and spills.
+        let batch_rows: i32 = 100_000;
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < LARGE_SORT_ROWS {
+            let end = (start + batch_rows).min(LARGE_SORT_ROWS);
+            let values: Int32Array = (start..end).map(|i| LARGE_SORT_ROWS - 1 - i).collect();
+            batches.push(RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                values,
+            )])?);
+            start = end;
+        }
+        let table = MemTable::try_new(arrow_schema.clone(), vec![batches])?;
+        ctx.register_table("t", Arc::new(table))?;
+
+        let plan = ctx
+            .sql("SELECT id FROM t ORDER BY id ASC")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let results = collect(plan.clone(), ctx.task_ctx()).await?;
+        Ok((plan, results))
     }
 
     /// Test building SQL with no delete files
@@ -2215,6 +2361,7 @@ mod tests {
                 predicate: None,
                 deletes: vec![],
                 sequence_number: 0,
+                file_sequence_number: Some(0),
                 file_size_in_bytes: 1024,
                 partition,
                 partition_spec,

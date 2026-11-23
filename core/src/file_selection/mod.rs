@@ -20,9 +20,11 @@ use iceberg::table::Table;
 
 use crate::Result;
 
+mod benefit;
 pub mod packer;
 pub mod strategy;
 
+pub use benefit::DeletedRowRatioFilterStrategy;
 pub use packer::ListPacker;
 pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
 
@@ -34,7 +36,7 @@ impl FileSelector {
     pub(crate) fn validate_file_sequence_numbers(data_files: &[FileScanTask]) -> Result<()> {
         if let Some(task) = data_files
             .iter()
-            .find(|task| task.data_sequence_number.is_none())
+            .find(|task| task.file_sequence_number.is_none())
         {
             return Err(crate::CompactionError::Config(format!(
                 "bounded compaction requires file_sequence_number for every scanned data file; missing for {}",

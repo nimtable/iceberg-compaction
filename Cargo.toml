@@ -18,16 +18,13 @@ datafusion = "54.1"
 
 # Local workspace members
 futures = "0.3.17"
-# TEMPORARY: pinned to the head of risingwavelabs/iceberg-rust#202 (open, based on
-# dev_rebase_main_20260807) for `validate_from_snapshot_id`. Re-pin to the merge commit
-# on dev_rebase_main_20260807 once #202 lands. Not for merge as-is.
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87" }
-iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87" }
-iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87" }
+# branch dev_rebase_main_20260807
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", default-features = false }
+iceberg-catalog-memory = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", default-features = false }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87" }
-iceberg-storage-opendal = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "02ab2a5af77431d8e42a4b016f02343a75b63e87", features = [
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4" }
+iceberg-storage-opendal = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "6e974ce0b94b93a3bf0a1c5005628529794a96d4", features = [
     "opendal-s3",
 ] }
 
@@ -41,6 +38,7 @@ tempfile = "3.8"
 # Error handling
 thiserror = "2.0.11"
 tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tracing = "0.1"
 url = "2"
 uuid = { version = "1.0", features = ["v7"] }

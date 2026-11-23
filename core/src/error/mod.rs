@@ -24,6 +24,12 @@ pub enum CompactionError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    #[error("Delete statistics unavailable for {data_file_path}: {reason}")]
+    DeleteStatistics {
+        data_file_path: String,
+        reason: String,
+    },
+
     #[error("Execution failed: {0}")]
     Execution(String),
 

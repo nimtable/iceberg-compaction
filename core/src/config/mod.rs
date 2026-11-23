@@ -99,10 +99,24 @@ pub enum FileGroupScope {
     Table,
 }
 
+/// Predicate used to select delete-heavy data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSelection {
+    /// Inclusive delete-descriptor count; zero is rejected during strategy construction.
+    FileCount(usize),
+    /// Inclusive percentage of physical rows deleted by one file-scoped position delete.
+    ///
+    /// Supports Puffin deletion vectors and Parquet position deletes with distinct
+    /// positions and `referenced_data_file` set. Other valid delete layouts are skipped
+    /// with a warning but remain eligible for small-file merging. Invalid references
+    /// and counts for a single file-scoped position delete remain errors.
+    DeletedRowRatioPercent(u32),
+}
+
 /// Group-level filters applied after grouping.
 ///
-/// These filters remove groups that don't meet certain criteria. They are
-/// orthogonal to the grouping strategy and can be used with any strategy.
+/// These thresholds gate small-file merges. Delete candidates are planned
+/// independently and do not inherit these thresholds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Builder)]
 #[builder(setter(into, strip_option), default)]
 pub struct GroupFilters {
@@ -235,10 +249,14 @@ impl Default for FullCompactionConfig {
 /// Configuration for files-with-deletes compaction strategy.
 ///
 /// This strategy targets data files that have associated delete files.
-/// It supports group filtering to control which groups get compacted.
+/// Delete candidates do not need to meet small-file merge thresholds.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct FilesWithDeletesConfig {
+    /// Overrides `min_delete_file_count_threshold` when set.
+    #[builder(default, setter(strip_option))]
+    pub delete_selection: Option<DeleteSelection>,
+
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -267,8 +285,7 @@ pub struct FilesWithDeletesConfig {
 
     /// Boundary for file groups before applying `grouping_strategy`.
     ///
-    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
-    /// all selected partitions instead of independently per partition.
+    /// With [`FileGroupScope::Table`], delete candidates may be grouped across partitions.
     #[builder(default)]
     pub file_group_scope: FileGroupScope,
 
@@ -277,14 +294,9 @@ pub struct FilesWithDeletesConfig {
     pub max_file_sequence_number: Option<i64>,
 
     /// Minimum number of delete files required to trigger compaction.
+    /// Ignored when `delete_selection` is set.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
-
-    /// Optional filters to apply after grouping.
-    ///
-    /// Groups that don't meet these criteria will be excluded from compaction.
-    #[builder(default, setter(strip_option))]
-    pub group_filters: Option<GroupFilters>,
 }
 
 impl Default for FilesWithDeletesConfig {
@@ -297,12 +309,17 @@ impl Default for FilesWithDeletesConfig {
 
 /// Planning configuration for automatic compaction.
 ///
-/// Auto selects the union of small and delete-heavy data files, then sends the
-/// unified candidate set through one grouping pipeline. A zero file threshold
-/// disables that predicate for the planning run.
+/// Auto plans small-file merges and delete rewrites with the same grouping logic.
+/// Group filters only gate merges; a file selected by both paths is rewritten once.
+/// A zero file threshold disables that predicate unless an explicit `delete_selection`
+/// overrides it.
 #[derive(Debug, Clone, Builder)]
 #[builder(setter(into))]
 pub struct AutoCompactionConfig {
+    /// Overrides `min_delete_file_count_threshold`, including its zero-disable behavior.
+    #[builder(default, setter(strip_option))]
+    pub delete_selection: Option<DeleteSelection>,
+
     #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
     pub target_file_size_bytes: u64,
 
@@ -327,7 +344,7 @@ pub struct AutoCompactionConfig {
     pub small_file_threshold_bytes: u64,
 
     /// Files with at least this many deletes participate in the Auto candidate
-    /// set. Zero disables the delete-heavy predicate.
+    /// set when `delete_selection` is unset. Zero disables this count predicate.
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
@@ -341,6 +358,7 @@ pub struct AutoCompactionConfig {
     #[builder(default)]
     pub max_file_sequence_number: Option<i64>,
 
+    /// Thresholds for small-file merges only, not delete candidates.
     #[builder(default, setter(strip_option))]
     pub group_filters: Option<GroupFilters>,
 }
@@ -566,6 +584,55 @@ pub struct CompactionExecutionConfig {
     /// volume with enough free space, or away from a small/`noexec` `/tmp`.
     #[builder(default)]
     pub spill_dir: Option<std::path::PathBuf>,
+
+    /// Sets the compression strategy for on-disk spill files.
+    ///
+    /// The data spilled is Arrow IPC data, which can be many times larger than
+    /// the Parquet input it came from. Compression can reduce the disk space
+    /// used.
+    #[builder(default)]
+    pub spill_compression: SpillCompression,
+
+    /// Upper bound (in bytes) on total spill-file disk usage, shared by every
+    /// plan on this executor. Exceeding it fails the plan with `DataFusion`
+    /// `ResourcesExhausted` instead of filling the disk.
+    ///
+    /// Only takes effect together with `max_memory_bytes`; ignored otherwise.
+    /// `None` (default) uses `DataFusion`'s default (100 GB).
+    #[builder(default)]
+    pub max_disk_spill_bytes: Option<u64>,
+
+    /// How output data files are named. Defaults to [`DataFileNaming::Default`].
+    #[builder(default)]
+    pub data_file_naming: DataFileNaming,
+}
+
+/// How compaction names the data files it writes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DataFileNaming {
+    /// `{data_location}/{partition_path}/{data_file_prefix}-{n:05}-{uuid}.parquet`.
+    #[default]
+    Default,
+    /// `{data_location}/{uuid}.parquet`, with a fresh UUID v7 per file and no partition
+    /// directory. `data_file_prefix` is ignored.
+    ///
+    /// Callers can rebuild such a path from the table data location and the UUID alone, so they
+    /// can reference a data file by its 16 UUID bytes instead of the full path.
+    FlatUuid,
+}
+
+/// Compression codec for on-disk spill files.
+///
+/// Mirrors `DataFusion`'s `SpillCompression` so the public config does not
+/// expose `DataFusion` types.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCompression {
+    #[default]
+    Uncompressed,
+    /// Faster (de)compression, larger files.
+    Lz4Frame,
+    /// Smaller files, more CPU.
+    Zstd,
 }
 
 impl Default for CompactionExecutionConfig {
@@ -635,6 +702,7 @@ mod tests {
         assert_eq!(full.max_file_sequence_number, None);
 
         let files_with_deletes = FilesWithDeletesConfig::default();
+        assert_eq!(files_with_deletes.delete_selection, None);
         assert_eq!(
             files_with_deletes.file_group_scope,
             FileGroupScope::Partition
@@ -642,6 +710,7 @@ mod tests {
         assert_eq!(files_with_deletes.max_file_sequence_number, None);
 
         let auto = AutoCompactionConfig::default();
+        assert_eq!(auto.delete_selection, None);
         assert_eq!(auto.file_group_scope, FileGroupScope::Partition);
         assert_eq!(auto.max_file_sequence_number, None);
     }
