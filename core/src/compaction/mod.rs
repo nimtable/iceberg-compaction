@@ -219,6 +219,34 @@ pub struct RewriteResult {
     pub validation_info: Option<ValidationInfo>,
 }
 
+impl RewriteResult {
+    fn input_data_file_paths(&self) -> impl Iterator<Item = &str> {
+        self.plan
+            .file_group
+            .data_files
+            .iter()
+            .map(|task| task.data_file_path.as_str())
+    }
+}
+
+/// Outcome of a commit that leaves out conflicting rewrite results.
+pub struct RewriteCommit {
+    pub table: Table,
+    pub committed: Vec<RewriteResult>,
+    /// Results left out because row-level deletes were added to their inputs after planning.
+    pub skipped: Vec<RewriteResult>,
+}
+
+/// Replaced data file paths that a rejected rewrite commit reports as hit by newer deletes.
+fn conflicting_data_file_paths(error: &iceberg::Error) -> HashSet<&str> {
+    error
+        .context()
+        .iter()
+        .filter(|(key, _)| *key == iceberg::transaction::CONFLICTING_DATA_FILE_CONTEXT_KEY)
+        .map(|(_, path)| path.as_str())
+        .collect()
+}
+
 /// Information for deferred `CompactionValidator` creation.
 #[derive(Debug, Clone)]
 pub struct ValidationInfo {
@@ -474,40 +502,64 @@ impl Compaction {
             ));
         }
 
+        self.commit_manager_for_results(&rewrite_results)
+            .await?
+            .rewrite_files_from_results(rewrite_results, &self.to_branch)
+            .await
+    }
+
+    /// Commits rewrite results in a single Iceberg transaction, leaving out each result whose
+    /// input data files received row-level deletes after the planned snapshot.
+    ///
+    /// The left-out inputs stay in the table, so a later plan compacts them with the new deletes.
+    ///
+    /// This is opt-in: [`compact()`](Self::compact) keeps the strict commit, which fails on any
+    /// conflict, like Java's `RewriteDataFiles` by default. The effect is close to Java's
+    /// `partial-progress.enabled`, where commit groups that conflict are ignored, but here the
+    /// remaining results are committed in one snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns error under the same conditions as
+    /// [`commit_rewrite_results()`](Self::commit_rewrite_results), including when every result
+    /// conflicts.
+    pub async fn commit_rewrite_results_skipping_conflicts(
+        &self,
+        rewrite_results: Vec<RewriteResult>,
+    ) -> Result<RewriteCommit> {
+        if rewrite_results.is_empty() {
+            return Err(CompactionError::Execution(
+                "No rewrite results to commit".to_owned(),
+            ));
+        }
+
+        self.commit_manager_for_results(&rewrite_results)
+            .await?
+            .rewrite_files_from_results_skipping_conflicts(rewrite_results, &self.to_branch)
+            .await
+    }
+
+    async fn commit_manager_for_results(
+        &self,
+        rewrite_results: &[RewriteResult],
+    ) -> Result<CommitManager> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let snapshot_id = rewrite_results[0].plan.snapshot_id;
 
         // verify all rewrite results are from the same branch and snapshot
-        validate_rewrite_results_consistency(&rewrite_results, snapshot_id, &self.to_branch)?;
+        validate_rewrite_results_consistency(rewrite_results, snapshot_id, &self.to_branch)?;
 
-        // Create commit manager and delegate the complex logic to it
-        if let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) {
-            let consistency_params = CommitConsistencyParams {
-                starting_snapshot_id: snapshot.snapshot_id(),
-                use_starting_sequence_number: true,
-                basic_schema_id: table.metadata().current_schema().schema_id(),
-            };
-
-            let commit_manager = CommitManager::new(
-                self.commit_retry_config.clone(),
-                self.catalog.clone(),
-                self.table_ident.clone(),
-                self.table_ident_name.clone(),
-                self.catalog_name.clone(),
-                self.metrics.clone(),
-                consistency_params,
-            );
-
-            // Delegate to CommitManager's high-level interface
-            commit_manager
-                .rewrite_files_from_results(rewrite_results, &self.to_branch)
-                .await
-        } else {
-            Err(CompactionError::Execution(format!(
-                "Snapshot {} not found",
-                snapshot_id
-            )))
-        }
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| {
+                CompactionError::Execution(format!("Snapshot {} not found", snapshot_id))
+            })?;
+        Ok(self.build_commit_manager(CommitConsistencyParams {
+            starting_snapshot_id: snapshot.snapshot_id(),
+            use_starting_sequence_number: true,
+            basic_schema_id: table.metadata().current_schema().schema_id(),
+        }))
     }
 
     /// Executes multiple plans concurrently using `futures::stream`.
@@ -974,6 +1026,107 @@ impl CommitManager {
             delete_cleanup_min_data_sequence_number,
         )
         .await
+    }
+
+    /// Rewrites files from results, leaving out each result whose input data files received
+    /// row-level deletes after the planned snapshot.
+    ///
+    /// The remaining results are committed together. A left-out result's output files are not
+    /// referenced by the table, and its input files stay live for a later plan.
+    ///
+    /// Each time results are left out, the rest are committed again. After the configured retries
+    /// end on a catalog commit conflict, one more attempt is made so that the delete check can
+    /// run against the commit that caused the conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns the conflict error if every result conflicts, and propagates other errors from
+    /// `collect_files_from_results()` and `rewrite_files()`.
+    pub async fn rewrite_files_from_results_skipping_conflicts(
+        &self,
+        rewrite_results: Vec<RewriteResult>,
+        to_branch: &str,
+    ) -> Result<RewriteCommit> {
+        // The bound is computed over every file in the planned snapshot, so it stays a valid lower
+        // bound when results are left out and their inputs stay live.
+        let delete_cleanup_min_data_sequence_number = rewrite_results
+            .first()
+            .and_then(|result| result.plan.delete_cleanup_min_data_sequence_number);
+        let (added_data_files, rewritten_data_files) = self
+            .collect_files_from_results(&rewrite_results, to_branch)
+            .await?;
+
+        let mut committed = rewrite_results;
+        let mut skipped: Vec<RewriteResult> = Vec::new();
+        // A catalog commit conflict names no files. With commit retries disabled it would end the
+        // run before the delete check sees the commit that caused it, so it gets one more attempt.
+        let mut conflict_attempt_used = false;
+        loop {
+            let skipped_inputs: HashSet<&str> = skipped
+                .iter()
+                .flat_map(|result| result.input_data_file_paths())
+                .collect();
+            let skipped_outputs: HashSet<&str> = skipped
+                .iter()
+                .flat_map(|result| result.output_data_files.iter().map(DataFile::file_path))
+                .collect();
+            let added = added_data_files
+                .iter()
+                .filter(|file| !skipped_outputs.contains(file.file_path()))
+                .cloned()
+                .collect();
+            let rewritten = rewritten_data_files
+                .iter()
+                .filter(|file| !skipped_inputs.contains(file.file_path()))
+                .cloned()
+                .collect();
+
+            let error = match self
+                .rewrite_files_with_delete_cleanup_sequence(
+                    added,
+                    rewritten,
+                    to_branch,
+                    delete_cleanup_min_data_sequence_number,
+                )
+                .await
+            {
+                Ok(table) => {
+                    return Ok(RewriteCommit {
+                        table,
+                        committed,
+                        skipped,
+                    });
+                }
+                Err(CompactionError::Iceberg(error)) => error,
+                Err(error) => return Err(error),
+            };
+
+            if error.kind() == iceberg::ErrorKind::CatalogCommitConflicts && !conflict_attempt_used
+            {
+                conflict_attempt_used = true;
+                continue;
+            }
+            let conflicting = conflicting_data_file_paths(&error);
+            let (hit, rest): (Vec<_>, Vec<_>) = committed.into_iter().partition(|result| {
+                result
+                    .input_data_file_paths()
+                    .any(|path| conflicting.contains(path))
+            });
+            // Stop when the error names no planned input, or nothing would be left to commit.
+            if hit.is_empty() || rest.is_empty() {
+                return Err(CompactionError::Iceberg(error));
+            }
+            tracing::warn!(
+                "Skipping {} of {} rewrite results for table '{}': row-level deletes were added \
+                 to their inputs after snapshot {}",
+                hit.len(),
+                hit.len() + rest.len() + skipped.len(),
+                self.table_ident,
+                self.starting_snapshot_id
+            );
+            skipped.extend(hit);
+            committed = rest;
+        }
     }
 
     /// Overwrites files from results: file collection, validation, and commit.
@@ -1496,14 +1649,19 @@ mod tests {
         CommitConsistencyParams, CommitManagerRetryConfig, CompactionPlan, RewriteResult,
         UNASSIGNED_SNAPSHOT_ID,
     };
-    use crate::compaction::{CompactionBuilder, CompactionPlanner, resolve_data_files_by_path};
+    use crate::compaction::{
+        CompactionBuilder, CompactionPlanner, conflicting_data_file_paths,
+        resolve_data_files_by_path,
+    };
     use crate::config::{
         CompactionConfigBuilder, CompactionExecutionConfigBuilder, CompactionPlanningConfig,
         SmallFilesConfigBuilder,
     };
     use crate::executor::{ExecutorType, RewriteFilesStat};
+    use crate::file_selection::FileGroup;
 
     mod file_group_scope;
+    mod skip_conflicts;
 
     // ----------------------
     // Test helpers to reduce duplication
@@ -1895,12 +2053,33 @@ mod tests {
         warehouse_location: &str,
         deletes: &[(String, u64)],
     ) -> Vec<DataFile> {
+        let unpartitioned = (
+            iceberg::spec::Struct::empty(),
+            table.metadata().default_partition_spec_id(),
+        );
+        write_puffin_deletion_vectors(table, warehouse_location, deletes, |_| {
+            unpartitioned.clone()
+        })
+        .await
+    }
+
+    /// Like [`write_shared_puffin_deletion_vectors`], with each delete entry placed in the
+    /// partition (and spec) that `partition_of` returns for its referenced data file.
+    async fn write_puffin_deletion_vectors(
+        table: &Table,
+        warehouse_location: &str,
+        deletes: &[(String, u64)],
+        partition_of: impl Fn(&str) -> (iceberg::spec::Struct, i32),
+    ) -> Vec<DataFile> {
         use std::collections::HashMap as StdHashMap;
 
         use iceberg::puffin::{CompressionCodec, PuffinWriter};
-        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
 
-        let puffin_path = format!("{warehouse_location}/data/shared-deletes.puffin");
+        let puffin_path = format!(
+            "{warehouse_location}/data/shared-deletes-{}.puffin",
+            Uuid::now_v7()
+        );
         let output = table.file_io().new_output(&puffin_path).unwrap();
 
         let mut writer = PuffinWriter::new(&output, StdHashMap::new(), false)
@@ -1936,12 +2115,13 @@ mod tests {
             .iter()
             .zip(deletes)
             .map(|(blob, (referenced_data_file, _))| {
+                let (partition, partition_spec_id) = partition_of(referenced_data_file);
                 DataFileBuilder::default()
                     .content(DataContentType::PositionDeletes)
                     .file_path(puffin_path.clone())
                     .file_format(DataFileFormat::Puffin)
-                    .partition(Struct::empty())
-                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .partition(partition)
+                    .partition_spec_id(partition_spec_id)
                     .record_count(1)
                     .file_size_in_bytes(result.file_size_in_bytes)
                     .referenced_data_file(Some(referenced_data_file.clone()))
@@ -2112,6 +2292,114 @@ mod tests {
             after.iter().filter(|id| **id == 1).count(),
             9,
             "the large file's deleted id=1 must still be deleted"
+        );
+    }
+
+    /// A deletion vector committed between planning and commit for one group's input must not be
+    /// lost: the strict commit fails, and the skipping commit leaves that group out and commits
+    /// the other.
+    #[tokio::test]
+    async fn test_commit_skips_groups_whose_inputs_received_new_deletes() {
+        let env = create_v3_test_env().await;
+        let files = write_simple_files(&env.table, &env.warehouse_location, "input", 2).await;
+        let (kept_path, hit_path) = (
+            files[0].file_path().to_owned(),
+            files[1].file_path().to_owned(),
+        );
+        let table = append_and_commit(&env.table, env.catalog.as_ref(), files).await;
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default().build().unwrap(),
+            ))
+            .build();
+        let plans = compaction.plan_compaction().await.unwrap();
+        assert_eq!(plans.len(), 1);
+        let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
+        // One group per input file, so the conflict hits exactly one group.
+        let mut results = Vec::new();
+        for task in plans[0].file_group.data_files.clone() {
+            let plan = CompactionPlan::new(
+                FileGroup::new(vec![task]),
+                MAIN_BRANCH,
+                plans[0].snapshot_id,
+            );
+            results.push(
+                compaction
+                    .rewrite_plan(plan, &execution_config, &table)
+                    .await
+                    .unwrap(),
+            );
+        }
+        results.sort_by_key(|result| {
+            result.plan.file_group.data_files[0].data_file_path() == hit_path
+        });
+
+        // Another writer deletes id=1 from the second input after planning.
+        let deletes = write_shared_puffin_deletion_vectors(&table, &env.warehouse_location, &[(
+            hit_path.clone(),
+            0,
+        )])
+        .await;
+        append_and_commit(&table, env.catalog.as_ref(), deletes).await;
+
+        let err = compaction
+            .commit_rewrite_results(results.clone())
+            .await
+            .expect_err("the strict commit must reject the conflicting group");
+        let CompactionError::Iceberg(err) = err else {
+            panic!("expected an iceberg conflict error, got {err:?}");
+        };
+        assert_eq!(
+            conflicting_data_file_paths(&err),
+            HashSet::from([hit_path.as_str()])
+        );
+
+        let commit = compaction
+            .commit_rewrite_results_skipping_conflicts(results.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            commit
+                .committed
+                .iter()
+                .flat_map(RewriteResult::input_data_file_paths)
+                .collect::<Vec<_>>(),
+            vec![kept_path.as_str()]
+        );
+        assert_eq!(
+            commit
+                .skipped
+                .iter()
+                .flat_map(RewriteResult::input_data_file_paths)
+                .collect::<Vec<_>>(),
+            vec![hit_path.as_str()]
+        );
+
+        let live_paths: HashSet<String> = load_data_files_from_snapshot(&commit.table, MAIN_BRANCH)
+            .await
+            .iter()
+            .filter(|file| file.content_type() == iceberg::spec::DataContentType::Data)
+            .map(|file| file.file_path().to_owned())
+            .collect();
+        let expected_paths: HashSet<String> = results[0]
+            .output_data_files
+            .iter()
+            .map(|file| file.file_path().to_owned())
+            .chain([hit_path])
+            .collect();
+        assert_eq!(live_paths, expected_paths);
+        assert_eq!(surviving_ids(&commit.table).await, vec![1, 2, 2, 3, 3]);
+
+        // With nothing left to commit, the conflict is returned instead.
+        let err = compaction
+            .commit_rewrite_results_skipping_conflicts(vec![results[1].clone()])
+            .await
+            .err()
+            .expect("a commit where every group conflicts must fail");
+        assert!(
+            matches!(&err, CompactionError::Iceberg(err) if err.kind() == iceberg::ErrorKind::PreconditionFailed),
+            "unexpected error {err:?}"
         );
     }
 
