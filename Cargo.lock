@@ -2310,7 +2310,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=6e974ce0b94b93a3bf0a1c5005628529794a96d4#6e974ce0b94b93a3bf0a1c5005628529794a96d4"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c08b876791cc9030408ff41bc479aa5cee6ebd4#7c08b876791cc9030408ff41bc479aa5cee6ebd4"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2368,7 +2368,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=6e974ce0b94b93a3bf0a1c5005628529794a96d4#6e974ce0b94b93a3bf0a1c5005628529794a96d4"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c08b876791cc9030408ff41bc479aa5cee6ebd4#7c08b876791cc9030408ff41bc479aa5cee6ebd4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2454,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=6e974ce0b94b93a3bf0a1c5005628529794a96d4#6e974ce0b94b93a3bf0a1c5005628529794a96d4"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c08b876791cc9030408ff41bc479aa5cee6ebd4#7c08b876791cc9030408ff41bc479aa5cee6ebd4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=6e974ce0b94b93a3bf0a1c5005628529794a96d4#6e974ce0b94b93a3bf0a1c5005628529794a96d4"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=7c08b876791cc9030408ff41bc479aa5cee6ebd4#7c08b876791cc9030408ff41bc479aa5cee6ebd4"
 dependencies = [
  "anyhow",
  "async-trait",
