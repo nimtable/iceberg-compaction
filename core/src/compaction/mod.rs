@@ -4105,6 +4105,77 @@ mod tests {
         );
     }
 
+    async fn append_to_branch<C: Catalog>(
+        table: &Table,
+        catalog: &C,
+        branch: &str,
+        data_files: Vec<DataFile>,
+    ) -> Table {
+        let transaction = Transaction::new(table);
+        let tx = transaction
+            .fast_append()
+            .set_target_branch(branch.to_owned())
+            .add_data_files(data_files)
+            .apply(transaction)
+            .unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// Compaction on a branch other than `main` (for example a copy-on-write rewrite on an
+    /// ingestion branch) checks deletes on that branch only: a deletion vector committed to `main`
+    /// for a planned input does not conflict, and the same deletion vector on the branch does.
+    #[tokio::test]
+    async fn test_commit_on_a_branch_validates_against_that_branch_only() {
+        const BRANCH: &str = "ingestion";
+        for delete_branch in [MAIN_BRANCH, BRANCH] {
+            let env = create_v3_test_env().await;
+            let files = write_simple_files(&env.table, &env.warehouse_location, "input", 2).await;
+            let hit_path = files[1].file_path().to_owned();
+            let table = append_to_branch(&env.table, env.catalog.as_ref(), BRANCH, files).await;
+
+            let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+                .with_config(Arc::new(
+                    CompactionConfigBuilder::default().build().unwrap(),
+                ))
+                .with_to_branch(BRANCH)
+                .build();
+            let plans = compaction.plan_compaction().await.unwrap();
+            assert_eq!(plans.len(), 1);
+            let execution_config = CompactionExecutionConfigBuilder::default().build().unwrap();
+            let result = compaction
+                .rewrite_plan(plans[0].clone(), &execution_config, &table)
+                .await
+                .unwrap();
+
+            let deletes =
+                write_shared_puffin_deletion_vectors(&table, &env.warehouse_location, &[(
+                    hit_path.clone(),
+                    0,
+                )])
+                .await;
+            append_to_branch(&table, env.catalog.as_ref(), delete_branch, deletes).await;
+
+            let outcome = compaction.commit_rewrite_results(vec![result]).await;
+            if delete_branch == BRANCH {
+                assert!(
+                    matches!(&outcome, Err(CompactionError::Iceberg(err)) if err.kind() == iceberg::ErrorKind::PreconditionFailed),
+                    "a deletion vector on the branch must conflict: {:?}",
+                    outcome.map(|_| "committed")
+                );
+            } else {
+                let committed = outcome.expect("a deletion vector on main must not conflict");
+                assert_ne!(
+                    committed
+                        .metadata()
+                        .snapshot_for_ref(BRANCH)
+                        .unwrap()
+                        .snapshot_id(),
+                    plans[0].snapshot_id
+                );
+            }
+        }
+    }
+
     /// A deletion vector committed after planning for a rewritten input fails the commit on both
     /// commit paths, and the table keeps the delete.
     #[tokio::test]
